@@ -211,9 +211,25 @@ fn handleConnectionInner(
     _ = try client_stream.write(server_hello);
 
     // Read 64-byte MTProto handshake (wrapped in TLS Application Data)
+    // The client may send a Change Cipher Spec (CCS) record first — skip it.
     var tls_header: [5]u8 = undefined;
-    if (try readExact(client_stream, &tls_header) < 5) return;
-    if (tls_header[0] != constants.tls_record_application) return;
+    while (true) {
+        if (try readExact(client_stream, &tls_header) < 5) return;
+
+        if (tls_header[0] == constants.tls_record_application) break;
+
+        if (tls_header[0] == constants.tls_record_change_cipher) {
+            // Read and discard the CCS body
+            const ccs_len = std.mem.readInt(u16, tls_header[3..5], .big);
+            if (ccs_len > 256) return;
+            var ccs_buf: [256]u8 = undefined;
+            if (try readExact(client_stream, ccs_buf[0..ccs_len]) < ccs_len) return;
+            continue;
+        }
+
+        log.debug("[{d}] Unexpected TLS record type after ServerHello: 0x{x:0>2}", .{ conn_id, tls_header[0] });
+        return;
+    }
 
     const payload_len = std.mem.readInt(u16, tls_header[3..5], .big);
     if (payload_len < constants.handshake_len) return;
