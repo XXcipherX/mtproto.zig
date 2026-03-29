@@ -15,6 +15,8 @@ const Aes256 = std.crypto.core.aes.Aes256;
 /// CTR mode is symmetric — encrypt and decrypt are the same operation.
 pub const AesCtr = struct {
     key: [32]u8,
+    /// Cached expanded key schedule (avoids re-computing on every apply())
+    enc_ctx: @TypeOf(Aes256.initEnc([_]u8{0} ** 32)),
     /// Current counter value (big-endian u128)
     ctr: u128,
     /// Buffered keystream block
@@ -25,6 +27,7 @@ pub const AesCtr = struct {
     pub fn init(key: *const [32]u8, iv: u128) AesCtr {
         return .{
             .key = key.*,
+            .enc_ctx = Aes256.initEnc(key.*),
             .ctr = iv,
         };
     }
@@ -39,7 +42,6 @@ pub const AesCtr = struct {
 
     /// Apply keystream to data in-place (encrypt or decrypt).
     pub fn apply(self: *AesCtr, data: []u8) void {
-        const ctx = Aes256.initEnc(self.key);
         var i: usize = 0;
 
         while (i < data.len) {
@@ -47,7 +49,7 @@ pub const AesCtr = struct {
                 // Generate new keystream block
                 var ctr_bytes: [16]u8 = undefined;
                 std.mem.writeInt(u128, &ctr_bytes, self.ctr, .big);
-                ctx.encrypt(&self.buffer, &ctr_bytes);
+                self.enc_ctx.encrypt(&self.buffer, &ctr_bytes);
                 self.ctr +%= 1;
                 self.buffer_pos = 0;
             }
@@ -78,6 +80,8 @@ pub const AesCtr = struct {
         @memset(&self.key, 0);
         @memset(&self.buffer, 0);
         self.ctr = 0;
+        // Wipe expanded key schedule
+        self.enc_ctx = Aes256.initEnc([_]u8{0} ** 32);
     }
 };
 
@@ -107,7 +111,8 @@ pub const AesCbc = struct {
     }
 
     /// Encrypt data in-place. Data length must be a multiple of 16.
-    pub fn encryptInPlace(self: *const AesCbc, data: []u8) !void {
+    /// IV is updated after each call to support chaining across multiple calls.
+    pub fn encryptInPlace(self: *AesCbc, data: []u8) !void {
         if (data.len % block_size != 0) return error.UnalignedData;
         if (data.len == 0) return;
 
@@ -127,10 +132,14 @@ pub const AesCbc = struct {
             block.* = encrypted;
             prev = encrypted;
         }
+
+        // Persist IV for chaining across calls
+        self.iv = prev;
     }
 
     /// Decrypt data in-place. Data length must be a multiple of 16.
-    pub fn decryptInPlace(self: *const AesCbc, data: []u8) !void {
+    /// IV is updated after each call to support chaining across multiple calls.
+    pub fn decryptInPlace(self: *AesCbc, data: []u8) !void {
         if (data.len % block_size != 0) return error.UnalignedData;
         if (data.len == 0) return;
 
@@ -151,6 +160,9 @@ pub const AesCbc = struct {
             }
             prev = saved;
         }
+
+        // Persist IV for chaining across calls
+        self.iv = prev;
     }
 
     pub fn wipe(self: *AesCbc) void {
@@ -251,10 +263,12 @@ test "AesCbc roundtrip" {
     }
     const original = plaintext;
 
-    const cbc = AesCbc.init(&key, &iv);
+    var cbc = AesCbc.init(&key, &iv);
     try cbc.encryptInPlace(&plaintext);
     try std.testing.expect(!std.mem.eql(u8, &plaintext, &original));
 
+    // Reset IV for decryption (since encryptInPlace updated it)
+    cbc.iv = iv;
     try cbc.decryptInPlace(&plaintext);
     try std.testing.expectEqualSlices(u8, &original, &plaintext);
 }
@@ -264,7 +278,7 @@ test "AesCbc chaining works" {
     const iv = [_]u8{0x00} ** 16;
     var plaintext = [_]u8{0xAA} ** 32;
 
-    const cbc = AesCbc.init(&key, &iv);
+    var cbc = AesCbc.init(&key, &iv);
     try cbc.encryptInPlace(&plaintext);
 
     // With CBC chaining, identical plaintext blocks should produce different ciphertext blocks

@@ -193,7 +193,7 @@ fn handleConnectionInner(
     // Send ServerHello response
     const server_hello = try tls.buildServerHello(
         state.allocator,
-        &v.digest,
+        &v.secret,
         &v.digest,
         v.session_id,
         1024,
@@ -209,6 +209,7 @@ fn handleConnectionInner(
 
     const payload_len = std.mem.readInt(u16, tls_header[3..5], .big);
     if (payload_len < constants.handshake_len) return;
+    if (payload_len > constants.max_tls_ciphertext_size) return; // Fix #4: bounds check against buffer size
 
     var payload_buf: [constants.max_tls_ciphertext_size]u8 = undefined;
     if (try readExact(client_stream, payload_buf[0..payload_len]) < payload_len) return;
@@ -231,11 +232,11 @@ fn handleConnectionInner(
         params.proto_tag,
     });
 
-    // Resolve DC address
+    // Resolve DC address — use @abs() to avoid overflow when dc_idx == minInt(i16)
     const dc_idx: usize = if (params.dc_idx > 0)
         @as(usize, @intCast(params.dc_idx)) - 1
     else if (params.dc_idx < 0)
-        @as(usize, @intCast(-params.dc_idx)) - 1
+        @as(usize, @abs(params.dc_idx)) - 1
     else
         return;
 
@@ -274,6 +275,7 @@ fn handleConnectionInner(
     // Encrypt the nonce: encrypt full nonce to advance counter, but only
     // replace bytes from proto_tag_pos onwards with ciphertext
     var tg_encryptor = crypto.AesCtr.init(&tg_enc_key, tg_enc_iv);
+    defer tg_encryptor.wipe();
     var encrypted_nonce: [constants.handshake_len]u8 = undefined;
     @memcpy(&encrypted_nonce, &tg_nonce);
     tg_encryptor.apply(&encrypted_nonce);
@@ -286,6 +288,7 @@ fn handleConnectionInner(
     // tg_encryptor counter is now at position 4 (past 64 bytes), correct for subsequent data
 
     var tg_decryptor = crypto.AesCtr.init(&tg_dec_key, tg_dec_iv);
+    defer tg_decryptor.wipe();
 
     // Wipe key material from stack
     @memset(&tg_enc_key, 0);
@@ -295,11 +298,35 @@ fn handleConnectionInner(
 
     log.info("[{d}] Relaying traffic", .{conn_id});
 
+    // Set both sockets to non-blocking to prevent deadlocks with poll().
+    // The relay handlers already handle WouldBlock errors correctly.
+    setNonBlocking(client_stream.handle);
+    setNonBlocking(dc_stream.handle);
+
     // Create client-side crypto
     // client_decryptor: decrypt client→proxy traffic (C2S)
     // client_encryptor: encrypt proxy→client traffic (S2C)
     var client_decryptor = params.createDecryptor();
     var client_encryptor = params.createEncryptor();
+    defer client_decryptor.wipe();
+    defer client_encryptor.wipe();
+
+    // CRITICAL: The client encrypted its 64-byte handshake with AES-CTR, advancing
+    // its counter by 4 blocks (64 / 16 = 4). fromHandshake() used a temp decryptor
+    // to verify the handshake then discarded it. Our fresh decryptor starts at
+    // counter 0 — we must advance it by 4 to match the client's CTR state.
+    client_decryptor.ctr +%= 4;
+
+    // Fix #3: Handle pipelined data — Telegram clients send their first RPC request
+    // immediately after the 64-byte handshake in the same TLS record. If we don't
+    // forward these bytes, the client's first message is silently lost.
+    if (payload_len > constants.handshake_len) {
+        const pipelined = payload_buf[constants.handshake_len..payload_len];
+        // Decrypt with client cipher, re-encrypt with DC cipher
+        client_decryptor.apply(pipelined);
+        tg_encryptor.apply(pipelined);
+        try writeAll(dc_stream, pipelined);
+    }
 
     relayBidirectional(
         client_stream,
@@ -420,15 +447,19 @@ fn relayClientToDc(
             }
 
             if (record_type == constants.tls_record_change_cipher) {
-                // CCS: skip the 1-byte body
-                tls_body_len.* = std.mem.readInt(u16, tls_hdr_buf[3..5], .big);
-                tls_body_pos.* = 0;
-                // Read and discard CCS body
-                var discard_buf: [1]u8 = undefined;
-                const dn = client.read(&discard_buf) catch |err| {
-                    return if (err == error.WouldBlock) {} else err;
-                };
-                if (dn == 0) return error.ConnectionReset;
+                // CCS: read and discard the body (variable length, not always 1 byte)
+                const ccs_body_len = std.mem.readInt(u16, tls_hdr_buf[3..5], .big);
+                if (ccs_body_len > max_tls_payload) return error.ConnectionReset;
+                var ccs_discard_pos: usize = 0;
+                while (ccs_discard_pos < ccs_body_len) {
+                    var discard_buf: [256]u8 = undefined;
+                    const to_read = @min(ccs_body_len - ccs_discard_pos, discard_buf.len);
+                    const dn = client.read(discard_buf[0..to_read]) catch |err| {
+                        return if (err == error.WouldBlock) {} else err;
+                    };
+                    if (dn == 0) return error.ConnectionReset;
+                    ccs_discard_pos += dn;
+                }
                 // Reset for next record
                 tls_hdr_pos.* = 0;
                 tls_body_pos.* = 0;
@@ -552,6 +583,13 @@ fn readExact(stream: net.Stream, buf: []u8) !usize {
         total += nr;
     }
     return total;
+}
+
+/// Set a file descriptor to non-blocking mode.
+fn setNonBlocking(fd: posix.fd_t) void {
+    var fl_flags = posix.fcntl(fd, posix.F.GETFL, 0) catch return;
+    fl_flags |= 1 << @bitOffsetOf(posix.O, "NONBLOCK");
+    _ = posix.fcntl(fd, posix.F.SETFL, fl_flags) catch return;
 }
 
 test "ProxyState init/deinit" {

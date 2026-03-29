@@ -22,6 +22,8 @@ pub const TlsValidation = struct {
     digest: [constants.tls_digest_len]u8,
     /// Timestamp extracted from digest
     timestamp: u32,
+    /// The 16-byte user secret that matched (needed for ServerHello HMAC)
+    secret: [16]u8,
 };
 
 // ============= Public Functions =============
@@ -63,8 +65,8 @@ pub fn validateTlsHandshake(
     for (secrets) |entry| {
         const computed = crypto.sha256Hmac(&entry.secret, msg);
 
-        // Constant-time comparison of first 28 bytes
-        if (!constantTimeEq(u8, digest[0..28], computed[0..28])) continue;
+        // Constant-time comparison of first 28 bytes using stdlib
+        if (!std.crypto.timing_safe.eql([28]u8, digest[0..28].*, computed[0..28].*)) continue;
 
         // Extract timestamp from last 4 bytes (XOR)
         const timestamp = std.mem.readInt(u32, &[4]u8{
@@ -86,20 +88,11 @@ pub fn validateTlsHandshake(
             .session_id = handshake[session_id_start .. session_id_start + session_id_len],
             .digest = digest,
             .timestamp = timestamp,
+            .secret = entry.secret,
         };
     }
 
     return null;
-}
-
-/// Constant-time equality check.
-fn constantTimeEq(comptime T: type, a: []const T, b: []const T) bool {
-    if (a.len != b.len) return false;
-    var diff: T = 0;
-    for (a, b) |x, y| {
-        diff |= x ^ y;
-    }
-    return diff == 0;
 }
 
 /// Build a fake TLS ServerHello response.
@@ -323,12 +316,12 @@ test "isTlsHandshake" {
     try std.testing.expect(!isTlsHandshake(&[_]u8{ 0x17, 0x03, 0x03 }));
 }
 
-test "constantTimeEq" {
+test "timing_safe.eql" {
     const a = [_]u8{ 1, 2, 3 };
     const b = [_]u8{ 1, 2, 3 };
     const c = [_]u8{ 1, 2, 4 };
-    try std.testing.expect(constantTimeEq(u8, &a, &b));
-    try std.testing.expect(!constantTimeEq(u8, &a, &c));
+    try std.testing.expect(std.crypto.timing_safe.eql([3]u8, a, b));
+    try std.testing.expect(!std.crypto.timing_safe.eql([3]u8, a, c));
 }
 
 test "buildServerHello produces valid structure" {
