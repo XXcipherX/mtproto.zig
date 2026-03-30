@@ -428,9 +428,13 @@ fn handleConnectionInner(
     // Generate and send obfuscated handshake to Telegram DC
     var tg_nonce = obfuscation.generateNonce();
 
-    // In FAST_MODE, embed the client's S2C key/IV into the DC nonce so the DC
-    // derives direct-to-client encryption parameters, bypassing proxy S2C crypto.
-    if (state.config.fast_mode) {
+    // FIX: Telegram Media DCs (negative dc_idx) do not support FAST_MODE S2C offloading.
+    // They ignore the embedded client keys and encrypt S2C traffic with the proxy's session key.
+    // We must dynamically disable fast_mode for them and fall back to double-encryption.
+    const is_media_dc = params.dc_idx < 0;
+    const use_fast_mode = state.config.fast_mode and !is_media_dc;
+
+    if (use_fast_mode) {
         var client_s2c_key_iv: [constants.key_len + constants.iv_len]u8 = undefined;
         @memcpy(client_s2c_key_iv[0..constants.key_len], &params.encrypt_key);
         std.mem.writeInt(u128, client_s2c_key_iv[constants.key_len..][0..constants.iv_len], params.encrypt_iv, .big);
@@ -529,7 +533,7 @@ fn handleConnectionInner(
         &tg_decryptor,
         initial_c2s_bytes,
         conn_id,
-        state.config.fast_mode,
+        use_fast_mode,
     ) catch |err| {
         log.debug("[{d}] ({s}) Relay ended: {any}", .{ conn_id, peer_str, err });
     };
