@@ -95,6 +95,10 @@ pub const ProxyState = struct {
     connection_count: std.atomic.Value(u64),
     /// Active concurrent connections (for overload protection)
     active_connections: std.atomic.Value(u32),
+    /// Cached resolved address for mask domain (tls_domain).
+    /// Resolved once at startup to avoid per-connection DNS (getaddrinfo)
+    /// which uses ~48-80KB of stack and causes SEGFAULT on 128KB threads.
+    mask_addr: ?net.Address,
 
     /// Maximum concurrent connections before rejecting new ones.
     /// Prevents thread exhaustion under load.
@@ -110,12 +114,29 @@ pub const ProxyState = struct {
             }) catch continue;
         }
 
+        // Resolve mask domain DNS at startup (avoids getaddrinfo on small-stack threads)
+        var resolved_addr: ?net.Address = null;
+        if (cfg.mask) {
+            const list = net.getAddressList(allocator, cfg.tls_domain, cfg.mask_port) catch |err| blk: {
+                log.err("Failed to resolve mask domain '{s}': {any}", .{ cfg.tls_domain, err });
+                break :blk null;
+            };
+            if (list) |al| {
+                defer al.deinit();
+                if (al.addrs.len > 0) {
+                    resolved_addr = al.addrs[0];
+                    log.info("Mask domain '{s}' resolved at startup", .{cfg.tls_domain});
+                }
+            }
+        }
+
         return .{
             .allocator = allocator,
             .config = cfg,
             .user_secrets = secrets.toOwnedSlice(allocator) catch &.{},
             .connection_count = std.atomic.Value(u64).init(0),
             .active_connections = std.atomic.Value(u32).init(0),
+            .mask_addr = resolved_addr,
         };
     }
 
@@ -150,10 +171,11 @@ pub const ProxyState = struct {
             }
 
             const thread = std.Thread.spawn(.{
-                // Proxy threads just shuffle bytes between sockets + AES-CTR (no deep recursion).
-                // 128 KB is plenty. Default 8-16 MB per thread would exhaust memory with thousands
+                // Proxy threads shuffle bytes between sockets + AES-CTR (no deep recursion).
+                // 256 KB is plenty with safety margin for stack-heavy operations.
+                // Default 8-16 MB per thread would exhaust memory with thousands
                 // of idle iOS pool connections (e.g. 4000 threads * 8 MB = 32 GB virtual memory).
-                .stack_size = 128 * 1024,
+                .stack_size = 256 * 1024,
             }, handleConnection, .{ self, conn.stream, conn.address, conn_id }) catch |err| {
                 log.err("[{d}] Spawn error: {any}", .{ conn_id, err });
                 conn.stream.close();
@@ -474,6 +496,37 @@ fn handleConnectionInner(
 
     try writeAll(dc_stream, &nonce_to_send);
     // tg_encryptor counter is now at position 4 (past 64 bytes), correct for subsequent data
+
+    // Promotion (Sponsorship) Tag
+    if (state.config.tag) |tag| {
+        var promote_buf: [32]u8 = undefined;
+        var packet_len: usize = 0;
+
+        const rpc_id: u32 = 0xaeaf0c42;
+        var rpc_payload: [20]u8 = undefined;
+        std.mem.writeInt(u32, rpc_payload[0..4], rpc_id, .little);
+        @memcpy(rpc_payload[4..20], &tag);
+
+        switch (params.proto_tag) {
+            .abridged => {
+                promote_buf[0] = 5; // 20 / 4
+                @memcpy(promote_buf[1..21], &rpc_payload);
+                packet_len = 21;
+            },
+            .intermediate, .secure => {
+                // For both Intermediate and Secure (Padded), we use 4-byte little-endian length.
+                // Telegram is generally fine with unpadded promotion tags even in Secure mode.
+                std.mem.writeInt(u32, promote_buf[0..4], 20, .little);
+                @memcpy(promote_buf[4..24], &rpc_payload);
+                packet_len = 24;
+            },
+        }
+
+        const to_send = promote_buf[0..packet_len];
+        tg_encryptor.apply(to_send);
+        try writeAll(dc_stream, to_send);
+        log.debug("[{d}] ({s}) Sent promotion tag", .{ conn_id, peer_str });
+    }
 
     var tg_decryptor = crypto.AesCtr.init(&tg_dec_key, tg_dec_iv);
     defer tg_decryptor.wipe();
@@ -1012,8 +1065,13 @@ fn maskConnection(
 ) void {
     if (!state.config.mask) return;
 
-    // Connect to the real domain on port 443 (or mask_port for tests)
-    const upstream_stream = std.net.tcpConnectToHost(state.allocator, state.config.tls_domain, state.config.mask_port) catch {
+    // Use cached DNS result from startup — avoids getaddrinfo on small-stack threads
+    const addr = state.mask_addr orelse {
+        log.debug("[{d}] ({s}) Masking skipped: no resolved address for {s}", .{ conn_id, peer_str, state.config.tls_domain });
+        return;
+    };
+
+    const upstream_stream = net.tcpConnectToAddress(addr) catch {
         log.debug("[{d}] ({s}) Masking failed: cannot connect to {s}:{d}", .{ conn_id, peer_str, state.config.tls_domain, state.config.mask_port });
         return;
     };
