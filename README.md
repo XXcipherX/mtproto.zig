@@ -43,16 +43,32 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 
 ## &nbsp; How It Works
 
-```
- Client                       Proxy                        Telegram DC
-   |                            |                                |
-   |---- TLS ClientHello ------>|                                |
-   |<--- TLS ServerHello -------|                                |
-   |                            |                                |
-   |-- TLS(MTProto Handshake) ->|--- Obfuscated Handshake ------>|
-   |                            |                                |
-   |== TLS(AES-CTR(data)) ====>|==== AES-CTR(data) ============>|
-   |<= TLS(AES-CTR(data)) =====|<=== AES-CTR(data) =============|
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant P as Proxy
+    participant DC as Telegram DC
+
+    rect rgb(40, 40, 60)
+    Note over C,P: Layer 1 — Fake TLS 1.3
+    C->>P: TLS ClientHello (HMAC-SHA256 in random)
+    P-->>C: TLS ServerHello + ChangeCipherSpec
+    end
+
+    rect rgb(40, 60, 40)
+    Note over C,DC: Layer 2 — MTProto Obfuscation
+    C->>P: TLS AppData ← 64-byte obfuscated handshake
+    P->>DC: Obfuscated handshake (AES-256-CTR keys derived)
+    DC-->>P: Obfuscated response
+    end
+
+    rect rgb(60, 40, 40)
+    Note over C,DC: Layer 3 — Encrypted Relay
+    C->>P: TLS( AES-CTR( data ) )
+    P->>DC: AES-CTR( data )
+    DC-->>P: AES-CTR( data )
+    P-->>C: TLS( AES-CTR( data ) )
+    end
 ```
 
 > **Layer 1 -- Fake TLS 1.3** &nbsp; The client embeds an HMAC-SHA256 digest (derived from its secret) in the ClientHello `random` field. The proxy validates it and responds with an indistinguishable ServerHello.
