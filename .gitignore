@@ -6,3 +6,4 @@ telemt/
 VALIDATION.md
 config.toml
 .env
+.ruff_cache/
