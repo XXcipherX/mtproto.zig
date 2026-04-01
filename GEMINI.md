@@ -371,50 +371,78 @@ If connecting to the proxy while behind a **Commercial/Premium VPN**, the VPN pr
 ### Service & Process Monitoring
 ```bash
 # Check service status
-ssh root@154.59.110.193 'systemctl status mtproto-proxy --no-pager'
+ssh root@154.59.111.234 'systemctl status mtproto-proxy --no-pager'
 
 # Check active connections (IPv4 + IPv6)
-ssh root@154.59.110.193 'ss -tnp | grep mtproto'
+ssh root@154.59.111.234 'ss -tnp | grep mtproto'
 
 # Check process stats (CPU, threads, memory)
-ssh root@154.59.110.193 'ps -o pid,pcpu,pmem,nlwp,rss,vsz,args -p $(pgrep -f mtproto-proxy)'
+ssh root@154.59.111.234 'ps -o pid,pcpu,pmem,nlwp,rss,vsz,args -p $(pgrep -f mtproto-proxy)'
 ```
 
 ### Log Analysis
 ```bash
 # Check recent logs
-ssh root@154.59.110.193 'journalctl -u mtproto-proxy --since "1 hour ago" --no-pager'
+ssh root@154.59.111.234 'journalctl -u mtproto-proxy --since "1 hour ago" --no-pager'
 
 # Check for Replay attacks detected (ТСПУ Revisor)
-ssh root@154.59.110.193 'journalctl -u mtproto-proxy --no-pager | grep "Replay attack"'
+ssh root@154.59.111.234 'journalctl -u mtproto-proxy --no-pager | grep "Replay attack"'
 
 # Check IPv6 hopping log
-ssh root@154.59.110.193 'cat /var/log/mtproto-ipv6-hop.log | tail -20'
+ssh root@154.59.111.234 'cat /var/log/mtproto-ipv6-hop.log | tail -20'
 
 # Check current active IPv6
-ssh root@154.59.110.193 'cat /tmp/mtproto-ipv6-current'
+ssh root@154.59.111.234 'cat /tmp/mtproto-ipv6-current'
 ```
 
 ### IPv6 Hopping
 ```bash
 # Manual hop to new IPv6 address
-ssh root@154.59.110.193 '/opt/mtproto-proxy/ipv6-hop.sh'
+ssh root@154.59.111.234 '/opt/mtproto-proxy/ipv6-hop.sh'
 
 # Check hop status
-ssh root@154.59.110.193 '/opt/mtproto-proxy/ipv6-hop.sh --check'
+ssh root@154.59.111.234 '/opt/mtproto-proxy/ipv6-hop.sh --check'
 
 # Check cron job
-ssh root@154.59.110.193 'cat /etc/cron.d/mtproto-ipv6'
+ssh root@154.59.111.234 'cat /etc/cron.d/mtproto-ipv6'
 ```
 
 ### Low-level Debugging
 ```bash
 # Check for CLOSE-WAIT sockets
-ssh root@154.59.110.193 'ss -tnp state close-wait | grep mtproto'
+ssh root@154.59.111.234 'ss -tnp state close-wait | grep mtproto'
 
 # Check thread states in Linux /proc
-ssh root@154.59.110.193 'cat /proc/$(pgrep -f mtproto-proxy)/status | grep -E "Threads|State"'
+ssh root@154.59.111.234 'cat /proc/$(pgrep -f mtproto-proxy)/status | grep -E "Threads|State"'
 
 # Verify TCPMSS clamping rule
-ssh root@154.59.110.193 'iptables -t mangle -L OUTPUT -n -v | grep TCPMSS'
+ssh root@154.59.111.234 'iptables -t mangle -L OUTPUT -n -v | grep TCPMSS'
 ```
+
+---
+
+## Server Migration Guide
+
+If the current VPS is permanently blocked or blacklisted, migrating to a new VPS requires these steps to maintain seamless connectivity for clients:
+
+1. **Deploy to New VPS**: 
+   Use the `install.sh` script to set up Zig, clone the proxy, compile it, and enable DPI bypass metrics (TCPMSS).
+   *The `--auto` mode for IPv6 hopping requires Cloudflare API credentials.*
+   ```bash
+   cat deploy/install.sh | ssh root@<NEW_VPS_IP> "export CF_TOKEN='...'; export CF_ZONE='...'; bash"
+   ```
+
+2. **Migrate Configuration**:
+   It is crucial to keep the `[access.users]` secrets identical so the client connection strings (`tg://proxy?server=...&secret=...`) remain valid.
+   Copy `/opt/mtproto-proxy/config.toml` from the old server to the new one, and then restart the proxy.
+   ```bash
+   systemctl restart mtproto-proxy
+   ```
+
+3. **Update DNS Records**:
+   To ensure transparent failover without changing the immutable client link:
+   - Update the **A record** (`proxy.sleep3r.ru`) to point to the new `<NEW_VPS_IP>` using the Cloudflare Dashboard or API.
+   - Run `/opt/mtproto-proxy/ipv6-hop.sh` on the new server to force an immediate **AAAA record** overwrite to the new server's IPv6 pool.
+
+4. **Verify**:
+   Check `systemctl status mtproto-proxy` and verify that the Cloudflare DNS now resolves to the new IP addresses. Telegram clients will automatically pick up the new IPs from the existing proxy link.
