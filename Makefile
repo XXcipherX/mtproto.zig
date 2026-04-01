@@ -1,4 +1,4 @@
-.PHONY: build release run test clean fmt deploy
+.PHONY: build release run test clean fmt deploy migrate update-dns
 
 SERVER ?= 185.125.46.60
 CONFIG ?= config.toml
@@ -52,6 +52,10 @@ migrate:
 	$(MAKE) deploy SERVER=$(SERVER)
 	@if [ "$(UPDATE_DNS)" = "1" ] || [ "$(UPDATE_DNS)" = "true" ]; then \
 		echo "--- 5. Updating Cloudflare DNS ---"; \
-		bash deploy/update_dns.sh $(SERVER); \
+		$(MAKE) update-dns SERVER=$(SERVER); \
 	fi
 	@echo "--- MIGRATION COMPLETE ---"
+
+update-dns:
+	@if [ -z "$(SERVER)" ]; then echo "Usage: make update-dns SERVER=<ip>"; exit 1; fi
+	bash deploy/update_dns.sh $(SERVER)
