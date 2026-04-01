@@ -16,6 +16,8 @@ pub const Config = struct {
     mask: bool = true,
     /// Test-only hook to override the mask port
     mask_port: u16 = 443,
+    /// TCP desync: split ServerHello into 1-byte + rest to evade DPI
+    desync: bool = true,
     /// Fast mode: skip S2C encryption by passing client keys to DC directly
     fast_mode: bool = false,
     /// Test-only hook to redirect upstream connections locally
@@ -88,6 +90,8 @@ pub const Config = struct {
                         cfg.tls_domain = try allocator.dupe(u8, value);
                     } else if (std.mem.eql(u8, key, "mask")) {
                         cfg.mask = std.mem.eql(u8, value, "true");
+                    } else if (std.mem.eql(u8, key, "desync")) {
+                        cfg.desync = std.mem.eql(u8, value, "true");
                     }
                 }
             }
@@ -134,6 +138,7 @@ test "parse config - valid complete" {
         \\[censorship]
         \\tls_domain = "example.com"
         \\mask = true
+        \\desync = true
         \\
         \\[access.users]
         \\alice = "00112233445566778899aabbccddeeff"
@@ -146,6 +151,7 @@ test "parse config - valid complete" {
     try std.testing.expectEqual(@as(u16, 8443), cfg.port);
     try std.testing.expectEqualStrings("example.com", cfg.tls_domain);
     try std.testing.expect(cfg.mask);
+    try std.testing.expect(cfg.desync);
     try std.testing.expect(cfg.fast_mode);
     try std.testing.expectEqual(@as(usize, 2), cfg.users.count());
 
@@ -165,6 +171,7 @@ test "parse config - missing fields defaults" {
     try std.testing.expectEqual(@as(u16, 443), cfg.port);
     try std.testing.expectEqualStrings("google.com", cfg.tls_domain);
     try std.testing.expect(cfg.mask); // Default is true
+    try std.testing.expect(cfg.desync); // Default is true
     try std.testing.expect(!cfg.fast_mode); // Default is false
     try std.testing.expectEqual(@as(usize, 1), cfg.users.count());
 }

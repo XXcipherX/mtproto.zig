@@ -12,7 +12,7 @@ High-performance MTProto proxy that mimics TLS 1.3 handshakes (domain fronting) 
 - **Stability**: Service previously degraded to 99% CPU within 2 days. Root cause (logging mutexes) found and fixed.
 - **Test Coverage**: 34/34 tests passing, including fully simulated Black-Box E2E tests for DPI active-probing defense and FakeTLS validation workflows.
 - **Promotion Tag**: Supported. Sends `proxy_ans_tag` (RPC `0xaeaf0c42`) after DC handshake for sponsored channel registration.
-- **ТСПУ Evasion**: Three-layer DPI bypass implemented and active (see section below).
+- **ТСПУ Evasion**: Seven-layer DPI bypass implemented and active (see section below).
 
 ---
 
@@ -32,13 +32,21 @@ src/
 ├── main.zig              # Entry point, banner, public IP detection, custom logger
 ├── config.zig            # TOML config parser
 ├── proxy/
-│   └── proxy.zig         # Core: accept loop, client handler, relay, DRS
+│   └── proxy.zig         # Core: accept loop, client handler, relay, DRS, Split-TLS desync
 ├── protocol/
-│   ├── tls.zig           # FakeTLS 1.3: ClientHello validation, ServerHello builder
+│   ├── tls.zig           # FakeTLS 1.3: ClientHello validation, Nginx template ServerHello
 │   ├── obfuscation.zig   # MTProto handshake parsing, key derivation, nonce generation
 │   └── constants.zig     # DC addresses, protocol tags, TLS constants
-└── crypto/
-    └── crypto.zig        # AES-256-CTR, SHA-256, HMAC wrappers
+├── crypto/
+│   └── crypto.zig        # AES-256-CTR, SHA-256, HMAC wrappers
+deploy/
+├── install.sh            # One-line VPS bootstrap (Zig + build + systemd + TCPMSS + IPv6)
+├── ipv6-hop.sh           # IPv6 address rotation (Cloudflare API)
+├── mtproto-proxy.service # systemd unit file
+├── update_dns.sh         # Cloudflare DNS A-record updater
+├── capture_template.py   # Capture real Nginx ServerHello for template verification
+├── setup_masking.sh      # Local Nginx for zero-RTT DPI masking
+└── setup_nfqws.sh        # zapret nfqws OS-level TCP desync
 ```
 
 ### Connection Flow
@@ -100,6 +108,7 @@ tag = "1234567890abcdef1234567890abcdef"   # Optional: promotion tag from @MTPro
 [censorship]
 tls_domain = "wb.ru"
 mask = true
+desync = true                              # TCP desync: split ServerHello (1-byte + rest)
 fast_mode = true
 
 [access.users]
@@ -242,6 +251,8 @@ All relay sockets use these settings:
 15. TLS Alert logging added.
 16. **Hairpin routing fix**: AmneziaVPN (Docker/WireGuard) on the same server blocked iOS VPN clients from reaching port 443 due to Docker's `FORWARD policy DROP`. Fixed with `iptables -I DOCKER-USER -s 172.29.172.0/24 -p tcp --dport 443 -j ACCEPT`.
 17. **Promotion tag**: Added `tag` config field and `proxy_ans_tag` RPC (`0xaeaf0c42`) sent to DC after handshake. Supports abridged, intermediate, and secure framing.
+18. **Nginx template ServerHello**: Replaced hand-crafted `buildServerHello` with comptime Nginx/OpenSSL template. Fixed extension ordering (supported_versions before key_share), fixed AppData size (2878 bytes), deterministic PRNG body.
+19. **Split-TLS desync**: Added 1-byte TCP split on ServerHello send to break ТСПУ passive signature matching. Gated by `desync` config flag.
 
 ---
 
@@ -311,6 +322,83 @@ AVPS получает бесплатную подсеть `/64` (18 квинти
 
 # Credentials (Cloudflare API):
 # CF_TOKEN и CF_ZONE хранятся в /opt/mtproto-proxy/env.sh
+```
+
+### Solution 4: Nginx Template ServerHello (код в `tls.zig`)
+
+Старый `buildServerHello` собирал TLS 1.3 ServerHello вручную с рядом fingerprint-проблем:
+- **Extension ordering**: `key_share` шёл до `supported_versions`, а OpenSSL/Nginx ставит `supported_versions` первым. DPI сравнивает порядок расширений.
+- **Random AppData size**: Случайный размер `1024 + (random % 3072)` — у реального Nginx размер фиксирован (зависит от сертификата).
+- **AppData content**: Нули вместо реалистичного зашифрованного контента.
+
+**Исправление**: Comptime-шаблон `buildNginxTemplate()` генерирует побайтово идентичный ответ Nginx/OpenSSL:
+- Правильный порядок расширений: `supported_versions` (0x002b) → `key_share` (0x0033)
+- Фиксированный AppData = 2878 байт (реальный Let's Encrypt ECDSA cert chain)
+- Детерминированное псевдослучайное тело AppData через SplitMix64 PRNG (comptime)
+- Runtime-патчинг только 3 полей: HMAC random (32B), session_id (32B), x25519 key (32B)
+- `@setEvalBranchQuota(100_000)` для 2878-байтового comptime цикла
+
+```
+Template layout (3016 bytes total):
+  [0..127]     ServerHello record (5 hdr + 122 body)
+  [127..133]   ChangeCipherSpec record (5 hdr + 1 body)
+  [133..3016]  ApplicationData record (5 hdr + 2878 body)
+
+Mutable field offsets:
+  tmpl_random_offset     = 11   (32 bytes — HMAC)
+  tmpl_session_id_offset = 44   (32 bytes — echo from client)
+  tmpl_x25519_key_offset = 95   (32 bytes — random x25519)
+```
+
+Утилита `deploy/capture_template.py` позволяет захватить реальный ServerHello с живого сервера для верификации/обновления шаблона при смене версии OpenSSL/Nginx.
+
+### Solution 5: Split-TLS Desync (код в `proxy.zig`)
+
+Серверный аналог zapret split — разбивает ServerHello на два TCP-сегмента:
+1. **Первый сегмент**: 1 байт (`0x16` — TLS record type)
+2. **Пауза 3ms** (`std.Thread.sleep`) — форсирует границу сегмента
+3. **Второй сегмент**: остальные ~3015 байт
+
+Пассивный ТСПУ классифицирует TCP payload по первым байтам. Одиночный `0x16` не даёт DPI достаточно данных для сигнатуры FakeTLS. К моменту прихода второго сегмента DPI уже не ассоциирует его с TLS handshake.
+
+```zig
+// proxy.zig ~line 388:
+if (state.config.desync and server_hello.len > 1) {
+    setsockopt(TCP_NODELAY, enable);
+    writeAll(client_stream, server_hello[0..1]);    // 1 byte
+    std.Thread.sleep(3 * std.time.ns_per_ms);       // 3ms
+    writeAll(client_stream, server_hello[1..]);      // rest
+}
+```
+
+Безопасно с thread-per-connection: sleep блокирует только текущий поток, accept loop продолжает работать. Управляется конфигом: `desync = true` в `[censorship]` (включён по умолчанию).
+
+### Solution 6: nfqws OS-Level Desync (`deploy/setup_nfqws.sh`)
+
+Для максимальной защиты — OS-level TCP desync через zapret `nfqws`:
+- **Fake packets**: отправляет поддельный TLS ServerHello с TTL, который истекает до DPI, но после ISP-роутера. DPI видит «валидный TLS» и пропускает соединение.
+- **MD5sig fooling**: fake-пакеты имеют невалидную TCP MD5 подпись — ядро Linux на стороне клиента их дропает, но DPI не проверяет md5sig.
+- **Split at byte 1**: дублирует Split-TLS из proxy.zig на уровне ядра (belt and suspenders).
+
+```bash
+# Установка:
+sudo bash deploy/setup_nfqws.sh
+
+# С кастомным TTL (по traceroute до ISP):
+sudo bash deploy/setup_nfqws.sh --ttl 4
+
+# Удаление:
+sudo bash deploy/setup_nfqws.sh --remove
+```
+
+### Solution 7: Local Nginx Masking (`deploy/setup_masking.sh`)
+
+Timing side-channel: при маскировке bad clients проксирование на удалённый `wb.ru:443` добавляет 30-60ms RTT. DPI может сравнить RTT «нашего wb.ru» с реальным и обнаружить аномалию.
+
+Решение: локальный Nginx на `127.0.0.1:8443` с self-signed (или Let's Encrypt) сертификатом. RTT маскировки < 1ms — неотличимо от реального сервера.
+
+```bash
+sudo bash deploy/setup_masking.sh wb.ru
 ```
 
 ### Конфигурация для работы с ТСПУ

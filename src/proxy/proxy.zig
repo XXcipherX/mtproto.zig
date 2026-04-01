@@ -376,7 +376,32 @@ fn handleConnectionInner(
     );
     defer state.allocator.free(server_hello);
 
-    try writeAll(client_stream, server_hello);
+    // === DPI DESYNC: Split-TLS ===
+    // Split the ServerHello across TCP segments to break ТСПУ's TLS signature matching.
+    // ТСПУ's passive DPI looks for `16 03 03` at the start of a TCP payload to classify
+    // the response as TLS. By sending the first byte (0x16) in a separate segment,
+    // the DPI sees an unclassifiable single byte, then the rest arrives in a new segment.
+    //
+    // TCP_NODELAY disables Nagle's algorithm so the kernel sends each writeAll immediately.
+    // The 3ms sleep forces the first byte into a separate TCP segment.
+    // This is safe with our thread-per-connection model — sleeping doesn't block the accept loop.
+    if (state.config.desync and server_hello.len > 1) {
+        const IPPROTO_TCP: i32 = 6;
+        const TCP_NODELAY: i32 = 1;
+        const enable = std.mem.toBytes(@as(c_int, 1));
+        _ = posix.setsockopt(client_stream.handle, IPPROTO_TCP, TCP_NODELAY, &enable) catch {};
+
+        // Send just the first byte (0x16 — TLS record type) as a separate TCP segment
+        try writeAll(client_stream, server_hello[0..1]);
+
+        // Force segment boundary: 3ms sleep pushes the first byte out
+        std.Thread.sleep(3 * std.time.ns_per_ms);
+
+        // Send the rest of ServerHello (version, length, handshake body, CCS, AppData)
+        try writeAll(client_stream, server_hello[1..]);
+    } else {
+        try writeAll(client_stream, server_hello);
+    }
 
     // Assemble the 64-byte MTProto handshake from potentially multiple TLS AppData records.
     // iOS Telegram may split the handshake across records or interleave CCS records.
@@ -1065,8 +1090,8 @@ fn formatAddress(addr: net.Address, buf: *[64]u8) []const u8 {
             const bytes: *const [16]u8 = @ptrCast(&addr.in6.sa.addr);
             // Check if it's an IPv4-mapped IPv6 address (::ffff:0:0/96)
             const is_ipv4_mapped = std.mem.eql(u8, bytes[0..10], &[_]u8{0} ** 10) and
-                                   std.mem.eql(u8, bytes[10..12], &[_]u8{0xff, 0xff});
-                                   
+                std.mem.eql(u8, bytes[10..12], &[_]u8{ 0xff, 0xff });
+
             if (is_ipv4_mapped) {
                 return std.fmt.bufPrint(buf, "[ipv4]:{d}", .{
                     std.mem.bigToNative(u16, addr.in6.sa.port),
@@ -1439,6 +1464,7 @@ test "E2E: Valid MTProto Handshake Drop" {
         .mask = true,
         .mask_port = 8080, // Irrelevant for this success path
         .datacenter_override = mock_dc,
+        .desync = false, // Disable Split-TLS in test — avoids split read on ServerHello
     };
     defer cfg.users.deinit();
 
@@ -1519,7 +1545,9 @@ test "E2E: Valid MTProto Handshake Drop" {
 
     try client.writeAll(&payload);
 
-    // Ensure proxy doesn't crash and terminates appropriately
+    // Ensure proxy doesn't crash and terminates appropriately.
+    // Give the proxy thread time to process the invalid payload and close the socket.
+    std.Thread.sleep(50 * std.time.ns_per_ms);
     const m = try client.read(&buf);
     try std.testing.expect(m == 0); // EOF
 }

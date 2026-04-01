@@ -95,12 +95,23 @@ pub fn validateTlsHandshake(
     return null;
 }
 
-/// Build a fake TLS ServerHello response.
+/// Build a fake TLS ServerHello response using a pre-built Nginx/OpenSSL template.
 ///
 /// The response consists of three TLS records that the client validates:
 /// 1. ServerHello record (type 0x16) — contains the HMAC digest in the `random` field
 /// 2. Change Cipher Spec record (type 0x14) — fixed 6 bytes
-/// 3. Fake Application Data record (type 0x17) — random body simulating encrypted data
+/// 3. Fake Application Data record (type 0x17) — fixed-size body simulating encrypted cert
+///
+/// Template approach: instead of hand-crafting bytes (which DPI fingerprints as non-Nginx),
+/// we use a comptime-built template that matches real Nginx/OpenSSL TLS 1.3 fingerprint:
+/// - Extensions in OpenSSL order: supported_versions THEN key_share
+/// - Fixed AppData size (consistent like a real certificate, not random)
+/// - Deterministic pseudo-random AppData body (high entropy, same every time)
+///
+/// Only three fields are patched at runtime:
+/// - Server Random (offset 11..43): HMAC-SHA256 digest
+/// - Session ID (offset 44..76): echoed from ClientHello
+/// - X25519 key (offset 95..127): fresh random key
 ///
 /// The client (ConnectionSocket.cpp) validates the response by:
 /// - Checking for `\x16\x03\x03` prefix (ServerHello record)
@@ -117,152 +128,189 @@ pub fn buildServerHello(
     client_digest: *const [constants.tls_digest_len]u8,
     session_id: []const u8,
 ) ![]u8 {
-    // Generate random X25519-like key (just random bytes for fake TLS)
+    // 1. Copy the pre-built Nginx template (random and session_id are zeroed in template)
+    const response = try allocator.alloc(u8, nginx_template.len);
+    errdefer allocator.free(response);
+    @memcpy(response, &nginx_template);
+
+    // 2. Patch Session ID (echo from client). Template assumes 32-byte session ID.
+    if (session_id.len == 32) {
+        @memcpy(response[tmpl_session_id_offset..][0..32], session_id);
+    } else if (session_id.len <= 32) {
+        // Non-standard length: patch the length byte and copy what we have
+        response[tmpl_session_id_offset - 1] = @intCast(session_id.len);
+        @memcpy(response[tmpl_session_id_offset..][0..session_id.len], session_id);
+    }
+
+    // 3. Patch X25519 public key with fresh random bytes
     var x25519_key: [32]u8 = undefined;
     crypto.randomBytes(&x25519_key);
+    @memcpy(response[tmpl_x25519_key_offset..][0..32], &x25519_key);
 
-    const session_id_len: u8 = @intCast(session_id.len);
-
-    // Extensions: key_share (x25519) + supported_versions (TLS 1.3)
-    const key_share_ext = buildKeyShareExt(&x25519_key);
-    const supported_versions_ext = [_]u8{
-        0x00, 0x2b, // supported_versions
-        0x00, 0x02, // length
-        0x03, 0x04, // TLS 1.3
-    };
-    const extensions_len: u16 = @intCast(key_share_ext.len + supported_versions_ext.len);
-
-    const body_len: u24 = @intCast(2 + // version
-        32 + // random
-        1 + session_id.len + // session_id
-        2 + // cipher suite
-        1 + // compression
-        2 + key_share_ext.len + supported_versions_ext.len // extensions
-    );
-
-    // Pre-calculate total response size
-    const record_len: u16 = @intCast(@as(u32, body_len) + 4);
-    const server_hello_len = 5 + @as(usize, record_len);
-    const ccs_len: usize = 6;
-
-    // Fake Application Data record: simulates encrypted handshake data.
-    // The canonical Python proxy uses random.randrange(1024, 4096) bytes.
-    // We use a deterministic-ish size within that range.
-    const fake_app_data_body_len: u16 = blk: {
-        var len_buf: [2]u8 = undefined;
-        crypto.randomBytes(&len_buf);
-        const raw = std.mem.readInt(u16, &len_buf, .big);
-        // Map to range [1024, 4096): 1024 + (raw % 3072)
-        break :blk 1024 + (raw % 3072);
-    };
-    const app_data_record_len: usize = 5 + @as(usize, fake_app_data_body_len);
-
-    const total_len = server_hello_len + ccs_len + app_data_record_len;
-
-    const response = try allocator.alloc(u8, total_len);
-    errdefer allocator.free(response);
-    var pos: usize = 0;
-
-    // --- ServerHello record ---
-    // Record header
-    response[pos] = constants.tls_record_handshake;
-    pos += 1;
-    @memcpy(response[pos..][0..2], &constants.tls_version);
-    pos += 2;
-    std.mem.writeInt(u16, response[pos..][0..2], record_len, .big);
-    pos += 2;
-
-    // Handshake header
-    response[pos] = 0x02; // ServerHello type
-    pos += 1;
-    response[pos] = @intCast((body_len >> 16) & 0xff);
-    response[pos + 1] = @intCast((body_len >> 8) & 0xff);
-    response[pos + 2] = @intCast(body_len & 0xff);
-    pos += 3;
-
-    // Version (TLS 1.2 in header)
-    @memcpy(response[pos..][0..2], &constants.tls_version);
-    pos += 2;
-
-    // Random (32 bytes placeholder — will be replaced with HMAC digest)
-    const random_pos = pos;
-    @memset(response[pos..][0..32], 0);
-    pos += 32;
-
-    // Session ID
-    response[pos] = session_id_len;
-    pos += 1;
-    @memcpy(response[pos..][0..session_id.len], session_id);
-    pos += session_id.len;
-
-    // Cipher suite: TLS_AES_128_GCM_SHA256
-    response[pos] = 0x13;
-    response[pos + 1] = 0x01;
-    pos += 2;
-
-    // Compression: none
-    response[pos] = 0x00;
-    pos += 1;
-
-    // Extensions
-    std.mem.writeInt(u16, response[pos..][0..2], extensions_len, .big);
-    pos += 2;
-    @memcpy(response[pos..][0..key_share_ext.len], &key_share_ext);
-    pos += key_share_ext.len;
-    @memcpy(response[pos..][0..supported_versions_ext.len], &supported_versions_ext);
-    pos += supported_versions_ext.len;
-
-    // --- Change Cipher Spec record ---
-    response[pos] = constants.tls_record_change_cipher;
-    response[pos + 1] = constants.tls_version[0];
-    response[pos + 2] = constants.tls_version[1];
-    response[pos + 3] = 0x00;
-    response[pos + 4] = 0x01;
-    response[pos + 5] = 0x01;
-    pos += 6;
-
-    // --- Fake Application Data record ---
-    // The client expects \x17\x03\x03 + 2-byte length + body after the CCS record.
-    response[pos] = constants.tls_record_application;
-    response[pos + 1] = constants.tls_version[0];
-    response[pos + 2] = constants.tls_version[1];
-    std.mem.writeInt(u16, response[pos + 3 ..][0..2], fake_app_data_body_len, .big);
-    pos += 5;
-
-    // Fill with random bytes to simulate encrypted handshake data
-    crypto.randomBytes(response[pos..][0..fake_app_data_body_len]);
-    pos += fake_app_data_body_len;
-
-    std.debug.assert(pos == total_len);
-
-    // Compute HMAC over the ENTIRE response (all three records) with random field zeroed.
-    // The client validates: HMAC-SHA256(secret, client_digest || full_response_zeroed_random)
-    // and compares the result to the 32 bytes at offset 11 (straight compare, no XOR).
-    const hmac_input = try allocator.alloc(u8, constants.tls_digest_len + total_len);
+    // 4. Compute HMAC over full response with random field zeroed.
+    //    Template already has zeros at offset 11..43, so HMAC input is correct.
+    const hmac_input = try allocator.alloc(u8, constants.tls_digest_len + response.len);
     defer allocator.free(hmac_input);
     @memcpy(hmac_input[0..constants.tls_digest_len], client_digest);
-    @memcpy(hmac_input[constants.tls_digest_len..], response[0..total_len]);
+    @memcpy(hmac_input[constants.tls_digest_len..], response);
 
     const response_digest = crypto.sha256Hmac(secret, hmac_input);
 
-    // Insert digest into ServerHello random field (no timestamp XOR for server response)
-    @memcpy(response[random_pos..][0..32], &response_digest);
+    // 5. Insert HMAC digest into Server Random field
+    @memcpy(response[tmpl_random_offset..][0..32], &response_digest);
 
     return response;
 }
 
-fn buildKeyShareExt(public_key: *const [32]u8) [40]u8 {
-    var ext: [40]u8 = undefined;
-    ext[0] = 0x00;
-    ext[1] = 0x33; // key_share
-    ext[2] = 0x00;
-    ext[3] = 0x24; // length = 36
-    ext[4] = 0x00;
-    ext[5] = 0x1d; // x25519
-    ext[6] = 0x00;
-    ext[7] = 0x20; // key length = 32
-    @memcpy(ext[8..40], public_key);
-    return ext;
+// ============= Nginx/OpenSSL TLS 1.3 Template =============
+//
+// Pre-built at comptime to match the fingerprint of Nginx 1.25+ with OpenSSL 3.x.
+// Structure: ServerHello (127 bytes) + CCS (6 bytes) + AppData (5 + 2878 bytes)
+//
+// Key differences from naive FakeTLS that DPI detects:
+// 1. Extension ordering: OpenSSL sends supported_versions (0x002b) BEFORE key_share (0x0033)
+// 2. AppData size: fixed 2878 bytes (realistic Let's Encrypt ECDSA cert chain),
+//    NOT random in [1024,4096) which is an entropy fingerprint
+// 3. AppData body: deterministic pseudo-random (same across connections, like a real cert)
+
+/// Offset of Server Random field (32 bytes) — patched with HMAC at runtime
+const tmpl_random_offset: usize = 11;
+/// Offset of Session ID (32 bytes) — echoed from client at runtime
+const tmpl_session_id_offset: usize = 44;
+/// Offset of X25519 public key (32 bytes) — filled with random at runtime
+const tmpl_x25519_key_offset: usize = 95;
+
+/// Fake encrypted certificate payload size.
+/// 2878 bytes matches a typical Nginx + Let's Encrypt ECDSA P-256 cert chain:
+///   EncryptedExtensions (~20) + Certificate (~2400) + CertificateVerify (~100) +
+///   Finished (~36) + AEAD tags (~50) + record layer overhead.
+/// Fixed size eliminates the random-range fingerprint that ТСПУ detects.
+const fake_cert_payload_len: u16 = 2878;
+
+/// Total template size: ServerHello(127) + CCS(6) + AppData(5 + 2878)
+const nginx_template_len: usize = 127 + 6 + 5 + fake_cert_payload_len;
+
+/// The pre-built template, constructed at comptime.
+const nginx_template: [nginx_template_len]u8 = buildNginxTemplate();
+
+fn buildNginxTemplate() [nginx_template_len]u8 {
+    @setEvalBranchQuota(100_000);
+    var t: [nginx_template_len]u8 = undefined;
+    var pos: usize = 0;
+
+    // ── Record 1: ServerHello ──────────────────────────────────
+    // Record header: type(1) + version(2) + length(2) = 5 bytes
+    t[pos] = 0x16; // Handshake
+    pos += 1;
+    t[pos] = 0x03;
+    t[pos + 1] = 0x03; // TLS 1.2 compat
+    pos += 2;
+    t[pos] = 0x00;
+    t[pos + 1] = 0x7A; // Record payload length = 122
+    pos += 2;
+
+    // Handshake header: type(1) + length(3) = 4 bytes
+    t[pos] = 0x02; // ServerHello
+    pos += 1;
+    t[pos] = 0x00;
+    t[pos + 1] = 0x00;
+    t[pos + 2] = 0x76; // Handshake body length = 118
+    pos += 3;
+
+    // Server version: TLS 1.2 (legacy, per RFC 8446)
+    t[pos] = 0x03;
+    t[pos + 1] = 0x03;
+    pos += 2;
+
+    // Server Random: 32 zero bytes (PLACEHOLDER — patched with HMAC at runtime)
+    for (0..32) |i| {
+        t[pos + i] = 0x00;
+    }
+    pos += 32;
+
+    // Session ID length: 32 (TLS 1.3 compatibility mode)
+    t[pos] = 0x20;
+    pos += 1;
+
+    // Session ID: 32 zero bytes (PLACEHOLDER — echoed from client at runtime)
+    for (0..32) |i| {
+        t[pos + i] = 0x00;
+    }
+    pos += 32;
+
+    // Cipher suite: TLS_AES_128_GCM_SHA256 (0x1301) — most common in Nginx
+    t[pos] = 0x13;
+    t[pos + 1] = 0x01;
+    pos += 2;
+
+    // Compression: none
+    t[pos] = 0x00;
+    pos += 1;
+
+    // Extensions length: 46 bytes (supported_versions: 6 + key_share: 40)
+    t[pos] = 0x00;
+    t[pos + 1] = 0x2E;
+    pos += 2;
+
+    // Extension: supported_versions (0x002b) — OpenSSL sends this FIRST
+    t[pos] = 0x00;
+    t[pos + 1] = 0x2B;
+    t[pos + 2] = 0x00;
+    t[pos + 3] = 0x02; // length
+    t[pos + 4] = 0x03;
+    t[pos + 5] = 0x04; // TLS 1.3
+    pos += 6;
+
+    // Extension: key_share (0x0033) — x25519
+    t[pos] = 0x00;
+    t[pos + 1] = 0x33;
+    t[pos + 2] = 0x00;
+    t[pos + 3] = 0x24; // length = 36
+    t[pos + 4] = 0x00;
+    t[pos + 5] = 0x1D; // x25519 group
+    t[pos + 6] = 0x00;
+    t[pos + 7] = 0x20; // key length = 32
+    pos += 8;
+
+    // X25519 public key: 32 zero bytes (PLACEHOLDER — random at runtime)
+    for (0..32) |i| {
+        t[pos + i] = 0x00;
+    }
+    pos += 32;
+
+    // ── Record 2: Change Cipher Spec ──────────────────────────
+    t[pos] = 0x14; // CCS type
+    t[pos + 1] = 0x03;
+    t[pos + 2] = 0x03; // TLS 1.2
+    t[pos + 3] = 0x00;
+    t[pos + 4] = 0x01; // length = 1
+    t[pos + 5] = 0x01; // CCS byte
+    pos += 6;
+
+    // ── Record 3: Fake Application Data (encrypted certificate) ─
+    t[pos] = 0x17; // Application Data type
+    t[pos + 1] = 0x03;
+    t[pos + 2] = 0x03; // TLS 1.2
+    // Payload length in big-endian
+    t[pos + 3] = @intCast((fake_cert_payload_len >> 8) & 0xFF);
+    t[pos + 4] = @intCast(fake_cert_payload_len & 0xFF);
+    pos += 5;
+
+    // Fill with deterministic pseudo-random bytes (SplitMix64).
+    // Looks like encrypted data to DPI, same every time like a real cert.
+    var prng_state: u64 = 0x4E67_696E_785F_544C; // "NginX_TL" as seed
+    for (0..fake_cert_payload_len) |i| {
+        prng_state +%= 0x9E3779B97F4A7C15;
+        var z = prng_state;
+        z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9;
+        z = (z ^ (z >> 27)) *% 0x94D049BB133111EB;
+        z = z ^ (z >> 31);
+        t[pos + i] = @intCast((z >> 24) & 0xFF);
+    }
+    pos += fake_cert_payload_len;
+
+    if (pos != nginx_template_len) unreachable;
+    return t;
 }
 
 /// Check if bytes look like a TLS ClientHello.
@@ -349,7 +397,7 @@ test "timing_safe.eql" {
     try std.testing.expect(!std.crypto.timing_safe.eql([3]u8, a, c));
 }
 
-test "buildServerHello produces valid three-record structure" {
+test "buildServerHello produces valid three-record Nginx template structure" {
     const allocator = std.testing.allocator;
     var digest = [_]u8{0x42} ** 32;
     const session_id = [_]u8{0x01} ** 32;
@@ -362,12 +410,16 @@ test "buildServerHello produces valid three-record structure" {
     );
     defer allocator.free(response);
 
+    // Template produces fixed-size response
+    try std.testing.expectEqual(nginx_template_len, response.len);
+
     // Record 1: ServerHello (\x16\x03\x03)
     try std.testing.expectEqual(@as(u8, constants.tls_record_handshake), response[0]);
     try std.testing.expectEqual(@as(u8, 0x03), response[1]);
     try std.testing.expectEqual(@as(u8, 0x03), response[2]);
 
     const len1 = std.mem.readInt(u16, response[3..5], .big);
+    try std.testing.expectEqual(@as(u16, 122), len1); // Fixed ServerHello payload
     const ccs_start = 5 + @as(usize, len1);
 
     // Record 2: Change Cipher Spec (\x14\x03\x03\x00\x01\x01)
@@ -387,12 +439,21 @@ test "buildServerHello produces valid three-record structure" {
     try std.testing.expectEqual(@as(u8, 0x03), response[app_start + 2]);
 
     const len2 = std.mem.readInt(u16, response[app_start + 3 ..][0..2], .big);
-    // Fake AppData body should be in [1024, 4096)
-    try std.testing.expect(len2 >= 1024);
-    try std.testing.expect(len2 < 4096);
+    // AppData is now FIXED size (Nginx template), not random
+    try std.testing.expectEqual(fake_cert_payload_len, len2);
 
     // Total response length should match all three records
     try std.testing.expectEqual(5 + @as(usize, len1) + 6 + 5 + @as(usize, len2), response.len);
+
+    // Extension ordering: supported_versions (0x002b) BEFORE key_share (0x0033)
+    // Extensions start at offset 81
+    try std.testing.expectEqual(@as(u8, 0x00), response[81]); // supported_versions ext type hi
+    try std.testing.expectEqual(@as(u8, 0x2B), response[82]); // supported_versions ext type lo
+    try std.testing.expectEqual(@as(u8, 0x00), response[87]); // key_share ext type hi
+    try std.testing.expectEqual(@as(u8, 0x33), response[88]); // key_share ext type lo
+
+    // Session ID was echoed correctly
+    try std.testing.expectEqualSlices(u8, &session_id, response[tmpl_session_id_offset..][0..32]);
 
     // HMAC digest is at offset 11 (tls_digest_pos) in the response
     // Verify it by recomputing: HMAC(secret, client_digest || response_with_zeroed_random)
@@ -414,9 +475,28 @@ test "buildServerHello produces valid three-record structure" {
     ));
 }
 
+test "buildServerHello deterministic AppData (no random size fingerprint)" {
+    const allocator = std.testing.allocator;
+    var digest = [_]u8{0xAA} ** 32;
+    const session_id = [_]u8{0xBB} ** 32;
+
+    // Build two responses — AppData body should be identical (deterministic template)
+    const r1 = try buildServerHello(allocator, &digest, &digest, &session_id);
+    defer allocator.free(r1);
+    const r2 = try buildServerHello(allocator, &digest, &digest, &session_id);
+    defer allocator.free(r2);
+
+    // Same total size (fixed template)
+    try std.testing.expectEqual(r1.len, r2.len);
+
+    // AppData bodies are identical (deterministic PRNG, same "certificate" every time)
+    const app_offset = 127 + 6 + 5; // after ServerHello + CCS + AppData header
+    try std.testing.expectEqualSlices(u8, r1[app_offset..], r2[app_offset..]);
+}
+
 test "validateTlsHandshake - valid handshake" {
     const allocator = std.testing.allocator;
-    
+
     // Create mock secrets
     var secrets = [_]UserSecret{
         .{ .name = "alice", .secret = [_]u8{0x1A} ** 16 },
@@ -426,23 +506,23 @@ test "validateTlsHandshake - valid handshake" {
     // Client hello mock
     // min_len = 11 + 32 + 1 = 44 bytes minimum
     var handshake = [_]u8{0x00} ** 64;
-    // Set timestamp (say 123456789 = 0x075BCD15) 
+    // Set timestamp (say 123456789 = 0x075BCD15)
     // Wait, the client sends digest WITH timestamp XOR'd in the last 4 bytes.
     // If ignore_time_skew = true, the proxy doesn't care what timestamp is.
     // Proxy calculates HMAC on handshake with zeroed digest, then expects it to match (up to 28 bytes) the given digest.
-    
+
     var hmac_input = std.mem.zeroes([64]u8);
     // Add session id len
     hmac_input[43] = 4; // session_id len
     hmac_input[44] = 0xaa; // session ID
-    
+
     // Compute HMAC
     const computed_mac = crypto.sha256Hmac(&secrets[1].secret, &hmac_input);
-    
+
     // Create the actual handshake by copying hmac_input and setting the digest with some timestamp
     @memcpy(&handshake, &hmac_input);
     @memcpy(handshake[constants.tls_digest_pos..][0..28], computed_mac[0..28]);
-    
+
     // XOR timestamp into the last 4 bytes of digest
     const timestamp: u32 = 0x12345678;
     const ts_bytes = std.mem.toBytes(timestamp);
