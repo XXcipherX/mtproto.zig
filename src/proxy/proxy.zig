@@ -1053,20 +1053,29 @@ fn readExact(stream: net.Stream, buf: []u8) !usize {
     return total;
 }
 
-/// Format a network address as "ip:port" for logging.
+/// Format a network address as "[ipv4]:port" or "[ipv6]:port" for logging.
 fn formatAddress(addr: net.Address, buf: *[64]u8) []const u8 {
     switch (addr.any.family) {
         posix.AF.INET => {
-            const bytes: *const [4]u8 = @ptrCast(&addr.in.sa.addr);
-            return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}:{d}", .{
-                bytes[0],                                  bytes[1], bytes[2], bytes[3],
+            return std.fmt.bufPrint(buf, "[ipv4]:{d}", .{
                 std.mem.bigToNative(u16, addr.in.sa.port),
             }) catch "?";
         },
         posix.AF.INET6 => {
-            return std.fmt.bufPrint(buf, "[ipv6]:{d}", .{
-                std.mem.bigToNative(u16, addr.in6.sa.port),
-            }) catch "?";
+            const bytes: *const [16]u8 = @ptrCast(&addr.in6.sa.addr);
+            // Check if it's an IPv4-mapped IPv6 address (::ffff:0:0/96)
+            const is_ipv4_mapped = std.mem.eql(u8, bytes[0..10], &[_]u8{0} ** 10) and
+                                   std.mem.eql(u8, bytes[10..12], &[_]u8{0xff, 0xff});
+                                   
+            if (is_ipv4_mapped) {
+                return std.fmt.bufPrint(buf, "[ipv4]:{d}", .{
+                    std.mem.bigToNative(u16, addr.in6.sa.port),
+                }) catch "?";
+            } else {
+                return std.fmt.bufPrint(buf, "[ipv6]:{d}", .{
+                    std.mem.bigToNative(u16, addr.in6.sa.port),
+                }) catch "?";
+            }
         },
         else => return "?",
     }
