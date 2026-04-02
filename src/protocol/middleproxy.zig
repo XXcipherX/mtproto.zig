@@ -370,6 +370,19 @@ pub const MiddleProxyContext = struct {
         while (self.s2c_decrypted_len >= 4) {
             const frame_len = std.mem.readInt(u32, self.s2c_buf[0..4], .little);
 
+            // MTProto CBC stream may contain standalone NO-OP padding words
+            // (0x04 00 00 00). Python reference reader skips them.
+            if (frame_len == 4) {
+                if (self.s2c_len < 4 or self.s2c_decrypted_len < 4) break;
+                const remaining_noop = self.s2c_len - 4;
+                if (remaining_noop > 0) {
+                    std.mem.copyForwards(u8, self.s2c_buf[0..remaining_noop], self.s2c_buf[4..self.s2c_len]);
+                }
+                self.s2c_len = remaining_noop;
+                self.s2c_decrypted_len -= 4;
+                continue;
+            }
+
             // Total bytes an MTProtoFrame occupies depends on CBC padding to 16 byte boundary
             const padded_len = if (frame_len % 16 == 0) frame_len else frame_len + (16 - (frame_len % 16));
 
@@ -732,4 +745,62 @@ test "encapsulated c2s keeps rpc_proxy_req header" {
     const payload = encrypted_out[8 .. total_len - 4];
     try std.testing.expect(payload.len >= 4);
     try std.testing.expectEqualSlices(u8, &rpc_proxy_req, payload[0..4]);
+}
+
+test "decapsulate s2c skips noop padding words" {
+    const allocator = std.testing.allocator;
+
+    const key = [_]u8{0} ** 32;
+    const iv = [_]u8{0} ** 16;
+
+    var ctx = try MiddleProxyContext.init(
+        allocator,
+        crypto.AesCbc.init(&key, &iv),
+        crypto.AesCbc.init(&key, &iv),
+        [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 },
+        -2,
+        std.net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
+        std.net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
+        .intermediate,
+    );
+    defer ctx.deinit(allocator);
+
+    // Build plaintext stream:
+    // - one full 16-byte NO-OP block (4x uint32(4))
+    // - one RPC_SIMPLE_ACK frame (len=28, padded to 32)
+    var plain: [48]u8 = undefined;
+    var off: usize = 0;
+
+    // 16-byte NO-OP block
+    var i: usize = 0;
+    while (i < 16) : (i += 4) {
+        std.mem.writeInt(u32, plain[off + i ..][0..4], 4, .little);
+    }
+    off += 16;
+
+    // RPC_SIMPLE_ACK frame: total_len=28, payload=16
+    const total_len: u32 = 28;
+    std.mem.writeInt(u32, plain[off..][0..4], total_len, .little);
+    std.mem.writeInt(i32, plain[off + 4 ..][0..4], -2, .little);
+
+    // payload: type(4) + conn_id(8) + confirm(4)
+    @memcpy(plain[off + 8 .. off + 12], &rpc_simple_ack);
+    @memset(plain[off + 12 .. off + 20], 0);
+    const confirm = [_]u8{ 0xaa, 0xbb, 0xcc, 0xdd };
+    @memcpy(plain[off + 20 .. off + 24], &confirm);
+
+    const checksum = crc32(plain[off .. off + 24]);
+    std.mem.writeInt(u32, plain[off + 24 ..][0..4], checksum, .little);
+
+    // Padded tail for len=28 -> 32
+    std.mem.writeInt(u32, plain[off + 28 ..][0..4], 4, .little);
+
+    // Encrypt the full stream as one CBC chain
+    var enc = crypto.AesCbc.init(&key, &iv);
+    var wire = plain;
+    try enc.encryptInPlace(wire[0..]);
+
+    const out = try ctx.decapsulateS2C(wire[0..]);
+    try std.testing.expectEqual(@as(usize, 4), out.len);
+    try std.testing.expectEqualSlices(u8, &confirm, out);
 }
