@@ -36,6 +36,7 @@ src/
 ├── protocol/
 │   ├── tls.zig           # FakeTLS 1.3: ClientHello validation, Nginx template ServerHello
 │   ├── obfuscation.zig   # MTProto handshake parsing, key derivation, nonce generation
+│   ├── middleproxy.zig   # Telegram MiddleProxy transport (RPC_PROXY_REQ/ANS over AES-CBC)
 │   └── constants.zig     # DC addresses, protocol tags, TLS constants
 ├── crypto/
 │   └── crypto.zig        # AES-256-CTR, SHA-256, HMAC wrappers
@@ -55,11 +56,13 @@ deploy/
 2. Proxy validates HMAC, sends `ServerHello`.
 3. Client sends `CCS` + 64-byte MTProto obfuscation handshake (in TLS `AppData`).
 4. Proxy derives AES-CTR keys, connects to Telegram DC.
-5. Proxy sends 64-byte nonce to DC.
+5. For regular DCs, proxy sends 64-byte obfuscated nonce.
+6. For media DC203, proxy performs MiddleProxy handshake (`RPC_NONCE`, `RPC_HANDSHAKE`) and relays user frames via `RPC_PROXY_REQ/ANS`.
 5b. (Optional) Proxy sends promotion tag RPC (`0xaeaf0c42` + 16-byte tag) to DC.
-6. **Bidirectional relay**: Client ↔ Proxy ↔ DC
+7. **Bidirectional relay**: Client ↔ Proxy ↔ DC
    - **C2S**: TLS unwrap → AES-CTR decrypt(client) → AES-CTR encrypt(DC) → DC
-   - **S2C**: DC → AES-CTR decrypt(DC) → AES-CTR encrypt(client) → TLS wrap → Client
+   - **S2C (classic DC)**: DC → AES-CTR decrypt(DC) → AES-CTR encrypt(client) → TLS wrap → Client
+   - **S2C (DC203)**: DC AES-CBC frame → decapsulate `RPC_PROXY_ANS`/`RPC_SIMPLE_ACK` → TLS wrap → Client
 
 ### Threading Model
 - One thread per connection (spawned from accept loop).
@@ -233,6 +236,14 @@ All relay sockets use these settings:
 - **Improved `writeAll`**: Handles `WouldBlock` with `POLLOUT` and a spin counter (32 max).
 - **Overload protection**: Max 8192 concurrent connections.
 
+### MiddleProxy Auto-Refresh
+- Proxy caches DC203 MiddleProxy endpoint and shared secret inside `ProxyState`.
+- On startup and then every 24 hours, it fetches:
+  - `https://core.telegram.org/getProxyConfig` (parse `proxy_for 203 ...`)
+  - `https://core.telegram.org/getProxySecret`
+- Runtime updates are protected by `std.Thread.RwLock` and applied per new connection.
+- If fetching fails, bundled defaults remain active.
+
 ---
 
 ## Chronological Bug Fixes
@@ -255,6 +266,8 @@ All relay sockets use these settings:
 17. **Promotion tag**: Added `tag` config field and `proxy_ans_tag` RPC (`0xaeaf0c42`) sent to DC after handshake. Supports abridged, intermediate, and secure framing.
 18. **Nginx template ServerHello**: Replaced hand-crafted `buildServerHello` with comptime Nginx/OpenSSL template. Fixed extension ordering (supported_versions before key_share), fixed AppData size (2878 bytes), deterministic PRNG body.
 19. **Split-TLS desync**: Added 1-byte TCP split on ServerHello send to break ТСПУ passive signature matching. Gated by `desync` config flag.
+20. **MiddleProxy DC203 parity fix**: Added complete `middleproxy.zig` path, fixed `RPC_PROXY_REQ` serialization, CBC frame handling, key derivation inputs, and `RPC_HANDSHAKE_ANS` validation.
+21. **MiddleProxy metadata updater**: Added periodic refresh of DC203 proxy endpoint and shared secret from Telegram core endpoints.
 
 ---
 

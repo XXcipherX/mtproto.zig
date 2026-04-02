@@ -36,6 +36,8 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 | **Anti-replay** | Timestamp + Digest Cache | Rejects replayed handshakes outside ±2 min window AND detects ТСПУ Revisor active probes |
 | **Masking** | Connection Cloaking | Forwards unauthenticated clients to a real domain |
 | **Fast Mode** | Zero-copy S2C | Drastically reduces CPU usage by delegating Server-to-Client AES encryption to the DC |
+| **MiddleProxy** | DC203 Media Relay | Handles media DC203 via `RPC_PROXY_REQ/ANS` encapsulation over AES-CBC |
+| **Auto Refresh** | Telegram Metadata | Periodically updates MiddleProxy endpoint and secret from Telegram core endpoints |
 | **Promotion** | Tag Support | Optional promotion tag for sponsored proxy channel registration |
 | **IPv6 Hopping** | DPI Evasion | Auto-rotates IPv6 from /64 subnet on ban detection via Cloudflare API |
 | **TCPMSS=88** | DPI Evasion | Forces ClientHello fragmentation across 6 TCP packets, breaking ISP DPI reassembly |
@@ -294,6 +296,8 @@ bob   = "ffeeddccbbaa99887766554433221100"
 
 > **Note** &nbsp; The configuration format is compatible with the Rust-based `telemt` proxy.
 
+> **Note** &nbsp; Media DC203 settings (MiddleProxy address + shared secret) are refreshed automatically from Telegram (`getProxyConfig`, `getProxySecret`) with a bundled fallback.
+
 ## &nbsp; Troubleshooting ("Updating...")
 
 If your Telegram app is stuck on "Updating...", your provider or network is dropping the connection.
@@ -321,6 +325,16 @@ If you run both this proxy and AmneziaVPN (or a WireGuard Docker container) **on
 ```bash
 iptables -I DOCKER-USER -s 172.29.172.0/24 -p tcp --dport 443 -j ACCEPT
 ```
+
+### 4. DC203 media resets
+
+If only media-heavy sessions fail on non-premium clients, check MiddleProxy logs first:
+
+```bash
+sudo journalctl -u mtproto-proxy --since "15 min ago" | grep -E "dc=203|Middle-proxy"
+```
+
+On startup the proxy now refreshes DC203 metadata from Telegram automatically. If your server cannot reach `core.telegram.org`, it falls back to bundled defaults.
 
 ## &nbsp; License
 
