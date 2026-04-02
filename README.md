@@ -100,6 +100,8 @@ make test
 
 Automated releases are managed by GitHub Actions and `release-please`.
 
+Before enabling required status checks on release PRs, create repository secret `RELEASE_PLEASE_TOKEN` (PAT with access to this repo). This allows CI to run on release-please PRs.
+
 ### Recommended flow (automatic)
 
 1. Merge commits into `main` using Conventional Commit prefixes.
