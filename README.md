@@ -149,9 +149,9 @@ curl -sSf https://raw.githubusercontent.com/sleep3r/mtproto.zig/main/deploy/inst
 
 ```bash
 # x86_64
-curl -sSfL https://ziglang.org/download/0.15.2/zig-linux-x86_64-0.15.2.tar.xz | \
+curl -sSfL https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz | \
   sudo tar xJ -C /usr/local
-sudo ln -sf /usr/local/zig-linux-x86_64-0.15.2/zig /usr/local/bin/zig
+sudo ln -sf /usr/local/zig-x86_64-linux-0.15.2/zig /usr/local/bin/zig
 
 # Verify
 zig version   # → 0.15.2
