@@ -313,7 +313,7 @@ fn handleConnectionInner(
     }
 
     if (!tls.isTlsHandshake(&first_bytes)) {
-        log.debug("[{d}] ({s}) Non-TLS connection, dropping. First bytes: {s}", .{ conn_id, peer_str, std.fmt.fmtSliceHexLower(&first_bytes) });
+        log.debug("[{d}] ({s}) Non-TLS connection, dropping. First bytes: {s}", .{ conn_id, peer_str, std.fmt.bytesToHex(first_bytes, .lower) });
         maskConnection(state, client_stream, peer_str, conn_id, &first_bytes, null);
         return;
     }
