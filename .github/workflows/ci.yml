@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Test & Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Run tests
+        run: zig build test
+
+      - name: Debug build
+        run: zig build
+
+      - name: Release build (native)
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Cross-compile for Linux x86_64
+        run: zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux
+
+      - name: Verify binary exists
+        run: |
+          ls -lh zig-out/bin/mtproto-proxy
+          file zig-out/bin/mtproto-proxy
