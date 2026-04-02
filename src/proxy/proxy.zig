@@ -8,6 +8,7 @@ const posix = std.posix;
 const constants = @import("../protocol/constants.zig");
 const crypto = @import("../crypto/crypto.zig");
 const obfuscation = @import("../protocol/obfuscation.zig");
+const middleproxy = @import("../protocol/middleproxy.zig");
 const tls = @import("../protocol/tls.zig");
 const Config = @import("../config.zig").Config;
 
@@ -35,6 +36,12 @@ const max_connection_lifetime_ms: i64 = 30 * 60 * 1000;
 /// Send timeout (seconds). Prevents writeAll from hanging indefinitely
 /// on a dead peer whose kernel buffer isn't full.
 const send_timeout_sec: u32 = 30;
+/// MiddleProxy config source (same as mtprotoproxy.py)
+const middle_proxy_config_url = "https://core.telegram.org/getProxyConfig";
+/// MiddleProxy secret source (same as mtprotoproxy.py)
+const middle_proxy_secret_url = "https://core.telegram.org/getProxySecret";
+/// MiddleProxy refresh period (24h)
+const middle_proxy_update_period_ns: u64 = 24 * 60 * 60 * std.time.ns_per_s;
 
 // ============= Dynamic Record Sizing (DRS) =============
 
@@ -136,6 +143,14 @@ pub const ProxyState = struct {
     mask_addr: ?net.Address,
     /// Anti-replay cache — detects ТСПУ Revisor active probing.
     replay_cache: ReplayCache,
+    /// Protects live middle-proxy address/secret cache.
+    middle_proxy_lock: std.Thread.RwLock = .{},
+    /// Current middle-proxy endpoint for media DC 203.
+    middle_proxy_addr: net.Address,
+    /// Current middle-proxy shared secret from getProxySecret.
+    middle_proxy_secret: [256]u8,
+    /// Valid length of middle_proxy_secret bytes.
+    middle_proxy_secret_len: usize,
 
     /// Maximum concurrent connections before rejecting new ones.
     /// Prevents thread exhaustion under load.
@@ -167,6 +182,9 @@ pub const ProxyState = struct {
             }
         }
 
+        var default_middle_proxy_secret = [_]u8{0} ** 256;
+        @memcpy(default_middle_proxy_secret[0..middleproxy.proxy_secret.len], middleproxy.proxy_secret[0..]);
+
         return .{
             .allocator = allocator,
             .config = cfg,
@@ -175,6 +193,9 @@ pub const ProxyState = struct {
             .active_connections = std.atomic.Value(u32).init(0),
             .mask_addr = resolved_addr,
             .replay_cache = .{},
+            .middle_proxy_addr = constants.getDcAddressV4(203),
+            .middle_proxy_secret = default_middle_proxy_secret,
+            .middle_proxy_secret_len = middleproxy.proxy_secret.len,
         };
     }
 
@@ -199,6 +220,20 @@ pub const ProxyState = struct {
         defer server.deinit();
 
         log.info("Listening on 0.0.0.0:{d}", .{self.config.port});
+
+        // Keep middle-proxy address/secret in sync with Telegram endpoints.
+        // Skip in tests when datacenter is explicitly overridden.
+        if (self.config.datacenter_override == null) {
+            self.refreshMiddleProxyInfo() catch |err| {
+                log.warn("Initial middle-proxy refresh failed, using bundled defaults: {any}", .{err});
+            };
+
+            if (std.Thread.spawn(.{}, ProxyState.middleProxyUpdaterMain, .{self})) |updater| {
+                updater.detach();
+            } else |err| {
+                log.warn("Middle-proxy updater thread failed to start: {any}", .{err});
+            }
+        }
 
         while (true) {
             const conn = server.accept() catch |err| {
@@ -230,7 +265,151 @@ pub const ProxyState = struct {
             thread.detach();
         }
     }
+
+    const MiddleProxySnapshot = struct {
+        addr: net.Address,
+        secret: [256]u8,
+        secret_len: usize,
+    };
+
+    fn getMiddleProxySnapshot(self: *ProxyState) MiddleProxySnapshot {
+        self.middle_proxy_lock.lockShared();
+        defer self.middle_proxy_lock.unlockShared();
+
+        return .{
+            .addr = self.middle_proxy_addr,
+            .secret = self.middle_proxy_secret,
+            .secret_len = self.middle_proxy_secret_len,
+        };
+    }
+
+    fn middleProxyUpdaterMain(self: *ProxyState) void {
+        while (true) {
+            std.Thread.sleep(middle_proxy_update_period_ns);
+            self.refreshMiddleProxyInfo() catch |err| {
+                log.warn("Middle-proxy refresh failed: {any}", .{err});
+            };
+        }
+    }
+
+    fn refreshMiddleProxyInfo(self: *ProxyState) !void {
+        const cfg_bytes = try fetchUrlBytes(self.allocator, middle_proxy_config_url);
+        defer self.allocator.free(cfg_bytes);
+
+        const next_addr = parseMiddleProxyAddressForDc(cfg_bytes, 203);
+
+        const next_secret = try fetchUrlBytes(self.allocator, middle_proxy_secret_url);
+        defer self.allocator.free(next_secret);
+
+        if (next_secret.len < 16 or next_secret.len > self.middle_proxy_secret.len) {
+            return error.BadMiddleProxySecret;
+        }
+
+        self.middle_proxy_lock.lock();
+        defer self.middle_proxy_lock.unlock();
+
+        var changed = false;
+
+        if (next_addr) |addr| {
+            if (!self.middle_proxy_addr.eql(addr)) {
+                self.middle_proxy_addr = addr;
+                changed = true;
+            }
+        }
+
+        if (self.middle_proxy_secret_len != next_secret.len or
+            !std.mem.eql(u8, self.middle_proxy_secret[0..self.middle_proxy_secret_len], next_secret))
+        {
+            @memset(self.middle_proxy_secret[0..], 0);
+            @memcpy(self.middle_proxy_secret[0..next_secret.len], next_secret);
+            self.middle_proxy_secret_len = next_secret.len;
+            changed = true;
+        }
+
+        if (changed) {
+            log.info("Middle-proxy cache updated: addr={any} secret_len={d}", .{
+                self.middle_proxy_addr,
+                self.middle_proxy_secret_len,
+            });
+        }
+    }
 };
+
+fn parseMiddleProxyAddressForDc(config_text: []const u8, target_dc: i16) ?net.Address {
+    var lines = std.mem.splitScalar(u8, config_text, '\n');
+    while (lines.next()) |raw_line| {
+        var line = std.mem.trim(u8, raw_line, &[_]u8{ ' ', '\t', '\r' });
+        if (line.len == 0 or line[0] == '#') continue;
+        if (line[line.len - 1] == ';') line = line[0 .. line.len - 1];
+
+        var parts = std.mem.tokenizeAny(u8, line, " \t");
+        const keyword = parts.next() orelse continue;
+        if (!std.mem.eql(u8, keyword, "proxy_for")) continue;
+
+        const dc_text = parts.next() orelse continue;
+        const host_port = parts.next() orelse continue;
+
+        const dc_idx = std.fmt.parseInt(i16, dc_text, 10) catch continue;
+        if (dc_idx != target_dc and dc_idx != -target_dc) continue;
+
+        const parsed = net.Address.parseIpAndPort(host_port) catch continue;
+        return parsed;
+    }
+
+    return null;
+}
+
+fn runCurl(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
+    const result = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = argv,
+    });
+    defer allocator.free(result.stderr);
+    errdefer allocator.free(result.stdout);
+
+    switch (result.term) {
+        .Exited => |code| if (code != 0) return error.CurlFailed,
+        else => return error.CurlFailed,
+    }
+
+    return result.stdout;
+}
+
+fn fetchUrlBytes(allocator: std.mem.Allocator, url: []const u8) ![]u8 {
+    const strict_argv = [_][]const u8{ "curl", "-fsSL", "--max-time", "10", url };
+    return runCurl(allocator, &strict_argv) catch {
+        const insecure_argv = [_][]const u8{ "curl", "-kfsSL", "--max-time", "10", url };
+        return runCurl(allocator, &insecure_argv);
+    };
+}
+
+test "parse middle proxy address for dc203" {
+    const cfg =
+        "# force_probability 10 10\n" ++
+        "default 2;\n" ++
+        "proxy_for 1 149.154.175.50:8888;\n" ++
+        "proxy_for 203 91.105.192.110:443;\n" ++
+        "proxy_for -203 91.105.192.110:443;\n";
+
+    const addr = parseMiddleProxyAddressForDc(cfg, 203) orelse return error.TestExpectedEqual;
+
+    try std.testing.expect(addr.any.family == posix.AF.INET);
+    try std.testing.expectEqual(@as(u16, 443), std.mem.bigToNative(u16, addr.in.sa.port));
+
+    const ip = std.mem.asBytes(&addr.in.sa.addr);
+    try std.testing.expectEqual(@as(u8, 91), ip[0]);
+    try std.testing.expectEqual(@as(u8, 105), ip[1]);
+    try std.testing.expectEqual(@as(u8, 192), ip[2]);
+    try std.testing.expectEqual(@as(u8, 110), ip[3]);
+}
+
+test "parse middle proxy address returns null when absent" {
+    const cfg =
+        "proxy_for 1 149.154.175.50:8888;\n" ++
+        "proxy_for 2 149.154.161.144:8888;\n";
+
+    try std.testing.expect(parseMiddleProxyAddressForDc(cfg, 203) == null);
+}
 
 /// Handle a single client connection.
 fn handleConnection(
@@ -249,7 +428,7 @@ fn handleConnection(
     var addr_buf: [64]u8 = undefined;
     const peer_str = formatAddress(peer_addr, &addr_buf);
 
-    handleConnectionInner(state, client_stream, peer_str, conn_id) catch |err| {
+    handleConnectionInner(state, client_stream, peer_addr, peer_str, conn_id) catch |err| {
         // Idle pool closure is normal — mobile clients pre-warm connections
         // that may never send data. Don't pollute logs.
         if (err == error.IdleConnectionClosed) {
@@ -268,6 +447,7 @@ fn handleConnection(
 fn handleConnectionInner(
     state: *ProxyState,
     client_stream: net.Stream,
+    client_addr: net.Address,
     peer_str: []const u8,
     conn_id: u64,
 ) !void {
@@ -514,15 +694,15 @@ fn handleConnectionInner(
     else
         return;
 
-    const dc_idx = (dc_abs - 1) % constants.tg_datacenters_v4.len;
+    const middle_proxy_snapshot = if (dc_abs == 203)
+        state.getMiddleProxySnapshot()
+    else
+        null;
 
-    if (dc_abs > constants.tg_datacenters_v4.len) {
-        log.info("[{d}] ({s}) Special DC {d} → mapped to physical DC {d}", .{
-            conn_id, peer_str, params.dc_idx, dc_idx + 1,
-        });
-    }
-
-    const dc_addr = state.config.datacenter_override orelse constants.tg_datacenters_v4[dc_idx];
+    const dc_addr = state.config.datacenter_override orelse if (dc_abs == 203)
+        middle_proxy_snapshot.?.addr
+    else
+        constants.getDcAddressV4(dc_abs);
     log.debug("[{d}] ({s}) Connecting to DC {d} (addr: {any})", .{ conn_id, peer_str, params.dc_idx, dc_addr });
 
     const dc_stream = net.tcpConnectToAddress(dc_addr) catch |err| {
@@ -531,95 +711,115 @@ fn handleConnectionInner(
     };
     defer dc_stream.close();
 
-    // Generate and send obfuscated handshake to Telegram DC
-    var tg_nonce = obfuscation.generateNonce();
+    const is_primary_dc = (dc_abs >= 1 and dc_abs <= constants.tg_datacenters_v4.len);
+    var use_fast_mode = false;
 
-    // FIX: Telegram Media DCs (negative dc_idx) do not support FAST_MODE S2C offloading.
-    // They ignore the embedded client keys and encrypt S2C traffic with the proxy's session key.
-    // We must dynamically disable fast_mode for them and fall back to double-encryption.
-    const is_media_dc = params.dc_idx < 0;
-    const use_fast_mode = state.config.fast_mode and !is_media_dc;
+    var opt_middle_proxy: ?middleproxy.MiddleProxyContext = null;
+    defer if (opt_middle_proxy) |*mp| mp.deinit(state.allocator);
 
-    if (use_fast_mode) {
-        var client_s2c_key_iv: [constants.key_len + constants.iv_len]u8 = undefined;
-        @memcpy(client_s2c_key_iv[0..constants.key_len], &params.encrypt_key);
-        std.mem.writeInt(u128, client_s2c_key_iv[constants.key_len..][0..constants.iv_len], params.encrypt_iv, .big);
-        obfuscation.prepareTgNonce(&tg_nonce, params.proto_tag, &client_s2c_key_iv);
+    var tg_encryptor_opt: ?crypto.AesCtr = null;
+    var tg_decryptor_opt: ?crypto.AesCtr = null;
+
+    if (dc_abs == 203) {
+        // Execute MiddleProxy Handshake
+        const mp_secret = if (middle_proxy_snapshot) |snap| snap.secret[0..snap.secret_len] else middleproxy.proxy_secret[0..];
+        opt_middle_proxy = try middleproxy.executeHandshake(
+            state.allocator,
+            dc_stream,
+            dc_addr,
+            params.proto_tag,
+            client_addr,
+            mp_secret,
+        );
+        log.debug("[{d}] MiddleProxy handshake successful", .{conn_id});
     } else {
-        obfuscation.prepareTgNonce(&tg_nonce, params.proto_tag, null);
-    }
+        // Generate and send obfuscated handshake to Telegram DC
+        var tg_nonce = obfuscation.generateNonce();
 
-    // DC index must be set explicitly after prepareTgNonce
-    std.mem.writeInt(i16, tg_nonce[constants.dc_idx_pos..][0..2], params.dc_idx, .little);
+        use_fast_mode = state.config.fast_mode and is_primary_dc;
 
-    // Derive TG crypto keys from nonce (raw key bytes, NOT SHA256)
-    const tg_enc_key_iv = tg_nonce[constants.skip_len..][0 .. constants.key_len + constants.iv_len];
-    var tg_enc_key: [constants.key_len]u8 = tg_enc_key_iv[0..constants.key_len].*;
-    var tg_enc_iv_bytes: [constants.iv_len]u8 = tg_enc_key_iv[constants.key_len..][0..constants.iv_len].*;
-    const tg_enc_iv = std.mem.readInt(u128, &tg_enc_iv_bytes, .big);
-
-    // Decrypt direction: reversed key+IV
-    var tg_dec_key_iv: [constants.key_len + constants.iv_len]u8 = undefined;
-    for (0..tg_enc_key_iv.len) |i| {
-        tg_dec_key_iv[i] = tg_enc_key_iv[tg_enc_key_iv.len - 1 - i];
-    }
-    var tg_dec_key: [constants.key_len]u8 = tg_dec_key_iv[0..constants.key_len].*;
-    const tg_dec_iv = std.mem.readInt(u128, tg_dec_key_iv[constants.key_len..][0..constants.iv_len], .big);
-
-    // Encrypt the nonce: encrypt full nonce to advance counter, but only
-    // replace bytes from proto_tag_pos onwards with ciphertext
-    var tg_encryptor = crypto.AesCtr.init(&tg_enc_key, tg_enc_iv);
-    defer tg_encryptor.wipe();
-    var encrypted_nonce: [constants.handshake_len]u8 = undefined;
-    @memcpy(&encrypted_nonce, &tg_nonce);
-    tg_encryptor.apply(&encrypted_nonce);
-    // Build final nonce: unencrypted prefix + encrypted suffix
-    var nonce_to_send: [constants.handshake_len]u8 = undefined;
-    @memcpy(nonce_to_send[0..constants.proto_tag_pos], tg_nonce[0..constants.proto_tag_pos]);
-    @memcpy(nonce_to_send[constants.proto_tag_pos..], encrypted_nonce[constants.proto_tag_pos..]);
-
-    try writeAll(dc_stream, &nonce_to_send);
-    // tg_encryptor counter is now at position 4 (past 64 bytes), correct for subsequent data
-
-    // Promotion (Sponsorship) Tag
-    if (state.config.tag) |tag| {
-        var promote_buf: [32]u8 = undefined;
-        var packet_len: usize = 0;
-
-        const rpc_id: u32 = 0xaeaf0c42;
-        var rpc_payload: [20]u8 = undefined;
-        std.mem.writeInt(u32, rpc_payload[0..4], rpc_id, .little);
-        @memcpy(rpc_payload[4..20], &tag);
-
-        switch (params.proto_tag) {
-            .abridged => {
-                promote_buf[0] = 5; // 20 / 4
-                @memcpy(promote_buf[1..21], &rpc_payload);
-                packet_len = 21;
-            },
-            .intermediate, .secure => {
-                // For both Intermediate and Secure (Padded), we use 4-byte little-endian length.
-                // Telegram is generally fine with unpadded promotion tags even in Secure mode.
-                std.mem.writeInt(u32, promote_buf[0..4], 20, .little);
-                @memcpy(promote_buf[4..24], &rpc_payload);
-                packet_len = 24;
-            },
+        if (use_fast_mode) {
+            var client_s2c_key_iv: [constants.key_len + constants.iv_len]u8 = undefined;
+            @memcpy(client_s2c_key_iv[0..constants.key_len], &params.encrypt_key);
+            std.mem.writeInt(u128, client_s2c_key_iv[constants.key_len..][0..constants.iv_len], params.encrypt_iv, .big);
+            obfuscation.prepareTgNonce(&tg_nonce, params.proto_tag, &client_s2c_key_iv);
+        } else {
+            obfuscation.prepareTgNonce(&tg_nonce, params.proto_tag, null);
         }
 
-        const to_send = promote_buf[0..packet_len];
-        tg_encryptor.apply(to_send);
-        try writeAll(dc_stream, to_send);
-        log.debug("[{d}] ({s}) Sent promotion tag", .{ conn_id, peer_str });
+        // DC index must be set explicitly after prepareTgNonce
+        std.mem.writeInt(i16, tg_nonce[constants.dc_idx_pos..][0..2], params.dc_idx, .little);
+
+        // Derive TG crypto keys from nonce (raw key bytes, NOT SHA256)
+        const tg_enc_key_iv = tg_nonce[constants.skip_len..][0 .. constants.key_len + constants.iv_len];
+        var tg_enc_key: [constants.key_len]u8 = tg_enc_key_iv[0..constants.key_len].*;
+        var tg_enc_iv_bytes: [constants.iv_len]u8 = tg_enc_key_iv[constants.key_len..][0..constants.iv_len].*;
+        const tg_enc_iv = std.mem.readInt(u128, &tg_enc_iv_bytes, .big);
+
+        // Decrypt direction: reversed key+IV
+        var tg_dec_key_iv: [constants.key_len + constants.iv_len]u8 = undefined;
+        for (0..tg_enc_key_iv.len) |i| {
+            tg_dec_key_iv[i] = tg_enc_key_iv[tg_enc_key_iv.len - 1 - i];
+        }
+        var tg_dec_key: [constants.key_len]u8 = tg_dec_key_iv[0..constants.key_len].*;
+        const tg_dec_iv = std.mem.readInt(u128, tg_dec_key_iv[constants.key_len..][0..constants.iv_len], .big);
+
+        // Encrypt the nonce: encrypt full nonce to advance counter, but only
+        // replace bytes from proto_tag_pos onwards with ciphertext
+        var tg_encryptor = crypto.AesCtr.init(&tg_enc_key, tg_enc_iv);
+        var encrypted_nonce: [constants.handshake_len]u8 = undefined;
+        @memcpy(&encrypted_nonce, &tg_nonce);
+        tg_encryptor.apply(&encrypted_nonce);
+
+        // Build final nonce: unencrypted prefix + encrypted suffix
+        var nonce_to_send: [constants.handshake_len]u8 = undefined;
+        @memcpy(nonce_to_send[0..constants.proto_tag_pos], tg_nonce[0..constants.proto_tag_pos]);
+        @memcpy(nonce_to_send[constants.proto_tag_pos..], encrypted_nonce[constants.proto_tag_pos..]);
+
+        try writeAll(dc_stream, &nonce_to_send);
+
+        // Promotion (Sponsorship) Tag — only for primary DCs (1-5).
+        if (state.config.tag) |tag| {
+            if (is_primary_dc and dc_abs != 203) {
+                var promote_buf: [32]u8 = undefined;
+                var packet_len: usize = 0;
+
+                const rpc_id: u32 = 0xaeaf0c42;
+                var rpc_payload: [20]u8 = undefined;
+                std.mem.writeInt(u32, rpc_payload[0..4], rpc_id, .little);
+                @memcpy(rpc_payload[4..20], &tag);
+
+                switch (params.proto_tag) {
+                    .abridged => {
+                        promote_buf[0] = 5; // 20 / 4
+                        @memcpy(promote_buf[1..21], &rpc_payload);
+                        packet_len = 21;
+                    },
+                    .intermediate, .secure => {
+                        std.mem.writeInt(u32, promote_buf[0..4], 20, .little);
+                        @memcpy(promote_buf[4..24], &rpc_payload);
+                        packet_len = 24;
+                    },
+                }
+
+                const to_send = promote_buf[0..packet_len];
+                tg_encryptor.apply(to_send);
+                try writeAll(dc_stream, to_send);
+                log.debug("[{d}] ({s}) Sent promotion tag to primary DC{d}", .{ conn_id, peer_str, dc_abs });
+            } else {
+                log.debug("[{d}] ({s}) Skipping promotion tag for non-primary DC{d}", .{ conn_id, peer_str, params.dc_idx });
+            }
+        }
+
+        tg_encryptor_opt = tg_encryptor;
+        tg_decryptor_opt = crypto.AesCtr.init(&tg_dec_key, tg_dec_iv);
+
+        // Wipe key material from stack
+        @memset(&tg_enc_key, 0);
+        @memset(&tg_enc_iv_bytes, 0);
+        @memset(&tg_dec_key, 0);
+        @memset(&tg_dec_key_iv, 0);
     }
-
-    var tg_decryptor = crypto.AesCtr.init(&tg_dec_key, tg_dec_iv);
-    defer tg_decryptor.wipe();
-
-    // Wipe key material from stack
-    @memset(&tg_enc_key, 0);
-    @memset(&tg_enc_iv_bytes, 0);
-    @memset(&tg_dec_key, 0);
-    @memset(&tg_dec_key_iv, 0);
 
     log.info("[{d}] ({s}) Relaying traffic", .{ conn_id, peer_str });
 
@@ -656,8 +856,13 @@ fn handleConnectionInner(
         log.debug("[{d}] ({s}) Pipelined {d}B after handshake", .{ conn_id, peer_str, pipelined.len });
         // Decrypt with client cipher, re-encrypt with DC cipher
         client_decryptor.apply(pipelined);
-        tg_encryptor.apply(pipelined);
-        try writeAll(dc_stream, pipelined);
+        if (opt_middle_proxy) |*mp| {
+            const out_data = try mp.encapsulateC2S(pipelined);
+            if (out_data.len > 0) try writeAll(dc_stream, out_data);
+        } else if (tg_encryptor_opt) |*enc| {
+            enc.apply(pipelined);
+            try writeAll(dc_stream, pipelined);
+        }
         initial_c2s_bytes = pipelined.len;
     }
 
@@ -666,13 +871,15 @@ fn handleConnectionInner(
         dc_stream,
         &client_decryptor,
         &client_encryptor,
-        &tg_encryptor,
-        &tg_decryptor,
+        if (tg_encryptor_opt) |*enc| enc else null,
+        if (tg_decryptor_opt) |*dec| dec else null,
+        if (opt_middle_proxy) |*mp| mp else null,
         initial_c2s_bytes,
         conn_id,
         use_fast_mode,
     ) catch |err| {
-        log.debug("[{d}] ({s}) Relay ended: {any}", .{ conn_id, peer_str, err });
+        // DIAG: temporarily info-level to see relay death reasons in ReleaseFast
+        log.info("[{d}] ({s}) Relay ended: dc={d} err={any} fast={}", .{ conn_id, peer_str, params.dc_idx, err, use_fast_mode });
     };
 }
 
@@ -697,8 +904,9 @@ fn relayBidirectional(
     dc: net.Stream,
     client_decryptor: *crypto.AesCtr,
     client_encryptor: *crypto.AesCtr,
-    tg_encryptor: *crypto.AesCtr,
-    tg_decryptor: *crypto.AesCtr,
+    tg_encryptor: ?*crypto.AesCtr,
+    tg_decryptor: ?*crypto.AesCtr,
+    middle_proxy: ?*middleproxy.MiddleProxyContext,
     initial_c2s_bytes: u64,
     conn_id: u64,
     fast_mode: bool,
@@ -767,6 +975,7 @@ fn relayBidirectional(
                 dc,
                 client_decryptor,
                 tg_encryptor,
+                middle_proxy,
                 &tls_hdr_buf,
                 &tls_hdr_pos,
                 &tls_body_buf,
@@ -775,7 +984,7 @@ fn relayBidirectional(
                 &c2s_bytes,
                 conn_id,
             ) catch |err| {
-                log.debug("[{d}] Relay: C2S error: {any}, polls={d} c2s={d} s2c={d}", .{ conn_id, err, poll_iterations, c2s_bytes, s2c_bytes });
+                log.info("[{d}] DIAG C2S err: {any} c2s={d} s2c={d}", .{ conn_id, err, c2s_bytes, s2c_bytes });
                 return err;
             };
             if (step != .none) progressed = true;
@@ -787,11 +996,12 @@ fn relayBidirectional(
                 client,
                 if (fast_mode) null else tg_decryptor,
                 if (fast_mode) null else client_encryptor,
+                middle_proxy,
                 &dc_read_buf,
                 &drs,
                 &s2c_bytes,
             ) catch |err| {
-                log.debug("[{d}] Relay: S2C error: {any}, polls={d} c2s={d} s2c={d}", .{ conn_id, err, poll_iterations, c2s_bytes, s2c_bytes });
+                log.info("[{d}] DIAG S2C err: {any} c2s={d} s2c={d}", .{ conn_id, err, c2s_bytes, s2c_bytes });
                 return err;
             };
             if (step != .none) progressed = true;
@@ -799,30 +1009,22 @@ fn relayBidirectional(
 
         // Hard errors after draining readable data
         if ((client_revents & (posix.POLL.ERR | posix.POLL.NVAL)) != 0) {
-            log.debug("[{d}] Relay: client ERR/NVAL (revents=0x{x}), polls={d} c2s={d} s2c={d}", .{
-                conn_id, client_revents, poll_iterations, c2s_bytes, s2c_bytes,
-            });
+            log.info("[{d}] DIAG client ERR/NVAL c2s={d} s2c={d}", .{ conn_id, c2s_bytes, s2c_bytes });
             return error.ConnectionReset;
         }
         if ((dc_revents & (posix.POLL.ERR | posix.POLL.NVAL)) != 0) {
-            log.debug("[{d}] Relay: DC ERR/NVAL (revents=0x{x}), polls={d} c2s={d} s2c={d}", .{
-                conn_id, dc_revents, poll_iterations, c2s_bytes, s2c_bytes,
-            });
+            log.info("[{d}] DIAG DC ERR/NVAL c2s={d} s2c={d}", .{ conn_id, c2s_bytes, s2c_bytes });
             return error.ConnectionReset;
         }
 
         // If HUP arrived without readable data, close immediately.
         // If it arrived with POLLIN, we already drained what we could above.
         if (((client_revents & posix.POLL.HUP) != 0) and ((client_revents & posix.POLL.IN) == 0)) {
-            log.debug("[{d}] Relay: client HUP, polls={d} c2s={d} s2c={d}", .{
-                conn_id, poll_iterations, c2s_bytes, s2c_bytes,
-            });
+            log.info("[{d}] DIAG client HUP c2s={d} s2c={d}", .{ conn_id, c2s_bytes, s2c_bytes });
             return error.ConnectionReset;
         }
         if (((dc_revents & posix.POLL.HUP) != 0) and ((dc_revents & posix.POLL.IN) == 0)) {
-            log.debug("[{d}] Relay: DC HUP, polls={d} c2s={d} s2c={d}", .{
-                conn_id, poll_iterations, c2s_bytes, s2c_bytes,
-            });
+            log.info("[{d}] DIAG DC HUP c2s={d} s2c={d}", .{ conn_id, c2s_bytes, s2c_bytes });
             return error.ConnectionReset;
         }
 
@@ -859,7 +1061,8 @@ fn relayClientToDc(
     client: net.Stream,
     dc: net.Stream,
     client_decryptor: *crypto.AesCtr,
-    tg_encryptor: *crypto.AesCtr,
+    tg_encryptor: ?*crypto.AesCtr,
+    middle_proxy: ?*middleproxy.MiddleProxyContext,
     tls_hdr_buf: *[tls_header_len]u8,
     tls_hdr_pos: *usize,
     tls_body_buf: *[max_tls_payload]u8,
@@ -954,11 +1157,17 @@ fn relayClientToDc(
         // AES-CTR decrypt (client obfuscation layer)
         client_decryptor.apply(payload);
 
-        // AES-CTR encrypt for DC
-        tg_encryptor.apply(payload);
-
-        // Send to DC
-        try writeAll(dc, payload);
+        if (middle_proxy) |mp| {
+            const out_data = try mp.encapsulateC2S(payload);
+            if (out_data.len > 0) {
+                try writeAll(dc, out_data);
+            }
+        } else if (tg_encryptor) |enc| {
+            // AES-CTR encrypt for DC
+            enc.apply(payload);
+            // Send to DC
+            try writeAll(dc, payload);
+        }
         bytes_counter.* += payload.len;
 
         // Reset for next TLS record
@@ -977,6 +1186,7 @@ fn relayDcToClient(
     client: net.Stream,
     tg_decryptor: ?*crypto.AesCtr,
     client_encryptor: ?*crypto.AesCtr,
+    middle_proxy: ?*middleproxy.MiddleProxyContext,
     dc_read_buf: *[constants.default_buffer_size]u8,
     drs: *DynamicRecordSizer,
     bytes_counter: *u64,
@@ -987,7 +1197,39 @@ fn relayDcToClient(
     };
     if (nr == 0) return error.ConnectionReset;
 
-    const data = dc_read_buf[0..nr];
+    const raw_data = dc_read_buf[0..nr];
+
+    if (middle_proxy) |mp| {
+        const payload = try mp.decapsulateS2C(raw_data);
+
+        if (payload.len == 0) return .partial;
+
+        // AES-CTR encrypt for client obfuscation
+        if (client_encryptor) |enc| enc.apply(payload);
+
+        // Wrap in TLS Application Data record(s)
+        var record_buf: [tls_header_len + constants.max_tls_plaintext_size]u8 = undefined;
+        var offset: usize = 0;
+        while (offset < payload.len) {
+            const max_chunk = drs.nextRecordSize();
+            const chunk_len = @min(payload.len - offset, max_chunk);
+
+            record_buf[0] = constants.tls_record_application;
+            record_buf[1] = constants.tls_version[0];
+            record_buf[2] = constants.tls_version[1];
+            std.mem.writeInt(u16, record_buf[3..5], @intCast(chunk_len), .big);
+            @memcpy(record_buf[tls_header_len..][0..chunk_len], payload[offset..][0..chunk_len]);
+
+            try writeAll(client, record_buf[0 .. tls_header_len + chunk_len]);
+            drs.recordSent(chunk_len);
+            offset += chunk_len;
+        }
+
+        bytes_counter.* += payload.len;
+        return .forwarded;
+    }
+
+    const data = raw_data;
 
     // In fast mode, the DC encrypts directly for the client, so we skip these
     if (tg_decryptor) |dec| dec.apply(data);
@@ -1303,7 +1545,8 @@ test "Proxy Integration - Drops invalid connection (masking disabled)" {
 
             // Just run it synchronously
             const stream = std.net.Stream{ .handle = client_fd };
-            handleConnectionInner(s, stream, "127.0.0.1:0", 1) catch {};
+            const t_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+            handleConnectionInner(s, stream, t_addr, "127.0.0.1:0", 1) catch {};
         }
     };
 
@@ -1368,7 +1611,8 @@ test "E2E: DPI Masking (Active Probing Defense)" {
             const client_fd = std.posix.accept(l, null, null, std.posix.SOCK.CLOEXEC) catch return;
             defer std.posix.close(client_fd);
             const stream = std.net.Stream{ .handle = client_fd };
-            handleConnectionInner(s, stream, "127.0.0.1:0", 1) catch {};
+            const t_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+            handleConnectionInner(s, stream, t_addr, "127.0.0.1:0", 1) catch {};
         }
     };
 
@@ -1451,7 +1695,8 @@ test "E2E: Valid MTProto Handshake Drop" {
             const client_fd = std.posix.accept(l, null, null, std.posix.SOCK.CLOEXEC) catch return;
             defer std.posix.close(client_fd);
             const stream = std.net.Stream{ .handle = client_fd };
-            handleConnectionInner(s, stream, "127.0.0.1:0", 1) catch {};
+            const t_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+            handleConnectionInner(s, stream, t_addr, "127.0.0.1:0", 1) catch {};
         }
     };
 

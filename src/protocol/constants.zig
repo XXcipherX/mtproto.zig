@@ -22,6 +22,20 @@ pub const tg_datacenters_v6 = [5]std.net.Address{
     std.net.Address.initIp6(.{ 0x20, 0x01, 0x0b, 0x28, 0xf2, 0x3f, 0xf0, 0x05, 0, 0, 0, 0, 0, 0, 0, 0x0a }, tg_datacenter_port, 0, 0),
 };
 
+/// Resolves physical Datacenter IP by its index, handling special media DCs.
+pub fn getDcAddressV4(abs_dc: usize) std.net.Address {
+    if (abs_dc == 203) {
+        // Media DC 203 has a dedicated network, resolving to MiddleProxy IP
+        return std.net.Address.initIp4(.{ 91, 105, 192, 110 }, tg_datacenter_port);
+    }
+    if (abs_dc >= 1 and abs_dc <= tg_datacenters_v4.len) {
+        return tg_datacenters_v4[abs_dc - 1];
+    }
+    // Fallback to modulo arithmetic for unknown DC indices
+    const fallback_idx = (abs_dc - 1) % tg_datacenters_v4.len;
+    return tg_datacenters_v4[fallback_idx];
+}
+
 // ============= Protocol Tags =============
 
 pub const ProtoTag = enum(u32) {
@@ -128,3 +142,4 @@ test "invalid proto tag" {
     try std.testing.expect(ProtoTag.fromBytes(.{ 0, 0, 0, 0 }) == null);
     try std.testing.expect(ProtoTag.fromBytes(.{ 0xff, 0xff, 0xff, 0xff }) == null);
 }
+

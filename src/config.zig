@@ -92,6 +92,8 @@ pub const Config = struct {
                         cfg.mask = std.mem.eql(u8, value, "true");
                     } else if (std.mem.eql(u8, key, "desync")) {
                         cfg.desync = std.mem.eql(u8, value, "true");
+                    } else if (std.mem.eql(u8, key, "fast_mode")) {
+                        cfg.fast_mode = std.mem.eql(u8, value, "true");
                     }
                 }
             }
