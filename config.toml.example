@@ -7,6 +7,8 @@ use_middle_proxy = true
 
 [server]
 port = 443
+# TCP listen queue size (default is 4096)
+# backlog = 4096
 # Optional: 32 hex-char promotion tag from @MTProxybot
 # tag = "1234567890abcdef1234567890abcdef"
 

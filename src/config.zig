@@ -12,6 +12,8 @@ pub const Config = struct {
     /// Mirrors telemt's [general].use_middle_proxy behavior.
     use_middle_proxy: bool = false,
     port: u16 = 443,
+    /// TCP listen(2) backlog for client-facing sockets
+    backlog: u32 = 4096,
     tag: ?[16]u8 = null,
     tls_domain: []const u8 = "google.com",
     users: std.StringHashMap([16]u8),
@@ -97,6 +99,8 @@ pub const Config = struct {
                 } else if (in_server_section) {
                     if (std.mem.eql(u8, key, "port")) {
                         cfg.port = std.fmt.parseInt(u16, value, 10) catch 443;
+                    } else if (std.mem.eql(u8, key, "backlog")) {
+                        cfg.backlog = std.fmt.parseInt(u32, value, 10) catch 4096;
                     } else if (std.mem.eql(u8, key, "tag")) {
                         if (value.len == 32) {
                             var tag: [16]u8 = undefined;
@@ -163,6 +167,7 @@ test "parse config - valid complete" {
         \\
         \\[server]
         \\port = 8443
+        \\backlog = 8192
         \\fast_mode = true
         \\
         \\[censorship]
@@ -179,6 +184,7 @@ test "parse config - valid complete" {
     defer cfg.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u16, 8443), cfg.port);
+    try std.testing.expectEqual(@as(u32, 8192), cfg.backlog);
     try std.testing.expectEqualStrings("example.com", cfg.tls_domain);
     try std.testing.expect(cfg.use_middle_proxy);
     try std.testing.expect(cfg.mask);
@@ -200,6 +206,7 @@ test "parse config - missing fields defaults" {
     defer cfg.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u16, 443), cfg.port);
+    try std.testing.expectEqual(@as(u32, 4096), cfg.backlog); // Default is 4096
     try std.testing.expectEqualStrings("google.com", cfg.tls_domain);
     try std.testing.expect(!cfg.use_middle_proxy); // Default is false
     try std.testing.expect(cfg.mask); // Default is true

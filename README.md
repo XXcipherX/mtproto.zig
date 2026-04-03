@@ -320,6 +320,7 @@ ad_tag = "1234567890abcdef1234567890abcdef"    # Optional alias for [server].tag
 
 [server]
 port = 443
+backlog = 4096                             # TCP listen queue size
 tag = "1234567890abcdef1234567890abcdef"   # Optional: promotion tag from @MTProxybot
 
 [censorship]
@@ -342,6 +343,7 @@ bob   = "ffeeddccbbaa99887766554433221100"
 | `[general]` | `use_middle_proxy` | `false` | Telemt-compatible ME mode for regular DC1..5 (recommended for promo-channel parity) |
 | `[general]` | `ad_tag` | _(none)_ | Telemt-compatible alias for promotion tag; ignored if `[server].tag` is set |
 | `[server]` | `port` | `443` | TCP port to listen on |
+| `[server]` | `backlog` | `4096` | TCP listen queue size (for high-traffic loads) |
 | `[server]` | `tag` | _(none)_ | Optional 32 hex-char promotion tag from [@MTProxybot](https://t.me/MTProxybot) |
 | `[censorship]` | `tls_domain` | `"google.com"` | Domain to impersonate / forward bad clients to |
 | `[censorship]` | `mask` | `true` | Forward unauthenticated connections to `tls_domain` to defeat DPI |
