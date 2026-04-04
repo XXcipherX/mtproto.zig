@@ -137,8 +137,9 @@ chown -R mtproto:mtproto "$INSTALL_DIR"
 cp "$TMPBUILD/deploy/mtproto-proxy.service" /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable "$SERVICE_NAME"
-systemctl restart "$SERVICE_NAME"
-ok "Systemd service installed and started"
+# NOTE: Do NOT start the proxy here. Config will be modified by
+# setup_masking.sh below. The proxy is started once at the end.
+ok "Systemd service installed"
 
 # ── Firewall & DPI bypass ───────────────────────────────────
 if command -v ufw &>/dev/null && ufw status | grep -q "active"; then
