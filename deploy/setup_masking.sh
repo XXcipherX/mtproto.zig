@@ -51,14 +51,14 @@ if command -v nginx &>/dev/null; then
     ok "Nginx already installed"
 else
     info "Installing Nginx..."
-    apt-get update -qq || true
+    apt-get update -qq < /dev/null || true
     
     # Prevent default nginx IPv6 config from breaking installation on IPv4-only hosts
     mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
     echo "# Empty default" > /etc/nginx/sites-available/default
     ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default
     
-    apt-get install -y nginx >/dev/null 2>&1 || true
+    apt-get install -y nginx < /dev/null >/dev/null 2>&1 || true
     ok "Nginx installed"
 fi
 

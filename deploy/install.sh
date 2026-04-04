@@ -44,8 +44,10 @@ fail()  { echo -e "${RED}✗${RESET} $*" >&2; exit 1; }
 [[ $EUID -eq 0 ]] || fail "Run as root: sudo bash install.sh"
 
 # ── Packages & Dependencies ──────────────────────────────────
-apt-get update -qq || true
-apt-get install -y iptables xxd git curl openssl tar xz-utils >/dev/null 2>&1 || true
+# NOTE: All apt-get calls use < /dev/null to prevent dpkg hooks from
+# consuming stdin when this script is run via 'curl | bash'.
+apt-get update -qq < /dev/null || true
+apt-get install -y iptables xxd git curl openssl tar xz-utils < /dev/null >/dev/null 2>&1 || true
 
 # ── Install Zig ─────────────────────────────────────────────
 if command -v zig &>/dev/null && zig version 2>/dev/null | grep -q "$ZIG_VERSION"; then
@@ -199,14 +201,14 @@ MASKING_OK=false
 NFQWS_OK=false
 
 info "Setting up Local Nginx Masking (zero-RTT)..."
-if bash "$TMPBUILD/deploy/setup_masking.sh" "$TLS_DOMAIN" 2>&1; then
+if bash "$TMPBUILD/deploy/setup_masking.sh" "$TLS_DOMAIN" < /dev/null 2>&1; then
     MASKING_OK=true
 else
     warn "Masking setup failed (non-critical, proxy still works)"
 fi
 
 info "Setting up zapret nfqws TCP desync..."
-if bash "$TMPBUILD/deploy/setup_nfqws.sh" 2>&1; then
+if bash "$TMPBUILD/deploy/setup_nfqws.sh" < /dev/null 2>&1; then
     NFQWS_OK=true
 else
     warn "nfqws setup failed (non-critical, proxy still works)"
