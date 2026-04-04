@@ -51,6 +51,8 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 
 > **Engineering Notes:** For deep technical details, cryptography internals, systemd hardening, and benchmarks, refer to the `.agent/skills` and `.agent/workflows` directories.
 
+Connection-capacity methodology and command profiles: `test/README.md`.
+
 ## &nbsp; Quick Start
 
 ### Prerequisites
