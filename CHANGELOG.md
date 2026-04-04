@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.0](https://github.com/sleep3r/mtproto.zig/compare/v0.3.1...v0.4.0) (2026-04-04)
+
+
+### Features
+
+* Add Dockerfile and build instructions ([#16](https://github.com/sleep3r/mtproto.zig/issues/16)) ([ba13e35](https://github.com/sleep3r/mtproto.zig/commit/ba13e35d203fe367f0035d96d096805bd6a016b6))
+* soak gate CI + re-enable DRS with config toggle ([#45](https://github.com/sleep3r/mtproto.zig/issues/45)) ([e1435a8](https://github.com/sleep3r/mtproto.zig/commit/e1435a8a56918135e0812d2534a88dc36459b69d))
+
 ## [0.3.1](https://github.com/sleep3r/mtproto.zig/compare/v0.3.0...v0.3.1) (2026-04-03)
 
 
