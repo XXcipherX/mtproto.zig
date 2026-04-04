@@ -25,6 +25,9 @@ mask = true
 # TCP desync: split ServerHello into 1-byte + rest to evade passive DPI signatures
 desync = true
 
+# Dynamic Record Sizing: ramp TLS records from 1369→16384 bytes (mimics real browser behavior)
+# drs = false
+
 # Recommended: Drastically reduces RAM/CPU usage by natively delegating S2C AES encryption to the Telegram DC
 fast_mode = true
 

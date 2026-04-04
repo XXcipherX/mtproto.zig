@@ -23,6 +23,8 @@ pub const Config = struct {
     mask_port: u16 = 443,
     /// TCP desync: split ServerHello into 1-byte + rest to evade DPI
     desync: bool = true,
+    /// Dynamic Record Sizing: ramp TLS records from 1369→16384 bytes
+    drs: bool = false,
     /// Fast mode: skip S2C encryption by passing client keys to DC directly
     fast_mode: bool = false,
     /// Test-only hook to redirect upstream connections locally
@@ -121,6 +123,8 @@ pub const Config = struct {
                         cfg.mask_port = std.fmt.parseInt(u16, value, 10) catch 443;
                     } else if (std.mem.eql(u8, key, "desync")) {
                         cfg.desync = std.mem.eql(u8, value, "true");
+                    } else if (std.mem.eql(u8, key, "drs")) {
+                        cfg.drs = std.mem.eql(u8, value, "true");
                     } else if (std.mem.eql(u8, key, "fast_mode")) {
                         cfg.fast_mode = std.mem.eql(u8, value, "true");
                     }

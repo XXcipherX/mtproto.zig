@@ -59,6 +59,8 @@ const DynamicRecordSizer = struct {
     records_sent: u32,
     /// Total bytes sent (for ramp threshold)
     bytes_sent: u64,
+    /// Whether ramp-up is enabled (vs fixed at initial_size)
+    enabled: bool,
 
     /// Initial record size: MSS(1460) - IP(20) - TCP(20) - TLS_header(5) - AEAD(16) - options(~30) ≈ 1369
     const initial_size: usize = 1369;
@@ -69,26 +71,32 @@ const DynamicRecordSizer = struct {
     /// Or ramp up after this many total bytes
     const ramp_byte_threshold: u64 = 128 * 1024;
 
-    fn init() DynamicRecordSizer {
+    fn init(enabled: bool) DynamicRecordSizer {
         return .{
             .current_size = initial_size,
             .records_sent = 0,
             .bytes_sent = 0,
+            .enabled = enabled,
         };
     }
 
     /// Get the max payload size for the next TLS record.
-    /// COMPATIBILITY: Fixed at initial_size (1369) for iOS compatibility testing.
-    /// Large records (16384) may cause issues with some clients.
+    /// When disabled, always returns initial_size (1369) for maximum compatibility.
+    /// When enabled, ramps from initial_size to full_size (16384) after threshold.
     fn nextRecordSize(self: *DynamicRecordSizer) usize {
-        _ = self;
-        return initial_size;
+        return self.current_size;
     }
 
-    /// Report that a record was sent. Ramp-up disabled for compatibility testing.
+    /// Report that a record was sent. Updates ramp state when enabled.
     fn recordSent(self: *DynamicRecordSizer, payload_len: usize) void {
-        _ = self;
-        _ = payload_len;
+        if (!self.enabled) return;
+        self.records_sent += 1;
+        self.bytes_sent += @as(u64, @intCast(payload_len));
+        if (self.current_size == initial_size and
+            (self.records_sent >= ramp_record_threshold or self.bytes_sent >= ramp_byte_threshold))
+        {
+            self.current_size = full_size;
+        }
     }
 };
 
@@ -1255,6 +1263,7 @@ fn handleConnectionInner(
         initial_c2s_bytes,
         conn_id,
         use_fast_mode,
+        state.config.drs,
     ) catch |err| {
         log.debug("[{d}] ({s}) Relay ended: dc={d} err={any} fast={}", .{ conn_id, peer_str, params.dc_idx, err, use_fast_mode });
     };
@@ -1287,6 +1296,7 @@ fn relayBidirectional(
     initial_c2s_bytes: u64,
     conn_id: u64,
     fast_mode: bool,
+    drs_enabled: bool,
 ) !void {
     var fds = [2]posix.pollfd{
         .{ .fd = client.handle, .events = posix.POLL.IN, .revents = 0 },
@@ -1301,7 +1311,7 @@ fn relayBidirectional(
     var tls_body_len: usize = 0;
 
     // Dynamic Record Sizing for S2C TLS records
-    var drs = DynamicRecordSizer.init();
+    var drs = DynamicRecordSizer.init(drs_enabled);
 
     // Buffer for DC → client direction
     var dc_read_buf: [constants.default_buffer_size]u8 = undefined;
@@ -1896,8 +1906,8 @@ test "ProxyState init/deinit" {
     try std.testing.expectEqual(@as(usize, 1), state.user_secrets.len);
 }
 
-test "DRS always returns fixed size (compatibility mode)" {
-    var drs = DynamicRecordSizer.init();
+test "DRS disabled — always returns fixed size (compatibility mode)" {
+    var drs = DynamicRecordSizer.init(false);
 
     // Should always use small records (compatibility mode)
     try std.testing.expectEqual(DynamicRecordSizer.initial_size, drs.nextRecordSize());
@@ -1907,6 +1917,31 @@ test "DRS always returns fixed size (compatibility mode)" {
         drs.recordSent(1369);
     }
     try std.testing.expectEqual(DynamicRecordSizer.initial_size, drs.nextRecordSize());
+}
+
+test "DRS enabled — ramps to full size after threshold" {
+    var drs = DynamicRecordSizer.init(true);
+
+    // Starts at initial size
+    try std.testing.expectEqual(DynamicRecordSizer.initial_size, drs.nextRecordSize());
+
+    // Send 7 records (just below threshold of 8)
+    for (0..7) |_| {
+        drs.recordSent(1369);
+    }
+    try std.testing.expectEqual(DynamicRecordSizer.initial_size, drs.nextRecordSize());
+
+    // 8th record triggers ramp
+    drs.recordSent(1369);
+    try std.testing.expectEqual(DynamicRecordSizer.full_size, drs.nextRecordSize());
+}
+
+test "DRS enabled — ramps on byte threshold" {
+    var drs = DynamicRecordSizer.init(true);
+
+    // Send one large chunk that exceeds byte threshold (128KB)
+    drs.recordSent(128 * 1024);
+    try std.testing.expectEqual(DynamicRecordSizer.full_size, drs.nextRecordSize());
 }
 
 test "Proxy Integration - Drops invalid connection (masking disabled)" {
