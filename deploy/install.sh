@@ -214,6 +214,9 @@ else
     warn "nfqws setup failed (non-critical, proxy still works)"
 fi
 
+# Fix ownership: setup_masking.sh rewrites config.toml via awk+mv as root
+chown -R mtproto:mtproto "$INSTALL_DIR"
+
 # Restart proxy to apply Mask Port and NFQUEUE capabilities
 systemctl restart "$SERVICE_NAME" 2>/dev/null || true
 ok "Proxy restarted"
