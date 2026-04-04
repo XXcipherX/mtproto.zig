@@ -97,9 +97,13 @@ chmod +x "$INSTALL_DIR"/*.sh
 # ── Generate config (if not exists) ─────────────────────────
 if [[ ! -f "$INSTALL_DIR/config.toml" ]]; then
     SECRET=$(openssl rand -hex 16)
-    # wb.ru is the default masking domain — must match the hex suffix in the ee-secret.
     # ee-secret format: ee + hex(user_secret) + hex(tls_domain)
-    TLS_DOMAIN="wb.ru"
+    # Read domain from terminal (stdin is busy with curl pipe, so use /dev/tty)
+    echo ""
+    echo -e "${BOLD}${CYAN}  Enter TLS masking domain${RESET} ${DIM}(e.g. google.com, wb.ru)${RESET}"
+    echo -ne "  ${CYAN}▸${RESET} Domain [wb.ru]: "
+    read -r USER_DOMAIN < /dev/tty || true
+    TLS_DOMAIN="${USER_DOMAIN:-wb.ru}"
 
     cat > "$INSTALL_DIR/config.toml" << EOF
 [server]
