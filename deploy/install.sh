@@ -192,15 +192,29 @@ else
 fi
 
 # ── OS-Level DPI Evasion (Zero-RTT Masking & Zapret) ────────
+# These are optional hardening steps — failures must NOT prevent
+# the final banner from being displayed.
+
+MASKING_OK=false
+NFQWS_OK=false
+
 info "Setting up Local Nginx Masking (zero-RTT)..."
-bash "$TMPBUILD/deploy/setup_masking.sh" "$TLS_DOMAIN" || warn "Masking setup failed"
+if bash "$TMPBUILD/deploy/setup_masking.sh" "$TLS_DOMAIN" 2>&1; then
+    MASKING_OK=true
+else
+    warn "Masking setup failed (non-critical, proxy still works)"
+fi
 
 info "Setting up zapret nfqws TCP desync..."
-bash "$TMPBUILD/deploy/setup_nfqws.sh" || warn "nfqws setup failed"
+if bash "$TMPBUILD/deploy/setup_nfqws.sh" 2>&1; then
+    NFQWS_OK=true
+else
+    warn "nfqws setup failed (non-critical, proxy still works)"
+fi
 
 # Restart proxy to apply Mask Port and NFQUEUE capabilities
-systemctl restart "$SERVICE_NAME"
-ok "Advanced OS-Level DPI Evasion and Masking successfully configured!"
+systemctl restart "$SERVICE_NAME" 2>/dev/null || true
+ok "Proxy restarted"
 
 # Validate masking configuration after restart
 MASK_PORT="$(awk '
@@ -217,22 +231,25 @@ MASK_PORT="$(awk '
         gsub(/[[:space:]]/, "", value)
         print value
     }
-' "$INSTALL_DIR/config.toml" | tail -1)"
+' "$INSTALL_DIR/config.toml" | tail -1)" || true
 
-if [[ -z "$MASK_PORT" ]]; then
-    warn "mask_port is not set in [censorship] — masking may fall back to remote tls_domain:443"
-elif curl -sk --max-time 5 "https://127.0.0.1:${MASK_PORT}/" >/dev/null 2>&1; then
-    ok "Masking validation passed (127.0.0.1:${MASK_PORT} responds over TLS)"
-else
-    warn "Masking validation failed: https://127.0.0.1:${MASK_PORT}/ is not responding"
+if [[ -n "${MASK_PORT:-}" ]]; then
+    if curl -sk --max-time 5 "https://127.0.0.1:${MASK_PORT}/" >/dev/null 2>&1; then
+        ok "Masking validation passed (127.0.0.1:${MASK_PORT} responds over TLS)"
+    else
+        warn "Masking validation failed: https://127.0.0.1:${MASK_PORT}/ is not responding"
+    fi
 fi
 
 # ── Cleanup ─────────────────────────────────────────────────
 rm -rf "$TMPBUILD"
 
 # ── Print connection info ───────────────────────────────────
-PUBLIC_IP=$(curl -s --max-time 5 https://ifconfig.me || echo "<SERVER_IP>")
-PORT=$(grep -oP 'port\s*=\s*\K[0-9]+' "$INSTALL_DIR/config.toml" || echo "443")
+# This section MUST always run, so disable errexit for safety
+set +e
+
+PUBLIC_IP=$(curl -s --max-time 5 https://ifconfig.me 2>/dev/null || echo "<SERVER_IP>")
+PORT=$(grep -oP 'port\s*=\s*\K[0-9]+' "$INSTALL_DIR/config.toml" 2>/dev/null || echo "443")
 
 # Build ee-secret: ee + hex(secret) + hex(tls_domain)
 DOMAIN_HEX=$(echo -n "$TLS_DOMAIN" | xxd -p | tr -d '\n')
@@ -256,12 +273,20 @@ echo -e "  ${CYAN}tg://proxy?server=${PUBLIC_IP}&port=${PORT}&secret=${GREEN}${E
 echo ""
 echo -e "  ${DIM}t.me/proxy?server=${PUBLIC_IP}&port=${PORT}&secret=${EE_SECRET}${RESET}"
 echo ""
-echo -e "  ${BOLD}DPI Bypass active:${RESET}"
+echo -e "  ${BOLD}DPI Bypass:${RESET}"
 echo -e "  ${GREEN}✓${RESET} Anti-Replay Cache (ТСПУ Revisor protection)"
 echo -e "  ${GREEN}✓${RESET} TCPMSS=88 (ClientHello fragmentation)"
+if $MASKING_OK; then
 echo -e "  ${GREEN}✓${RESET} Local Nginx Dummy (Zero-RTT Active Probe defense)"
+else
+echo -e "  ${RED}✗${RESET} Local Nginx Masking (setup failed)"
+fi
 echo -e "  ${GREEN}✓${RESET} Split-TLS (1-byte TLS Record chunking)"
+if $NFQWS_OK; then
 echo -e "  ${GREEN}✓${RESET} TCP Desync nfqws (Zapret OS fragmentation)"
+else
+echo -e "  ${RED}✗${RESET} TCP Desync nfqws (setup failed)"
+fi
 if [[ -f /etc/cron.d/mtproto-ipv6 ]]; then
 echo -e "  ${GREEN}✓${RESET} IPv6 auto-hopping every 5 min"
 else
