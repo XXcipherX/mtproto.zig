@@ -109,6 +109,8 @@ zig build -Doptimize=ReleaseFast soak -- --seconds=120 --threads=8 --max-payload
 | `make test` | Run unit tests |
 | `make bench` | Run ReleaseFast encapsulation microbenchmarks |
 | `make soak` | Run ReleaseFast multithreaded soak stress test (30s default) |
+| `make capacity-probe-idle` | Run idle-socket capacity probe for `mtproto.zig` |
+| `make capacity-probe-active` | Run TLS-auth (active) capacity probe for `mtproto.zig` |
 | `make clean` | Remove build artifacts |
 | `make fmt` | Format all Zig source files |
 | `make deploy` | Cross-compile, upload binary/scripts/config to VPS, restart service |
@@ -296,7 +298,6 @@ fast_mode = true
 
 # Server tunables for high capacity
 # max_connections = 10000
-# thread_stack_kb = 256
 EOF
 
 ### &nbsp; Capacity & RAM Monitoring
@@ -399,7 +400,6 @@ bob   = "ffeeddccbbaa99887766554433221100"
 | `[server]` | `port` | `443` | TCP port to listen on |
 | `[server]` | `backlog` | `4096` | TCP listen queue size (for high-traffic loads) |
 | `[server]` | `max_connections` | `65535` | Hard cap for concurrently served client sockets (overload protection) |
-| `[server]` | `thread_stack_kb` | `256` | Per-connection thread stack size (keep small for high concurrency) |
 | `[server]` | `idle_timeout_sec` | `300` | Timeout before first byte from client (helps mobile pool stability) |
 | `[server]` | `handshake_timeout_sec` | `60` | Handshake timeout after first byte arrives |
 | `[server]` | `middleproxy_buffer_kb` | `256` | MiddleProxy per-connection buffer size in KiB |
@@ -426,7 +426,23 @@ bob   = "ffeeddccbbaa99887766554433221100"
 
 If your Telegram app is stuck on "Updating...", your provider or network is dropping the connection.
 
-### 1. Home Wi-Fi restricts IPv4
+### 1. AAAA exists, but server IPv6 is not actually working
+
+This proxy supports IPv6, but your VPS must have real end-to-end IPv6 routing.
+If DNS has an `AAAA` record and the server has no usable global IPv6 route, iOS often tries IPv6 first, waits for timeout, then falls back to IPv4. This usually looks like a ~3-8 second connect delay.
+
+Quick checks:
+
+```bash
+dig +short proxy.example.com A
+dig +short proxy.example.com AAAA
+ip -6 addr show scope global
+ip -6 route
+```
+
+If `AAAA` exists but the server has no working global IPv6/default route, remove `AAAA` and keep only `A` until IPv6 is fully configured.
+
+### 2. Home Wi-Fi restricts IPv4
 
 Often, mobile networks will connect instantly because they use **IPv6**, but Home Wi-Fi internet providers block the destination's IPv4 address directly at the gateway.
 **Solution:** Enable **IPv6 Prefix Delegation** on your home Wi-Fi router. 
@@ -435,14 +451,14 @@ Often, mobile networks will connect instantly because they use **IPv6**, but Hom
 - Enable `IPv6`, and specifically check **IA_PD** (Prefix Delegation) for the WAN/DHCP client, and **IA_NA** for the LAN/DHCP Server.
 - Reboot the router and verify your phone gets an IPv6 address at [test-ipv6.com](https://test-ipv6.com). 
 
-### 2. Commercial / Premium VPNs Block Traffic
+### 3. Commercial / Premium VPNs Block Traffic
 
 If your iPhone is connected to a **commercial/premium VPN** and stuck on "Updating...", the VPN provider is actively dropping the MTProto TLS traffic using their own DPI.
 **Solutions**:
 - **Switch Protocol**: Try switching the VPN protocol (e.g., Xray/VLESS to WireGuard).
 - **Self-Host**: Use a self-hosted VPN (like AmneziaWG) on your own server.
 
-### 3. Co-located WireGuard (Docker routing)
+### 4. Co-located WireGuard (Docker routing)
 
 If you run both this proxy and AmneziaVPN (or a WireGuard Docker container) **on the same server**, iOS clients will route proxy traffic inside the VPN tunnel, and Docker will drop the bridge packets.
 **Solution**: Allow traffic from the VPN Docker subnet:
@@ -450,7 +466,7 @@ If you run both this proxy and AmneziaVPN (or a WireGuard Docker container) **on
 iptables -I DOCKER-USER -s 172.29.172.0/24 -p tcp --dport 443 -j ACCEPT
 ```
 
-### 4. DC203 media resets
+### 5. DC203 media resets
 
 If only media-heavy sessions fail on non-premium clients, check MiddleProxy logs first:
 

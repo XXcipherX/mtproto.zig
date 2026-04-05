@@ -9,8 +9,8 @@ This document records severe execution issues, profiling details, and project st
 
 ## Critical Zig Gotchas
 
-### 1. `log_level = .debug` Causes 99% CPU in `ReleaseFast`
-**THIS WAS THE #1 STABILITY KILLER.**
+### 1. `log_level = .debug` Causes 99% CPU (Historical Context)
+**THIS WAS THE #1 STABILITY KILLER in the legacy model.**
 
 ```zig
 // BAD — forces ALL log.debug calls to execute even in ReleaseFast
@@ -19,13 +19,8 @@ pub const std_options = std.Options{
 };
 ```
 
-Zig's default logger (`std.log.defaultLog`) acquires a global `stderr_mutex` (`std.Thread.Mutex.Recursive` in `std.Progress`) for **EVERY** log message. It uses a small 64-byte buffer, causing multiple `flush`/`write` syscalls per message while holding the lock.
-
-**The Cascade:**
-1. Hundreds of connections spawn threads.
-2. Each thread logs debug messages, contending on the single `stderr_mutex`.
-3. **Concurrency Limit**: `max_connections = 65535` is enforced in the accept loop to prevent thread exhaustion.
-4. CPU hits 99%, and `CLOSE-WAIT` sockets accumulate.
+Zig's default logger (`std.log.defaultLog`) acquires a global `stderr_mutex`. Under high concurrency, logging cascades into stalls.
+**The Rule (Current):** Keep hot-path logs minimal. We now use a custom lock-free logger, but flooding `ReleaseFast` with `.debug` will still hurt event-loop latency.
 
 **Evidence from `/proc` analysis:**
 - 337 threads in `futex_wait_queue`.
@@ -59,24 +54,13 @@ Only 4 `log.info` messages survive in the hot path:
 
 Everything else is `log.debug` (compiled out in `ReleaseFast`).
 
-### 5. Atomic Counter Race in Accept Loop
-**The Problem**: If `active_connections` is incremented *inside* the spawned thread, a burst of incoming connections can overshoot `max_connections`. The main loop checks the counter, sees it's below the limit, and spawns a thread. If 100 connections arrive simultaneously, 100 threads are spawned before any of them increment the counter.
+### 5. Atomic Counter Races
+**The Lesson**: Reserve slots proactively. `active_connections` must be incremented before accepting operations to prevent burst overshoots.
 
-**The Fix**: **Reserve the slot in the main loop.**
-```zig
-const active_before = state.active_connections.fetchAdd(1, .monotonic);
-if (active_before >= state.config.max_connections) {
-    _ = state.active_connections.fetchSub(1, .monotonic);
-    conn.stream.close();
-    continue;
-}
-```
-
-### 6. Large Stack Buffers vs. High Concurrency
-**The Problem**: Zig's `std.Thread.spawn` uses a fixed stack size. Allocating `[16KB]u8` buffers on the stack for every connection is dangerous. With a `256KB` stack, just a few heavy functions or deep recursion can cause a `Stack Overflow`.
-
-**The Fix**: Move all large buffers (TLS ciphertext, handshake assembly) to the **Heap** (`ProxyState.allocator`). This allows keeping `thread_stack_kb` small (256KB) while safely handling 10,000+ concurrent connections.
-
+### 6. Epoll & Event Loop Transition
+**The Problem**: The legacy model spawned threads with fixed `256KB` stacks, leading to large baseline memory usage (e.g. 144MB for 13k connections) and susceptibility to stack overflow under heavy buffers.
+**The Fix**: The codebase transitioned entirely to an **epoll-based event loop**. Memory allocation is decoupled from connections, allowing robust scalability (49MB for 12,000 connections).
+**Current Rule**: Do not re-introduce thread-per-connection features!
 
 ### 7. Zig stdlib Internals (Reference)
 - `std/log.zig:122`: Comptime log level check.

@@ -34,8 +34,12 @@ To ensure transparent failover without changing the immutable client link:
 - Update the **A record** (`proxy.xxcipherx.ru`) to point to the new `<NEW_VPS_IP>` using the Cloudflare Dashboard or API.
 - Run `/opt/mtproto-proxy/ipv6-hop.sh` on the new server to force an immediate **AAAA record** overwrite to the new server's IPv6 pool.
 
-## Step 4: Verify Connectivity
+## Step 4: Verify Connectivity & Validation
 
 1. Check `systemctl status mtproto-proxy`.
 2. Verify that the Cloudflare DNS now resolves to the new IP addresses using `dig +short proxy.xxcipherx.ru`.
-3. Telegram clients will automatically pick up the new IPs from the existing proxy link.
+3. Validate traffic capacity before decommissioning the old host:
+```bash
+ssh root@<NEW_VPS_IP> 'sudo python3 /opt/mtproto-proxy/test/capacity_connections_probe.py --profile mtproto.zig --traffic-mode tls-auth --tls-domain google.com --levels 200,500 --open-budget-sec 8 --hold-seconds 0.5 --settle-seconds 0.8 --connect-timeout-sec 0.1 --nofile 200000 --nproc 12000'
+```
+4. Telegram clients will automatically pick up the new IPs from the existing proxy link.
