@@ -20,6 +20,11 @@ const log = std.log.scoped(.proxy);
 
 const tls_header_len = 5;
 const event_loop_wait_ms = 37;
+const accept_backoff_ms: i64 = 500;
+const accept_backoff_ns: i128 = @as(i128, accept_backoff_ms) * std.time.ns_per_ms;
+const stats_log_interval_s: i64 = 10;
+const stats_log_interval_ns: i128 = @as(i128, stats_log_interval_s) * std.time.ns_per_s;
+const nofile_fd_overhead: usize = 512;
 const middle_proxy_config_url = "https://core.telegram.org/getProxyConfig";
 const middle_proxy_secret_url = "https://core.telegram.org/getProxySecret";
 const middle_proxy_update_period_ns: u64 = 24 * 60 * 60 * std.time.ns_per_s;
@@ -726,8 +731,24 @@ pub const ProxyState = struct {
             }
         }
 
-        const needed_fds = @as(usize, self.config.max_connections) * 2 + 512;
-        checkNofileLimit(@max(needed_fds, min_nofile_soft));
+        if (getNofileSoftLimit()) |soft| {
+            const configured_max = self.config.max_connections;
+            const needed_fds = requiredFdsForConnections(configured_max);
+            if (soft < needed_fds) {
+                const clamped = maxConnectionsForNofile(soft);
+                if (clamped < configured_max) {
+                    self.config.max_connections = clamped;
+                    log.warn("max_connections clamped from {d} to {d} due to RLIMIT_NOFILE soft={d}", .{
+                        configured_max,
+                        clamped,
+                        soft,
+                    });
+                }
+            }
+        }
+
+        const effective_needed_fds = requiredFdsForConnections(self.config.max_connections);
+        checkNofileLimit(@max(effective_needed_fds, min_nofile_soft), self.config.max_connections);
 
         var loop = try EventLoop.init(self, server.stream.handle);
         defer loop.deinit();
@@ -888,6 +909,11 @@ const EventLoop = struct {
     epoll_fd: posix.fd_t,
     listen_fd: posix.fd_t,
     pool: ConnectionPool,
+    accept_paused: bool,
+    accept_resume_ns: i128,
+    stats_next_log_ns: i128,
+    accepted_since_log: u64,
+    closed_since_log: u64,
 
     fn init(state: *ProxyState, listen_fd: posix.fd_t) !EventLoop {
         const epoll_fd = try epollCreate();
@@ -898,6 +924,11 @@ const EventLoop = struct {
             .epoll_fd = epoll_fd,
             .listen_fd = listen_fd,
             .pool = try ConnectionPool.init(state.allocator, state.config.max_connections),
+            .accept_paused = false,
+            .accept_resume_ns = 0,
+            .stats_next_log_ns = std.time.nanoTimestamp() + stats_log_interval_ns,
+            .accepted_since_log = 0,
+            .closed_since_log = 0,
         };
         errdefer loop.pool.deinit();
 
@@ -946,9 +977,15 @@ const EventLoop = struct {
             }
 
             const now_ns = std.time.nanoTimestamp();
+            if (self.accept_paused and now_ns >= self.accept_resume_ns) {
+                self.resumeAccepting();
+            }
             if (now_ns >= next_timer_tick_ns) {
                 self.runTimers();
                 next_timer_tick_ns = now_ns + timer_tick_ns;
+            }
+            if (now_ns >= self.stats_next_log_ns) {
+                self.logPeriodicStats(now_ns);
             }
         }
     }
@@ -994,8 +1031,14 @@ const EventLoop = struct {
             var client_addr: net.Address = undefined;
             var client_len: posix.socklen_t = @sizeOf(net.Address);
             const cfd = posix.accept(self.listen_fd, &client_addr.any, &client_len, posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK) catch |err| {
-                if (err == error.WouldBlock) return;
-                return err;
+                switch (err) {
+                    error.WouldBlock => return,
+                    error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded => {
+                        self.pauseAccepting(err);
+                        return;
+                    },
+                    else => return err,
+                }
             };
 
             const active_before = self.state.active_connections.fetchAdd(1, .monotonic);
@@ -1025,11 +1068,64 @@ const EventLoop = struct {
                     self.closeSlot(slot, "fd map failed");
                     continue;
                 };
+                self.accepted_since_log += 1;
             } else |_| {
                 self.closeSlot(slot, "epoll add client failed");
                 continue;
             }
         }
+    }
+
+    fn logPeriodicStats(self: *EventLoop, now_ns: i128) void {
+        const active = self.state.active_connections.load(.monotonic);
+        const accepted_total = self.state.connection_count.load(.monotonic);
+        log.info("conn stats: active={d}/{d} accepted+={d} closed+={d} tracked_fds={d} total={d} accept_paused={}", .{
+            active,
+            self.state.config.max_connections,
+            self.accepted_since_log,
+            self.closed_since_log,
+            self.pool.fd_to_slot.count(),
+            accepted_total,
+            self.accept_paused,
+        });
+
+        self.accepted_since_log = 0;
+        self.closed_since_log = 0;
+
+        while (self.stats_next_log_ns <= now_ns) {
+            self.stats_next_log_ns += stats_log_interval_ns;
+        }
+    }
+
+    fn pauseAccepting(self: *EventLoop, err: anyerror) void {
+        self.accept_resume_ns = std.time.nanoTimestamp() + accept_backoff_ns;
+        if (self.accept_paused) return;
+
+        self.modFd(self.listen_fd, false, false) catch |mod_err| {
+            log.err("failed to pause accepts after fd quota error: {any}", .{mod_err});
+            return;
+        };
+
+        self.accept_paused = true;
+        const needed = requiredFdsForConnections(self.state.config.max_connections);
+        log.warn("fd quota reached ({any}); pausing accepts for {d}ms (recommended LimitNOFILE >= {d})", .{
+            err,
+            accept_backoff_ms,
+            needed,
+        });
+    }
+
+    fn resumeAccepting(self: *EventLoop) void {
+        if (!self.accept_paused) return;
+
+        self.modFd(self.listen_fd, true, false) catch |err| {
+            self.accept_resume_ns = std.time.nanoTimestamp() + accept_backoff_ns;
+            log.warn("failed to resume accepts; retry in {d}ms: {any}", .{ accept_backoff_ms, err });
+            return;
+        };
+
+        self.accept_paused = false;
+        self.accept_resume_ns = 0;
     }
 
     fn onClientReadable(self: *EventLoop, slot: *ConnectionSlot) void {
@@ -2366,6 +2462,7 @@ const EventLoop = struct {
         if (slot.active_reserved) {
             _ = self.state.active_connections.fetchSub(1, .monotonic);
             slot.active_reserved = false;
+            self.closed_since_log += 1;
         }
 
         slot.phase = .idle;
@@ -2566,23 +2663,40 @@ fn epollCreate() !posix.fd_t {
     }
 }
 
-fn checkNofileLimit(required: usize) void {
-    if (builtin.os.tag != .linux) return;
+fn requiredFdsForConnections(max_connections: u32) usize {
+    return @as(usize, max_connections) * 2 + nofile_fd_overhead;
+}
+
+fn maxConnectionsForNofile(soft_nofile: usize) u32 {
+    if (soft_nofile <= nofile_fd_overhead + 2) return 32;
+
+    const cap = (soft_nofile - nofile_fd_overhead) / 2;
+    const capped_u32: u32 = @intCast(@min(cap, @as(usize, std.math.maxInt(u32))));
+    return @max(@as(u32, 32), capped_u32);
+}
+
+fn getNofileSoftLimit() ?usize {
+    if (builtin.os.tag != .linux) return null;
 
     var lim: linux.rlimit = undefined;
     const rc = linux.getrlimit(.NOFILE, &lim);
     switch (posix.errno(rc)) {
         .SUCCESS => {},
-        else => return,
+        else => return null,
     }
 
-    const soft: usize = @intCast(lim.cur);
+    return @intCast(lim.cur);
+}
+
+fn checkNofileLimit(required: usize, max_connections: u32) void {
+    const soft = getNofileSoftLimit() orelse return;
+
     if (soft >= required) return;
 
     log.warn("RLIMIT_NOFILE soft limit is {d}, recommended >= {d} for max_connections={d}", .{
         soft,
         required,
-        required / 2,
+        max_connections,
     });
 }
 
@@ -3043,4 +3157,10 @@ test "epoll hangup helper" {
     try std.testing.expect(hasFatalEpollHangup(linux.EPOLL.HUP));
     try std.testing.expect(hasFatalEpollHangup(linux.EPOLL.ERR));
     try std.testing.expect(!hasFatalEpollHangup(linux.EPOLL.IN));
+}
+
+test "fd requirement helpers" {
+    try std.testing.expectEqual(@as(usize, 131582), requiredFdsForConnections(65535));
+    try std.testing.expectEqual(@as(u32, 65535), maxConnectionsForNofile(131582));
+    try std.testing.expectEqual(@as(u32, 32511), maxConnectionsForNofile(65535));
 }
