@@ -40,6 +40,12 @@ ssh root@<NEW_VPS_IP> 'systemctl restart mtproto-proxy'
 ssh root@<NEW_VPS_IP> '/opt/mtproto-proxy/ipv6-hop.sh'
 ```
 
+If the target region blocks Telegram, add the tunnel layer before cutover:
+
+```bash
+make deploy-tunnel SERVER=<NEW_VPS_IP> AWG_CONF=<path> [PASSWORD=<pass>] [TUNNEL_MODE=direct|preserve|middleproxy]
+```
+
 ## Step 4: Validate Before Decommission
 
 ```bash

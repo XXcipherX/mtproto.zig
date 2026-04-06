@@ -20,7 +20,7 @@ Production MTProto proxy implemented in Zig with FakeTLS entry, obfuscated MTPro
 - Relay path is a single-threaded Linux `epoll` event loop.
 - Connections are represented by pooled `ConnectionSlot` state objects.
 - File descriptors are tracked via epoll + fd-to-slot mapping.
-- Recent runtime changes added safer failed-connect cleanup, bounded timer scanning, fd-budget clamping, and low-noise periodic connection stats.
+- Recent runtime changes added safer failed-connect cleanup, bounded timer scanning, fd-budget clamping, 90%/80% saturation hysteresis, and low-noise periodic connection stats.
 - A background updater thread refreshes MiddleProxy metadata from Telegram core endpoints once per 24h.
 
 Code anchors:
@@ -41,7 +41,7 @@ Code anchors:
 - Direct DC path.
 - MiddleProxy path (`use_middle_proxy=true` and endpoint available).
 - Media path (`dc=203` or negative index) prefers MiddleProxy endpoint when available.
-6. If MiddleProxy connect/handshake fails on non-media path, proxy can reconnect directly to the DC fallback endpoint.
+6. If MiddleProxy connect/handshake fails, proxy can reconnect directly to the same DC fallback endpoint.
 7. Bidirectional relay starts (`relaying` phase).
 
 ## MiddleProxy Routing and Refresh
@@ -55,7 +55,7 @@ Code anchors:
 Important behavior:
 
 - If a MiddleProxy endpoint is unavailable, direct path is allowed by the current connect-plan logic to avoid dropping valid users.
-- Tunnel deployment forces direct mode and removes `tag`, because the effective source IP becomes the AWG exit node.
+- Tunnel deployment supports `direct`, `preserve`, and `middleproxy` modes. `direct` only affects regular DC traffic; media path still prefers MiddleProxy when available.
 
 ## Fast Mode
 

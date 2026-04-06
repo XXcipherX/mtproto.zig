@@ -29,7 +29,7 @@ ssh root@<SERVER_IP> 'cat /proc/$(pgrep -f mtproto-proxy)/limits | grep "open fi
 ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy --since "1 hour ago" --no-pager'
 
 # Runtime capacity / fd-pressure signals
-ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy --since "1 hour ago" --no-pager | grep -E "conn stats|max_connections clamped|fd quota reached|failed to resume accepts"'
+ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy --since "1 hour ago" --no-pager | grep -E "conn stats|drops:|max_connections clamped|fd quota reached|failed to resume accepts|connection saturation|saturation eased"'
 
 # Connect-path and fallback signals
 ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy --since "1 hour ago" --no-pager | grep -E "middle-proxy exhausted|middle-proxy handshake failed|media path connect failed|epoll hup/err"'
@@ -44,8 +44,8 @@ ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy --since "24 hours ago" --no-pa
 Note:
 
 - Older grep patterns like `DIAG: Short read`, `DC4 MiddleProxy timeout`, `DC203 MiddleProxy timeout` are legacy and not emitted by current code.
-- `conn stats: active=... accepted+=... closed+=... tracked_fds=... total=... accept_paused=...` is the current 10s heartbeat for production visibility.
-- `accept_paused=true` means `accept()` hit `EMFILE`/`ENFILE` and the loop intentionally backed off for 500ms instead of spinning.
+- `conn stats: active=... hs_inflight=... accepted+=... closed+=... tracked_fds=... total=... paused=<fd>/<saturation>` is the current 10s heartbeat for production visibility.
+- `paused=true/false` means fd-quota backoff is active; `paused=false/true` means 90%/80% saturation hysteresis is active.
 - Fatal hangups during `connecting_upstream` are now cleaned through the connect-completion path; repeated CPU spin on dead upstream sockets should no longer be expected.
 
 ## IPv6 Hopping and DNS
@@ -112,5 +112,6 @@ ssh root@<SERVER_IP> 'sudo python3 /opt/mtproto-proxy/test/connection_stability_
 Interpretation helpers:
 
 - `max_connections clamped ...` means the configured connection cap was reduced to fit current `RLIMIT_NOFILE`.
-- `fd quota reached ...` means the listener paused accepts; expect `accept_paused=true` in nearby `conn stats` lines until the retry window clears.
-- A healthy idle box should keep `accept_paused=false` and `tracked_fds` close to active socket count plus listener/upstream overhead.
+- `fd quota reached ...` means the listener paused accepts; expect the first `paused=` flag to flip to `true` in nearby `conn stats` lines until the retry window clears.
+- `connection saturation ...` / `saturation eased ...` is RAM/capacity admission control, not an fd-limit incident.
+- A healthy idle box should keep both `paused=` flags at `false` and `tracked_fds` close to active socket count plus listener/upstream overhead.

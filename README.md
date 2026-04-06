@@ -7,12 +7,11 @@
 Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorship.
 
 <p align="center">
-  <strong>126 KB binary. Extreme Scalability: 13,000+ stable connections on 1GB RAM. Zero dependencies.</strong>
+  <strong>12,000 stable idle connections on 1GB RAM in the current benchmark snapshot. Zero third-party Zig dependencies.</strong>
 </p>
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Zig](https://img.shields.io/badge/zig-0.15.2-f7a41d.svg?logo=zig&logoColor=white)](https://ziglang.org)
-[![LOC](https://img.shields.io/badge/lines_of_code-1.7k-informational)](src/)
 [![Dependencies](https://img.shields.io/badge/dependencies-0-success)](build.zig)
 
 ---
@@ -48,7 +47,7 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 | **Split-TLS** | DPI Evasion | Splits fake `ServerHello` write into `1 byte + short pause + rest` to desynchronize passive DPI |
 | **Zero-RTT** | DPI Evasion | Local Nginx server deployed on-the-fly (`127.0.0.1:8443`) to defeat active probing timing analysis |
 | **0 deps** | Stdlib Only | No third-party Zig packages (proxy core uses Zig standard library only) |
-| **0 globals** | Thread Safety | Dependency injection -- no global mutable state |
+| **Explicit State** | Runtime Ownership | Proxy state is passed explicitly; runtime log level is the only mutable global knob |
 
 > **Engineering Notes:** For deep technical details, cryptography internals, systemd hardening, and benchmarks, refer to the `.agent/skills` and `.agent/workflows` directories.
 
@@ -121,7 +120,7 @@ zig build -Doptimize=ReleaseFast soak -- --seconds=120 --threads=8 --max-payload
 | `make capacity-probe-idle` | Run idle-socket capacity probe for `mtproto.zig` |
 | `make capacity-probe-active` | Run TLS-auth (active) capacity probe for `mtproto.zig` |
 | `make clean` | Remove build artifacts |
-| `make fmt` | Format all Zig source files |
+| `make fmt` | Format Zig files under `src/` |
 | `make deploy` | Cross-compile, upload binary/scripts/config to VPS, restart service |
 | `make deploy SERVER=<ip>` | Deploy to a specific server |
 | `make deploy-tunnel SERVER=<ip> AWG_CONF=<path> [PASSWORD=<pass>] [TUNNEL_MODE=direct\|preserve\|middleproxy]` | Full migration + AmneziaWG tunnel for blocked regions |
@@ -137,7 +136,7 @@ To update an already installed proxy, simply re-run the same install command:
 curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/install.sh | sudo bash
 ```
 
-The script is **idempotent**: it rebuilds from latest source, replaces the binary, and preserves your existing `config.toml` and `env.sh`. User secrets and connection links remain unchanged.
+The script is **idempotent**: it rebuilds from latest source, replaces the binary, and preserves your existing `config.toml`. Existing `env.sh` stays untouched unless you rerun install with new `CF_TOKEN` / `CF_ZONE`. User secrets and connection links remain unchanged.
 
 ## Docker image
 
@@ -298,6 +297,9 @@ SECRET=$(openssl rand -hex 16)
 echo $SECRET
 
 sudo tee /opt/mtproto-proxy/config.toml <<EOF
+[general]
+# use_middle_proxy = true               # Enable if you use @MTProxybot promo tags
+
 [server]
 port = 443
 # tag = "<your-promotion-tag>"   # Optional: 32 hex-char promotion tag from @MTProxybot
@@ -309,13 +311,15 @@ fast_mode = true
 
 # Server tunables for high capacity
 # max_connections = 10000
-EOF
 
-### &nbsp; Capacity & RAM Monitoring
-On startup, the proxy automatically detects your Host RAM and prints a **CAPACITY** banner. It calculates a "Safe cap" based on your current settings and memory overhead. If your `max_connections` is dangerously high for your VPS RAM, it will display a warning.
+[access.users]
 user = "$SECRET"
 EOF
 ```
+
+### &nbsp; Capacity & RAM Monitoring
+
+On startup, the proxy automatically detects host RAM and prints a **CAPACITY** banner. If your configured `max_connections` is above the RAM-safe estimate, it warns and auto-clamps unless `unsafe_override_limits = true`.
 
 **4. Install the systemd service**
 
@@ -450,7 +454,7 @@ ssh root@<VPS_IP> 'bash /opt/mtproto-proxy/setup_tunnel.sh /tmp/awg.conf middlep
 | Policy routing (`from 10.200.200.2 table 100`) | Inside namespace | Response packets return via veth (not via tunnel) |
 | `mtproto-proxy` | Inside `tg_proxy_ns` | Listens on `:443`, connects to Telegram via `awg0` |
 
-> **Note** &nbsp; Tunnel setup supports three modes: `direct` (default, sets `use_middle_proxy=false`), `preserve` (keeps current config), and `middleproxy` (sets `use_middle_proxy=true`). Use `middleproxy` if you need promo-tag parity and stable media behavior on non-premium clients.
+> **Note** &nbsp; Tunnel setup supports three modes: `direct` (default, regular DC traffic stays direct; media still prefers MiddleProxy when available), `preserve` (keeps current config), and `middleproxy` (sets `use_middle_proxy=true`). Use `middleproxy` if you want full promo-tag parity for regular traffic through the tunnel.
 
 > **Note** &nbsp; To check tunnel status: `ssh root@<VPS_IP> 'ip netns exec tg_proxy_ns awg show'`
 
@@ -535,7 +539,7 @@ bob   = "ffeeddccbbaa99887766554433221100"
 
 > **Operational note** &nbsp; `deploy/mtproto-proxy.service` ships with `LimitNOFILE=131582` to allow higher custom caps when needed. Default `max_connections=512` is tuned for small VPS profiles; increase it only after capacity testing.
 
-> **Operational note** &nbsp; If `accept()` hits `EMFILE`/`ENFILE`, the listener temporarily disables `EPOLLIN`, waits 500ms, and retries. Watch for `accept_paused=true` in periodic `conn stats` lines if the host is under FD pressure.
+> **Operational note** &nbsp; If `accept()` hits `EMFILE`/`ENFILE`, the listener temporarily disables `EPOLLIN`, waits 500ms, and retries. In periodic `conn stats`, the first `paused=` flag reflects this fd-quota backoff.
 
 > **Operational note** &nbsp; On startup, `max_connections` is automatically clamped to a RAM-safe estimate (with a warning). Set `unsafe_override_limits = true` in `[server]` to disable this. The proxy also has built-in admission control: at 90% capacity it pauses `accept()` and resumes at 80%, preventing CPU-wasteful accept→close spin loops.
 
@@ -560,7 +564,7 @@ This proxy uses a Linux `epoll` event loop (single-thread relay path). Timeouts 
 Before chasing client/network hypotheses, inspect the new low-noise runtime signals:
 
 ```bash
-ssh root@<VPS_IP> 'journalctl -u mtproto-proxy --since "30 min ago" --no-pager | grep -E "conn stats|max_connections clamped|fd quota reached|failed to resume accepts"'
+ssh root@<VPS_IP> 'journalctl -u mtproto-proxy --since "30 min ago" --no-pager | grep -E "conn stats|drops:|max_connections clamped|fd quota reached|failed to resume accepts|connection saturation|saturation eased"'
 ssh root@<VPS_IP> 'cat /proc/$(pgrep -f mtproto-proxy)/limits | grep "open files"'
 ```
 
@@ -568,7 +572,8 @@ Interpretation:
 
 - `max_connections clamped ...` means runtime reduced configured capacity to fit current `RLIMIT_NOFILE`.
 - `fd quota reached ... pausing accepts for 500ms` means the listener hit `EMFILE`/`ENFILE` and intentionally backed off instead of busy-looping.
-- `conn stats ... accept_paused=true` means the backoff window is active; raise `LimitNOFILE`, lower `max_connections`, or inspect other open FDs before blaming client behavior.
+- `conn stats ... paused=<fd_pause>/<saturation_pause>` exposes two pause reasons: fd-quota backoff first, saturation hysteresis second.
+- `connection saturation ...` and `saturation eased ...` are the 90%/80% admission-control logs; if the second `paused=` flag is `true`, raise capacity only after checking RAM and probe results.
 
 If you use the AmneziaWG tunnel deployment path, also confirm the namespace tunnel is up:
 

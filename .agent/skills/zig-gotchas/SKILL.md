@@ -47,7 +47,7 @@ Do not reintroduce thread-per-connection or blocking relay loops.
 
 - Endpoints and secret are refreshed from Telegram core endpoints; bundled defaults remain fallback.
 - Candidate rotation and direct fallback behavior are part of normal operation.
-- Non-media requests may reconnect direct when ME candidates are exhausted.
+- Direct fallback can happen for both regular and media traffic when MiddleProxy candidates are missing or ME transport fails.
 
 ## Timeout and Lifetime Notes
 

@@ -24,8 +24,8 @@ This workflow documents current build and deploy paths as implemented in `Makefi
 - `make soak` : 30s multithreaded soak
 - `make deploy SERVER=<ip>` : cross-compile and deploy to VPS
 - `make migrate SERVER=<ip> [PASSWORD=<pass>]` : bootstrap + push config + deploy
-- `make deploy-tunnel SERVER=<ip> AWG_CONF=<path> [PASSWORD=<pass>]` : full migration + AmneziaWG tunnel
-- `make deploy-tunnel-only SERVER=<ip> AWG_CONF=<path>` : add tunnel to an already-installed node
+- `make deploy-tunnel SERVER=<ip> AWG_CONF=<path> [PASSWORD=<pass>] [TUNNEL_MODE=direct|preserve|middleproxy]` : full migration + AmneziaWG tunnel
+- `make deploy-tunnel-only SERVER=<ip> AWG_CONF=<path> [TUNNEL_MODE=direct|preserve|middleproxy]` : add tunnel to an already-installed node
 
 ## `make deploy` (current behavior)
 
@@ -51,7 +51,7 @@ Why service stop is required:
 
 ## Tunnel Workflows
 
-`make deploy-tunnel` first runs `make migrate`, then uploads the AmneziaWG client config plus `deploy/setup_tunnel.sh` and executes the script remotely.
+`make deploy-tunnel` first runs `make migrate`, then uploads the AmneziaWG client config plus `deploy/setup_tunnel.sh` and executes the script remotely with the selected `TUNNEL_MODE`.
 
 `make deploy-tunnel-only` skips bootstrap/redeploy and only applies the tunnel plumbing to an existing installation.
 
@@ -62,12 +62,13 @@ Remote tunnel setup currently:
 - Brings up `awg0` inside the namespace only.
 - Adds host DNAT `:443 -> 10.200.200.2:443` and namespace policy routing so replies go back through the veth path, not the tunnel.
 - Rewrites the systemd unit to `ip netns exec tg_proxy_ns /opt/mtproto-proxy/mtproto-proxy ...`.
-- Switches proxy config to direct mode (`use_middle_proxy = false`) and removes `tag`.
+- Applies one of three modes: `direct` (`use_middle_proxy=false` for regular traffic), `preserve` (leave config as-is), or `middleproxy` (`use_middle_proxy=true`).
+- Preserves an existing promotion `tag`, and may restore it from `env.sh`.
 - Validates all 5 Telegram DCs through the tunnel before finishing.
 
 Important operational notes:
 
-- Tunnel mode is intentionally direct-only: MiddleProxy registration is tied to the egress IP, which becomes the AWG exit node.
+- `direct` is only the default. Media path still prefers MiddleProxy when available, and `middleproxy` mode is supported when you want regular traffic to stay on ME too.
 - Host SSH and host-network services stay outside the namespace; only proxy traffic is redirected through AWG.
 
 ## One-line operator update path
@@ -76,7 +77,7 @@ Important operational notes:
 curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/install.sh | sudo bash
 ```
 
-The installer is idempotent and preserves existing operational config/secrets on update.
+The installer is idempotent and preserves `config.toml` on update; existing `env.sh` stays untouched unless install is rerun with fresh `CF_TOKEN` / `CF_ZONE`.
 
 ## Systemd Unit Notes (`deploy/mtproto-proxy.service`)
 
