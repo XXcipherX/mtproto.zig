@@ -30,6 +30,8 @@ const WorkerArgs = struct {
     shared: *SoakShared,
 };
 
+const payload_alignment: usize = 4;
+
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
 
@@ -330,15 +332,30 @@ fn nextRand(state: *u64) u64 {
 }
 
 fn nextPayloadLen(state: *u64, max_payload: usize) usize {
-    const hot_sizes = [_]usize{ 64, 256, 1024, 4096, 16384, 32768, 65535, 65536, 65537, 131072 };
+    const hot_sizes = [_]usize{ 64, 256, 1024, 4096, 16384, 32768, 65532, 65536, 65540, 131072 };
+    // Middleproxy C2S encapsulation accepts only 4-byte-aligned payloads.
+    const aligned_max = max_payload - (max_payload % payload_alignment);
+    std.debug.assert(aligned_max >= payload_alignment);
 
     const pick_hot = (nextRand(state) % 10) < 7;
     if (pick_hot) {
         const idx: usize = @intCast(nextRand(state) % hot_sizes.len);
-        const capped = @min(hot_sizes[idx], max_payload);
-        return if (capped == 0) 1 else capped;
+        return @min(hot_sizes[idx], aligned_max);
     }
 
-    const max_u64 = @as(u64, @intCast(@max(@as(usize, 1), max_payload)));
-    return 1 + @as(usize, @intCast(nextRand(state) % max_u64));
+    const aligned_slots: u64 = @intCast(aligned_max / payload_alignment);
+    return (1 + @as(usize, @intCast(nextRand(state) % aligned_slots))) * payload_alignment;
+}
+
+test "soak payload lengths stay aligned and in range" {
+    var state: u64 = 0x0123_4567_89ab_cdef;
+    const max_payload: usize = 131071;
+    const aligned_max = max_payload - (max_payload % payload_alignment);
+
+    for (0..4096) |_| {
+        const payload_len = nextPayloadLen(&state, max_payload);
+        try std.testing.expect(payload_len >= payload_alignment);
+        try std.testing.expect(payload_len <= aligned_max);
+        try std.testing.expectEqual(@as(usize, 0), payload_len % payload_alignment);
+    }
 }
