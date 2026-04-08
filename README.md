@@ -559,6 +559,10 @@ fast_mode = true
 [access.users]
 alice = "00112233445566778899aabbccddeeff"
 bob   = "ffeeddccbbaa99887766554433221100"
+
+[access.direct_users]
+alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eligible
+# bob = true   # optional
 ```
 
 <details>
@@ -586,6 +590,7 @@ bob   = "ffeeddccbbaa99887766554433221100"
 | `[censorship]` | `drs` | `false` | Dynamic Record Sizing: ramp TLS records from 1369→16384 bytes after warmup (mimics Chrome/Firefox) |
 | `[censorship]` | `fast_mode` | `false` | **Recommended** for direct-path traffic. Delegates S2C AES encryption to Telegram DC and reduces proxy CPU/RAM pressure |
 | `[access.users]` | `<name>` | -- | 32 hex-char secret (16 bytes) per user |
+| `[access.direct_users]` | `<name> = true` | _(none)_ | Optional per-user MiddleProxy bypass. `<name>` must match a user from `[access.users]`; such users always connect directly to Telegram DCs (including media paths). Alias section: `[access.admins]` |
 
 </details>
 
