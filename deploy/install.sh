@@ -14,7 +14,7 @@
 #   2. Clones and builds the proxy from latest source
 #   3. Generates a random user secret (only on first install)
 #   4. Creates a systemd service
-#   5. Opens port 443 in ufw (if active)
+#   5. Opens configured proxy port in ufw (if active)
 #   6. Applies TCPMSS clamping (DPI bypass: splits ClientHello into tiny packets)
 #   7. Installs IPv6 address hopping script + cron job (optional, requires CF_TOKEN + CF_ZONE)
 #   8. Prints the ready-to-use tg:// link
@@ -39,6 +39,28 @@ info()  { echo -e "${CYAN}▸${RESET} $*"; }
 ok()    { echo -e "${GREEN}✓${RESET} $*"; }
 warn()  { echo -e "${RED}⚠${RESET} $*"; }
 fail()  { echo -e "${RED}✗${RESET} $*" >&2; exit 1; }
+
+get_server_port() {
+    local cfg="$1"
+    awk '
+        BEGIN { in_server = 0 }
+        /^[[:space:]]*\[server\][[:space:]]*$/ { in_server = 1; next }
+        /^[[:space:]]*\[[^]]+\][[:space:]]*$/ { in_server = 0; next }
+        in_server {
+            line = $0
+            sub(/#.*/, "", line)
+            if (line ~ /^[[:space:]]*port[[:space:]]*=/) {
+                split(line, parts, "=")
+                value = parts[2]
+                gsub(/[^0-9]/, "", value)
+                if (value != "") {
+                    print value
+                    exit
+                }
+            }
+        }
+    ' "$cfg" 2>/dev/null
+}
 
 # ── Check root ──────────────────────────────────────────────
 [[ $EUID -eq 0 ]] || fail "Run as root: sudo bash install.sh"
@@ -145,15 +167,18 @@ systemctl enable "$SERVICE_NAME"
 ok "Systemd service installed"
 
 # ── Firewall & DPI bypass ───────────────────────────────────
+PORT="$(get_server_port "$INSTALL_DIR/config.toml")"
+PORT="${PORT:-443}"
+
 if command -v ufw &>/dev/null && ufw status | grep -q "active"; then
-    ufw allow 443/tcp >/dev/null 2>&1
-    ok "Opened port 443 in ufw"
+    ufw allow "$PORT"/tcp >/dev/null 2>&1
+    ok "Opened port $PORT in ufw"
 fi
 
 # TCPMSS clamping: force ClientHello fragmentation to bypass passive DPI
 if command -v iptables &>/dev/null; then
-    iptables -t mangle -D OUTPUT -p tcp --sport 443 --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88 2>/dev/null || true
-    iptables -t mangle -A OUTPUT -p tcp --sport 443 --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88
+    iptables -t mangle -D OUTPUT -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88 2>/dev/null || true
+    iptables -t mangle -A OUTPUT -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88
     mkdir -p /etc/iptables
     iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
     ok "TCPMSS=88 clamping applied to IPv4 (passive DPI bypass)"
@@ -162,8 +187,8 @@ else
 fi
 
 if command -v ip6tables &>/dev/null; then
-    ip6tables -t mangle -D OUTPUT -p tcp --sport 443 --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88 2>/dev/null || true
-    if ip6tables -t mangle -A OUTPUT -p tcp --sport 443 --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88 2>/dev/null; then
+    ip6tables -t mangle -D OUTPUT -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88 2>/dev/null || true
+    if ip6tables -t mangle -A OUTPUT -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88 2>/dev/null; then
         mkdir -p /etc/iptables
         ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
         ok "TCPMSS=88 clamping applied to IPv6 (passive DPI bypass)"
@@ -258,14 +283,7 @@ rm -rf "$TMPBUILD"
 set +e
 
 PUBLIC_IP=$(curl -4 -s --max-time 5 https://ifconfig.me 2>/dev/null || echo "<SERVER_IP>")
-# Match only 'port' in [server] section, not 'mask_port' in [censorship]
-PORT=$(awk '
-    /^[[:space:]]*\[server\]/ { in_server=1; next }
-    /^[[:space:]]*\[/ { in_server=0 }
-    in_server && /^[[:space:]]*port[[:space:]]*=/ {
-        sub(/.*=[[:space:]]*/, ""); sub(/[[:space:]]*#.*/, ""); print; exit
-    }
-' "$INSTALL_DIR/config.toml" 2>/dev/null)
+PORT="$(get_server_port "$INSTALL_DIR/config.toml")"
 PORT="${PORT:-443}"
 
 # Build ee-secret: ee + hex(secret) + hex(tls_domain)
