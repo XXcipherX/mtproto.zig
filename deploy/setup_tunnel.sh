@@ -115,7 +115,9 @@ fi
 # ── Step 2: Copy AWG config ─────────────────────────────────
 info "Installing AmneziaWG config..."
 mkdir -p "$AWG_CONF_DIR"
-cp "$AWG_CONF" "$AWG_CONF_DIR/awg0.conf"
+if [[ "$(realpath "$AWG_CONF")" != "$(realpath "$AWG_CONF_DIR/awg0.conf" 2>/dev/null)" ]]; then
+    cp "$AWG_CONF" "$AWG_CONF_DIR/awg0.conf"
+fi
 chmod 600 "$AWG_CONF_DIR/awg0.conf"
 ok "Config installed to $AWG_CONF_DIR/awg0.conf"
 
@@ -246,6 +248,16 @@ if ! grep -Eq '^[[:space:]]*tag[[:space:]]*=' "$INSTALL_DIR/config.toml"; then
     fi
 fi
 
+PUBLIC_IP=$(curl -s4 --max-time 5 https://ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
+if [[ -n "$PUBLIC_IP" ]]; then
+    if grep -Eq '^[[:space:]]*public_ip[[:space:]]*=' "$INSTALL_DIR/config.toml"; then
+        sed -i "s/^[[:space:]]*public_ip[[:space:]]*=.*/public_ip = \"$PUBLIC_IP\"/" "$INSTALL_DIR/config.toml"
+    else
+        sed -i "/^\[server\]/a public_ip = \"$PUBLIC_IP\"" "$INSTALL_DIR/config.toml"
+    fi
+    ok "Injected public IP ($PUBLIC_IP) into config"
+fi
+
 # ── Step 6: Restart proxy ───────────────────────────────────
 info "Restarting proxy..."
 systemctl restart mtproto-proxy
@@ -274,7 +286,6 @@ if [[ $FAIL -eq 1 ]]; then
 fi
 
 # ── Print result ────────────────────────────────────────────
-PUBLIC_IP=$(curl -s --max-time 5 https://ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
 PORT=$(awk '
     BEGIN { in_server = 0 }
     /^\[server\]/ { in_server = 1; next }
