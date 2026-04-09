@@ -9,10 +9,17 @@ SERVICE_NAME="proxy-monitor"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 PORT="61208"
 
+if [[ $EUID -ne 0 ]]; then
+  echo "Run as root: sudo bash /opt/mtproto-proxy/monitor/install.sh"
+  exit 1
+fi
+
 echo "=== MTProto Proxy Monitor — Install ==="
 
 # 1. Python deps
 echo "[1/4] Installing Python dependencies..."
+apt-get update < /dev/null
+DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-pip python3-venv < /dev/null
 pip3 install --break-system-packages --quiet \
   fastapi uvicorn psutil websockets 2>/dev/null || \
 pip3 install --quiet \
