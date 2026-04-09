@@ -33,9 +33,16 @@ TLS_DOMAIN="${1:-wb.ru}"
 NGINX_PORT=8443
 INSTALL_DIR="/opt/mtproto-proxy"
 CERT_DIR="/etc/nginx/ssl"
+SERVICE_FILE="/etc/systemd/system/mtproto-proxy.service"
 TUNNEL_HOST_IP=""
 
-if ip -4 addr show 2>/dev/null | grep -q '10\.200\.200\.1/'; then
+is_tunnel_service_unit() {
+    local unit_path="$1"
+    [[ -f "$unit_path" ]] || return 1
+    grep -Eq 'setup_netns\.sh|ip[[:space:]]+netns[[:space:]]+exec|AmneziaWG[[:space:]]+Tunnel' "$unit_path"
+}
+
+if ip -4 addr show 2>/dev/null | grep -q '10\.200\.200\.1/' || is_tunnel_service_unit "$SERVICE_FILE"; then
     TUNNEL_HOST_IP="10.200.200.1"
 fi
 

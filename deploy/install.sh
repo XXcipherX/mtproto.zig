@@ -125,7 +125,12 @@ chmod +x "$INSTALL_DIR/mtproto-proxy"
 # Keep helper scripts locally for future maintenance/update operations
 cp "$TMPBUILD/deploy"/*.sh "$INSTALL_DIR/"
 cp "$TMPBUILD/deploy/capture_template.py" "$INSTALL_DIR/"
+mkdir -p "$INSTALL_DIR/monitor/static"
+cp "$TMPBUILD/deploy/monitor/install.sh" "$INSTALL_DIR/monitor/"
+cp "$TMPBUILD/deploy/monitor/server.py" "$INSTALL_DIR/monitor/"
+cp -R "$TMPBUILD/deploy/monitor/static/." "$INSTALL_DIR/monitor/static/"
 chmod +x "$INSTALL_DIR"/*.sh
+chmod +x "$INSTALL_DIR/monitor/install.sh"
 
 # ── Generate config (if not exists) ─────────────────────────
 if [[ ! -f "$INSTALL_DIR/config.toml" ]]; then
@@ -264,8 +269,15 @@ fi
 chown -R mtproto:mtproto "$INSTALL_DIR"
 
 # Restart proxy to apply Mask Port and NFQUEUE capabilities
-systemctl restart "$SERVICE_NAME" 2>/dev/null || true
-ok "Proxy restarted"
+if systemctl restart "$SERVICE_NAME"; then
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
+        ok "Proxy restarted"
+    else
+        fail "Proxy restart finished but service is not active. Check: journalctl -u $SERVICE_NAME --no-pager -n 50"
+    fi
+else
+    fail "Proxy failed to restart. Check: journalctl -u $SERVICE_NAME --no-pager -n 50"
+fi
 
 if [[ -x "$INSTALL_DIR/setup_mask_monitor.sh" ]]; then
     info "Applying masking monitor setup..."
@@ -273,6 +285,19 @@ if [[ -x "$INSTALL_DIR/setup_mask_monitor.sh" ]]; then
         ok "Masking monitor setup applied"
     else
         warn "Masking monitor setup failed"
+    fi
+fi
+
+if systemctl list-unit-files --type=service --no-legend 2>/dev/null | grep -q '^proxy-monitor\.service[[:space:]]'; then
+    if systemctl is-active --quiet proxy-monitor; then
+        info "Restarting optional proxy monitor..."
+        if systemctl restart proxy-monitor; then
+            ok "Optional proxy monitor restarted"
+        else
+            warn "Optional proxy monitor failed to restart"
+        fi
+    else
+        info "Optional proxy monitor files updated on disk"
     fi
 fi
 
