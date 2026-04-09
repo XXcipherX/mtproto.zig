@@ -26,6 +26,8 @@ ZIG_VERSION="0.15.2"
 INSTALL_DIR="/opt/mtproto-proxy"
 REPO_URL="https://github.com/XXcipherX/mtproto.zig.git"
 SERVICE_NAME="mtproto-proxy"
+SERVICE_FILE="/etc/systemd/system/mtproto-proxy.service"
+FORCE_SERVICE_UPDATE="${FORCE_SERVICE_UPDATE:-0}"
 IS_UPDATE=false
 [[ -f "$INSTALL_DIR/mtproto-proxy" ]] && IS_UPDATE=true
 
@@ -40,6 +42,12 @@ info()  { echo -e "${CYAN}▸${RESET} $*"; }
 ok()    { echo -e "${GREEN}✓${RESET} $*"; }
 warn()  { echo -e "${RED}⚠${RESET} $*"; }
 fail()  { echo -e "${RED}✗${RESET} $*" >&2; exit 1; }
+
+is_tunnel_service_unit() {
+    local unit_path="$1"
+    [[ -f "$unit_path" ]] || return 1
+    grep -Eq 'setup_netns\.sh|ip[[:space:]]+netns[[:space:]]+exec|AmneziaWG[[:space:]]+Tunnel' "$unit_path"
+}
 
 get_server_port() {
     local cfg="$1"
@@ -160,12 +168,20 @@ fi
 chown -R mtproto:mtproto "$INSTALL_DIR"
 
 # ── Install systemd service ─────────────────────────────────
-cp "$TMPBUILD/deploy/mtproto-proxy.service" /etc/systemd/system/
+if [[ "$FORCE_SERVICE_UPDATE" == "1" ]]; then
+    warn "FORCE_SERVICE_UPDATE=1: replacing ${SERVICE_FILE}"
+    cp "$TMPBUILD/deploy/mtproto-proxy.service" "$SERVICE_FILE"
+elif is_tunnel_service_unit "$SERVICE_FILE"; then
+    warn "Detected tunnel-aware service unit; preserving existing ${SERVICE_FILE}"
+    warn "Run with FORCE_SERVICE_UPDATE=1 if you intentionally want to overwrite it"
+else
+    cp "$TMPBUILD/deploy/mtproto-proxy.service" "$SERVICE_FILE"
+fi
 systemctl daemon-reload
 systemctl enable "$SERVICE_NAME"
 # NOTE: Do NOT start the proxy here. Config will be modified by
 # setup_masking.sh below. The proxy is started once at the end.
-ok "Systemd service installed"
+ok "Systemd service ready"
 
 # ── Firewall & DPI bypass ───────────────────────────────────
 PORT="$(get_server_port "$INSTALL_DIR/config.toml")"
