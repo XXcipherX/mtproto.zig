@@ -22,14 +22,21 @@ This workflow documents current build and deploy paths as implemented in `Makefi
 - `make test` : run unit tests
 - `make bench` : encapsulation microbench
 - `make soak` : 30s multithreaded soak
+- `make stability-check PID=<pid> [HOST=127.0.0.1 PORT=443]` : churn + idle-pool stability harness
+- `make stability-check-load [HOST=127.0.0.1 PORT=443]` : load-only stability smoke
+- `make capacity-probe-idle` : idle-socket capacity probe
+- `make capacity-probe-active` : TLS-auth capacity probe
 - `make deploy SERVER=<ip>` : cross-compile and deploy to VPS
 - `make migrate SERVER=<ip> [PASSWORD=<pass>]` : bootstrap + push config + deploy
+- `make update-dns SERVER=<ip>` : run Cloudflare DNS updater helper
 - `make deploy-tunnel SERVER=<ip> AWG_CONF=<path> [PASSWORD=<pass>] [TUNNEL_MODE=direct|preserve|middleproxy]` : full migration + AmneziaWG tunnel
 - `make deploy-tunnel-only SERVER=<ip> AWG_CONF=<path> [TUNNEL_MODE=direct|preserve|middleproxy]` : add tunnel to an already-installed node
+- `make deploy-monitor SERVER=<ip>` : deploy optional monitoring dashboard
+- `make monitor SERVER=<ip>` : open SSH tunnel to optional monitoring dashboard
 
 ## `make deploy` (current behavior)
 
-1. Builds Linux target: `zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux`.
+1. Builds Linux target: `zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux -Dcpu=x86_64_v3`.
 2. Stops remote service (`systemctl stop mtproto-proxy`).
 3. Uploads binary and `deploy/*.sh` via `scp`.
 4. Uploads config when local config file exists.
@@ -78,6 +85,12 @@ curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/in
 ```
 
 The installer is idempotent and preserves `config.toml` on update; existing `env.sh` stays untouched unless install is rerun with fresh `CF_TOKEN` / `CF_ZONE`.
+
+Current installer behavior also:
+
+- refreshes local masking (`setup_masking.sh`) and the masking health timer when available;
+- attempts optional `zapret` / `nfqws` setup;
+- refreshes optional `proxy-monitor` files on disk and restarts that service if it is already active.
 
 ## Systemd Unit Notes (`deploy/mtproto-proxy.service`)
 

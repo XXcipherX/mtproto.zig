@@ -46,18 +46,25 @@ If the target region blocks Telegram, add the tunnel layer before cutover:
 make deploy-tunnel SERVER=<NEW_VPS_IP> AWG_CONF=<path> [PASSWORD=<pass>] [TUNNEL_MODE=direct|preserve|middleproxy]
 ```
 
+Tunnel deploy currently injects `public_ip` into `/opt/mtproto-proxy/config.toml`, so the generated `tg://` link keeps using the server address instead of the tunnel exit IP.
+
 ## Step 4: Validate Before Decommission
 
 ```bash
 # Service is healthy
 ssh root@<NEW_VPS_IP> 'systemctl status mtproto-proxy --no-pager'
 
-# Capacity smoke
-ssh root@<NEW_VPS_IP> 'sudo python3 /opt/mtproto-proxy/test/capacity_connections_probe.py --profile mtproto.zig --traffic-mode tls-auth --tls-domain google.com --levels 200,500 --open-budget-sec 8 --hold-seconds 0.5 --settle-seconds 0.8 --connect-timeout-sec 0.1 --nofile 200000 --nproc 12000'
+# Optional capacity smoke from a repo checkout on the server
+ssh root@<NEW_VPS_IP> 'cd /root/mtproto.zig && sudo python3 test/capacity_connections_probe.py --profile mtproto.zig --traffic-mode tls-auth --tls-domain google.com --levels 200,500 --open-budget-sec 8 --hold-seconds 0.5 --settle-seconds 0.8 --connect-timeout-sec 0.1 --nofile 200000 --nproc 12000'
 
 # Fallback/refresh visibility
 ssh root@<NEW_VPS_IP> 'journalctl -u mtproto-proxy --since "30 min ago" --no-pager | grep -E "Middle-proxy cache updated|Initial middle-proxy refresh failed|middle-proxy exhausted|middle-proxy handshake failed"'
 ```
+
+Note:
+
+- `deploy/install.sh` and `make deploy` do not copy `test/` into `/opt/mtproto-proxy`; use a repo checkout or benchmark workspace for the optional Python harnesses above.
+- Replace `/root/mtproto.zig` in the optional probe command with your actual checkout path.
 
 Operational note:
 

@@ -3,6 +3,11 @@
 # Required when using a promotion tag from @MTProxybot.
 use_middle_proxy = true
 
+# Keep media-path traffic on MiddleProxy by default, even when regular DC1..5
+# traffic stays direct. Set to false if you want media to follow use_middle_proxy
+# without special preference.
+# force_media_middle_proxy = true
+
 # Telemt-compatible alias for promotion tag (alternative to [server].tag).
 # If both are set, [server].tag takes priority.
 # ad_tag = "1234567890abcdef1234567890abcdef"
@@ -12,9 +17,15 @@ port = 443
 
 # Override the auto-detected public IP shown in startup links.
 # Useful when running inside a VPN tunnel (AmneziaWG) where ifconfig.me
-# returns the tunnel exit IP instead of the server's real address.
+# would return the tunnel exit IP instead of the server's real address.
+# Tunnel deploy scripts auto-inject public_ip for you.
 # Accepts IP addresses or domain names (e.g. "proxy.example.com").
 # public_ip = "proxy.example.com"
+
+# Optional IPv4 override used in MiddleProxy NAT/AES derivation.
+# Useful when public_ip is a hostname or when auto-detection would pick the
+# wrong IPv4 because of tunnel egress.
+# middle_proxy_nat_ip = "203.0.113.10"
 
 # 32 hex-char promotion tag from @MTProxybot (enables sponsored channels).
 # tag = "1234567890abcdef1234567890abcdef"
@@ -33,7 +44,9 @@ port = 443
 # Seconds to complete TLS+MTProto handshake after first byte arrives.
 # handshake_timeout_sec = 60
 
-# Per-connection MiddleProxy stream buffer size in KiB.
+# MiddleProxy stream buffer size in KiB.
+# Current code keeps 2 such buffers per active ME connection and 2 shared
+# scratch buffers in the event loop.
 # 1024 (default) is the validated minimum for reliable media downloads (Stories, video).
 # Values below 1024 may cause MiddleProxyBufferOverflow on media-heavy sessions.
 # Raise to 2048 for high-throughput media; values below 512 are not recommended.
@@ -56,6 +69,9 @@ port = 443
 # unsafe_override_limits = false
 
 [monitor]
+# Optional: read only by the separate proxy-monitor service.
+# The mtproto-proxy binary ignores this section.
+
 # Bind address for the monitoring dashboard HTTP server.
 # Default: 127.0.0.1 (localhost only).
 # Set to "0.0.0.0" to expose the dashboard on all interfaces.

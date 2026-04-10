@@ -47,6 +47,8 @@ Note:
 - `conn stats: active=... hs_inflight=... accepted+=... closed+=... tracked_fds=... total=... paused=<fd>/<saturation>` is the current 10s heartbeat for production visibility.
 - `paused=true/false` means fd-quota backoff is active; `paused=false/true` means 90%/80% saturation hysteresis is active.
 - Fatal hangups during `connecting_upstream` are now cleaned through the connect-completion path; repeated CPU spin on dead upstream sockets should no longer be expected.
+- `drops: ... hs_budget+=...` means the handshake-inflight budget (30% of `max_connections`) rejected excess new handshakes.
+- `drops: ... mp_fallback+=...` means MiddleProxy degraded and the proxy recovered by reconnecting directly to the same DC.
 
 ## IPv6 Hopping and DNS
 
@@ -95,23 +97,27 @@ ssh root@<SERVER_IP> 'ip netns exec tg_proxy_ns nc -zw3 149.154.167.50 443 && ec
 
 ## Capacity and Stability
 
+These Python harnesses are repo-local tools. `deploy/install.sh` and `make deploy` do **not** copy `test/` into `/opt/mtproto-proxy`, so run them from a separate checkout (or benchmark workspace), not from the install directory. Replace `/root/mtproto.zig` below with your actual checkout path.
+
 ```bash
 # Startup banner with RAM/capacity estimate
 ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy -n 80 --no-pager'
 
-# Idle capacity probe
-ssh root@<SERVER_IP> 'sudo python3 /opt/mtproto-proxy/test/capacity_connections_probe.py --profile mtproto.zig --traffic-mode idle'
+# Idle capacity probe (from a repo checkout on the server)
+ssh root@<SERVER_IP> 'cd /root/mtproto.zig && sudo python3 test/capacity_connections_probe.py --profile mtproto.zig --traffic-mode idle'
 
-# Active (TLS-auth) capacity probe
-ssh root@<SERVER_IP> 'sudo python3 /opt/mtproto-proxy/test/capacity_connections_probe.py --profile mtproto.zig --traffic-mode tls-auth --tls-domain google.com --levels 500,1000,1500,2000 --open-budget-sec 14 --hold-seconds 0.8 --settle-seconds 1.0 --connect-timeout-sec 0.1 --nofile 200000 --nproc 12000'
+# Active (TLS-auth) capacity probe (from a repo checkout on the server)
+ssh root@<SERVER_IP> 'cd /root/mtproto.zig && sudo python3 test/capacity_connections_probe.py --profile mtproto.zig --traffic-mode tls-auth --tls-domain google.com --levels 500,1000,1500,2000 --open-budget-sec 14 --hold-seconds 0.8 --settle-seconds 1.0 --connect-timeout-sec 0.1 --nofile 200000 --nproc 12000'
 
-# Stability harness
-ssh root@<SERVER_IP> 'sudo python3 /opt/mtproto-proxy/test/connection_stability_check.py --host 127.0.0.1 --port 443 --pid $(pgrep -f mtproto-proxy | head -n1) --idle-connections 6000 --idle-cycles 3 --churn-total 30000 --churn-concurrency 300'
+# Stability harness (from a repo checkout on the server)
+ssh root@<SERVER_IP> 'cd /root/mtproto.zig && sudo python3 test/connection_stability_check.py --host 127.0.0.1 --port 443 --pid $(pgrep -f mtproto-proxy | head -n1) --idle-connections 6000 --idle-cycles 3 --churn-total 30000 --churn-concurrency 300'
 ```
 
 Interpretation helpers:
 
 - `max_connections clamped ...` means the configured connection cap was reduced to fit current `RLIMIT_NOFILE`.
 - `fd quota reached ...` means the listener paused accepts; expect the first `paused=` flag to flip to `true` in nearby `conn stats` lines until the retry window clears.
+- `hs_budget+=...` means connection churn is exhausting the handshake budget before established relays become the bottleneck.
+- `mp_fallback+=...` means users are still being served, but MiddleProxy path quality is degraded enough to trigger direct fallback.
 - `connection saturation ...` / `saturation eased ...` is RAM/capacity admission control, not an fd-limit incident.
 - A healthy idle box should keep both `paused=` flags at `false` and `tracked_fds` close to active socket count plus listener/upstream overhead.

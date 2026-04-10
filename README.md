@@ -122,10 +122,13 @@ zig build -Doptimize=ReleaseFast soak -- --seconds=120 --threads=8 --max-payload
 | `make soak` | Run ReleaseFast multithreaded soak stress test (30s default) |
 | `make capacity-probe-idle` | Run idle-socket capacity probe for `mtproto.zig` |
 | `make capacity-probe-active` | Run TLS-auth (active) capacity probe for `mtproto.zig` |
+| `make stability-check PID=<pid> [HOST=127.0.0.1 PORT=443]` | Run churn + idle-pool stability harness against an existing proxy process |
+| `make stability-check-load [HOST=127.0.0.1 PORT=443]` | Run load-only stability smoke without `/proc` assertions |
 | `make clean` | Remove build artifacts |
 | `make fmt` | Format Zig files under `src/` |
-| `make deploy` | Cross-compile, upload binary/scripts/config to VPS, restart service |
-| `make deploy SERVER=<ip>` | Deploy to a specific server |
+| `make deploy [SERVER=<ip>]` | Cross-compile, upload binary/scripts/config to VPS, restart service |
+| `make migrate SERVER=<ip> [PASSWORD=<pass>]` | Bootstrap server, push local `config.toml`, then run `make deploy` |
+| `make update-dns SERVER=<ip>` | Run the Cloudflare DNS update helper on demand |
 | `make deploy-tunnel SERVER=<ip> AWG_CONF=<path> [PASSWORD=<pass>] [TUNNEL_MODE=direct\|preserve\|middleproxy]` | Full migration + AmneziaWG tunnel for blocked regions |
 | `make deploy-tunnel-only SERVER=<ip> AWG_CONF=<path> [TUNNEL_MODE=direct\|preserve\|middleproxy]` | Add AmneziaWG tunnel to existing installation |
 | `make deploy-monitor SERVER=<ip>` | Deploy monitoring dashboard to server |
@@ -145,7 +148,7 @@ The script is **idempotent**: it rebuilds from latest source, replaces the binar
 
 ## Docker image
 
-The repository includes a **multi-stage Dockerfile**: Zig is bootstrapped from the official tarball inside the build stage; the runtime image is Debian **bookworm-slim** with `curl` and CA certs (startup banner resolves the public IP via `curl`). The process runs as **root** inside the container (simple bind to port 443). The image ships `config.toml.example` as `/etc/mtproto-proxy/config.toml` for a quick start; mount your own file for real secrets and settings.
+The repository includes a **multi-stage Dockerfile**: Zig is bootstrapped from the official tarball inside the build stage; the runtime image is Debian **bookworm-slim** with `curl` and CA certs. The proxy binary performs HTTPS public-IP detection itself at startup, so CA certs are required; `curl` is kept for container-side diagnostics and operator convenience. The process runs as **root** inside the container (simple bind to port 443). The image ships `config.toml.example` as `/etc/mtproto-proxy/config.toml` for a quick start; mount your own file for real secrets and settings.
 
 ### Build
 
@@ -222,12 +225,14 @@ curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/in
 This will:
 1. Install **Zig 0.15.2** (if not present)
 2. Clone and build the proxy with `ReleaseFast`
-3. Generate a random 16-byte secret
+3. Generate a random 16-byte secret on first install
 4. Create a `systemd` service (`mtproto-proxy`)
-5. Open port 443 in `ufw` (if active)
+5. Open the configured proxy port in `ufw` (if active)
 6. Apply **TCPMSS=88** iptables rule (passive DPI bypass)
-7. Install **IPv6 hop script** (optional cron auto-rotation with `CF_TOKEN`+`CF_ZONE`)
-8. Print a ready-to-use `tg://` connection link
+7. Set up local Nginx masking on `127.0.0.1:8443` and the masking health timer
+8. Attempt OS-level `zapret` / `nfqws` TCP desync setup
+9. Install **IPv6 hop script** (optional cron auto-rotation with `CF_TOKEN`+`CF_ZONE`)
+10. Print a ready-to-use `tg://` connection link
 
 To enable IPv6 auto-hopping (Cloudflare DNS rotation on ban detection), you must provide Cloudflare API credentials. The script uses these to update your domain's AAAA record to a new random IPv6 address from your server's `/64` pool when it detects DPI active probing.
 
@@ -401,7 +406,7 @@ The project includes a lightweight, Zig-themed web dashboard for real-time serve
 make deploy-monitor SERVER=<SERVER_IP>
 ```
 
-This uploads `deploy/monitor/` (Python FastAPI backend + static frontend), installs Python dependencies (`fastapi`, `uvicorn`, `psutil`, `websockets`), creates a `proxy-monitor` systemd service, and starts it. By default, it binds to `127.0.0.1:61208` (configurable via `[monitor]` section in `config.toml`).
+This uploads `deploy/monitor/` (Python FastAPI backend + static frontend), installs Python dependencies (`fastapi`, `uvicorn`, `psutil`, `websockets`), creates a `proxy-monitor` systemd service, and starts it. By default, it binds to `127.0.0.1:61208`; the optional `[monitor]` section in `config.toml` is read by `deploy/monitor/server.py` only and is ignored by the `mtproto-proxy` binary itself.
 
 ### Access
 
@@ -543,13 +548,15 @@ Create a `config.toml` in the project root:
 ```toml
 [general]
 use_middle_proxy = true                         # Telemt-compatible ME mode for promo parity
+force_media_middle_proxy = true                 # Default: keep media-path traffic on ME when endpoints are available
 ad_tag = "1234567890abcdef1234567890abcdef"    # Optional alias for [server].tag
 
 [server]
 port = 443
-# public_ip = "proxy.example.com"           # Override auto-detected IP (useful with VPN tunnels)
+# public_ip = "proxy.example.com"           # Override auto-detected IP/domain shown in startup links
+# middle_proxy_nat_ip = "203.0.113.10"      # Optional IPv4 override for MiddleProxy NAT/AES derivation
 backlog = 4096                             # TCP listen queue size
-middleproxy_buffer_kb = 1024              # Per-connection ME buffers (4x this size), tune for VPS RAM
+middleproxy_buffer_kb = 1024              # ME uses 2 per-conn buffers; event loop keeps 2 shared scratch buffers
 max_connections = 512                      # Safe default for small (1 vCPU / ~1 GB) VPS
 idle_timeout_sec = 120
 handshake_timeout_sec = 15
@@ -559,6 +566,7 @@ rate_limit_per_subnet = 30                # Max new connections/sec per /24 subn
 # unsafe_override_limits = false           # Set true to disable auto-clamp of max_connections
 
 [monitor]
+# Optional: read only by the separate proxy-monitor service
 # host = "127.0.0.1"                       # Bind address for dashboard. Use "0.0.0.0" to expose externally
 # port = 61208                             # TCP port for the dashboard
 
@@ -585,20 +593,22 @@ alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eli
 | Section | Key | Default | Description |
 |---------|-----|---------|-------------|
 | `[general]` | `use_middle_proxy` | `false` | Telemt-compatible ME mode for regular DC1..5. Media-path requests still prefer ME endpoints when available; direct fallback can be used if ME endpoints are unavailable |
+| `[general]` | `force_media_middle_proxy` | `true` | Keep media-path traffic (`dc=203` / negative `dc_idx`) on MiddleProxy when ME endpoints are available, even if regular DC traffic stays direct |
 | `[general]` | `ad_tag` | _(none)_ | Telemt-compatible alias for promotion tag; ignored if `[server].tag` is set |
 | `[server]` | `port` | `443` | TCP port to listen on |
-| `[server]` | `public_ip` | _(auto-detect)_ | Override the IP/domain shown in startup links. When unset, the proxy queries `ifconfig.me`. **Required** when running inside an AmneziaWG tunnel (otherwise prints the VPN exit IP). Accepts IPs or domain names |
+| `[server]` | `public_ip` | _(auto-detect)_ | Override the IP/domain shown in startup links. When unset, the proxy tries multiple HTTPS IP-echo services. Tunnel deploy scripts auto-inject `public_ip` so the banner/link keeps showing the server address instead of the tunnel exit IP. Accepts IPs or domain names |
+| `[server]` | `middle_proxy_nat_ip` | _(auto-detect)_ | Optional IPv4 override used in MiddleProxy NAT/AES derivation. Useful when `public_ip` is a hostname or when tunnel egress/detection would choose the wrong IPv4 |
 | `[server]` | `backlog` | `4096` | TCP listen queue size (for high-traffic loads) |
 | `[server]` | `max_connections` | `512` | Concurrent connection cap (small-VPS tuned default). On Linux, runtime is auto-clamped by `RLIMIT_NOFILE` if configured higher than available FD budget |
 | `[server]` | `idle_timeout_sec` | `120` | Connection idle timeout in seconds (also used before first client byte) |
 | `[server]` | `handshake_timeout_sec` | `15` | Timeout for completing handshake after first byte |
-| `[server]` | `middleproxy_buffer_kb` | `1024` | MiddleProxy per-connection buffer size in KiB (4 buffers allocated per active ME session). Values below 1024 may cause `MiddleProxyBufferOverflow` on media-heavy traffic (Stories, video messages) |
+| `[server]` | `middleproxy_buffer_kb` | `1024` | MiddleProxy buffer size in KiB. Current code keeps 2 such buffers per active ME connection and 2 shared scratch buffers per event loop. Values below 1024 may cause `MiddleProxyBufferOverflow` on media-heavy traffic (Stories, video messages) |
 | `[server]` | `tag` | _(none)_ | Optional 32 hex-char promotion tag from [@MTProxybot](https://t.me/MTProxybot) |
 | `[server]` | `log_level` | `"info"` | Runtime log verbosity: `debug` (all DC routing, relay, close details), `info` (default — connection stats, warnings), `warn`, `err`. Change without recompilation; takes effect on restart |
 | `[server]` | `rate_limit_per_subnet` | `30` | Max new connections per second per /24 (IPv4) or /48 (IPv6) subnet. Blocks scanner/DPI-probe flood. Set `0` to disable |
 | `[server]` | `unsafe_override_limits` | `false` | Disable auto-clamping of `max_connections` to the RAM-safe estimate. Use only if you're sure your host has enough memory |
-| `[monitor]` | `host` | `"127.0.0.1"` | Bind address for the monitoring dashboard HTTP server. Set to `"0.0.0.0"` to expose on all interfaces (warning: no built-in auth) |
-| `[monitor]` | `port` | `61208` | TCP port for the monitoring dashboard HTTP server |
+| `[monitor]` | `host` | `"127.0.0.1"` | Bind address for the optional monitoring dashboard HTTP server. This section is read by `proxy-monitor`, not by the proxy binary. Set to `"0.0.0.0"` to expose on all interfaces (warning: no built-in auth) |
+| `[monitor]` | `port` | `61208` | TCP port for the optional monitoring dashboard HTTP server |
 | `[censorship]` | `tls_domain` | `"google.com"` | Domain to impersonate / forward bad clients to |
 | `[censorship]` | `mask` | `true` | Forward unauthenticated connections to `tls_domain` to defeat DPI |
 | `[censorship]` | `mask_port` | `443` | Non-standard port override for masking locally (e.g. `8443` for zero-RTT local Nginx) |
@@ -648,6 +658,8 @@ Interpretation:
 - `max_connections clamped ...` means runtime reduced configured capacity to fit current `RLIMIT_NOFILE`.
 - `fd quota reached ... pausing accepts for 500ms` means the listener hit `EMFILE`/`ENFILE` and intentionally backed off instead of busy-looping.
 - `conn stats ... paused=<fd_pause>/<saturation_pause>` exposes two pause reasons: fd-quota backoff first, saturation hysteresis second.
+- `drops: ... hs_budget+=...` means the handshake-inflight budget rejected excess new handshakes after the 30%-of-capacity threshold.
+- `drops: ... mp_fallback+=...` means the MiddleProxy path degraded and the proxy recovered by reconnecting directly to the same DC.
 - `connection saturation ...` and `saturation eased ...` are the 90%/80% admission-control logs; if the second `paused=` flag is `true`, raise capacity only after checking RAM and probe results.
 
 If you use the AmneziaWG tunnel deployment path, also confirm the namespace tunnel is up:

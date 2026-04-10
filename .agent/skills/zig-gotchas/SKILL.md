@@ -48,6 +48,9 @@ Do not reintroduce thread-per-connection or blocking relay loops.
 - Endpoints and secret are refreshed from Telegram core endpoints; bundled defaults remain fallback.
 - Candidate rotation and direct fallback behavior are part of normal operation.
 - Direct fallback can happen for both regular and media traffic when MiddleProxy candidates are missing or ME transport fails.
+- `middleproxy_buffer_kb` is not "4x per connection" in current code: there are 2 per-connection buffers plus 2 shared event-loop scratch buffers.
+- `force_media_middle_proxy` defaults to true, so media traffic keeps preferring ME unless explicitly disabled.
+- `middle_proxy_nat_ip` can override the IPv4 embedded into MiddleProxy NAT/AES derivation when AWG/public-IP detection is not the address you want.
 
 ## Timeout and Lifetime Notes
 

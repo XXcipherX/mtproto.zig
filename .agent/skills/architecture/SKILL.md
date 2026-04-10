@@ -55,7 +55,10 @@ Code anchors:
 Important behavior:
 
 - If a MiddleProxy endpoint is unavailable, direct path is allowed by the current connect-plan logic to avoid dropping valid users.
-- Tunnel deployment supports `direct`, `preserve`, and `middleproxy` modes. `direct` only affects regular DC traffic; media path still prefers MiddleProxy when available.
+- `force_media_middle_proxy=true` is the default, so `direct` only affects regular DC traffic; media path still prefers MiddleProxy when available unless that knob is disabled.
+- `[access.direct_users]` / `[access.admins]` bypass MiddleProxy entirely, including media paths.
+- `server.middle_proxy_nat_ip` can pin the IPv4 used for MiddleProxy NAT/AES derivation when AWG/public-IP detection would choose the wrong address.
+- Tunnel deployment supports `direct`, `preserve`, and `middleproxy` modes.
 
 ## Fast Mode
 
@@ -76,13 +79,14 @@ Startup banner computes a safety estimate from host RAM:
 
 ```text
 tls_working_bytes = ~6 KiB
-middleproxy_bytes = middleproxy_buffer_kb * 1024 * 4 (if ME enabled)
+middleproxy_per_conn_bytes = middleproxy_buffer_kb * 1024 * 2 (if ME enabled)
+middleproxy_shared_bytes   = middleproxy_buffer_kb * 1024 * 2 (if ME enabled)
 overhead_bytes    = ~2 KiB
-per_conn_bytes    = tls_working_bytes + middleproxy_bytes + overhead_bytes
+per_conn_bytes    = tls_working_bytes + middleproxy_per_conn_bytes + overhead_bytes
 
 usable_bytes  = RAM * 70%
 reserve_bytes = max(256 MiB, RAM * 10%)
-budget_bytes  = max(0, usable_bytes - reserve_bytes)
+budget_bytes  = max(0, usable_bytes - reserve_bytes - middleproxy_shared_bytes)
 safe_connections = max(32, budget_bytes / per_conn_bytes)
 ```
 
