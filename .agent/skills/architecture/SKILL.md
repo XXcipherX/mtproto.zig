@@ -96,10 +96,10 @@ If `max_connections` exceeds safe estimate, startup prints a warning.
 
 - FakeTLS ServerHello template with runtime digest patching.
 - Anti-replay cache keyed by canonical HMAC digest.
-- Optional masking for unauthenticated clients to `tls_domain`/`mask_port`.
+- Self-site masking for unauthenticated clients to `tls_domain` via local Nginx on `mask_port`.
 - TCPMSS clamping and optional zapret/nfqws integration via deploy scripts.
 - Split-TLS desync (`desync=true`) as split write of fake ServerHello.
-- Optional local masking endpoint (`127.0.0.1:8443`) through `setup_masking.sh`.
+- Local self-site masking endpoint (`127.0.0.1:8443`, or `10.200.200.1:8443` in tunnel netns mode) through `setup_masking.sh`.
 
 ## What To Verify During Changes
 

@@ -46,7 +46,7 @@ If the target region blocks Telegram, add the tunnel layer before cutover:
 make deploy-tunnel SERVER=<NEW_VPS_IP> AWG_CONF=<path> [PASSWORD=<pass>] [TUNNEL_MODE=direct|preserve|middleproxy]
 ```
 
-Tunnel deploy currently injects `public_ip` into `/opt/mtproto-proxy/config.toml`, so the generated `tg://` link keeps using the server address instead of the tunnel exit IP.
+Tunnel deploy preserves a configured `public_ip` domain in `/opt/mtproto-proxy/config.toml`; it only injects a detected IP when `public_ip` is absent or still a placeholder. This keeps self-site masking links on the operator-owned domain instead of the tunnel exit IP.
 
 ## Step 4: Validate Before Decommission
 

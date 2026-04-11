@@ -71,6 +71,36 @@ get_server_port() {
     ' "$cfg" 2>/dev/null
 }
 
+get_config_value() {
+    local cfg="$1"
+    local section="$2"
+    local key="$3"
+    local default_value="${4:-}"
+
+    [[ -f "$cfg" ]] || { printf '%s\n' "$default_value"; return; }
+
+    awk -v want_section="$section" -v want_key="$key" -v fallback="$default_value" '
+        BEGIN { in_section = 0; value = "" }
+        /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
+            header = $0
+            gsub(/^[[:space:]]*\[|\][[:space:]]*$/, "", header)
+            in_section = (header == want_section)
+            next
+        }
+        in_section {
+            line = $0
+            sub(/#.*/, "", line)
+            if (line ~ "^[[:space:]]*" want_key "[[:space:]]*=") {
+                split(line, parts, "=")
+                value = parts[2]
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+                gsub(/^"|"$/, "", value)
+            }
+        }
+        END { print value == "" ? fallback : value }
+    ' "$cfg" 2>/dev/null
+}
+
 # ── Check root ──────────────────────────────────────────────
 [[ $EUID -eq 0 ]] || fail "Run as root: sudo bash install.sh"
 
@@ -138,14 +168,19 @@ if [[ ! -f "$INSTALL_DIR/config.toml" ]]; then
     # ee-secret format: ee + hex(user_secret) + hex(tls_domain)
     # Read domain from terminal (stdin is busy with curl pipe, so use /dev/tty)
     echo ""
-    echo -e "${BOLD}${CYAN}  Enter TLS masking domain${RESET} ${DIM}(e.g. google.com, wb.ru)${RESET}"
-    echo -ne "  ${CYAN}▸${RESET} Domain [wb.ru]: "
+    echo -e "${BOLD}${CYAN}  Enter your self-site masking domain${RESET} ${DIM}(DNS A record must point to this VPS)${RESET}"
+    echo -ne "  ${CYAN}▸${RESET} Domain: "
     read -r USER_DOMAIN < /dev/tty || true
-    TLS_DOMAIN="${USER_DOMAIN:-wb.ru}"
+    TLS_DOMAIN="${MASK_DOMAIN:-${USER_DOMAIN:-}}"
+    if [[ -z "$TLS_DOMAIN" ]]; then
+        fail "Self-site masking requires a domain. Re-run with MASK_DOMAIN=proxy.example.com or enter a domain at the prompt."
+    fi
+    [[ "$TLS_DOMAIN" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || fail "Invalid masking domain: ${TLS_DOMAIN}"
 
     cat > "$INSTALL_DIR/config.toml" << EOF
 [server]
 port = 443
+public_ip = "$TLS_DOMAIN"
 max_connections = 512
 idle_timeout_sec = 120
 handshake_timeout_sec = 15
@@ -153,6 +188,7 @@ handshake_timeout_sec = 15
 [censorship]
 tls_domain = "$TLS_DOMAIN"
 mask = true
+mask_port = 8443
 fast_mode = true
 
 [access.users]
@@ -162,7 +198,7 @@ EOF
 else
     ok "Config already exists, keeping it"
     SECRET=$(grep -oP '= "\K[0-9a-f]{32}' "$INSTALL_DIR/config.toml" | head -1 || echo "")
-    TLS_DOMAIN=$(grep -oP 'tls_domain\s*=\s*"\K[^"]+' "$INSTALL_DIR/config.toml" || echo "wb.ru")
+    TLS_DOMAIN="${MASK_DOMAIN:-$(get_config_value "$INSTALL_DIR/config.toml" "censorship" "tls_domain" "wb.ru")}"
 fi
 
 # ── Create service user ─────────────────────────────────────
@@ -251,11 +287,11 @@ fi
 MASKING_OK=false
 NFQWS_OK=false
 
-info "Setting up Local Nginx Masking (zero-RTT)..."
-if bash "$TMPBUILD/deploy/setup_masking.sh" "$TLS_DOMAIN" < /dev/null 2>&1; then
+info "Setting up Self-site Nginx Masking (zero-RTT)..."
+if MASK_DOMAIN="$TLS_DOMAIN" bash "$TMPBUILD/deploy/setup_masking.sh" "$TLS_DOMAIN" < /dev/null 2>&1; then
     MASKING_OK=true
 else
-    warn "Masking setup failed (non-critical, proxy still works)"
+    warn "Masking setup failed (non-critical, proxy still works). Check DNS A record, TCP/80, and run: sudo env MASK_DOMAIN=${TLS_DOMAIN} bash ${INSTALL_DIR}/setup_masking.sh"
 fi
 
 info "Setting up zapret nfqws TCP desync..."
@@ -319,10 +355,11 @@ MASK_PORT="$(awk '
 ' "$INSTALL_DIR/config.toml" | tail -1)" || true
 
 if [[ -n "${MASK_PORT:-}" ]]; then
-    if curl -sk --max-time 5 "https://127.0.0.1:${MASK_PORT}/" >/dev/null 2>&1; then
-        ok "Masking validation passed (127.0.0.1:${MASK_PORT} responds over TLS)"
+    MASK_TLS_DOMAIN="$(get_config_value "$INSTALL_DIR/config.toml" "censorship" "tls_domain" "$TLS_DOMAIN")"
+    if curl -sk --max-time 5 --resolve "${MASK_TLS_DOMAIN}:${MASK_PORT}:127.0.0.1" "https://${MASK_TLS_DOMAIN}:${MASK_PORT}/" >/dev/null 2>&1; then
+        ok "Masking validation passed (${MASK_TLS_DOMAIN} via 127.0.0.1:${MASK_PORT} responds over TLS)"
     else
-        warn "Masking validation failed: https://127.0.0.1:${MASK_PORT}/ is not responding"
+        warn "Masking validation failed: ${MASK_TLS_DOMAIN} via 127.0.0.1:${MASK_PORT} is not responding"
     fi
 fi
 
@@ -339,9 +376,11 @@ rm -rf "$TMPBUILD"
 # This section MUST always run, so disable errexit for safety
 set +e
 
-PUBLIC_IP=$(curl -4 -s --max-time 5 https://ifconfig.me 2>/dev/null || echo "<SERVER_IP>")
+PUBLIC_IP="$(get_config_value "$INSTALL_DIR/config.toml" "server" "public_ip" "")"
+PUBLIC_IP="${PUBLIC_IP:-$(curl -4 -s --max-time 5 https://ifconfig.me 2>/dev/null || echo "<SERVER_IP>")}"
 PORT="$(get_server_port "$INSTALL_DIR/config.toml")"
 PORT="${PORT:-443}"
+TLS_DOMAIN="$(get_config_value "$INSTALL_DIR/config.toml" "censorship" "tls_domain" "$TLS_DOMAIN")"
 
 # Build ee-secret: ee + hex(secret) + hex(tls_domain)
 DOMAIN_HEX=$(echo -n "$TLS_DOMAIN" | xxd -p | tr -d '\n')
@@ -371,9 +410,9 @@ echo -e "  ${BOLD}DPI Bypass:${RESET}"
 echo -e "  ${GREEN}✓${RESET} Anti-Replay Cache (ТСПУ Revisor protection)"
 echo -e "  ${GREEN}✓${RESET} TCPMSS=88 (ClientHello fragmentation)"
 if $MASKING_OK; then
-echo -e "  ${GREEN}✓${RESET} Local Nginx Dummy (Zero-RTT Active Probe defense)"
+echo -e "  ${GREEN}✓${RESET} Self-site Nginx Masking (Zero-RTT Active Probe defense)"
 else
-echo -e "  ${RED}✗${RESET} Local Nginx Masking (setup failed)"
+echo -e "  ${RED}✗${RESET} Self-site Nginx Masking (setup failed)"
 fi
 echo -e "  ${GREEN}✓${RESET} Split-TLS (1-byte TLS Record chunking)"
 if $NFQWS_OK; then

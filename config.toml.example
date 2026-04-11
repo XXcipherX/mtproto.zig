@@ -15,11 +15,10 @@ use_middle_proxy = true
 [server]
 port = 443
 
-# Override the auto-detected public IP shown in startup links.
-# Useful when running inside a VPN tunnel (AmneziaWG) where ifconfig.me
-# would return the tunnel exit IP instead of the server's real address.
-# Tunnel deploy scripts auto-inject public_ip for you.
-# Accepts IP addresses or domain names (e.g. "proxy.example.com").
+# Override the auto-detected public IP/domain shown in startup links.
+# For self-site masking, set this to the same domain as censorship.tls_domain
+# and point its DNS A record to this VPS. Tunnel deploys preserve a configured
+# domain instead of replacing it with the tunnel exit IP.
 # public_ip = "proxy.example.com"
 
 # Optional IPv4 override used in MiddleProxy NAT/AES derivation.
@@ -83,16 +82,19 @@ port = 443
 # port = 61208
 
 [censorship]
-# Domain to impersonate in TLS ServerHello and forward unauthenticated clients to.
-# Choose a popular, high-traffic domain in the target region.
-tls_domain = "google.com"
+# Self-site masking domain. Point this domain's DNS A record to this VPS.
+# Public :443 is handled by mtproto-proxy; ordinary HTTPS clients are forwarded
+# to local Nginx on mask_port.
+tls_domain = "proxy.example.com"
 
-# Forward unauthenticated / invalid connections to tls_domain (active probing defense).
+# Forward unauthenticated / invalid connections to the self-site Nginx backend
+# (active probing defense).
 mask = true
 
-# Local port override for mask forwarding (e.g. 8443 for zero-RTT local Nginx).
-# When unset, connects to tls_domain:443 directly.
-# mask_port = 8443
+# Local Nginx HTTPS backend. setup_masking.sh obtains a Let's Encrypt cert via
+# HTTP-01 on public :80, then configures Nginx on 127.0.0.1:8443. In tunnel
+# netns mode, the runtime automatically targets 10.200.200.1:8443.
+mask_port = 8443
 
 # Split ServerHello into 1-byte + 3ms delay + rest (defeats passive DPI signatures).
 # Enabled by default.

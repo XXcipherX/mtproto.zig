@@ -1,40 +1,107 @@
 #!/usr/bin/env bash
 #
-# setup_masking.sh — Install local Nginx for zero-RTT DPI masking.
+# setup_masking.sh - Install self-site Nginx masking for mtproto-proxy.
 #
-# Problem: When the proxy masks bad clients by forwarding to a remote tls_domain
-# (e.g. wb.ru:443), the additional RTT (30-60ms to wb.ru vs <1ms locally) creates
-# a timing side-channel that ТСПУ can detect. A connection that takes 80ms to get
-# a ServerHello from "wb.ru" when real wb.ru responds in 20ms is suspicious.
-#
-# Solution: Run Nginx locally with a self-signed cert. Update config.toml to use
-# mask_port=8443 (or keep 443 with upstream). The proxy connects to local Nginx
-# (`127.0.0.1` by default, or `10.200.200.1` in tunnel netns mode)
-# instead of the remote domain, eliminating the RTT fingerprint.
+# Public :443 stays owned by mtproto-proxy. Regular HTTPS browsers and active
+# probers that do not present a valid MTProto secret are relayed by the proxy to
+# this local Nginx backend on 127.0.0.1:8443. Use your own domain here: its DNS A
+# record should point to the same VPS, while Nginx serves the real site locally.
 #
 # Usage:
-#   sudo bash deploy/setup_masking.sh [tls_domain]
-#   sudo bash deploy/setup_masking.sh wb.ru
-#   sudo bash deploy/setup_masking.sh              # defaults to wb.ru
+#   sudo env MASK_DOMAIN=proxy.example.com bash deploy/setup_masking.sh
+#   sudo bash deploy/setup_masking.sh proxy.example.com
+#
+# Optional environment:
+#   MASK_SITE_ROOT=/var/www/proxy.example.com  # site document root
+#   MASK_PORT=8443                            # local HTTPS backend port
+#   LE_EMAIL=admin@example.com                # Let's Encrypt account email
+#   MASK_ALLOW_SELF_SIGNED=1                  # dev/test fallback only
+#   MASK_SET_PUBLIC_IP=0                      # do not set [server].public_ip
 #
 # What it does:
-#   1. Installs Nginx (if not present)
-#   2. Obtains a real Let's Encrypt certificate for tls_domain (via certbot)
-#      OR generates a self-signed cert if certbot fails
-#   3. Configures Nginx to listen on 127.0.0.1:8443 (and 10.200.200.1 when tunnel veth exists)
-#   4. Serves a minimal page that mimics the real domain
-#   5. Updates mtproto config to use local masking
-#   6. Installs self-healing masking monitor (systemd timer)
-#
+#   1. Installs Nginx and certbot if needed.
+#   2. Creates/keeps a real site root for the masking domain.
+#   3. Serves HTTP-01 ACME on public :80, because public :443 is the proxy.
+#   4. Obtains or reuses a Let's Encrypt certificate for the domain.
+#   5. Configures Nginx on 127.0.0.1:8443 (and 10.200.200.1 in tunnel mode).
+#   6. Updates config.toml with public_ip, tls_domain, mask=true, mask_port.
+#   7. Installs the masking health monitor timer.
 
 set -euo pipefail
 
-TLS_DOMAIN="${1:-wb.ru}"
-NGINX_PORT=8443
-INSTALL_DIR="/opt/mtproto-proxy"
-CERT_DIR="/etc/nginx/ssl"
+INSTALL_DIR="${INSTALL_DIR:-/opt/mtproto-proxy}"
+CONFIG_FILE="${INSTALL_DIR}/config.toml"
 SERVICE_FILE="/etc/systemd/system/mtproto-proxy.service"
+NGINX_PORT="${MASK_PORT:-8443}"
+MASK_SET_PUBLIC_IP="${MASK_SET_PUBLIC_IP:-1}"
+MASK_ALLOW_SELF_SIGNED="${MASK_ALLOW_SELF_SIGNED:-0}"
+ACME_ROOT="${MASK_ACME_ROOT:-/var/www/certbot}"
 TUNNEL_HOST_IP=""
+
+read_config_value() {
+    local section="$1"
+    local key="$2"
+    local default_value="${3:-}"
+
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        printf '%s\n' "$default_value"
+        return
+    fi
+
+    awk -v want_section="$section" -v want_key="$key" -v fallback="$default_value" '
+        BEGIN { in_section = 0; value = "" }
+        /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
+            header = $0
+            gsub(/^[[:space:]]*\[|\][[:space:]]*$/, "", header)
+            in_section = (header == want_section)
+            next
+        }
+        in_section {
+            line = $0
+            sub(/#.*/, "", line)
+            if (line ~ "^[[:space:]]*" want_key "[[:space:]]*=") {
+                split(line, parts, "=")
+                value = parts[2]
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+                gsub(/^"|"$/, "", value)
+            }
+        }
+        END { print value == "" ? fallback : value }
+    ' "$CONFIG_FILE"
+}
+
+TLS_DOMAIN="${1:-${MASK_DOMAIN:-}}"
+if [[ -z "$TLS_DOMAIN" ]]; then
+    TLS_DOMAIN="$(read_config_value "censorship" "tls_domain" "")"
+fi
+[[ -n "$TLS_DOMAIN" ]] || {
+    echo "Set your masking domain: sudo env MASK_DOMAIN=proxy.example.com bash setup_masking.sh" >&2
+    exit 1
+}
+
+if [[ ! "$TLS_DOMAIN" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; then
+    echo "Invalid domain: ${TLS_DOMAIN}" >&2
+    exit 1
+fi
+
+if [[ ! "$NGINX_PORT" =~ ^[0-9]+$ ]] || (( NGINX_PORT < 1 || NGINX_PORT > 65535 )); then
+    echo "Invalid MASK_PORT: ${NGINX_PORT}" >&2
+    exit 1
+fi
+
+SITE_ROOT="${MASK_SITE_ROOT:-/var/www/${TLS_DOMAIN}}"
+CERT_DIR="${MASK_CERT_DIR:-/etc/nginx/ssl/mtproto-mask/${TLS_DOMAIN}}"
+MASKING_SITE="/etc/nginx/sites-available/mtproto-masking"
+
+if [[ "$SITE_ROOT" != /* || "$SITE_ROOT" =~ [[:space:]] ]]; then
+    echo "MASK_SITE_ROOT must be an absolute path without spaces: ${SITE_ROOT}" >&2
+    exit 1
+fi
+
+if [[ "$ACME_ROOT" != /* || "$ACME_ROOT" =~ [[:space:]] ]]; then
+    echo "MASK_ACME_ROOT must be an absolute path without spaces: ${ACME_ROOT}" >&2
+    exit 1
+fi
 
 is_tunnel_service_unit() {
     local unit_path="$1"
@@ -53,198 +120,250 @@ BOLD='\033[1m'
 DIM='\033[2m'
 RESET='\033[0m'
 
-info()  { echo -e "${CYAN}▸${RESET} $*"; }
-ok()    { echo -e "${GREEN}✓${RESET} $*"; }
-warn()  { echo -e "${RED}⚠${RESET} $*"; }
-fail()  { echo -e "${RED}✗${RESET} $*" >&2; exit 1; }
+info()  { echo -e "${CYAN}>${RESET} $*"; }
+ok()    { echo -e "${GREEN}OK${RESET} $*"; }
+warn()  { echo -e "${RED}WARN${RESET} $*"; }
+fail()  { echo -e "${RED}FAIL${RESET} $*" >&2; exit 1; }
 
 [[ $EUID -eq 0 ]] || fail "Run as root: sudo bash setup_masking.sh"
 
-# ── Install Nginx ───────────────────────────────────────────
-if command -v nginx &>/dev/null; then
-    ok "Nginx already installed"
-else
-    info "Installing Nginx..."
-    apt-get update -qq < /dev/null || true
-    
-    # Prevent default nginx IPv6 config from breaking installation on IPv4-only hosts
-    mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
-    echo "# Empty default" > /etc/nginx/sites-available/default
-    ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default
-    
-    apt-get install -y nginx < /dev/null >/dev/null 2>&1 || true
-    ok "Nginx installed"
-fi
+set_config_value() {
+    local section="$1"
+    local key="$2"
+    local value="$3"
+    local tmp
 
-# ── Generate certificates ──────────────────────────────────
-mkdir -p "$CERT_DIR"
-
-# Try certbot first for a real cert (better for DPI — matches real domain)
-CERT_OK=false
-if command -v certbot &>/dev/null; then
-    info "Attempting Let's Encrypt certificate for ${TLS_DOMAIN}..."
-    # This only works if the VPS actually resolves to this domain
-    if certbot certonly --nginx -d "$TLS_DOMAIN" --non-interactive --agree-tos \
-        --register-unsafely-without-email 2>/dev/null; then
-        ln -sf "/etc/letsencrypt/live/${TLS_DOMAIN}/fullchain.pem" "${CERT_DIR}/cert.pem"
-        ln -sf "/etc/letsencrypt/live/${TLS_DOMAIN}/privkey.pem" "${CERT_DIR}/key.pem"
-        ok "Let's Encrypt certificate obtained for ${TLS_DOMAIN}"
-        CERT_OK=true
+    [[ -f "$CONFIG_FILE" ]] || return 0
+    tmp="$(mktemp)"
+    if awk -v want_section="$section" -v want_key="$key" -v new_value="$value" '
+        BEGIN { in_section = 0; saw_section = 0; wrote = 0 }
+        function emit_value() {
+            if (!wrote) {
+                print want_key " = " new_value
+                wrote = 1
+            }
+        }
+        /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
+            if (in_section) {
+                emit_value()
+            }
+            header = $0
+            gsub(/^[[:space:]]*\[|\][[:space:]]*$/, "", header)
+            in_section = (header == want_section)
+            if (in_section) {
+                saw_section = 1
+                wrote = 0
+            }
+            print
+            next
+        }
+        {
+            if (in_section && $0 ~ "^[[:space:]]*" want_key "[[:space:]]*=") {
+                emit_value()
+                next
+            }
+            print
+        }
+        END {
+            if (in_section) {
+                emit_value()
+            }
+            if (!saw_section) {
+                print ""
+                print "[" want_section "]"
+                print want_key " = " new_value
+            }
+        }
+    ' "$CONFIG_FILE" > "$tmp"; then
+        mv "$tmp" "$CONFIG_FILE"
+        chown mtproto:mtproto "$CONFIG_FILE" 2>/dev/null || true
     else
-        warn "Certbot failed (domain may not point to this server)"
+        rm -f "$tmp"
+        fail "Failed to update ${CONFIG_FILE}"
     fi
-fi
+}
 
-if ! $CERT_OK; then
-    info "Generating self-signed certificate for ${TLS_DOMAIN}..."
-    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
-        -keyout "${CERT_DIR}/key.pem" \
-        -out "${CERT_DIR}/cert.pem" \
-        -days 3650 -nodes \
-        -subj "/CN=${TLS_DOMAIN}" \
-        2>/dev/null
-    ok "Self-signed certificate generated"
-fi
+write_nginx_config() {
+    local cert_ready="$1"
+    local extra_listen_line=""
+    if [[ -n "$TUNNEL_HOST_IP" && "$cert_ready" == "1" ]]; then
+        extra_listen_line="    listen ${TUNNEL_HOST_IP}:${NGINX_PORT} ssl;"
+    fi
 
-# ── Configure Nginx ─────────────────────────────────────────
-info "Configuring Nginx on 127.0.0.1:${NGINX_PORT}..."
+    cat > "$MASKING_SITE" << NGINXEOF
+# mtproto-proxy self-site masking backend.
+# Public :443 is owned by mtproto-proxy. Nginx serves the real site locally.
 
-EXTRA_LISTEN_LINE=""
-if [[ -n "$TUNNEL_HOST_IP" ]]; then
-    EXTRA_LISTEN_LINE="    listen ${TUNNEL_HOST_IP}:${NGINX_PORT} ssl;"
-fi
+server {
+    listen 80;
+    server_name ${TLS_DOMAIN};
 
-# Create a minimal web root
-mkdir -p /var/www/masking
-cat > /var/www/masking/index.html << 'HTMLEOF'
-<!DOCTYPE html>
-<html><head><title>Welcome</title></head>
-<body><h1>It works!</h1></body></html>
-HTMLEOF
+    root ${SITE_ROOT};
+    index index.html;
 
-# Nginx config for local masking — binds ONLY on loopback
-cat > /etc/nginx/sites-available/mtproto-masking << NGINXEOF
-# MTProto proxy masking server — local only
-# Serves TLS responses that mimic ${TLS_DOMAIN} for DPI evasion
+    location ^~ /.well-known/acme-challenge/ {
+        root ${ACME_ROOT};
+        default_type text/plain;
+        try_files \$uri =404;
+    }
+
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
+}
+NGINXEOF
+
+    if [[ "$cert_ready" == "1" ]]; then
+        cat >> "$MASKING_SITE" << NGINXEOF
+
 server {
     listen 127.0.0.1:${NGINX_PORT} ssl;
-${EXTRA_LISTEN_LINE}
+${extra_listen_line}
 
     server_name ${TLS_DOMAIN};
 
     ssl_certificate     ${CERT_DIR}/cert.pem;
     ssl_certificate_key ${CERT_DIR}/key.pem;
 
-    # Match Nginx defaults for realistic TLS fingerprint
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_prefer_server_ciphers off;
 
-    # Minimal response
-    root /var/www/masking;
+    root ${SITE_ROOT};
     index index.html;
 
     location / {
         try_files \$uri \$uri/ =404;
     }
 
-    # Access log off — this is a DPI masking endpoint, not a real website
-    access_log off;
-    error_log /var/log/nginx/masking-error.log warn;
+    access_log /var/log/nginx/mtproto-mask-access.log;
+    error_log /var/log/nginx/mtproto-mask-error.log warn;
 }
 NGINXEOF
+    fi
+}
 
-# Enable the site
-ln -sf /etc/nginx/sites-available/mtproto-masking /etc/nginx/sites-enabled/
-
-# Remove default site if it conflicts
-if [[ -L /etc/nginx/sites-enabled/default ]]; then
-    rm -f /etc/nginx/sites-enabled/default
-    info "Removed default Nginx site"
+if [[ -f "$CONFIG_FILE" ]]; then
+    set_config_value "censorship" "tls_domain" "\"${TLS_DOMAIN}\""
+    set_config_value "censorship" "mask" "true"
+    set_config_value "censorship" "mask_port" "${NGINX_PORT}"
+    if [[ "$MASK_SET_PUBLIC_IP" == "1" ]]; then
+        set_config_value "server" "public_ip" "\"${TLS_DOMAIN}\""
+    fi
+    ok "Pre-set ${CONFIG_FILE} for local masking target ${NGINX_PORT}"
 fi
 
-# Test config and reload/restart
-nginx -t 2>/dev/null || fail "Nginx config test failed"
+info "Installing Nginx and certbot..."
+apt-get update -qq < /dev/null || true
+apt-get install -y nginx certbot curl openssl < /dev/null >/dev/null 2>&1 || true
+
+mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
+mkdir -p "$SITE_ROOT" "$ACME_ROOT/.well-known/acme-challenge" "$CERT_DIR"
+
+if [[ ! -f "$SITE_ROOT/index.html" ]]; then
+    cat > "$SITE_ROOT/index.html" << HTMLEOF
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${TLS_DOMAIN}</title>
+</head>
+<body>
+  <h1>${TLS_DOMAIN}</h1>
+  <p>This site is served by the local Nginx masking backend.</p>
+</body>
+</html>
+HTMLEOF
+    ok "Created placeholder site root at ${SITE_ROOT}"
+else
+    ok "Keeping existing site root at ${SITE_ROOT}"
+fi
+
+info "Preparing HTTP-01 ACME challenge on :80 for ${TLS_DOMAIN}..."
+write_nginx_config 0
+ln -sf "$MASKING_SITE" /etc/nginx/sites-enabled/mtproto-masking
+nginx -t 2>/dev/null || fail "Nginx HTTP config test failed"
+if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "active"; then
+    ufw allow 80/tcp >/dev/null 2>&1 || true
+    ok "Opened TCP/80 in ufw for Let's Encrypt HTTP-01"
+fi
 systemctl restart nginx || true
 systemctl enable nginx >/dev/null 2>&1 || true
-ok "Nginx configured on 127.0.0.1:${NGINX_PORT}"
-if [[ -n "$TUNNEL_HOST_IP" ]]; then
-    ok "Nginx configured on ${TUNNEL_HOST_IP}:${NGINX_PORT} for tunnel netns"
-fi
 
-# ── Verify Nginx is responding ──────────────────────────────
-sleep 1
-if curl -sk "https://127.0.0.1:${NGINX_PORT}/" >/dev/null 2>&1; then
-    ok "Nginx responding on https://127.0.0.1:${NGINX_PORT}"
+LE_CERT="/etc/letsencrypt/live/${TLS_DOMAIN}/fullchain.pem"
+LE_KEY="/etc/letsencrypt/live/${TLS_DOMAIN}/privkey.pem"
+CERT_OK=false
+
+if [[ -f "$LE_CERT" && -f "$LE_KEY" ]]; then
+    ok "Reusing existing Let's Encrypt certificate for ${TLS_DOMAIN}"
+    CERT_OK=true
 else
-    warn "Nginx may not be responding yet — check: curl -sk https://127.0.0.1:${NGINX_PORT}/"
-fi
-
-# ── Update mtproto config ──────────────────────────────────
-CONFIG_FILE="${INSTALL_DIR}/config.toml"
-if [[ -f "$CONFIG_FILE" ]]; then
-    TMP_CONFIG="$(mktemp)"
-    if awk -v mask_port="${NGINX_PORT}" '
-        BEGIN {
-            in_censorship = 0;
-            saw_censorship = 0;
-            wrote_mask_port = 0;
-        }
-
-        function emit_mask_port() {
-            if (!wrote_mask_port) {
-                print "mask_port = " mask_port;
-                wrote_mask_port = 1;
-            }
-        }
-
-        /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
-            if (in_censorship) {
-                emit_mask_port();
-            }
-            in_censorship = ($0 ~ /^[[:space:]]*\[censorship\][[:space:]]*$/);
-            if (in_censorship) {
-                saw_censorship = 1;
-                wrote_mask_port = 0;
-            }
-            print;
-            next;
-        }
-
-        {
-            if (in_censorship && $0 ~ /^[[:space:]]*mask_port[[:space:]]*=/) {
-                emit_mask_port();
-                next;
-            }
-            print;
-        }
-
-        END {
-            if (in_censorship) {
-                emit_mask_port();
-            }
-            if (!saw_censorship) {
-                print "";
-                print "[censorship]";
-                print "mask_port = " mask_port;
-            }
-        }
-    ' "$CONFIG_FILE" > "$TMP_CONFIG"; then
-        mv "$TMP_CONFIG" "$CONFIG_FILE"
-        # Restore ownership: mv creates a new inode owned by root
-        chown mtproto:mtproto "$CONFIG_FILE" 2>/dev/null || true
+    info "Requesting Let's Encrypt certificate for ${TLS_DOMAIN} via HTTP-01..."
+    CERTBOT_ARGS=(certonly --webroot -w "$ACME_ROOT" -d "$TLS_DOMAIN" --non-interactive --agree-tos --keep-until-expiring)
+    if [[ -n "${LE_EMAIL:-}" ]]; then
+        CERTBOT_ARGS+=(-m "$LE_EMAIL")
     else
-        rm -f "$TMP_CONFIG"
-        fail "Failed to update ${CONFIG_FILE} with mask_port=${NGINX_PORT}"
+        CERTBOT_ARGS+=(--register-unsafely-without-email)
     fi
 
-    ok "Updated ${CONFIG_FILE} with mask_port = ${NGINX_PORT}"
+    if certbot "${CERTBOT_ARGS[@]}"; then
+        CERT_OK=true
+        ok "Let's Encrypt certificate obtained for ${TLS_DOMAIN}"
+    else
+        warn "Let's Encrypt failed for ${TLS_DOMAIN}. Check DNS A record and port 80 reachability."
+    fi
+fi
+
+if $CERT_OK; then
+    ln -sf "$LE_CERT" "${CERT_DIR}/cert.pem"
+    ln -sf "$LE_KEY" "${CERT_DIR}/key.pem"
+    mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+    cat > /etc/letsencrypt/renewal-hooks/deploy/mtproto-mask-nginx-reload.sh << 'HOOKEOF'
+#!/usr/bin/env bash
+systemctl reload nginx >/dev/null 2>&1 || systemctl restart nginx >/dev/null 2>&1 || true
+HOOKEOF
+    chmod 0755 /etc/letsencrypt/renewal-hooks/deploy/mtproto-mask-nginx-reload.sh
+elif [[ "$MASK_ALLOW_SELF_SIGNED" == "1" ]]; then
+    warn "Using self-signed certificate because MASK_ALLOW_SELF_SIGNED=1"
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+        -keyout "${CERT_DIR}/key.pem" \
+        -out "${CERT_DIR}/cert.pem" \
+        -days 3650 -nodes \
+        -subj "/CN=${TLS_DOMAIN}" \
+        2>/dev/null
+else
+    fail "No valid certificate for ${TLS_DOMAIN}. Point DNS to this VPS and open TCP/80, or use DNS-01/copy certs manually."
+fi
+
+info "Configuring local HTTPS masking backend on 127.0.0.1:${NGINX_PORT}..."
+write_nginx_config 1
+nginx -t 2>/dev/null || fail "Nginx full config test failed"
+systemctl restart nginx || true
+ok "Nginx configured for ${TLS_DOMAIN}"
+if [[ -n "$TUNNEL_HOST_IP" ]]; then
+    ok "Nginx also listens on ${TUNNEL_HOST_IP}:${NGINX_PORT} for tunnel netns"
+fi
+
+if curl -sk --max-time 5 --resolve "${TLS_DOMAIN}:${NGINX_PORT}:127.0.0.1" "https://${TLS_DOMAIN}:${NGINX_PORT}/" >/dev/null 2>&1; then
+    ok "Masking backend responds with SNI ${TLS_DOMAIN} on 127.0.0.1:${NGINX_PORT}"
+else
+    warn "Masking backend probe failed. Check: curl -vk --resolve ${TLS_DOMAIN}:${NGINX_PORT}:127.0.0.1 https://${TLS_DOMAIN}:${NGINX_PORT}/"
+fi
+
+if [[ -f "$CONFIG_FILE" ]]; then
+    set_config_value "censorship" "tls_domain" "\"${TLS_DOMAIN}\""
+    set_config_value "censorship" "mask" "true"
+    set_config_value "censorship" "mask_port" "${NGINX_PORT}"
+    if [[ "$MASK_SET_PUBLIC_IP" == "1" ]]; then
+        set_config_value "server" "public_ip" "\"${TLS_DOMAIN}\""
+    fi
+    ok "Updated ${CONFIG_FILE} for self-site masking"
     info "Restart the proxy to apply: systemctl restart mtproto-proxy"
 else
     warn "Config file not found at ${CONFIG_FILE}"
-    info "Add 'mask_port = ${NGINX_PORT}' to your [censorship] section manually"
+    info "Set [server].public_ip, [censorship].tls_domain, mask=true, and mask_port=${NGINX_PORT} manually"
 fi
 
-# ── Install masking self-healing monitor ────────────────────
 MASK_MONITOR_SCRIPT="${INSTALL_DIR}/setup_mask_monitor.sh"
 if [[ ! -x "$MASK_MONITOR_SCRIPT" ]]; then
     MASK_MONITOR_SCRIPT="$(dirname "$0")/setup_mask_monitor.sh"
@@ -257,24 +376,18 @@ else
     warn "setup_mask_monitor.sh not found; masking self-healing monitor not installed"
 fi
 
-# ── Summary ─────────────────────────────────────────────────
 echo ""
-echo -e "${BOLD}${CYAN}══════════════════════════════════════════════════${RESET}"
-echo -e "${BOLD}  Local Nginx Masking Configured${RESET}"
-echo -e "${CYAN}══════════════════════════════════════════════════${RESET}"
+echo -e "${BOLD}${CYAN}Self-site masking configured${RESET}"
 echo ""
-echo -e "  ${DIM}Nginx:${RESET}     127.0.0.1:${NGINX_PORT} (TLS)"
+echo -e "  ${DIM}Domain:${RESET}      ${TLS_DOMAIN}"
+echo -e "  ${DIM}Public :443:${RESET} mtproto-proxy"
+echo -e "  ${DIM}Nginx TLS:${RESET}   127.0.0.1:${NGINX_PORT}"
 if [[ -n "$TUNNEL_HOST_IP" ]]; then
-echo -e "  ${DIM}Tunnel host:${RESET} ${TUNNEL_HOST_IP}:${NGINX_PORT} (TLS)"
+echo -e "  ${DIM}Tunnel TLS:${RESET}  ${TUNNEL_HOST_IP}:${NGINX_PORT}"
 fi
-echo -e "  ${DIM}Domain:${RESET}    ${TLS_DOMAIN}"
-echo -e "  ${DIM}Cert:${RESET}      ${CERT_DIR}/cert.pem"
-echo -e "  ${DIM}Monitor:${RESET}   systemctl status mtproto-mask-health.timer"
-echo -e "  ${DIM}Mon logs:${RESET}  journalctl -t mtproto-mask-health -n 50"
+echo -e "  ${DIM}Site root:${RESET}   ${SITE_ROOT}"
+echo -e "  ${DIM}Cert:${RESET}        ${CERT_DIR}/cert.pem"
+echo -e "  ${DIM}ACME HTTP:${RESET}   ${TLS_DOMAIN}:80"
 echo ""
-echo -e "  ${BOLD}Effect:${RESET}"
-echo -e "  Bad clients are now forwarded to local Nginx (<1ms RTT)"
-echo -e "  instead of remote ${TLS_DOMAIN} (30-60ms RTT)."
-echo -e "  This eliminates the timing side-channel that ТСПУ uses"
-echo -e "  to detect proxy masking connections."
-echo ""
+echo -e "Browsers and active probes for ${TLS_DOMAIN}:443 are relayed to this Nginx site."
+echo -e "Valid MTProto clients with the right secret stay on the proxy path."

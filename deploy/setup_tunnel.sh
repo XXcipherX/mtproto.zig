@@ -298,14 +298,34 @@ if ! grep -Eq '^[[:space:]]*tag[[:space:]]*=' "$INSTALL_DIR/config.toml"; then
     fi
 fi
 
-PUBLIC_IP=$(curl -s4 --max-time 5 https://ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
-if [[ -n "$PUBLIC_IP" ]]; then
-    if grep -Eq '^[[:space:]]*public_ip[[:space:]]*=' "$INSTALL_DIR/config.toml"; then
-        sed -i "s/^[[:space:]]*public_ip[[:space:]]*=.*/public_ip = \"$PUBLIC_IP\"/" "$INSTALL_DIR/config.toml"
-    else
-        sed -i "/^\[server\]/a public_ip = \"$PUBLIC_IP\"" "$INSTALL_DIR/config.toml"
+CONFIGURED_PUBLIC_IP="$(awk '
+    BEGIN { in_server = 0; value = "" }
+    /^[[:space:]]*\[server\][[:space:]]*$/ { in_server = 1; next }
+    /^[[:space:]]*\[[^]]+\][[:space:]]*$/ { in_server = 0; next }
+    in_server && /^[[:space:]]*public_ip[[:space:]]*=/ {
+        line = $0
+        sub(/#.*/, "", line)
+        split(line, parts, "=")
+        value = parts[2]
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+        gsub(/^"|"$/, "", value)
+    }
+    END { print value }
+' "$INSTALL_DIR/config.toml" 2>/dev/null || true)"
+
+if [[ -n "$CONFIGURED_PUBLIC_IP" && "$CONFIGURED_PUBLIC_IP" != "<SERVER_IP>" ]]; then
+    PUBLIC_IP="$CONFIGURED_PUBLIC_IP"
+    ok "Keeping configured public_ip ($PUBLIC_IP)"
+else
+    PUBLIC_IP=$(curl -s4 --max-time 5 https://ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
+    if [[ -n "$PUBLIC_IP" ]]; then
+        if grep -Eq '^[[:space:]]*public_ip[[:space:]]*=' "$INSTALL_DIR/config.toml"; then
+            sed -i "s/^[[:space:]]*public_ip[[:space:]]*=.*/public_ip = \"$PUBLIC_IP\"/" "$INSTALL_DIR/config.toml"
+        else
+            sed -i "/^\[server\]/a public_ip = \"$PUBLIC_IP\"" "$INSTALL_DIR/config.toml"
+        fi
+        ok "Injected public IP ($PUBLIC_IP) into config"
     fi
-    ok "Injected public IP ($PUBLIC_IP) into config"
 fi
 
 MASK_PORT="$(get_mask_port "$INSTALL_DIR/config.toml")"

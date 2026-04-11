@@ -99,13 +99,15 @@ read_censorship_value() {
 probe_local_endpoint() {
     local host="$1"
     local port="$2"
-    curl -sk --max-time 3 "https://${host}:${port}/" >/dev/null 2>&1
+    local domain="$3"
+    curl -sk --max-time 3 --resolve "${domain}:${port}:${host}" "https://${domain}:${port}/" >/dev/null 2>&1
 }
 
 probe_netns_endpoint() {
     local host="$1"
     local port="$2"
-    ip netns exec "$NS_NAME" curl -sk --max-time 3 "https://${host}:${port}/" >/dev/null 2>&1
+    local domain="$3"
+    ip netns exec "$NS_NAME" curl -sk --max-time 3 --resolve "${domain}:${port}:${host}" "https://${domain}:${port}/" >/dev/null 2>&1
 }
 
 if ! command -v systemctl >/dev/null 2>&1; then
@@ -136,6 +138,8 @@ fi
 mask_port_raw="$(read_censorship_value "mask_port" "443")"
 mask_port="${mask_port_raw//[^0-9]/}"
 mask_port="${mask_port:-443}"
+tls_domain="$(read_censorship_value "tls_domain" "localhost")"
+tls_domain="${tls_domain:-localhost}"
 
 if [[ "$mask_port" == "443" ]]; then
     exit 0
@@ -152,9 +156,9 @@ fi
 
 probe_endpoint() {
     if [[ "$use_netns" == "1" ]]; then
-        probe_netns_endpoint "$target_host" "$mask_port"
+        probe_netns_endpoint "$target_host" "$mask_port" "$tls_domain"
     else
-        probe_local_endpoint "$target_host" "$mask_port"
+        probe_local_endpoint "$target_host" "$mask_port" "$tls_domain"
     fi
 }
 
@@ -168,12 +172,12 @@ if probe_endpoint; then
     exit 0
 fi
 
-logger -t mtproto-mask-health "mask endpoint ${target_host}:${mask_port} unreachable; restarting nginx"
+logger -t mtproto-mask-health "mask endpoint ${tls_domain} via ${target_host}:${mask_port} unreachable; restarting nginx"
 systemctl restart nginx || true
 sleep 1
 
 if probe_endpoint; then
-    logger -t mtproto-mask-health "mask endpoint ${target_host}:${mask_port} recovered after nginx restart"
+    logger -t mtproto-mask-health "mask endpoint ${tls_domain} via ${target_host}:${mask_port} recovered after nginx restart"
     exit 0
 fi
 
@@ -184,11 +188,11 @@ if systemctl is-active --quiet mtproto-proxy; then
 fi
 
 if probe_endpoint; then
-    logger -t mtproto-mask-health "mask endpoint ${target_host}:${mask_port} recovered after mtproto-proxy restart"
+    logger -t mtproto-mask-health "mask endpoint ${tls_domain} via ${target_host}:${mask_port} recovered after mtproto-proxy restart"
     exit 0
 fi
 
-logger -t mtproto-mask-health "critical: mask endpoint ${target_host}:${mask_port} still unreachable"
+logger -t mtproto-mask-health "critical: mask endpoint ${tls_domain} via ${target_host}:${mask_port} still unreachable"
 exit 1
 EOF
 chmod 0755 "$MASK_HEALTH_SCRIPT"
