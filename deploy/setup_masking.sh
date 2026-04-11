@@ -132,7 +132,13 @@ set_config_value() {
     [[ -f "$CONFIG_FILE" ]] || return 0
     tmp="$(mktemp)"
     if awk -v want_section="$section" -v want_key="$key" -v new_value="$value" '
-        BEGIN { in_section = 0; saw_section = 0; wrote = 0 }
+        BEGIN { in_section = 0; saw_section = 0; wrote = 0; pending_blank = "" }
+        function flush_pending_blank() {
+            if (pending_blank != "") {
+                printf "%s", pending_blank
+                pending_blank = ""
+            }
+        }
         function emit_value() {
             if (!wrote) {
                 print want_key " = " new_value
@@ -142,6 +148,7 @@ set_config_value() {
         /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
             if (in_section) {
                 emit_value()
+                flush_pending_blank()
             }
             header = $0
             gsub(/^[[:space:]]*\[|\][[:space:]]*$/, "", header)
@@ -155,14 +162,23 @@ set_config_value() {
         }
         {
             if (in_section && $0 ~ "^[[:space:]]*" want_key "[[:space:]]*=") {
+                flush_pending_blank()
                 emit_value()
                 next
+            }
+            if (in_section && !wrote && $0 ~ /^[[:space:]]*$/) {
+                pending_blank = pending_blank $0 "\n"
+                next
+            }
+            if (in_section) {
+                flush_pending_blank()
             }
             print
         }
         END {
             if (in_section) {
                 emit_value()
+                flush_pending_blank()
             }
             if (!saw_section) {
                 print ""

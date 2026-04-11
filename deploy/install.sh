@@ -180,16 +180,16 @@ if [[ ! -f "$INSTALL_DIR/config.toml" ]]; then
     cat > "$INSTALL_DIR/config.toml" << EOF
 [server]
 port = 443
-public_ip = "$TLS_DOMAIN"
 max_connections = 512
 idle_timeout_sec = 120
 handshake_timeout_sec = 15
+public_ip = "$TLS_DOMAIN"
 
 [censorship]
 tls_domain = "$TLS_DOMAIN"
 mask = true
-mask_port = 8443
 fast_mode = true
+mask_port = 8443
 
 [access.users]
 user = "$SECRET"
