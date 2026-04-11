@@ -166,14 +166,17 @@ chmod +x "$INSTALL_DIR/monitor/install.sh"
 if [[ ! -f "$INSTALL_DIR/config.toml" ]]; then
     SECRET=$(openssl rand -hex 16)
     # ee-secret format: ee + hex(user_secret) + hex(tls_domain)
-    # Read domain from terminal (stdin is busy with curl pipe, so use /dev/tty)
-    echo ""
-    echo -e "${BOLD}${CYAN}  Enter your self-site masking domain${RESET} ${DIM}(DNS A record must point to this VPS)${RESET}"
-    echo -ne "  ${CYAN}▸${RESET} Domain: "
-    read -r USER_DOMAIN < /dev/tty || true
-    TLS_DOMAIN="${MASK_DOMAIN:-${USER_DOMAIN:-}}"
+    TLS_DOMAIN="${MASK_DOMAIN:-}"
     if [[ -z "$TLS_DOMAIN" ]]; then
-        fail "Self-site masking requires a domain. Re-run with MASK_DOMAIN=proxy.example.com or enter a domain at the prompt."
+        # Read domain from terminal (stdin is busy with curl pipe, so use /dev/tty)
+        echo ""
+        echo -e "${BOLD}${CYAN}  Enter your self-domain masking domain${RESET} ${DIM}(DNS A record must point to this VPS)${RESET}"
+        echo -ne "  ${CYAN}▸${RESET} Domain: "
+        read -r USER_DOMAIN < /dev/tty || true
+        TLS_DOMAIN="${USER_DOMAIN:-}"
+    fi
+    if [[ -z "$TLS_DOMAIN" ]]; then
+        fail "Self-domain masking requires a domain. Re-run with MASK_DOMAIN=proxy.example.com or enter a domain at the prompt."
     fi
     [[ "$TLS_DOMAIN" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || fail "Invalid masking domain: ${TLS_DOMAIN}"
 
@@ -287,7 +290,7 @@ fi
 MASKING_OK=false
 NFQWS_OK=false
 
-info "Setting up Self-site Nginx Masking (zero-RTT)..."
+info "Setting up Self-domain Nginx Masking (zero-RTT)..."
 if MASK_DOMAIN="$TLS_DOMAIN" bash "$TMPBUILD/deploy/setup_masking.sh" "$TLS_DOMAIN" < /dev/null 2>&1; then
     MASKING_OK=true
 else
@@ -410,9 +413,9 @@ echo -e "  ${BOLD}DPI Bypass:${RESET}"
 echo -e "  ${GREEN}✓${RESET} Anti-Replay Cache (ТСПУ Revisor protection)"
 echo -e "  ${GREEN}✓${RESET} TCPMSS=88 (ClientHello fragmentation)"
 if $MASKING_OK; then
-echo -e "  ${GREEN}✓${RESET} Self-site Nginx Masking (Zero-RTT Active Probe defense)"
+echo -e "  ${GREEN}✓${RESET} Self-domain Nginx Masking (Zero-RTT Active Probe defense)"
 else
-echo -e "  ${RED}✗${RESET} Self-site Nginx Masking (setup failed)"
+echo -e "  ${RED}✗${RESET} Self-domain Nginx Masking (setup failed)"
 fi
 echo -e "  ${GREEN}✓${RESET} Split-TLS (1-byte TLS Record chunking)"
 if $NFQWS_OK; then
