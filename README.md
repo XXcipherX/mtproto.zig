@@ -38,7 +38,7 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 | **DRS** | Dynamic Record Sizing | Mimics real browser TLS behavior (Chrome/Firefox) to resist fingerprinting |
 | **Multi-user** | Access Control | Independent secret-based authentication per user |
 | **Anti-replay** | Timestamp + Digest Cache | Rejects replayed handshakes outside ±2 min window AND detects ТСПУ Revisor active probes |
-| **Masking** | Self-Site Cloaking | Forwards unauthenticated clients to your own domain/site on local Nginx |
+| **Masking** | Self-Domain Cloaking | Forwards unauthenticated clients to a local Nginx 404 backend on your own domain |
 | **Fast Mode** | Direct-Path S2C Offload | Reduces CPU usage by delegating S2C AES work to Telegram DCs on direct paths (non-MiddleProxy) |
 | **MiddleProxy** | Telemt-Compatible ME | Optional ME transport for DC1..5 (`use_middle_proxy`); media-path traffic prefers ME endpoints with direct fallback when unavailable |
 | **Auto Refresh** | Telegram Metadata | Periodically updates MiddleProxy endpoint and secret from Telegram core endpoints |
@@ -47,7 +47,7 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 | **TCPMSS=88** | DPI Evasion | Forces ClientHello fragmentation across 6 TCP packets, breaking ISP DPI reassembly |
 | **TCP Desync** | DPI Evasion | Integrated `zapret` (`nfqws`) OS-level desynchronization (fake packets + TTL spoofing) |
 | **Split-TLS** | DPI Evasion | Splits fake `ServerHello` write into `1 byte + short pause + rest` to desynchronize passive DPI |
-| **Zero-RTT** | DPI Evasion | Local self-site Nginx masking (`127.0.0.1:8443`, with tunnel netns auto-routing) to defeat active probing timing analysis |
+| **Zero-RTT** | DPI Evasion | Local self-domain Nginx 404 masking (`127.0.0.1:8443`, with tunnel netns auto-routing) to defeat active probing timing analysis |
 | **0 deps** | Stdlib Only | No third-party Zig packages (proxy core uses Zig standard library only) |
 | **Explicit State** | Runtime Ownership | Proxy state is passed explicitly; runtime log level is the only mutable global knob |
 
@@ -229,28 +229,28 @@ This will:
 4. Create a `systemd` service (`mtproto-proxy`)
 5. Open the configured proxy port in `ufw` (if active)
 6. Apply **TCPMSS=88** iptables rule (passive DPI bypass)
-7. Set up self-site Nginx masking on `127.0.0.1:8443`, including Let's Encrypt on TCP/80 and the masking health timer
+7. Set up self-domain Nginx 404 masking on `127.0.0.1:8443`, including Let's Encrypt on TCP/80 and the masking health timer
 8. Attempt OS-level `zapret` / `nfqws` TCP desync setup
 9. Install **IPv6 hop script** (optional cron auto-rotation with `CF_TOKEN`+`CF_ZONE`)
 10. Print a ready-to-use `tg://` connection link
 
-### Self-Site Masking Domain
+### Self-Domain 404 Masking
 
-For the recommended Reality-style self-site masking flow, use a domain you own:
+For the recommended Reality-style self-domain masking flow, use a domain you own:
 
 1. Create an `A` record, for example `proxy.example.com -> <VPS_IP>`.
 2. If you use Cloudflare, keep this record **DNS only** (gray cloud), not proxied.
-3. Keep public TCP `443` for `mtproto-proxy`; Nginx will serve your site locally on `127.0.0.1:8443`.
+3. Keep public TCP `443` for `mtproto-proxy`; Nginx will answer `404` locally on `127.0.0.1:8443` for non-proxy clients.
 4. Keep public TCP `80` reachable for Let's Encrypt HTTP-01 certificate issuance.
 
-Fresh install with a self-site domain:
+Fresh install with a self-domain masking domain:
 
 ```bash
 curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/install.sh | \
   sudo env MASK_DOMAIN=proxy.example.com LE_EMAIL=admin@example.com bash
 ```
 
-The installer writes `server.public_ip = "proxy.example.com"` and `censorship.tls_domain = "proxy.example.com"` on first install, configures Nginx on `127.0.0.1:8443`, obtains a Let's Encrypt certificate via `:80`, installs a renewal hook that reloads Nginx, and generates links that use the domain. Existing installs can be converted with:
+The installer writes `server.public_ip = "proxy.example.com"` and `censorship.tls_domain = "proxy.example.com"` on first install, configures Nginx on `127.0.0.1:8443` to return `404` for non-proxy requests, obtains a Let's Encrypt certificate via `:80`, installs a renewal hook that reloads Nginx, and generates links that use the domain. Existing installs can be converted with:
 
 ```bash
 sudo env MASK_DOMAIN=proxy.example.com LE_EMAIL=admin@example.com \
@@ -258,7 +258,7 @@ sudo env MASK_DOMAIN=proxy.example.com LE_EMAIL=admin@example.com \
 sudo systemctl restart mtproto-proxy
 ```
 
-Your site files live in `/var/www/proxy.example.com` by default. Override that with `MASK_SITE_ROOT=/var/www/my-site` if you already have a site root.
+The Nginx backend intentionally does not publish a site body. Only `/.well-known/acme-challenge/` on port `80` is served for Let's Encrypt; all other HTTP/HTTPS requests receive `404`.
 
 To enable IPv6 auto-hopping (Cloudflare DNS rotation on ban detection), you must provide Cloudflare API credentials. The script uses these to update your domain's AAAA record to a new random IPv6 address from your server's `/64` pool when it detects DPI active probing.
 
@@ -375,7 +375,7 @@ sudo systemctl start mtproto-proxy
 
 ```bash
 sudo ufw allow 443/tcp
-sudo ufw allow 80/tcp   # Let's Encrypt HTTP-01 for self-site masking
+sudo ufw allow 80/tcp   # Let's Encrypt HTTP-01 for self-domain masking
 ```
 
 **6. Generate connection link**
@@ -582,7 +582,7 @@ ad_tag = "1234567890abcdef1234567890abcdef"    # Optional alias for [server].tag
 
 [server]
 port = 443
-public_ip = "proxy.example.com"             # Same domain as tls_domain for self-site masking links
+public_ip = "proxy.example.com"             # Same domain as tls_domain for self-domain masking links
 # middle_proxy_nat_ip = "203.0.113.10"      # Optional IPv4 override for MiddleProxy NAT/AES derivation
 backlog = 4096                             # TCP listen queue size
 middleproxy_buffer_kb = 1024              # ME uses 2 per-conn buffers; event loop keeps 2 shared scratch buffers
@@ -625,7 +625,7 @@ alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eli
 | `[general]` | `force_media_middle_proxy` | `true` | Keep media-path traffic (`dc=203` / negative `dc_idx`) on MiddleProxy when ME endpoints are available, even if regular DC traffic stays direct |
 | `[general]` | `ad_tag` | _(none)_ | Telemt-compatible alias for promotion tag; ignored if `[server].tag` is set |
 | `[server]` | `port` | `443` | TCP port to listen on |
-| `[server]` | `public_ip` | _(auto-detect)_ | Override the IP/domain shown in startup links. For self-site masking, set this to the same domain as `tls_domain`. Tunnel deploy scripts preserve an existing domain instead of replacing it with the tunnel exit IP |
+| `[server]` | `public_ip` | _(auto-detect)_ | Override the IP/domain shown in startup links. For self-domain masking, set this to the same domain as `tls_domain`. Tunnel deploy scripts preserve an existing domain instead of replacing it with the tunnel exit IP |
 | `[server]` | `middle_proxy_nat_ip` | _(auto-detect)_ | Optional IPv4 override used in MiddleProxy NAT/AES derivation. Useful when `public_ip` is a hostname or when tunnel egress/detection would choose the wrong IPv4 |
 | `[server]` | `backlog` | `4096` | TCP listen queue size (for high-traffic loads) |
 | `[server]` | `max_connections` | `512` | Concurrent connection cap (small-VPS tuned default). On Linux, runtime is auto-clamped by `RLIMIT_NOFILE` if configured higher than available FD budget |
@@ -638,9 +638,9 @@ alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eli
 | `[server]` | `unsafe_override_limits` | `false` | Disable auto-clamping of `max_connections` to the RAM-safe estimate. Use only if you're sure your host has enough memory |
 | `[monitor]` | `host` | `"127.0.0.1"` | Bind address for the optional monitoring dashboard HTTP server. This section is read by `proxy-monitor`, not by the proxy binary. Set to `"0.0.0.0"` to expose on all interfaces (warning: no built-in auth) |
 | `[monitor]` | `port` | `61208` | TCP port for the optional monitoring dashboard HTTP server |
-| `[censorship]` | `tls_domain` | `"google.com"` | Self-site masking domain. Point its DNS A record to the VPS; valid MTProto users use it as FakeTLS SNI, and invalid/ordinary HTTPS clients are forwarded to local Nginx |
-| `[censorship]` | `mask` | `true` | Forward unauthenticated connections to the self-site Nginx backend to defeat active probing |
-| `[censorship]` | `mask_port` | `443` | Local Nginx HTTPS backend port. Use `8443` for self-site masking so public `443` remains owned by `mtproto-proxy` |
+| `[censorship]` | `tls_domain` | `"google.com"` | Self-domain masking domain. Point its DNS A record to the VPS; valid MTProto users use it as FakeTLS SNI, and invalid/ordinary HTTPS clients are forwarded to local Nginx |
+| `[censorship]` | `mask` | `true` | Forward unauthenticated connections to the local Nginx 404 backend to defeat active probing |
+| `[censorship]` | `mask_port` | `443` | Local Nginx HTTPS backend port. Use `8443` for self-domain masking so public `443` remains owned by `mtproto-proxy` |
 | `[censorship]` | `desync` | `true` | Split fake `ServerHello` into `1 byte + short pause + rest` to desynchronize passive DPI |
 | `[censorship]` | `drs` | `false` | Dynamic Record Sizing: ramp TLS records from 1369→16384 bytes after warmup (mimics Chrome/Firefox) |
 | `[censorship]` | `fast_mode` | `false` | **Recommended** for direct-path traffic. Delegates S2C AES encryption to Telegram DC and reduces proxy CPU/RAM pressure |
@@ -659,7 +659,7 @@ alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eli
 
 > **Operational note** &nbsp; The proxy limits new connections to 30/sec per /24 subnet by default (`rate_limit_per_subnet`). This blocks ТСПУ scanners and DPI replay probes without affecting legitimate Telegram clients.
 
-> **Operational note** &nbsp; Self-site masking expects DNS `A proxy.example.com -> <VPS_IP>`, Cloudflare DNS-only mode if used, public TCP `80` for Let's Encrypt, public TCP `443` for `mtproto-proxy`, and local Nginx TLS on `127.0.0.1:8443`. The `ee` link secret changes when `tls_domain` changes, so regenerate client links after changing the domain.
+> **Operational note** &nbsp; Self-domain masking expects DNS `A proxy.example.com -> <VPS_IP>`, Cloudflare DNS-only mode if used, public TCP `80` for Let's Encrypt, public TCP `443` for `mtproto-proxy`, and local Nginx TLS on `127.0.0.1:8443` returning `404` for non-proxy requests. The `ee` link secret changes when `tls_domain` changes, so regenerate client links after changing the domain.
 
 > **Tip** &nbsp; Generate a random secret: `openssl rand -hex 16`
 

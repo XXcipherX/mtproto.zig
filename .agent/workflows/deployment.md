@@ -86,7 +86,7 @@ curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/in
 
 The installer is idempotent and preserves `config.toml` on update; existing `env.sh` stays untouched unless install is rerun with fresh `CF_TOKEN` / `CF_ZONE`.
 
-For a fresh self-site masking install, prefer:
+For a fresh self-domain masking install, prefer:
 
 ```bash
 curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/install.sh | sudo env MASK_DOMAIN=proxy.example.com LE_EMAIL=admin@example.com bash
@@ -94,14 +94,14 @@ curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/in
 
 Current installer behavior also:
 
-- refreshes self-site Nginx masking (`setup_masking.sh`) and the masking health timer when available;
+- refreshes self-domain Nginx 404 masking (`setup_masking.sh`) and the masking health timer when available;
 - attempts optional `zapret` / `nfqws` setup;
 - refreshes optional `proxy-monitor` files on disk and restarts that service if it is already active.
 
-Self-site masking notes:
+Self-domain masking notes:
 
 - Preferred setup is `MASK_DOMAIN=proxy.example.com`, with DNS `A` pointing to the VPS.
-- Public `:443` stays owned by `mtproto-proxy`; Nginx serves the real site on `127.0.0.1:8443`.
+- Public `:443` stays owned by `mtproto-proxy`; Nginx listens on `127.0.0.1:8443` and returns 404 for non-proxy requests.
 - Public `:80` must be reachable for Let's Encrypt HTTP-01 unless the operator provisions certificates manually.
 - `setup_masking.sh` installs a Let's Encrypt renewal hook that reloads Nginx after certificate renewal.
 - Cloudflare records for the proxy domain must be DNS-only, not proxied.

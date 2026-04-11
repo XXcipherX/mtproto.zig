@@ -16,7 +16,7 @@ use_middle_proxy = true
 port = 443
 
 # Override the auto-detected public IP/domain shown in startup links.
-# For self-site masking, set this to the same domain as censorship.tls_domain
+# For self-domain masking, set this to the same domain as censorship.tls_domain
 # and point its DNS A record to this VPS. Tunnel deploys preserve a configured
 # domain instead of replacing it with the tunnel exit IP.
 # public_ip = "proxy.example.com"
@@ -82,12 +82,12 @@ port = 443
 # port = 61208
 
 [censorship]
-# Self-site masking domain. Point this domain's DNS A record to this VPS.
+# Self-domain masking domain. Point this domain's DNS A record to this VPS.
 # Public :443 is handled by mtproto-proxy; ordinary HTTPS clients are forwarded
-# to local Nginx on mask_port.
+# to local Nginx on mask_port and receive 404.
 tls_domain = "proxy.example.com"
 
-# Forward unauthenticated / invalid connections to the self-site Nginx backend
+# Forward unauthenticated / invalid connections to the self-domain Nginx 404 backend
 # (active probing defense).
 mask = true
 

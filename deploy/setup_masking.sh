@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
 #
-# setup_masking.sh - Install self-site Nginx masking for mtproto-proxy.
+# setup_masking.sh - Install self-domain Nginx 404 masking for mtproto-proxy.
 #
 # Public :443 stays owned by mtproto-proxy. Regular HTTPS browsers and active
 # probers that do not present a valid MTProto secret are relayed by the proxy to
 # this local Nginx backend on 127.0.0.1:8443. Use your own domain here: its DNS A
-# record should point to the same VPS, while Nginx serves the real site locally.
+# record should point to the same VPS. The masking backend returns 404 for all
+# non-ACME requests; valid MTProto clients never reach Nginx.
 #
 # Usage:
 #   sudo env MASK_DOMAIN=proxy.example.com bash deploy/setup_masking.sh
 #   sudo bash deploy/setup_masking.sh proxy.example.com
 #
 # Optional environment:
-#   MASK_SITE_ROOT=/var/www/proxy.example.com  # site document root
+#   MASK_ACME_ROOT=/var/www/certbot            # ACME HTTP-01 webroot
+#   MASK_SITE_ROOT=/var/www/certbot            # deprecated alias for MASK_ACME_ROOT
 #   MASK_PORT=8443                            # local HTTPS backend port
 #   LE_EMAIL=admin@example.com                # Let's Encrypt account email
 #   MASK_ALLOW_SELF_SIGNED=1                  # dev/test fallback only
@@ -20,7 +22,7 @@
 #
 # What it does:
 #   1. Installs Nginx and certbot if needed.
-#   2. Creates/keeps a real site root for the masking domain.
+#   2. Creates/keeps an ACME webroot for the masking domain.
 #   3. Serves HTTP-01 ACME on public :80, because public :443 is the proxy.
 #   4. Obtains or reuses a Let's Encrypt certificate for the domain.
 #   5. Configures Nginx on 127.0.0.1:8443 (and 10.200.200.1 in tunnel mode).
@@ -35,7 +37,7 @@ SERVICE_FILE="/etc/systemd/system/mtproto-proxy.service"
 NGINX_PORT="${MASK_PORT:-8443}"
 MASK_SET_PUBLIC_IP="${MASK_SET_PUBLIC_IP:-1}"
 MASK_ALLOW_SELF_SIGNED="${MASK_ALLOW_SELF_SIGNED:-0}"
-ACME_ROOT="${MASK_ACME_ROOT:-/var/www/certbot}"
+ACME_ROOT="${MASK_ACME_ROOT:-${MASK_SITE_ROOT:-/var/www/certbot}}"
 TUNNEL_HOST_IP=""
 
 read_config_value() {
@@ -89,17 +91,11 @@ if [[ ! "$NGINX_PORT" =~ ^[0-9]+$ ]] || (( NGINX_PORT < 1 || NGINX_PORT > 65535 
     exit 1
 fi
 
-SITE_ROOT="${MASK_SITE_ROOT:-/var/www/${TLS_DOMAIN}}"
 CERT_DIR="${MASK_CERT_DIR:-/etc/nginx/ssl/mtproto-mask/${TLS_DOMAIN}}"
 MASKING_SITE="/etc/nginx/sites-available/mtproto-masking"
 
-if [[ "$SITE_ROOT" != /* || "$SITE_ROOT" =~ [[:space:]] ]]; then
-    echo "MASK_SITE_ROOT must be an absolute path without spaces: ${SITE_ROOT}" >&2
-    exit 1
-fi
-
 if [[ "$ACME_ROOT" != /* || "$ACME_ROOT" =~ [[:space:]] ]]; then
-    echo "MASK_ACME_ROOT must be an absolute path without spaces: ${ACME_ROOT}" >&2
+    echo "MASK_ACME_ROOT/MASK_SITE_ROOT must be an absolute path without spaces: ${ACME_ROOT}" >&2
     exit 1
 fi
 
@@ -191,15 +187,12 @@ write_nginx_config() {
     fi
 
     cat > "$MASKING_SITE" << NGINXEOF
-# mtproto-proxy self-site masking backend.
-# Public :443 is owned by mtproto-proxy. Nginx serves the real site locally.
+# mtproto-proxy self-domain 404 masking backend.
+# Public :443 is owned by mtproto-proxy. Nginx is only the 404 masking backend.
 
 server {
     listen 80;
     server_name ${TLS_DOMAIN};
-
-    root ${SITE_ROOT};
-    index index.html;
 
     location ^~ /.well-known/acme-challenge/ {
         root ${ACME_ROOT};
@@ -208,7 +201,7 @@ server {
     }
 
     location / {
-        return 301 https://\$host\$request_uri;
+        return 404;
     }
 }
 NGINXEOF
@@ -228,11 +221,8 @@ ${extra_listen_line}
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_prefer_server_ciphers off;
 
-    root ${SITE_ROOT};
-    index index.html;
-
     location / {
-        try_files \$uri \$uri/ =404;
+        return 404;
     }
 
     access_log /var/log/nginx/mtproto-mask-access.log;
@@ -257,27 +247,8 @@ apt-get update -qq < /dev/null || true
 apt-get install -y nginx certbot curl openssl < /dev/null >/dev/null 2>&1 || true
 
 mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
-mkdir -p "$SITE_ROOT" "$ACME_ROOT/.well-known/acme-challenge" "$CERT_DIR"
-
-if [[ ! -f "$SITE_ROOT/index.html" ]]; then
-    cat > "$SITE_ROOT/index.html" << HTMLEOF
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>${TLS_DOMAIN}</title>
-</head>
-<body>
-  <h1>${TLS_DOMAIN}</h1>
-  <p>This site is served by the local Nginx masking backend.</p>
-</body>
-</html>
-HTMLEOF
-    ok "Created placeholder site root at ${SITE_ROOT}"
-else
-    ok "Keeping existing site root at ${SITE_ROOT}"
-fi
+mkdir -p "$ACME_ROOT/.well-known/acme-challenge" "$CERT_DIR"
+ok "Prepared masking/ACME roots"
 
 info "Preparing HTTP-01 ACME challenge on :80 for ${TLS_DOMAIN}..."
 write_nginx_config 0
@@ -357,7 +328,7 @@ if [[ -f "$CONFIG_FILE" ]]; then
     if [[ "$MASK_SET_PUBLIC_IP" == "1" ]]; then
         set_config_value "server" "public_ip" "\"${TLS_DOMAIN}\""
     fi
-    ok "Updated ${CONFIG_FILE} for self-site masking"
+    ok "Updated ${CONFIG_FILE} for self-domain 404 masking"
     info "Restart the proxy to apply: systemctl restart mtproto-proxy"
 else
     warn "Config file not found at ${CONFIG_FILE}"
@@ -377,7 +348,7 @@ else
 fi
 
 echo ""
-echo -e "${BOLD}${CYAN}Self-site masking configured${RESET}"
+echo -e "${BOLD}${CYAN}Self-domain 404 masking configured${RESET}"
 echo ""
 echo -e "  ${DIM}Domain:${RESET}      ${TLS_DOMAIN}"
 echo -e "  ${DIM}Public :443:${RESET} mtproto-proxy"
@@ -385,9 +356,9 @@ echo -e "  ${DIM}Nginx TLS:${RESET}   127.0.0.1:${NGINX_PORT}"
 if [[ -n "$TUNNEL_HOST_IP" ]]; then
 echo -e "  ${DIM}Tunnel TLS:${RESET}  ${TUNNEL_HOST_IP}:${NGINX_PORT}"
 fi
-echo -e "  ${DIM}Site root:${RESET}   ${SITE_ROOT}"
+echo -e "  ${DIM}ACME root:${RESET}   ${ACME_ROOT}"
 echo -e "  ${DIM}Cert:${RESET}        ${CERT_DIR}/cert.pem"
 echo -e "  ${DIM}ACME HTTP:${RESET}   ${TLS_DOMAIN}:80"
 echo ""
-echo -e "Browsers and active probes for ${TLS_DOMAIN}:443 are relayed to this Nginx site."
+echo -e "Browsers and active probes for ${TLS_DOMAIN}:443 are relayed to Nginx and receive 404."
 echo -e "Valid MTProto clients with the right secret stay on the proxy path."
