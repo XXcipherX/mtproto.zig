@@ -258,7 +258,7 @@ sudo env MASK_DOMAIN=proxy.example.com LE_EMAIL=admin@example.com \
 sudo systemctl restart mtproto-proxy
 ```
 
-The Nginx backend intentionally does not publish a site body. Only `/.well-known/acme-challenge/` on port `80` is served for Let's Encrypt; all other HTTP/HTTPS requests receive `404`.
+The Nginx backend intentionally does not publish a site body. Only `/.well-known/acme-challenge/` on port `80` is served for Let's Encrypt; all other HTTP/HTTPS requests receive `404`. The masking setup also disables Debian's default Nginx site and makes `mtproto-masking` the default `:80` server so unmatched HTTP `Host`/IP requests return `404` too; set `MASK_KEEP_NGINX_DEFAULT=1` only if you intentionally want to keep an existing default site.
 
 To enable IPv6 auto-hopping (Cloudflare DNS rotation on ban detection), you must provide Cloudflare API credentials. The script uses these to update your domain's AAAA record to a new random IPv6 address from your server's `/64` pool when it detects DPI active probing.
 
@@ -659,7 +659,7 @@ alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eli
 
 > **Operational note** &nbsp; The proxy limits new connections to 30/sec per /24 subnet by default (`rate_limit_per_subnet`). This blocks ТСПУ scanners and DPI replay probes without affecting legitimate Telegram clients.
 
-> **Operational note** &nbsp; Self-domain masking expects DNS `A proxy.example.com -> <VPS_IP>`, Cloudflare DNS-only mode if used, public TCP `80` for Let's Encrypt, public TCP `443` for `mtproto-proxy`, and local Nginx TLS on `127.0.0.1:8443` returning `404` for non-proxy requests. The `ee` link secret changes when `tls_domain` changes, so regenerate client links after changing the domain.
+> **Operational note** &nbsp; Self-domain masking expects DNS `A proxy.example.com -> <VPS_IP>`, Cloudflare DNS-only mode if used, public TCP `80` for Let's Encrypt, public TCP `443` for `mtproto-proxy`, and local Nginx TLS on `127.0.0.1:8443` returning `404` for non-proxy requests. By default, `setup_masking.sh` disables `/etc/nginx/sites-enabled/default` and makes `mtproto-masking` the default public `:80` server so unmatched HTTP requests also return `404`. The `ee` link secret changes when `tls_domain` changes, so regenerate client links after changing the domain.
 
 > **Tip** &nbsp; Generate a random secret: `openssl rand -hex 16`
 

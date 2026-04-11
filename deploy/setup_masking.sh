@@ -19,15 +19,17 @@
 #   LE_EMAIL=admin@example.com                # Let's Encrypt account email
 #   MASK_ALLOW_SELF_SIGNED=1                  # dev/test fallback only
 #   MASK_SET_PUBLIC_IP=0                      # do not set [server].public_ip
+#   MASK_KEEP_NGINX_DEFAULT=1                 # keep existing sites-enabled/default
 #
 # What it does:
 #   1. Installs Nginx and certbot if needed.
 #   2. Creates/keeps an ACME webroot for the masking domain.
-#   3. Serves HTTP-01 ACME on public :80, because public :443 is the proxy.
-#   4. Obtains or reuses a Let's Encrypt certificate for the domain.
-#   5. Configures Nginx on 127.0.0.1:8443 (and 10.200.200.1 in tunnel mode).
-#   6. Updates config.toml with public_ip, tls_domain, mask=true, mask_port.
-#   7. Installs the masking health monitor timer.
+#   3. Makes the masking site the default public :80 server unless opted out.
+#   4. Serves HTTP-01 ACME on public :80, because public :443 is the proxy.
+#   5. Obtains or reuses a Let's Encrypt certificate for the domain.
+#   6. Configures Nginx on 127.0.0.1:8443 (and 10.200.200.1 in tunnel mode).
+#   7. Updates config.toml with public_ip, tls_domain, mask=true, mask_port.
+#   8. Installs the masking health monitor timer.
 
 set -euo pipefail
 
@@ -198,8 +200,21 @@ set_config_value() {
 write_nginx_config() {
     local cert_ready="$1"
     local extra_listen_line=""
+    local http_listen="    listen 80 default_server;"
+    local http_ipv6_listen=""
+    local http_server_name="    server_name ${TLS_DOMAIN} _;"
     if [[ -n "$TUNNEL_HOST_IP" && "$cert_ready" == "1" ]]; then
         extra_listen_line="    listen ${TUNNEL_HOST_IP}:${NGINX_PORT} ssl;"
+    fi
+    if [[ -s /proc/net/if_inet6 ]]; then
+        http_ipv6_listen="    listen [::]:80 default_server;"
+    fi
+    if [[ "${MASK_KEEP_NGINX_DEFAULT:-0}" == "1" ]]; then
+        http_listen="    listen 80;"
+        if [[ -s /proc/net/if_inet6 ]]; then
+            http_ipv6_listen="    listen [::]:80;"
+        fi
+        http_server_name="    server_name ${TLS_DOMAIN};"
     fi
 
     cat > "$MASKING_SITE" << NGINXEOF
@@ -207,8 +222,9 @@ write_nginx_config() {
 # Public :443 is owned by mtproto-proxy. Nginx is only the 404 masking backend.
 
 server {
-    listen 80;
-    server_name ${TLS_DOMAIN};
+${http_listen}
+${http_ipv6_listen}
+${http_server_name}
 
     location ^~ /.well-known/acme-challenge/ {
         root ${ACME_ROOT};
@@ -248,6 +264,17 @@ NGINXEOF
     fi
 }
 
+disable_default_nginx_site() {
+    if [[ "${MASK_KEEP_NGINX_DEFAULT:-0}" == "1" ]]; then
+        return
+    fi
+
+    if [[ -e /etc/nginx/sites-enabled/default ]]; then
+        rm -f /etc/nginx/sites-enabled/default
+        ok "Disabled default Nginx site so masking returns 404 on unmatched HTTP requests"
+    fi
+}
+
 info "Installing Nginx and certbot..."
 apt-get update -qq < /dev/null || true
 apt-get install -y nginx certbot curl openssl < /dev/null >/dev/null 2>&1 || true
@@ -255,6 +282,7 @@ apt-get install -y nginx certbot curl openssl < /dev/null >/dev/null 2>&1 || tru
 mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
 mkdir -p "$ACME_ROOT/.well-known/acme-challenge" "$CERT_DIR"
 ok "Prepared masking/ACME roots"
+disable_default_nginx_site
 
 info "Preparing HTTP-01 ACME challenge on :80 for ${TLS_DOMAIN}..."
 write_nginx_config 0

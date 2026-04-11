@@ -103,6 +103,7 @@ Self-domain masking notes:
 - Preferred setup is `MASK_DOMAIN=proxy.example.com`, with DNS `A` pointing to the VPS.
 - Public `:443` stays owned by `mtproto-proxy`; Nginx listens on `127.0.0.1:8443` and returns 404 for non-proxy requests.
 - Public `:80` must be reachable for Let's Encrypt HTTP-01 unless the operator provisions certificates manually.
+- `setup_masking.sh` disables `/etc/nginx/sites-enabled/default` by default and makes `mtproto-masking` the default public `:80` server, so unmatched HTTP `Host`/IP requests return 404. Set `MASK_KEEP_NGINX_DEFAULT=1` only when intentionally keeping an existing default site.
 - `setup_masking.sh` installs a Let's Encrypt renewal hook that reloads Nginx after certificate renewal.
 - Cloudflare records for the proxy domain must be DNS-only, not proxied.
 
