@@ -232,16 +232,6 @@ NGINXEOF
     fi
 }
 
-if [[ -f "$CONFIG_FILE" ]]; then
-    set_config_value "censorship" "tls_domain" "\"${TLS_DOMAIN}\""
-    set_config_value "censorship" "mask" "true"
-    set_config_value "censorship" "mask_port" "${NGINX_PORT}"
-    if [[ "$MASK_SET_PUBLIC_IP" == "1" ]]; then
-        set_config_value "server" "public_ip" "\"${TLS_DOMAIN}\""
-    fi
-    ok "Pre-set ${CONFIG_FILE} for local masking target ${NGINX_PORT}"
-fi
-
 info "Installing Nginx and certbot..."
 apt-get update -qq < /dev/null || true
 apt-get install -y nginx certbot curl openssl < /dev/null >/dev/null 2>&1 || true
