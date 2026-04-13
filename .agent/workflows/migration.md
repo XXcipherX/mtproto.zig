@@ -11,13 +11,13 @@ Use this flow when old VPS IP is blocked and you need a controlled cutover witho
 Install/update proxy with official installer:
 
 ```bash
-curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/install.sh | ssh root@<NEW_VPS_IP> "bash"
+curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/install.sh | ssh root@<NEW_VPS_IP> "MASK_DOMAIN=proxy.example.com LE_EMAIL=admin@example.com bash"
 ```
 
 If you use IPv6 auto-hopping, provide Cloudflare vars during install:
 
 ```bash
-curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/install.sh | ssh root@<NEW_VPS_IP> "export CF_TOKEN='...'; export CF_ZONE='...'; bash"
+curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/install.sh | ssh root@<NEW_VPS_IP> "MASK_DOMAIN=proxy.example.com LE_EMAIL=admin@example.com CF_TOKEN='...' CF_ZONE='...' bash"
 ```
 
 ## Step 2: Preserve Access Secrets
@@ -46,7 +46,7 @@ If the target region blocks Telegram, add the tunnel layer before cutover:
 make deploy-tunnel SERVER=<NEW_VPS_IP> AWG_CONF=<path> [PASSWORD=<pass>] [TUNNEL_MODE=direct|preserve|middleproxy]
 ```
 
-Tunnel deploy preserves a configured `public_ip` domain in `/opt/mtproto-proxy/config.toml`; it only injects a detected IP when `public_ip` is absent or still a placeholder. This keeps self-site masking links on the operator-owned domain instead of the tunnel exit IP.
+Tunnel deploy preserves a configured `public_ip` domain in `/opt/mtproto-proxy/config.toml`; it only injects a detected IP when `public_ip` is absent or still a placeholder. This keeps self-domain masking links on the operator-owned domain instead of the tunnel exit IP.
 
 ## Step 4: Validate Before Decommission
 
@@ -55,7 +55,7 @@ Tunnel deploy preserves a configured `public_ip` domain in `/opt/mtproto-proxy/c
 ssh root@<NEW_VPS_IP> 'systemctl status mtproto-proxy --no-pager'
 
 # Optional capacity smoke from a repo checkout on the server
-ssh root@<NEW_VPS_IP> 'cd /root/mtproto.zig && sudo python3 test/capacity_connections_probe.py --profile mtproto.zig --traffic-mode tls-auth --tls-domain google.com --levels 200,500 --open-budget-sec 8 --hold-seconds 0.5 --settle-seconds 0.8 --connect-timeout-sec 0.1 --nofile 200000 --nproc 12000'
+ssh root@<NEW_VPS_IP> 'cd /root/mtproto.zig && sudo python3 test/capacity_connections_probe.py --profile mtproto.zig --traffic-mode tls-auth --tls-domain proxy.example.com --levels 200,500 --open-budget-sec 8 --hold-seconds 0.5 --settle-seconds 0.8 --connect-timeout-sec 0.1 --nofile 200000 --nproc 12000'
 
 # Fallback/refresh visibility
 ssh root@<NEW_VPS_IP> 'journalctl -u mtproto-proxy --since "30 min ago" --no-pager | grep -E "Middle-proxy cache updated|Initial middle-proxy refresh failed|middle-proxy exhausted|middle-proxy handshake failed"'
@@ -65,6 +65,7 @@ Note:
 
 - `deploy/install.sh` and `make deploy` do not copy `test/` into `/opt/mtproto-proxy`; use a repo checkout or benchmark workspace for the optional Python harnesses above.
 - Replace `/root/mtproto.zig` in the optional probe command with your actual checkout path.
+- Replace `proxy.example.com` in the TLS-auth probe with the deployed `[censorship].tls_domain`.
 
 Operational note:
 

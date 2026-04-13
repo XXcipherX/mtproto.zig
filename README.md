@@ -38,7 +38,7 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 | **DRS** | Dynamic Record Sizing | Mimics real browser TLS behavior (Chrome/Firefox) to resist fingerprinting |
 | **Multi-user** | Access Control | Independent secret-based authentication per user |
 | **Anti-replay** | Timestamp + Digest Cache | Rejects replayed handshakes outside ±2 min window AND detects ТСПУ Revisor active probes |
-| **Masking** | Self-Domain Cloaking | Forwards unauthenticated clients to a local Nginx 404 backend on your own domain |
+| **Masking** | Connection Cloaking | Forwards unauthenticated clients either to `tls_domain:443` or, for self-domain installs, to a local Nginx 404 backend |
 | **Fast Mode** | Direct-Path S2C Offload | Reduces CPU usage by delegating S2C AES work to Telegram DCs on direct paths (non-MiddleProxy) |
 | **MiddleProxy** | Telemt-Compatible ME | Optional ME transport for DC1..5 (`use_middle_proxy`); media-path traffic prefers ME endpoints with direct fallback when unavailable |
 | **Auto Refresh** | Telegram Metadata | Periodically updates MiddleProxy endpoint and secret from Telegram core endpoints |
@@ -145,6 +145,8 @@ curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/in
 ```
 
 The script is **idempotent**: it rebuilds from latest source, replaces the binary, and preserves your existing `config.toml`. Existing `env.sh` stays untouched unless you rerun install with new `CF_TOKEN` / `CF_ZONE`. User secrets and connection links remain unchanged.
+
+For a fresh self-domain install, pass `MASK_DOMAIN` as shown below or enter the domain at the installer prompt. Non-interactive bootstrap paths must pass `MASK_DOMAIN` explicitly.
 
 ## Docker image
 
@@ -357,7 +359,7 @@ EOF
 
 ### &nbsp; Capacity & RAM Monitoring
 
-On startup, the proxy automatically detects host RAM and prints a **CAPACITY** banner. If your configured `max_connections` is above the RAM-safe estimate, it warns and auto-clamps unless `unsafe_override_limits = true`.
+On startup, the proxy automatically detects host RAM and prints a **CAPACITY** banner. If your configured `max_connections` is above the RAM-safe estimate, it auto-clamps and logs a warning unless `unsafe_override_limits = true`.
 
 **4. Install the systemd service**
 
@@ -368,7 +370,6 @@ sudo chown -R mtproto:mtproto /opt/mtproto-proxy
 
 sudo systemctl daemon-reload
 sudo systemctl enable mtproto-proxy
-sudo systemctl start mtproto-proxy
 ```
 
 **5. Open ports 443 and 80**
@@ -378,7 +379,17 @@ sudo ufw allow 443/tcp
 sudo ufw allow 80/tcp   # Let's Encrypt HTTP-01 for self-domain masking
 ```
 
-**6. Generate connection link**
+**6. Set up self-domain masking and start the proxy**
+
+```bash
+sudo env MASK_DOMAIN=proxy.example.com LE_EMAIL=admin@example.com \
+  bash deploy/setup_masking.sh
+sudo systemctl start mtproto-proxy
+```
+
+`setup_masking.sh` installs Nginx/certbot, obtains or reuses a Let's Encrypt certificate, configures the local HTTPS masking backend on `127.0.0.1:8443`, and updates `config.toml` for self-domain masking.
+
+**7. Generate connection link**
 
 The proxy prints links on startup. Check them with:
 
@@ -488,13 +499,15 @@ Client ──→ VPS:443 ──→ [iptables DNAT] ──→ 10.200.200.2:443
 - The `.conf` must contain `[Interface]` (with `PrivateKey`, AmneziaWG junk fields) and `[Peer]` (with `Endpoint`)
 - A VPS with **Ubuntu 24.04** in the target region
 
-### One-command deploy (new server)
+### Tunnel deploy via Makefile
 
 From your workstation:
 
 ```bash
 make deploy-tunnel SERVER=<VPS_IP> AWG_CONF=awg.conf PASSWORD=<root_password>
 ```
+
+For a brand-new self-domain install, bootstrap the server with `MASK_DOMAIN=proxy.example.com` first, then use `make deploy-tunnel-only`; the current `make deploy-tunnel` path goes through `make migrate`, whose installer step is non-interactive and does not pass `MASK_DOMAIN`. The command above is suitable when the server is already bootstrapped or when the existing config already has a masking domain.
 
 Optionally choose tunnel mode for `use_middle_proxy` handling:
 
@@ -628,7 +641,7 @@ alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eli
 | `[server]` | `public_ip` | _(auto-detect)_ | Override the IP/domain shown in startup links. For self-domain masking, set this to the same domain as `tls_domain`. Tunnel deploy scripts preserve an existing domain instead of replacing it with the tunnel exit IP |
 | `[server]` | `middle_proxy_nat_ip` | _(auto-detect)_ | Optional IPv4 override used in MiddleProxy NAT/AES derivation. Useful when `public_ip` is a hostname or when tunnel egress/detection would choose the wrong IPv4 |
 | `[server]` | `backlog` | `4096` | TCP listen queue size (for high-traffic loads) |
-| `[server]` | `max_connections` | `512` | Concurrent connection cap (small-VPS tuned default). On Linux, runtime is auto-clamped by `RLIMIT_NOFILE` if configured higher than available FD budget |
+| `[server]` | `max_connections` | `512` | Concurrent connection cap (small-VPS tuned default). On Linux, startup first auto-clamps this to the RAM-safe estimate unless `unsafe_override_limits=true`; the proxy then clamps again if `RLIMIT_NOFILE` cannot cover the fd budget |
 | `[server]` | `idle_timeout_sec` | `120` | Connection idle timeout in seconds (also used before first client byte) |
 | `[server]` | `handshake_timeout_sec` | `15` | Timeout for completing handshake after first byte |
 | `[server]` | `middleproxy_buffer_kb` | `1024` | MiddleProxy buffer size in KiB. Current code keeps 2 such buffers per active ME connection and 2 shared scratch buffers per event loop. Values below 1024 may cause `MiddleProxyBufferOverflow` on media-heavy traffic (Stories, video messages) |
@@ -638,9 +651,9 @@ alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eli
 | `[server]` | `unsafe_override_limits` | `false` | Disable auto-clamping of `max_connections` to the RAM-safe estimate. Use only if you're sure your host has enough memory |
 | `[monitor]` | `host` | `"127.0.0.1"` | Bind address for the optional monitoring dashboard HTTP server. This section is read by `proxy-monitor`, not by the proxy binary. Set to `"0.0.0.0"` to expose on all interfaces (warning: no built-in auth) |
 | `[monitor]` | `port` | `61208` | TCP port for the optional monitoring dashboard HTTP server |
-| `[censorship]` | `tls_domain` | `"google.com"` | Self-domain masking domain. Point its DNS A record to the VPS; valid MTProto users use it as FakeTLS SNI, and invalid/ordinary HTTPS clients are forwarded to local Nginx |
-| `[censorship]` | `mask` | `true` | Forward unauthenticated connections to the local Nginx 404 backend to defeat active probing |
-| `[censorship]` | `mask_port` | `443` | Local Nginx HTTPS backend port. Use `8443` for self-domain masking so public `443` remains owned by `mtproto-proxy` |
+| `[censorship]` | `tls_domain` | `"google.com"` | FakeTLS SNI domain. With `mask_port=443`, unauthenticated clients are forwarded to this domain directly. For self-domain masking, set it to your own domain and point its DNS A record to the VPS |
+| `[censorship]` | `mask` | `true` | Forward unauthenticated connections to the configured masking target to defeat active probing |
+| `[censorship]` | `mask_port` | `443` | Masking target port. `443` connects to `tls_domain:443`; non-443 values connect to a local address on that port (`127.0.0.1:<mask_port>`, or `10.200.200.1:<mask_port>` inside tunnel netns), so that port must be served by Nginx or another local backend. Use `8443` for self-domain Nginx so public `443` remains owned by `mtproto-proxy` |
 | `[censorship]` | `desync` | `true` | Split fake `ServerHello` into `1 byte + short pause + rest` to desynchronize passive DPI |
 | `[censorship]` | `drs` | `false` | Dynamic Record Sizing: ramp TLS records from 1369→16384 bytes after warmup (mimics Chrome/Firefox) |
 | `[censorship]` | `fast_mode` | `false` | **Recommended** for direct-path traffic. Delegates S2C AES encryption to Telegram DC and reduces proxy CPU/RAM pressure |
@@ -680,13 +693,13 @@ This proxy uses a Linux `epoll` event loop (single-thread relay path). Timeouts 
 Before chasing client/network hypotheses, inspect the new low-noise runtime signals:
 
 ```bash
-ssh root@<VPS_IP> 'journalctl -u mtproto-proxy --since "30 min ago" --no-pager | grep -E "conn stats|drops:|max_connections clamped|fd quota reached|failed to resume accepts|connection saturation|saturation eased"'
+ssh root@<VPS_IP> 'journalctl -u mtproto-proxy --since "30 min ago" --no-pager | grep -E "conn stats|drops:|auto-clamping max_connections|RAM-safe estimate|skipping max_connections safety clamp|max_connections clamped|fd quota reached|failed to resume accepts|connection saturation|saturation eased"'
 ssh root@<VPS_IP> 'cat /proc/$(pgrep -f mtproto-proxy)/limits | grep "open files"'
 ```
 
 Interpretation:
 
-- `max_connections clamped ...` means runtime reduced configured capacity to fit current `RLIMIT_NOFILE`.
+- `auto-clamping max_connections ...` means startup reduced configured capacity to the RAM-safe estimate. `max_connections clamped ... due to RLIMIT_NOFILE` means runtime reduced it again to fit the process fd limit.
 - `fd quota reached ... pausing accepts for 500ms` means the listener hit `EMFILE`/`ENFILE` and intentionally backed off instead of busy-looping.
 - `conn stats ... paused=<fd_pause>/<saturation_pause>` exposes two pause reasons: fd-quota backoff first, saturation hysteresis second.
 - `drops: ... hs_budget+=...` means the handshake-inflight budget rejected excess new handshakes after the 30%-of-capacity threshold.

@@ -29,7 +29,7 @@ ssh root@<SERVER_IP> 'cat /proc/$(pgrep -f mtproto-proxy)/limits | grep "open fi
 ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy --since "1 hour ago" --no-pager'
 
 # Runtime capacity / fd-pressure signals
-ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy --since "1 hour ago" --no-pager | grep -E "conn stats|drops:|max_connections clamped|fd quota reached|failed to resume accepts|connection saturation|saturation eased"'
+ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy --since "1 hour ago" --no-pager | grep -E "conn stats|drops:|auto-clamping max_connections|RAM-safe estimate|skipping max_connections safety clamp|max_connections clamped|fd quota reached|failed to resume accepts|connection saturation|saturation eased"'
 
 # Connect-path and fallback signals
 ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy --since "1 hour ago" --no-pager | grep -E "middle-proxy exhausted|middle-proxy handshake failed|media path connect failed|epoll hup/err"'
@@ -107,7 +107,7 @@ ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy -n 80 --no-pager'
 ssh root@<SERVER_IP> 'cd /root/mtproto.zig && sudo python3 test/capacity_connections_probe.py --profile mtproto.zig --traffic-mode idle'
 
 # Active (TLS-auth) capacity probe (from a repo checkout on the server)
-ssh root@<SERVER_IP> 'cd /root/mtproto.zig && sudo python3 test/capacity_connections_probe.py --profile mtproto.zig --traffic-mode tls-auth --tls-domain google.com --levels 500,1000,1500,2000 --open-budget-sec 14 --hold-seconds 0.8 --settle-seconds 1.0 --connect-timeout-sec 0.1 --nofile 200000 --nproc 12000'
+ssh root@<SERVER_IP> 'cd /root/mtproto.zig && sudo python3 test/capacity_connections_probe.py --profile mtproto.zig --traffic-mode tls-auth --tls-domain proxy.example.com --levels 500,1000,1500,2000 --open-budget-sec 14 --hold-seconds 0.8 --settle-seconds 1.0 --connect-timeout-sec 0.1 --nofile 200000 --nproc 12000'
 
 # Stability harness (from a repo checkout on the server)
 ssh root@<SERVER_IP> 'cd /root/mtproto.zig && sudo python3 test/connection_stability_check.py --host 127.0.0.1 --port 443 --pid $(pgrep -f mtproto-proxy | head -n1) --idle-connections 6000 --idle-cycles 3 --churn-total 30000 --churn-concurrency 300'
@@ -115,9 +115,10 @@ ssh root@<SERVER_IP> 'cd /root/mtproto.zig && sudo python3 test/connection_stabi
 
 Interpretation helpers:
 
-- `max_connections clamped ...` means the configured connection cap was reduced to fit current `RLIMIT_NOFILE`.
+- `auto-clamping max_connections ...` means the startup RAM-safety clamp reduced the configured cap. `max_connections clamped ... due to RLIMIT_NOFILE` means the later fd-budget clamp reduced it again.
 - `fd quota reached ...` means the listener paused accepts; expect the first `paused=` flag to flip to `true` in nearby `conn stats` lines until the retry window clears.
 - `hs_budget+=...` means connection churn is exhausting the handshake budget before established relays become the bottleneck.
 - `mp_fallback+=...` means users are still being served, but MiddleProxy path quality is degraded enough to trigger direct fallback.
 - `connection saturation ...` / `saturation eased ...` is RAM/capacity admission control, not an fd-limit incident.
 - A healthy idle box should keep both `paused=` flags at `false` and `tracked_fds` close to active socket count plus listener/upstream overhead.
+- For TLS-auth probes, replace `proxy.example.com` with the deployed `[censorship].tls_domain`; SNI mismatch is intentionally masked by the proxy.

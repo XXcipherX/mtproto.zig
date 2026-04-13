@@ -90,16 +90,18 @@ budget_bytes  = max(0, usable_bytes - reserve_bytes - middleproxy_shared_bytes)
 safe_connections = max(32, budget_bytes / per_conn_bytes)
 ```
 
-If `max_connections` exceeds safe estimate, startup prints a warning.
+If `max_connections` exceeds the RAM-safe estimate, startup auto-clamps it before the proxy starts unless `[server].unsafe_override_limits = true`. With the override enabled, startup keeps the configured value and logs a RAM-safety warning. If `/proc/meminfo` cannot be read on Linux, startup logs that the RAM clamp was skipped.
+
+`ProxyState.run` then applies a second, independent `RLIMIT_NOFILE` clamp before creating the event loop when the process soft fd limit cannot cover the effective connection cap.
 
 ## DPI Evasion Components
 
 - FakeTLS ServerHello template with runtime digest patching.
 - Anti-replay cache keyed by canonical HMAC digest.
-- Self-domain masking for unauthenticated clients to `tls_domain` via local Nginx 404 backend on `mask_port`.
+- Masking target selection for unauthenticated clients: `mask_port=443` resolves/connects to `tls_domain:443`; non-443 `mask_port` connects to a local address on that port (`127.0.0.1` in the init namespace, `10.200.200.1` inside the tunnel netns), so that port must be served by Nginx or another local masking backend.
 - TCPMSS clamping and optional zapret/nfqws integration via deploy scripts.
 - Split-TLS desync (`desync=true`) as split write of fake ServerHello.
-- Local self-domain masking endpoint (`127.0.0.1:8443`, or `10.200.200.1:8443` in tunnel netns mode) through `setup_masking.sh`; non-proxy requests receive 404.
+- Self-domain masking setup (`setup_masking.sh`) configures Nginx on `127.0.0.1:8443` and, in tunnel netns mode, `10.200.200.1:8443`; non-proxy requests receive 404.
 
 ## What To Verify During Changes
 

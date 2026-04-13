@@ -56,6 +56,8 @@ Why service stop is required:
 4. Calls `make deploy`.
 5. Optionally runs `make update-dns` when `UPDATE_DNS=1|true`.
 
+Fresh self-domain installs need a masking domain during `deploy/install.sh`. `make migrate` currently streams the installer over non-interactive SSH, so for a brand-new host either run the one-line `MASK_DOMAIN=...` installer first or invoke the installer manually with `ssh root@<ip> 'MASK_DOMAIN=proxy.example.com LE_EMAIL=admin@example.com bash -s' < deploy/install.sh`, then use `make deploy`.
+
 ## Tunnel Workflows
 
 `make deploy-tunnel` first runs `make migrate`, then uploads the AmneziaWG client config plus `deploy/setup_tunnel.sh` and executes the script remotely with the selected `TUNNEL_MODE`.
@@ -105,12 +107,14 @@ Self-domain masking notes:
 - Public `:80` must be reachable for Let's Encrypt HTTP-01 unless the operator provisions certificates manually.
 - `setup_masking.sh` disables `/etc/nginx/sites-enabled/default` by default and makes `mtproto-masking` the default public `:80` server, so unmatched HTTP `Host`/IP requests return 404. Set `MASK_KEEP_NGINX_DEFAULT=1` only when intentionally keeping an existing default site.
 - `setup_masking.sh` installs a Let's Encrypt renewal hook that reloads Nginx after certificate renewal.
+- `MASK_ALLOW_SELF_SIGNED=1` is available only as a dev/test fallback; the default flow fails closed when Let's Encrypt cannot issue a certificate.
+- `MASK_SET_PUBLIC_IP=0` skips rewriting `[server].public_ip`; otherwise `setup_masking.sh` sets it to the masking domain.
 - Cloudflare records for the proxy domain must be DNS-only, not proxied.
 
 ## Systemd Unit Notes (`deploy/mtproto-proxy.service`)
 
 - Default unit ships with `LimitNOFILE=131582` and `TasksMax=65535`.
-- Proxy auto-clamps effective `max_connections` downward at startup if host `RLIMIT_NOFILE` is lower than the configured FD budget.
+- Startup first auto-clamps `max_connections` to the RAM-safe estimate from `/proc/meminfo` unless `unsafe_override_limits=true`; `ProxyState.run` then clamps again if `RLIMIT_NOFILE` cannot cover the resulting fd budget.
 - Runtime relay model is still single-thread `epoll` in proxy core.
 - Default unit keeps `ReadOnlyPaths=/opt/mtproto-proxy` and only `CAP_NET_BIND_SERVICE`.
 - Tunnel-patched unit adds `CAP_NET_ADMIN` + `CAP_SYS_ADMIN` and uses `ExecStartPre=/usr/local/bin/setup_netns.sh` to recreate the namespace on every restart.
