@@ -38,6 +38,8 @@ pub fn validateTlsHandshake(
     secrets: []const UserSecret,
     ignore_time_skew: bool,
 ) !?TlsValidation {
+    _ = allocator;
+
     const min_len = constants.tls_digest_pos + constants.tls_digest_len + 1;
     if (handshake.len < min_len) return null;
 
@@ -53,11 +55,8 @@ pub fn validateTlsHandshake(
     const session_id_start = session_id_len_pos + 1;
     if (handshake.len < session_id_start + session_id_len) return null;
 
-    // Build message with zeroed digest for HMAC
-    const msg = try allocator.alloc(u8, handshake.len);
-    defer allocator.free(msg);
-    @memcpy(msg, handshake);
-    @memset(msg[constants.tls_digest_pos..][0..constants.tls_digest_len], 0);
+    const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+    const zero_digest = [_]u8{0} ** constants.tls_digest_len;
 
     const now: i64 = if (!ignore_time_skew)
         @intCast(std.time.timestamp())
@@ -65,7 +64,12 @@ pub fn validateTlsHandshake(
         0;
 
     for (secrets) |entry| {
-        const computed = crypto.sha256Hmac(&entry.secret, msg);
+        var hmac = HmacSha256.init(&entry.secret);
+        hmac.update(handshake[0..constants.tls_digest_pos]);
+        hmac.update(zero_digest[0..]);
+        hmac.update(handshake[constants.tls_digest_pos + constants.tls_digest_len ..]);
+        var computed: [constants.tls_digest_len]u8 = undefined;
+        hmac.final(&computed);
 
         // Constant-time comparison of first 28 bytes using stdlib
         if (!std.crypto.timing_safe.eql([28]u8, digest[0..28].*, computed[0..28].*)) continue;
@@ -164,12 +168,12 @@ pub fn buildServerHelloWithTemplate(
 
     // 4. Compute HMAC over full response with random field zeroed.
     //    Template already has zeros at offset 11..43, so HMAC input is correct.
-    const hmac_input = try allocator.alloc(u8, constants.tls_digest_len + response.len);
-    defer allocator.free(hmac_input);
-    @memcpy(hmac_input[0..constants.tls_digest_len], client_digest);
-    @memcpy(hmac_input[constants.tls_digest_len..], response);
-
-    const response_digest = crypto.sha256Hmac(secret, hmac_input);
+    const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+    var hmac = HmacSha256.init(secret);
+    hmac.update(client_digest[0..]);
+    hmac.update(response);
+    var response_digest: [32]u8 = undefined;
+    hmac.final(&response_digest);
 
     // 5. Insert HMAC digest into Server Random field
     @memcpy(response[tmpl_random_offset..][0..32], &response_digest);

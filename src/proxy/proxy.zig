@@ -141,8 +141,15 @@ const SubnetRateLimit = struct {
             const ip_bytes = std.mem.asBytes(&addr.in.sa.addr);
             return @as(u32, ip_bytes[0]) << 16 | @as(u32, ip_bytes[1]) << 8 | @as(u32, ip_bytes[2]);
         } else if (addr.any.family == posix.AF.INET6) {
-            // /48 subnet: first 6 bytes hashed to u32
             const ip6 = &addr.in6.sa.addr;
+
+            const is_ipv4_mapped = std.mem.eql(u8, ip6[0..10], &[_]u8{0} ** 10) and
+                ip6[10] == 0xff and ip6[11] == 0xff;
+            if (is_ipv4_mapped) {
+                return @as(u32, ip6[12]) << 16 | @as(u32, ip6[13]) << 8 | @as(u32, ip6[14]);
+            }
+
+            // /48 subnet: first 6 bytes hashed to u32
             return @as(u32, ip6[0]) << 24 | @as(u32, ip6[1]) << 16 | @as(u32, ip6[2]) << 8 | @as(u32, ip6[3]) ^ (@as(u32, ip6[4]) << 8 | @as(u32, ip6[5]));
         }
         return 0;
@@ -404,7 +411,7 @@ const DynamicRecordSizer = struct {
 
     fn init(enabled: bool) DynamicRecordSizer {
         return .{
-            .current_size = initial_size,
+            .current_size = if (enabled) initial_size else full_size,
             .records_sent = 0,
             .bytes_sent = 0,
             .enabled = enabled,
@@ -576,7 +583,7 @@ const ConnectionSlot = struct {
     relay_record_type: u8 = 0,
 
     drs: DynamicRecordSizer = DynamicRecordSizer{
-        .current_size = DynamicRecordSizer.initial_size,
+        .current_size = DynamicRecordSizer.full_size,
         .records_sent = 0,
         .bytes_sent = 0,
         .enabled = false,
@@ -815,9 +822,12 @@ pub const ProxyState = struct {
 
     middle_proxy_lock: std.Thread.RwLock = .{},
     middle_proxy_addrs_primary: [5]net.Address,
+    middle_proxy_addrs_media_primary: [5]net.Address,
     middle_proxy_addr_203: net.Address,
     middle_proxy_addrs_dc4: [16]net.Address,
     middle_proxy_addrs_dc4_len: usize,
+    middle_proxy_addrs_media_dc4: [16]net.Address,
+    middle_proxy_addrs_media_dc4_len: usize,
     middle_proxy_addrs_203: [8]net.Address,
     middle_proxy_addrs_203_len: usize,
     middle_proxy_secret: [256]u8,
@@ -923,9 +933,12 @@ pub const ProxyState = struct {
             .stats_hs_timeout = std.atomic.Value(u64).init(0),
             .stats_mp_fallback = std.atomic.Value(u64).init(0),
             .middle_proxy_addrs_primary = constants.tg_middle_proxies_v4,
+            .middle_proxy_addrs_media_primary = constants.tg_media_middle_proxies_v4,
             .middle_proxy_addr_203 = constants.getDcAddressV4(203),
             .middle_proxy_addrs_dc4 = [_]net.Address{constants.tg_middle_proxies_v4[3]} ++ ([_]net.Address{constants.tg_middle_proxies_v4[3]} ** 15),
             .middle_proxy_addrs_dc4_len = 1,
+            .middle_proxy_addrs_media_dc4 = [_]net.Address{constants.tg_media_middle_proxies_v4[3]} ++ ([_]net.Address{constants.tg_media_middle_proxies_v4[3]} ** 15),
+            .middle_proxy_addrs_media_dc4_len = 1,
             .middle_proxy_addrs_203 = [_]net.Address{constants.getDcAddressV4(203)} ++ ([_]net.Address{constants.getDcAddressV4(203)} ** 7),
             .middle_proxy_addrs_203_len = 1,
             .middle_proxy_secret = default_middle_proxy_secret,
@@ -1011,17 +1024,21 @@ pub const ProxyState = struct {
 
     const MiddleProxySnapshot = struct {
         addrs_primary: [5]net.Address,
+        addrs_media_primary: [5]net.Address,
         addr_203: net.Address,
         addrs_dc4: [16]net.Address,
         addrs_dc4_len: usize,
+        addrs_media_dc4: [16]net.Address,
+        addrs_media_dc4_len: usize,
         addrs_203: [8]net.Address,
         addrs_203_len: usize,
         secret: [256]u8,
         secret_len: usize,
 
-        fn getForDc(self: *const MiddleProxySnapshot, dc_abs: usize) ?net.Address {
+        fn getForDc(self: *const MiddleProxySnapshot, dc_abs: usize, media: bool) ?net.Address {
             if (dc_abs == 203) return self.addr_203;
             if (dc_abs >= 1 and dc_abs <= self.addrs_primary.len) {
+                if (media) return self.addrs_media_primary[dc_abs - 1];
                 return self.addrs_primary[dc_abs - 1];
             }
             return null;
@@ -1034,9 +1051,12 @@ pub const ProxyState = struct {
 
         return .{
             .addrs_primary = self.middle_proxy_addrs_primary,
+            .addrs_media_primary = self.middle_proxy_addrs_media_primary,
             .addr_203 = self.middle_proxy_addr_203,
             .addrs_dc4 = self.middle_proxy_addrs_dc4,
             .addrs_dc4_len = self.middle_proxy_addrs_dc4_len,
+            .addrs_media_dc4 = self.middle_proxy_addrs_media_dc4,
+            .addrs_media_dc4_len = self.middle_proxy_addrs_media_dc4_len,
             .addrs_203 = self.middle_proxy_addrs_203,
             .addrs_203_len = self.middle_proxy_addrs_203_len,
             .secret = self.middle_proxy_secret,
@@ -1058,11 +1078,16 @@ pub const ProxyState = struct {
         defer self.allocator.free(cfg_bytes);
 
         var next_primary: [5]?net.Address = [_]?net.Address{null} ** 5;
+        var next_media_primary: [5]?net.Address = [_]?net.Address{null} ** 5;
         var next_dc4_candidates: [16]net.Address = undefined;
         var next_dc4_candidates_len: usize = 0;
+        var next_media_dc4_candidates: [16]net.Address = undefined;
+        var next_media_dc4_candidates_len: usize = 0;
         for (0..next_primary.len) |i| {
+            const dc_num: i16 = @intCast(i + 1);
+
             var candidates: [16]net.Address = undefined;
-            const count = parseMiddleProxyAddressesForDc(cfg_bytes, @as(i16, @intCast(i + 1)), &candidates);
+            const count = parseMiddleProxyAddressesForDc(cfg_bytes, dc_num, .positive_only, &candidates);
 
             if (i == 3 and count > 0) {
                 const dc4_n = @min(count, next_dc4_candidates.len);
@@ -1078,10 +1103,28 @@ pub const ProxyState = struct {
                 reachable
             else
                 candidates[0];
+
+            var media_candidates: [16]net.Address = undefined;
+            const media_count = parseMiddleProxyAddressesForDc(cfg_bytes, dc_num, .negative_only, &media_candidates);
+
+            if (i == 3 and media_count > 0) {
+                const dc4_n = @min(media_count, next_media_dc4_candidates.len);
+                @memcpy(next_media_dc4_candidates[0..dc4_n], media_candidates[0..dc4_n]);
+                next_media_dc4_candidates_len = dc4_n;
+            }
+
+            next_media_primary[i] = if (media_count == 0)
+                null
+            else if (i == 3)
+                media_candidates[0]
+            else if (trySelectReachableMiddleProxy(media_candidates[0..media_count], 1200)) |reachable|
+                reachable
+            else
+                media_candidates[0];
         }
 
         var candidates_203: [8]net.Address = undefined;
-        const count_203 = parseMiddleProxyAddressesForDc(cfg_bytes, 203, &candidates_203);
+        const count_203 = parseMiddleProxyAddressesForDc(cfg_bytes, 203, .any, &candidates_203);
         var next_203_candidates: [8]net.Address = undefined;
         var next_203_candidates_len: usize = 0;
         if (count_203 > 0) {
@@ -1110,6 +1153,12 @@ pub const ProxyState = struct {
                     changed = true;
                 }
             }
+            if (next_media_primary[i]) |addr| {
+                if (!self.middle_proxy_addrs_media_primary[i].eql(addr)) {
+                    self.middle_proxy_addrs_media_primary[i] = addr;
+                    changed = true;
+                }
+            }
         }
 
         if (next_addr_203) |addr| {
@@ -1125,6 +1174,16 @@ pub const ProxyState = struct {
             {
                 @memcpy(self.middle_proxy_addrs_dc4[0..next_dc4_candidates_len], next_dc4_candidates[0..next_dc4_candidates_len]);
                 self.middle_proxy_addrs_dc4_len = next_dc4_candidates_len;
+                changed = true;
+            }
+        }
+
+        if (next_media_dc4_candidates_len > 0) {
+            if (self.middle_proxy_addrs_media_dc4_len != next_media_dc4_candidates_len or
+                !addressesEqual(self.middle_proxy_addrs_media_dc4[0..next_media_dc4_candidates_len], next_media_dc4_candidates[0..next_media_dc4_candidates_len]))
+            {
+                @memcpy(self.middle_proxy_addrs_media_dc4[0..next_media_dc4_candidates_len], next_media_dc4_candidates[0..next_media_dc4_candidates_len]);
+                self.middle_proxy_addrs_media_dc4_len = next_media_dc4_candidates_len;
                 changed = true;
             }
         }
@@ -1335,7 +1394,11 @@ const EventLoop = struct {
             const cfd = posix.accept(self.listen_fd, &client_addr.any, &client_len, posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK) catch |err| {
                 switch (err) {
                     error.WouldBlock => return,
-                    error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded => {
+                    error.ConnectionAborted, error.ConnectionResetByPeer => continue,
+                    error.ProcessFdQuotaExceeded,
+                    error.SystemFdQuotaExceeded,
+                    error.SystemResources,
+                    => {
                         self.pauseAccepting(err);
                         return;
                     },
@@ -1877,7 +1940,11 @@ const EventLoop = struct {
     }
 
     fn finishClientHandshake(self: *EventLoop, slot: *ConnectionSlot) void {
-        const result = obfuscation.ObfuscationParams.fromHandshake(&slot.handshake_buf, self.state.user_secrets) orelse {
+        const known_secret = [_]obfuscation.UserSecret{.{
+            .name = slot.validation_user[0..slot.validation_user_len],
+            .secret = slot.validation_secret,
+        }};
+        const result = obfuscation.ObfuscationParams.fromHandshake(&slot.handshake_buf, &known_secret) orelse {
             self.closeSlot(slot, "bad mtproto obfuscation handshake");
             return;
         };
@@ -2363,8 +2430,11 @@ const EventLoop = struct {
         var msg: [32]u8 = undefined;
         @memcpy(msg[0..4], &middleproxy.rpc_nonce_req);
         self.state.middle_proxy_lock.lockShared();
-        const key_sel_len = @min(@as(usize, 4), self.state.middle_proxy_secret_len);
-        @memcpy(msg[4..8], self.state.middle_proxy_secret[0..key_sel_len]);
+        @memset(msg[4..8], 0);
+        if (self.state.middle_proxy_secret_len > 0) msg[4] = self.state.middle_proxy_secret[0];
+        if (self.state.middle_proxy_secret_len > 1) msg[5] = self.state.middle_proxy_secret[1];
+        if (self.state.middle_proxy_secret_len > 2) msg[6] = self.state.middle_proxy_secret[2];
+        if (self.state.middle_proxy_secret_len > 3) msg[7] = self.state.middle_proxy_secret[3];
         self.state.middle_proxy_lock.unlockShared();
         @memcpy(msg[8..12], &middleproxy.rpc_crypto_aes);
         @memcpy(msg[12..16], &crypto_ts);
@@ -2988,7 +3058,9 @@ const EventLoop = struct {
 
     fn ensureMpC2sScratch(self: *EventLoop) ![]u8 {
         if (self.mp_c2s_scratch) |buf| return buf;
-        const buf = try self.state.allocator.alloc(u8, self.state.config.middleProxyBufferBytes());
+        const mp_max_expansion: usize = 96;
+        const capacity = self.state.config.middleProxyBufferBytes() * mp_max_expansion + 256;
+        const buf = try self.state.allocator.alloc(u8, capacity);
         self.mp_c2s_scratch = buf;
         return buf;
     }
@@ -3572,7 +3644,10 @@ fn buildDcConnectPlan(
 
     var middle_addr: ?net.Address = null;
     if (snapshot) |snap| {
-        middle_addr = snap.getForDc(dc_abs);
+        middle_addr = snap.getForDc(dc_abs, plan.is_media_path);
+        if (middle_addr == null and plan.is_media_path) {
+            middle_addr = snap.getForDc(dc_abs, false);
+        }
     }
 
     const force_media_middle_proxy = cfg.force_media_middle_proxy and plan.is_media_path and middle_addr != null;
@@ -3589,10 +3664,17 @@ fn buildDcConnectPlan(
     }
 
     if (snapshot) |snap| {
-        if (dc_abs == 4 and snap.addrs_dc4_len > 0) {
-            var n: usize = 0;
-            while (n < snap.addrs_dc4_len and plan.count < plan.candidates.len) : (n += 1) {
-                appendUniqueAddress(&plan.candidates, &plan.count, snap.addrs_dc4[n]);
+        if (dc_abs == 4) {
+            if (plan.is_media_path and snap.addrs_media_dc4_len > 0) {
+                var n: usize = 0;
+                while (n < snap.addrs_media_dc4_len and plan.count < plan.candidates.len) : (n += 1) {
+                    appendUniqueAddress(&plan.candidates, &plan.count, snap.addrs_media_dc4[n]);
+                }
+            } else if (snap.addrs_dc4_len > 0) {
+                var n: usize = 0;
+                while (n < snap.addrs_dc4_len and plan.count < plan.candidates.len) : (n += 1) {
+                    appendUniqueAddress(&plan.candidates, &plan.count, snap.addrs_dc4[n]);
+                }
             }
         } else if (dc_abs == 203 and snap.addrs_203_len > 0) {
             var n: usize = 0;
@@ -3623,7 +3705,13 @@ fn buildDcConnectPlan(
     return plan;
 }
 
-fn parseMiddleProxyAddressesForDc(config_text: []const u8, target_dc: i16, out: []net.Address) usize {
+const DcSignFilter = enum {
+    any,
+    positive_only,
+    negative_only,
+};
+
+fn parseMiddleProxyAddressesForDc(config_text: []const u8, target_dc: i16, sign: DcSignFilter, out: []net.Address) usize {
     if (out.len == 0) return 0;
 
     var lines = std.mem.splitScalar(u8, config_text, '\n');
@@ -3642,7 +3730,12 @@ fn parseMiddleProxyAddressesForDc(config_text: []const u8, target_dc: i16, out: 
         const host_port = parts.next() orelse continue;
 
         const dc_idx = std.fmt.parseInt(i16, dc_text, 10) catch continue;
-        if (dc_idx != target_dc and dc_idx != -target_dc) continue;
+        const abs_target: i16 = if (target_dc < 0) -target_dc else target_dc;
+        switch (sign) {
+            .any => if (dc_idx != abs_target and dc_idx != -abs_target) continue,
+            .positive_only => if (dc_idx != abs_target) continue,
+            .negative_only => if (dc_idx != -abs_target) continue,
+        }
 
         const parsed = net.Address.parseIpAndPort(host_port) catch continue;
 
@@ -3700,7 +3793,8 @@ fn isAddressReachable(address: net.Address, timeout_ms: i32) bool {
 
 fn parseMiddleProxyAddressForDc(config_text: []const u8, target_dc: i16) ?net.Address {
     var one: [1]net.Address = undefined;
-    const n = parseMiddleProxyAddressesForDc(config_text, target_dc, &one);
+    const sign: DcSignFilter = if (target_dc < 0) .negative_only else .positive_only;
+    const n = parseMiddleProxyAddressesForDc(config_text, target_dc, sign, &one);
     if (n == 0) return null;
     return one[0];
 }
@@ -3927,9 +4021,12 @@ test "direct users bypass middle-proxy routing" {
             mp_dc4,
             constants.tg_middle_proxies_v4[4],
         },
+        .addrs_media_primary = constants.tg_media_middle_proxies_v4,
         .addr_203 = mp_dc203,
         .addrs_dc4 = [_]net.Address{mp_dc4} ++ ([_]net.Address{mp_dc4} ** 15),
         .addrs_dc4_len = 1,
+        .addrs_media_dc4 = [_]net.Address{constants.tg_media_middle_proxies_v4[3]} ++ ([_]net.Address{constants.tg_media_middle_proxies_v4[3]} ** 15),
+        .addrs_media_dc4_len = 1,
         .addrs_203 = [_]net.Address{mp_dc203} ++ ([_]net.Address{mp_dc203} ** 7),
         .addrs_203_len = 1,
         .secret = [_]u8{0} ** 256,
@@ -3955,11 +4052,11 @@ test "direct users bypass middle-proxy routing" {
     try std.testing.expect(admin_media.candidates[0].eql(constants.getDcAddressV4(203)));
 }
 
-test "DRS disabled fixed size" {
+test "DRS disabled skips ramp and uses full TLS record size" {
     var drs = DynamicRecordSizer.init(false);
-    try std.testing.expectEqual(DynamicRecordSizer.initial_size, drs.nextRecordSize());
+    try std.testing.expectEqual(DynamicRecordSizer.full_size, drs.nextRecordSize());
     for (0..32) |_| drs.recordSent(1369);
-    try std.testing.expectEqual(DynamicRecordSizer.initial_size, drs.nextRecordSize());
+    try std.testing.expectEqual(DynamicRecordSizer.full_size, drs.nextRecordSize());
 }
 
 test "DRS enabled ramps" {
@@ -4052,6 +4149,25 @@ test "subnet rate limit - subnet key groups /24 IPv4" {
 
     try std.testing.expectEqual(key1, key2); // same /24
     try std.testing.expect(key1 != key3); // different /24
+}
+
+test "subnet rate limit - IPv4-mapped IPv6 keys match native IPv4 /24" {
+    const native_v4 = net.Address.initIp4(.{ 203, 0, 113, 42 }, 443);
+
+    const mapped_bytes = [_]u8{0} ** 10 ++ [_]u8{ 0xff, 0xff } ++ [_]u8{ 203, 0, 113, 42 };
+    const mapped = net.Address.initIp6(mapped_bytes, 443, 0, 0);
+
+    const native_key = SubnetRateLimit.subnetKey(native_v4);
+    const mapped_key = SubnetRateLimit.subnetKey(mapped);
+    try std.testing.expectEqual(native_key, mapped_key);
+
+    const mapped_other_bytes = [_]u8{0} ** 10 ++ [_]u8{ 0xff, 0xff } ++ [_]u8{ 198, 51, 100, 1 };
+    const mapped_other = net.Address.initIp6(mapped_other_bytes, 443, 0, 0);
+    try std.testing.expect(SubnetRateLimit.subnetKey(mapped_other) != mapped_key);
+
+    const native6_bytes = [_]u8{ 0x20, 0x01, 0x0d, 0xb8 } ++ [_]u8{0} ** 12;
+    const native6 = net.Address.initIp6(native6_bytes, 443, 0, 0);
+    try std.testing.expect(SubnetRateLimit.subnetKey(native6) != mapped_key);
 }
 
 test "subnet rate limit - allows up to max then blocks" {
