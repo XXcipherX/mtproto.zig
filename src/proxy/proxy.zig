@@ -2489,118 +2489,120 @@ const EventLoop = struct {
                     return;
                 }
 
+                var enc_keys: struct { [32]u8, [16]u8 } = undefined;
+                var dec_keys: struct { [32]u8, [16]u8 } = undefined;
+                var middle_local_addr: net.Address = undefined;
+
                 self.state.middle_proxy_lock.lockShared();
-                const key_sel = self.state.middle_proxy_secret[0..@min(@as(usize, 4), self.state.middle_proxy_secret_len)];
-                const secret_slice = self.state.middle_proxy_secret[0..self.state.middle_proxy_secret_len];
-                if (!std.mem.eql(u8, payload[4..8], key_sel)) {
-                    self.state.middle_proxy_lock.unlockShared();
-                    self.closeSlot(slot, "mp key selector mismatch");
-                    return;
-                }
-                if (!std.mem.eql(u8, payload[8..12], &middleproxy.rpc_crypto_aes)) {
-                    self.state.middle_proxy_lock.unlockShared();
-                    self.closeSlot(slot, "mp crypto schema mismatch");
-                    return;
-                }
+                {
+                    defer self.state.middle_proxy_lock.unlockShared();
 
-                slot.mp_rpc_nonce_ans = payload[16..32][0..16].*;
-
-                var ts_arr: [4]u8 = undefined;
-                std.mem.writeInt(u32, &ts_arr, slot.mp_timestamp, .little);
-
-                var peer_addr: net.Address = undefined;
-                var peer_len: posix.socklen_t = @sizeOf(net.Address);
-                posix.getpeername(slot.upstream_fd, &peer_addr.any, &peer_len) catch {
-                    self.state.middle_proxy_lock.unlockShared();
-                    self.closeSlot(slot, "mp getpeername failed");
-                    return;
-                };
-
-                var local_addr: net.Address = undefined;
-                var local_len: posix.socklen_t = @sizeOf(net.Address);
-                posix.getsockname(slot.upstream_fd, &local_addr.any, &local_len) catch {
-                    self.state.middle_proxy_lock.unlockShared();
-                    self.closeSlot(slot, "mp getsockname failed");
-                    return;
-                };
-                var middle_local_addr = local_addr;
-
-                var tg_port: [2]u8 = undefined;
-                var my_port: [2]u8 = undefined;
-                var tg_ip_v4_opt: ?[4]u8 = null;
-                var my_ip_v4_opt: ?[4]u8 = null;
-                var tg_ip_v6_opt: ?[16]u8 = null;
-                var my_ip_v6_opt: ?[16]u8 = null;
-
-                if (peer_addr.any.family == posix.AF.INET and local_addr.any.family == posix.AF.INET) {
-                    var tg_ip_v4: [4]u8 = undefined;
-                    @memcpy(&tg_ip_v4, std.mem.asBytes(&peer_addr.in.sa.addr));
-                    std.mem.reverse(u8, &tg_ip_v4);
-                    tg_ip_v4_opt = tg_ip_v4;
-
-                    var my_ip_v4: [4]u8 = undefined;
-                    @memcpy(&my_ip_v4, std.mem.asBytes(&local_addr.in.sa.addr));
-                    std.mem.reverse(u8, &my_ip_v4);
-
-                    if (self.state.middle_proxy_nat_ip4) |nat_ip| {
-                        my_ip_v4 = ipv4NetworkToHostBytes(nat_ip);
-                        middle_local_addr = net.Address.initIp4(nat_ip, std.mem.bigToNative(u16, local_addr.in.sa.port));
+                    const key_sel = self.state.middle_proxy_secret[0..@min(@as(usize, 4), self.state.middle_proxy_secret_len)];
+                    const secret_slice = self.state.middle_proxy_secret[0..self.state.middle_proxy_secret_len];
+                    if (!std.mem.eql(u8, payload[4..8], key_sel)) {
+                        self.closeSlot(slot, "mp key selector mismatch");
+                        return;
+                    }
+                    if (!std.mem.eql(u8, payload[8..12], &middleproxy.rpc_crypto_aes)) {
+                        self.closeSlot(slot, "mp crypto schema mismatch");
+                        return;
                     }
 
-                    my_ip_v4_opt = my_ip_v4;
+                    slot.mp_rpc_nonce_ans = payload[16..32][0..16].*;
 
-                    std.mem.writeInt(u16, &tg_port, std.mem.bigToNative(u16, peer_addr.in.sa.port), .little);
-                    std.mem.writeInt(u16, &my_port, std.mem.bigToNative(u16, local_addr.in.sa.port), .little);
-                } else if (peer_addr.any.family == posix.AF.INET6 and local_addr.any.family == posix.AF.INET6) {
-                    var tg_ip_v6: [16]u8 = undefined;
-                    @memcpy(&tg_ip_v6, &peer_addr.in6.sa.addr);
-                    tg_ip_v6_opt = tg_ip_v6;
+                    var ts_arr: [4]u8 = undefined;
+                    std.mem.writeInt(u32, &ts_arr, slot.mp_timestamp, .little);
 
-                    var my_ip_v6: [16]u8 = undefined;
-                    @memcpy(&my_ip_v6, &local_addr.in6.sa.addr);
-                    my_ip_v6_opt = my_ip_v6;
+                    var peer_addr: net.Address = undefined;
+                    var peer_len: posix.socklen_t = @sizeOf(net.Address);
+                    posix.getpeername(slot.upstream_fd, &peer_addr.any, &peer_len) catch {
+                        self.closeSlot(slot, "mp getpeername failed");
+                        return;
+                    };
 
-                    std.mem.writeInt(u16, &tg_port, std.mem.bigToNative(u16, peer_addr.in6.sa.port), .little);
-                    std.mem.writeInt(u16, &my_port, std.mem.bigToNative(u16, local_addr.in6.sa.port), .little);
-                } else {
-                    self.state.middle_proxy_lock.unlockShared();
-                    self.closeSlot(slot, "mp unsupported addr family");
-                    return;
+                    var local_addr: net.Address = undefined;
+                    var local_len: posix.socklen_t = @sizeOf(net.Address);
+                    posix.getsockname(slot.upstream_fd, &local_addr.any, &local_len) catch {
+                        self.closeSlot(slot, "mp getsockname failed");
+                        return;
+                    };
+                    middle_local_addr = local_addr;
+
+                    var tg_port: [2]u8 = undefined;
+                    var my_port: [2]u8 = undefined;
+                    var tg_ip_v4_opt: ?[4]u8 = null;
+                    var my_ip_v4_opt: ?[4]u8 = null;
+                    var tg_ip_v6_opt: ?[16]u8 = null;
+                    var my_ip_v6_opt: ?[16]u8 = null;
+
+                    if (peer_addr.any.family == posix.AF.INET and local_addr.any.family == posix.AF.INET) {
+                        var tg_ip_v4: [4]u8 = undefined;
+                        @memcpy(&tg_ip_v4, std.mem.asBytes(&peer_addr.in.sa.addr));
+                        std.mem.reverse(u8, &tg_ip_v4);
+                        tg_ip_v4_opt = tg_ip_v4;
+
+                        var my_ip_v4: [4]u8 = undefined;
+                        @memcpy(&my_ip_v4, std.mem.asBytes(&local_addr.in.sa.addr));
+                        std.mem.reverse(u8, &my_ip_v4);
+
+                        if (self.state.middle_proxy_nat_ip4) |nat_ip| {
+                            my_ip_v4 = ipv4NetworkToHostBytes(nat_ip);
+                            middle_local_addr = net.Address.initIp4(nat_ip, std.mem.bigToNative(u16, local_addr.in.sa.port));
+                        }
+
+                        my_ip_v4_opt = my_ip_v4;
+
+                        std.mem.writeInt(u16, &tg_port, std.mem.bigToNative(u16, peer_addr.in.sa.port), .little);
+                        std.mem.writeInt(u16, &my_port, std.mem.bigToNative(u16, local_addr.in.sa.port), .little);
+                    } else if (peer_addr.any.family == posix.AF.INET6 and local_addr.any.family == posix.AF.INET6) {
+                        var tg_ip_v6: [16]u8 = undefined;
+                        @memcpy(&tg_ip_v6, &peer_addr.in6.sa.addr);
+                        tg_ip_v6_opt = tg_ip_v6;
+
+                        var my_ip_v6: [16]u8 = undefined;
+                        @memcpy(&my_ip_v6, &local_addr.in6.sa.addr);
+                        my_ip_v6_opt = my_ip_v6;
+
+                        std.mem.writeInt(u16, &tg_port, std.mem.bigToNative(u16, peer_addr.in6.sa.port), .little);
+                        std.mem.writeInt(u16, &my_port, std.mem.bigToNative(u16, local_addr.in6.sa.port), .little);
+                    } else {
+                        self.closeSlot(slot, "mp unsupported addr family");
+                        return;
+                    }
+
+                    const tg_ip_v4_ptr: ?*const [4]u8 = if (tg_ip_v4_opt) |*ip| ip else null;
+                    const my_ip_v4_ptr: ?*const [4]u8 = if (my_ip_v4_opt) |*ip| ip else null;
+                    const my_ip_v6_ptr: ?*const [16]u8 = if (my_ip_v6_opt) |*ip| ip else null;
+                    const tg_ip_v6_ptr: ?*const [16]u8 = if (tg_ip_v6_opt) |*ip| ip else null;
+
+                    enc_keys = middleproxy.getAesKeyAndIv(
+                        &slot.mp_rpc_nonce_ans,
+                        &slot.mp_nonce,
+                        &ts_arr,
+                        tg_ip_v4_ptr,
+                        &my_port,
+                        "CLIENT",
+                        my_ip_v4_ptr,
+                        &tg_port,
+                        secret_slice,
+                        my_ip_v6_ptr,
+                        tg_ip_v6_ptr,
+                    );
+
+                    dec_keys = middleproxy.getAesKeyAndIv(
+                        &slot.mp_rpc_nonce_ans,
+                        &slot.mp_nonce,
+                        &ts_arr,
+                        tg_ip_v4_ptr,
+                        &my_port,
+                        "SERVER",
+                        my_ip_v4_ptr,
+                        &tg_port,
+                        secret_slice,
+                        my_ip_v6_ptr,
+                        tg_ip_v6_ptr,
+                    );
                 }
-
-                const tg_ip_v4_ptr: ?*const [4]u8 = if (tg_ip_v4_opt) |*ip| ip else null;
-                const my_ip_v4_ptr: ?*const [4]u8 = if (my_ip_v4_opt) |*ip| ip else null;
-                const my_ip_v6_ptr: ?*const [16]u8 = if (my_ip_v6_opt) |*ip| ip else null;
-                const tg_ip_v6_ptr: ?*const [16]u8 = if (tg_ip_v6_opt) |*ip| ip else null;
-
-                const enc_keys = middleproxy.getAesKeyAndIv(
-                    &slot.mp_rpc_nonce_ans,
-                    &slot.mp_nonce,
-                    &ts_arr,
-                    tg_ip_v4_ptr,
-                    &my_port,
-                    "CLIENT",
-                    my_ip_v4_ptr,
-                    &tg_port,
-                    secret_slice,
-                    my_ip_v6_ptr,
-                    tg_ip_v6_ptr,
-                );
-
-                const dec_keys = middleproxy.getAesKeyAndIv(
-                    &slot.mp_rpc_nonce_ans,
-                    &slot.mp_nonce,
-                    &ts_arr,
-                    tg_ip_v4_ptr,
-                    &my_port,
-                    "SERVER",
-                    my_ip_v4_ptr,
-                    &tg_port,
-                    secret_slice,
-                    my_ip_v6_ptr,
-                    tg_ip_v6_ptr,
-                );
-                self.state.middle_proxy_lock.unlockShared();
 
                 slot.mp_enc = crypto.AesCbc.init(&enc_keys[0], &enc_keys[1]);
                 slot.mp_dec = crypto.AesCbc.init(&dec_keys[0], &dec_keys[1]);
