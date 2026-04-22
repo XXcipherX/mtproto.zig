@@ -84,7 +84,7 @@ pub const Config = struct {
     }
 
     pub fn userBypassesMiddleProxy(self: *const Config, user_name: []const u8) bool {
-        return self.direct_users.contains(user_name);
+        return self.users.contains(user_name) and self.direct_users.contains(user_name);
     }
 
     /// Emit startup warnings for configuration values known to cause issues.
@@ -428,7 +428,7 @@ test "parse config - direct users allowlist" {
     try std.testing.expectEqual(@as(usize, 2), cfg.direct_users.count());
     try std.testing.expect(cfg.userBypassesMiddleProxy("admin"));
     try std.testing.expect(!cfg.userBypassesMiddleProxy("regular"));
-    try std.testing.expect(cfg.userBypassesMiddleProxy("ghost"));
+    try std.testing.expect(!cfg.userBypassesMiddleProxy("ghost"));
 }
 
 test "parse config - access admins alias" {
