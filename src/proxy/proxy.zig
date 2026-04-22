@@ -18,6 +18,8 @@ const Config = @import("../config.zig").Config;
 
 const log = std.log.scoped(.proxy);
 
+const http_fetch_timeout_sec: u32 = 10;
+
 const tls_header_len = 5;
 const event_loop_wait_ms = 37;
 const accept_backoff_ms: i64 = 500;
@@ -3441,6 +3443,11 @@ fn fetchUrlBytes(allocator: std.mem.Allocator, url: []const u8) ![]u8 {
         },
     });
     defer req.deinit();
+    if (req.connection) |connection| {
+        setSendTimeout(connection.stream_reader.getStream().handle, http_fetch_timeout_sec);
+        const tv = posix.timeval{ .sec = @intCast(http_fetch_timeout_sec), .usec = 0 };
+        posix.setsockopt(connection.stream_reader.getStream().handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
+    }
 
     try req.sendBodiless();
 

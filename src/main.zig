@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const posix = std.posix;
 const constants = @import("protocol/constants.zig");
 const crypto = @import("crypto/crypto.zig");
 const obfuscation = @import("protocol/obfuscation.zig");
@@ -79,6 +80,14 @@ fn writeRaw(s: []const u8) void {
 
 // ============= Public IP Detection =============
 
+const http_fetch_timeout_sec: u32 = 10;
+
+fn setHttpFetchTimeout(fd: posix.fd_t, timeout_sec: u32) void {
+    const tv = posix.timeval{ .sec = @intCast(timeout_sec), .usec = 0 };
+    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch return;
+    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch return;
+}
+
 fn fetchUrlBytes(allocator: std.mem.Allocator, url: []const u8) ![]u8 {
     const uri = try std.Uri.parse(url);
 
@@ -93,6 +102,9 @@ fn fetchUrlBytes(allocator: std.mem.Allocator, url: []const u8) ![]u8 {
         },
     });
     defer req.deinit();
+    if (req.connection) |connection| {
+        setHttpFetchTimeout(connection.stream_reader.getStream().handle, http_fetch_timeout_sec);
+    }
 
     try req.sendBodiless();
 
