@@ -131,6 +131,34 @@ pub const Config = struct {
         return parse(allocator, content);
     }
 
+    fn stripInlineComment(value: []const u8) []const u8 {
+        var in_quotes = false;
+        var escaped = false;
+
+        for (value, 0..) |ch, idx| {
+            if (escaped) {
+                escaped = false;
+                continue;
+            }
+
+            if (in_quotes and ch == '\\') {
+                escaped = true;
+                continue;
+            }
+
+            if (ch == '"') {
+                in_quotes = !in_quotes;
+                continue;
+            }
+
+            if (!in_quotes and (ch == '#' or ch == ';')) {
+                return std.mem.trimRight(u8, value[0..idx], &[_]u8{ ' ', '\t' });
+            }
+        }
+
+        return std.mem.trimRight(u8, value, &[_]u8{ ' ', '\t' });
+    }
+
     pub fn parse(allocator: std.mem.Allocator, content: []const u8) !Config {
         var cfg = Config{
             .users = std.StringHashMap([16]u8).init(allocator),
@@ -165,6 +193,7 @@ pub const Config = struct {
             if (std.mem.indexOfScalar(u8, line, '=')) |eq_pos| {
                 const key = std.mem.trim(u8, line[0..eq_pos], &[_]u8{ ' ', '\t' });
                 var value = std.mem.trim(u8, line[eq_pos + 1 ..], &[_]u8{ ' ', '\t' });
+                value = stripInlineComment(value);
 
                 // Strip quotes from value
                 if (value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"') {
@@ -534,6 +563,30 @@ test "parse config - spaces and tabs" {
     try std.testing.expectEqual(@as(u16, 9999), cfg.port);
     try std.testing.expectEqualStrings("test.com", cfg.tls_domain);
     try std.testing.expect(cfg.users.contains("user"));
+}
+
+test "parse config - inline comments after values" {
+    const content =
+        \\[server]
+        \\port = 8443 # dashboard port
+        \\middleproxy_buffer_kb = 192 ; keep below default in test
+        \\unsafe_override_limits = true # explicit override
+        \\public_ip = "proxy.example.com" # keep quoted strings working
+        \\[general]
+        \\force_media_middle_proxy = false ; disable media MP
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff" # main user
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 8443), cfg.port);
+    try std.testing.expectEqual(@as(u32, 192), cfg.middleproxy_buffer_kb);
+    try std.testing.expect(cfg.unsafe_override_limits);
+    try std.testing.expect(!cfg.force_media_middle_proxy);
+    try std.testing.expectEqualStrings("proxy.example.com", cfg.public_ip.?);
+    try std.testing.expectEqual(@as(usize, 1), cfg.users.count());
 }
 
 test "parse config - invalid hex secret skipped" {
