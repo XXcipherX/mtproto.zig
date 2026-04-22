@@ -2061,9 +2061,11 @@ const EventLoop = struct {
 
     fn onUpstreamConnectComplete(self: *EventLoop, slot: *ConnectionSlot) void {
         if (posix.getsockoptError(slot.upstream_fd)) |_| {} else |err| {
+            const failed_kind = slot.upstream_kind;
+            const failed_addr = slot.current_upstream_addr;
             self.cleanupFailedUpstreamConnect(slot);
 
-            if (slot.upstream_kind == .dc and self.tryNextDcEndpoint(slot, err)) {
+            if (failed_kind == .dc and self.tryNextDcEndpoint(slot, err, failed_addr)) {
                 return;
             }
 
@@ -2118,8 +2120,7 @@ const EventLoop = struct {
         slot.upstream_queue.clear();
     }
 
-    fn tryNextDcEndpoint(self: *EventLoop, slot: *ConnectionSlot, err: anyerror) bool {
-        const attempt_addr = slot.current_upstream_addr;
+    fn tryNextDcEndpoint(self: *EventLoop, slot: *ConnectionSlot, err: anyerror, attempt_addr: ?net.Address) bool {
         const candidates = slot.upstream_candidates orelse return false;
         const candidate_count = slotCandidateCount(slot);
 
@@ -2134,7 +2135,7 @@ const EventLoop = struct {
                     candidate_count,
                     next_err,
                 });
-                return self.tryNextDcEndpoint(slot, next_err);
+                return self.tryNextDcEndpoint(slot, next_err, next_addr);
             };
 
             if (attempt_addr) |addr| {
