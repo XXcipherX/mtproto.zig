@@ -412,12 +412,10 @@ pub const MiddleProxyContext = struct {
             }
 
             if (frame_len < 12 or frame_len > (1 << 24)) {
-                // Do not hard-fail on bad len; drop current decrypted window and resync.
-                // This matches telemt strategy and avoids tearing down long-lived sessions
-                // due to a single malformed/partial decrypted window.
-                self.s2c_len = 0;
-                self.s2c_decrypted_len = 0;
-                break;
+                // AES-CBC decryption is stateful across records, so dropping the current
+                // window without rewinding the chaining IV cannot produce a safe resync.
+                // Fail closed instead of continuing with corrupted stream state.
+                return error.BadMiddleProxyFrameLen;
             }
 
             if (self.s2c_decrypted_len - parse_pos < frame_len) {
@@ -772,6 +770,37 @@ test "decapsulate s2c validates seq and checksum" {
     try enc.encryptInPlace(wire2[0..]);
 
     try std.testing.expectError(error.BadMiddleProxySeqNo, ctx.decapsulateS2C(wire2[0..], out_buf[0..]));
+}
+
+test "decapsulate s2c rejects invalid frame length instead of resyncing" {
+    const allocator = std.testing.allocator;
+
+    const key = [_]u8{0} ** 32;
+    const iv = [_]u8{0} ** 16;
+
+    var ctx = try MiddleProxyContext.init(
+        allocator,
+        crypto.AesCbc.init(&key, &iv),
+        crypto.AesCbc.init(&key, &iv),
+        [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 },
+        -2,
+        std.net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
+        std.net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
+        .intermediate,
+        null,
+    );
+    defer ctx.deinit(allocator);
+
+    var plain: [16]u8 = undefined;
+    std.mem.writeInt(u32, plain[0..4], 8, .little);
+    @memset(plain[4..], 0);
+
+    var enc = crypto.AesCbc.init(&key, &iv);
+    var wire = plain;
+    try enc.encryptInPlace(wire[0..]);
+
+    var out_buf: [64]u8 = undefined;
+    try std.testing.expectError(error.BadMiddleProxyFrameLen, ctx.decapsulateS2C(wire[0..], out_buf[0..]));
 }
 
 test "encapsulate c2s supports payloads larger than 64KiB" {
