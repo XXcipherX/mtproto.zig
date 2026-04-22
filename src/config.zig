@@ -47,8 +47,9 @@ pub const Config = struct {
     /// Fast mode: skip S2C encryption by passing client keys to DC directly
     fast_mode: bool = false,
     /// MiddleProxy stream buffer size in KiB.
-    /// In current design, each connection keeps 2 such buffers and EventLoop
-    /// keeps 2 shared scratch buffers.
+    /// In current design, each active MiddleProxy connection keeps 2 such
+    /// buffers, while EventLoop also keeps shared C2S/S2C scratch space for
+    /// framing and decrypt/encrypt staging.
     /// Minimum 1024 recommended — lower values cause MiddleProxyBufferOverflow on media
     /// downloads (Stories, video messages) through middle proxy.
     middleproxy_buffer_kb: u32 = 1024,
@@ -64,8 +65,22 @@ pub const Config = struct {
     /// Test-only hook to redirect upstream connections locally
     datacenter_override: ?std.net.Address = null,
 
+    pub const middle_proxy_c2s_scratch_expansion: usize = 96;
+
     pub fn middleProxyBufferBytes(self: *const Config) usize {
         return @as(usize, self.middleproxy_buffer_kb) * 1024;
+    }
+
+    pub fn usesAnyMiddleProxy(self: *const Config) bool {
+        return self.use_middle_proxy or self.force_media_middle_proxy;
+    }
+
+    pub fn middleProxyC2sScratchBytes(self: *const Config) usize {
+        return self.middleProxyBufferBytes() * middle_proxy_c2s_scratch_expansion + 256;
+    }
+
+    pub fn middleProxySharedScratchBytes(self: *const Config) usize {
+        return self.middleProxyC2sScratchBytes() + self.middleProxyBufferBytes();
     }
 
     pub fn userBypassesMiddleProxy(self: *const Config, user_name: []const u8) bool {
@@ -74,7 +89,7 @@ pub const Config = struct {
 
     /// Emit startup warnings for configuration values known to cause issues.
     pub fn emitWarnings(self: *const Config) void {
-        if (self.use_middle_proxy and self.middleproxy_buffer_kb < 1024) {
+        if (self.usesAnyMiddleProxy() and self.middleproxy_buffer_kb < 1024) {
             const log = std.log.scoped(.config);
             log.warn(
                 "middleproxy_buffer_kb={d} is below recommended minimum (1024). " ++
@@ -83,10 +98,10 @@ pub const Config = struct {
                 .{self.middleproxy_buffer_kb},
             );
         }
-        if (self.use_middle_proxy and self.max_connections > 2000) {
+        if (self.usesAnyMiddleProxy() and self.max_connections > 2000) {
             const log = std.log.scoped(.config);
             const mem_per_conn_mb = (self.middleProxyBufferBytes() * 2) / (1024 * 1024);
-            const shared_mb = (self.middleProxyBufferBytes() * 2) / (1024 * 1024);
+            const shared_mb = self.middleProxySharedScratchBytes() / (1024 * 1024);
             log.warn(
                 "max_connections={d} with middleproxy_buffer_kb={d} may require " ++
                     "up to {d} MB + {d} MB shared RAM at full capacity. Ensure your VPS has sufficient memory.",
@@ -399,6 +414,21 @@ test "parse config - access admins alias" {
     defer cfg.deinit(std.testing.allocator);
 
     try std.testing.expect(cfg.userBypassesMiddleProxy("alice"));
+}
+
+test "middle proxy scratch helpers cover media-only mode" {
+    var cfg = Config{
+        .users = std.StringHashMap([16]u8).init(std.testing.allocator),
+        .direct_users = std.StringHashMap(void).init(std.testing.allocator),
+        .use_middle_proxy = false,
+        .force_media_middle_proxy = true,
+        .middleproxy_buffer_kb = 1024,
+    };
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expect(cfg.usesAnyMiddleProxy());
+    try std.testing.expectEqual(@as(usize, 1024 * 1024 * 96 + 256), cfg.middleProxyC2sScratchBytes());
+    try std.testing.expectEqual(@as(usize, 1024 * 1024 * 97 + 256), cfg.middleProxySharedScratchBytes());
 }
 
 test "parse config - middleproxy buffer size" {

@@ -180,14 +180,15 @@ fn estimateCapacity(cfg: *const config.Config, total_ram_bytes: u64) CapacityEst
     // - optional middle-proxy stream buffers (2 per-connection buffers)
     // - allocator/socket bookkeeping cushion
     const tls_working_bytes: u64 = @intCast(6 * 1024);
-    const middleproxy_per_conn_bytes: u64 = if (cfg.use_middle_proxy)
+    const uses_middle_proxy = cfg.usesAnyMiddleProxy();
+    const middleproxy_per_conn_bytes: u64 = if (uses_middle_proxy)
         @intCast(cfg.middleProxyBufferBytes() * 2)
     else
         0;
-    // Event loop also keeps 2 shared scratch buffers for middle-proxy
-    // encapsulate/decapsulate temporary output.
-    const middleproxy_shared_bytes: u64 = if (cfg.use_middle_proxy)
-        @intCast(cfg.middleProxyBufferBytes() * 2)
+    // Event loop also keeps shared C2S/S2C scratch for middle-proxy paths.
+    // Media-only middle-proxy mode still needs that shared budget.
+    const middleproxy_shared_bytes: u64 = if (uses_middle_proxy)
+        @intCast(cfg.middleProxySharedScratchBytes())
     else
         0;
     const overhead_bytes: u64 = 2 * 1024;
@@ -471,4 +472,31 @@ test "capacity safety clamp keeps configured limit when override enabled" {
 
     try enforceCapacitySafety(&cfg, est);
     try std.testing.expectEqual(@as(u32, 4096), cfg.max_connections);
+}
+
+test "capacity estimate accounts for media-only middle proxy overhead" {
+    var direct_cfg = config.Config{
+        .users = std.StringHashMap([16]u8).init(std.testing.allocator),
+        .direct_users = std.StringHashMap(void).init(std.testing.allocator),
+        .use_middle_proxy = false,
+        .force_media_middle_proxy = false,
+        .middleproxy_buffer_kb = 1024,
+    };
+    defer direct_cfg.deinit(std.testing.allocator);
+
+    var media_cfg = config.Config{
+        .users = std.StringHashMap([16]u8).init(std.testing.allocator),
+        .direct_users = std.StringHashMap(void).init(std.testing.allocator),
+        .use_middle_proxy = false,
+        .force_media_middle_proxy = true,
+        .middleproxy_buffer_kb = 1024,
+    };
+    defer media_cfg.deinit(std.testing.allocator);
+
+    const total_ram_bytes: u64 = 2 * 1024 * 1024 * 1024;
+    const direct_est = estimateCapacity(&direct_cfg, total_ram_bytes);
+    const media_est = estimateCapacity(&media_cfg, total_ram_bytes);
+
+    try std.testing.expect(media_est.per_conn_bytes > direct_est.per_conn_bytes);
+    try std.testing.expect(media_est.safe_connections < direct_est.safe_connections);
 }

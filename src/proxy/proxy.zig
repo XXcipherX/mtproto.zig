@@ -3059,8 +3059,7 @@ const EventLoop = struct {
 
     fn ensureMpC2sScratch(self: *EventLoop) ![]u8 {
         if (self.mp_c2s_scratch) |buf| return buf;
-        const mp_max_expansion: usize = 96;
-        const capacity = self.state.config.middleProxyBufferBytes() * mp_max_expansion + 256;
+        const capacity = self.state.config.middleProxyC2sScratchBytes();
         const buf = try self.state.allocator.alloc(u8, capacity);
         self.mp_c2s_scratch = buf;
         return buf;
