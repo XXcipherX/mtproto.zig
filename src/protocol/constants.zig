@@ -46,6 +46,9 @@ pub const tg_media_middle_proxies_v4 = [5]std.net.Address{
 
 /// Resolves physical Datacenter IP by its index, handling special media DCs.
 pub fn getDcAddressV4(abs_dc: usize) std.net.Address {
+    if (abs_dc == 0) {
+        return tg_datacenters_v4[0];
+    }
     if (abs_dc == 203) {
         // Media DC 203 has a dedicated network, resolving to MiddleProxy IP
         return std.net.Address.initIp4(.{ 91, 105, 192, 110 }, tg_datacenter_port);
@@ -163,4 +166,8 @@ test "proto tag roundtrip" {
 test "invalid proto tag" {
     try std.testing.expect(ProtoTag.fromBytes(.{ 0, 0, 0, 0 }) == null);
     try std.testing.expect(ProtoTag.fromBytes(.{ 0xff, 0xff, 0xff, 0xff }) == null);
+}
+
+test "getDcAddressV4 handles zero index defensively" {
+    try std.testing.expect(getDcAddressV4(0).eql(tg_datacenters_v4[0]));
 }
