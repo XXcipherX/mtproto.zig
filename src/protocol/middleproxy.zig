@@ -1088,6 +1088,10 @@ test "middle proxy context grows s2c buffer on demand within configured cap" {
     @memset(plain[24 .. 24 + conn_data_len], 0x5a);
     const checksum = crc32(plain[0 .. total_len - 4]);
     std.mem.writeInt(u32, plain[total_len - 4 .. total_len], checksum, .little);
+    var pad_off = total_len;
+    while (pad_off < padded_len) : (pad_off += 4) {
+        std.mem.writeInt(u32, plain[pad_off..][0..4], 4, .little);
+    }
 
     var enc = crypto.AesCbc.init(&key, &iv);
     try enc.encryptInPlace(plain);
