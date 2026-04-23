@@ -5,9 +5,9 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const posix = std.posix;
 const constants = @import("protocol/constants.zig");
 const crypto = @import("crypto/crypto.zig");
+const http_fetch = @import("http_fetch.zig");
 const obfuscation = @import("protocol/obfuscation.zig");
 const tls = @import("protocol/tls.zig");
 const config = @import("config.zig");
@@ -80,43 +80,6 @@ fn writeRaw(s: []const u8) void {
 
 // ============= Public IP Detection =============
 
-const http_fetch_timeout_sec: u32 = 10;
-
-fn setHttpFetchTimeout(fd: posix.fd_t, timeout_sec: u32) void {
-    const tv = posix.timeval{ .sec = @intCast(timeout_sec), .usec = 0 };
-    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch return;
-    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch return;
-}
-
-fn fetchUrlBytes(allocator: std.mem.Allocator, url: []const u8) ![]u8 {
-    const uri = try std.Uri.parse(url);
-
-    var client: std.http.Client = .{ .allocator = allocator };
-    defer client.deinit();
-
-    var req = try client.request(.GET, uri, .{
-        .redirect_behavior = @enumFromInt(3),
-        .keep_alive = false,
-        .headers = .{
-            .accept_encoding = .{ .override = "identity" },
-        },
-    });
-    defer req.deinit();
-    if (req.connection) |connection| {
-        setHttpFetchTimeout(connection.stream_reader.getStream().handle, http_fetch_timeout_sec);
-    }
-
-    try req.sendBodiless();
-
-    var redirect_buf: [8 * 1024]u8 = undefined;
-    var response = try req.receiveHead(&redirect_buf);
-    if (response.head.status.class() != .success) return error.HttpRequestFailed;
-
-    var transfer_buf: [4 * 1024]u8 = undefined;
-    const reader = response.reader(&transfer_buf);
-    return reader.allocRemaining(allocator, .limited(64 * 1024));
-}
-
 /// Try to detect the server's public IP address via external services.
 /// Returns the IP string (caller owns memory) or null on failure.
 fn detectPublicIp(allocator: std.mem.Allocator) ?[]const u8 {
@@ -128,7 +91,11 @@ fn detectPublicIp(allocator: std.mem.Allocator) ?[]const u8 {
     };
 
     for (services) |url| {
-        const stdout = fetchUrlBytes(allocator, url) catch continue;
+        const stdout = http_fetch.fetchUrlBytes(
+            allocator,
+            url,
+            .{ .max_response_bytes = 64 * 1024 },
+        ) catch continue;
         // Trim whitespace/newlines
         const trimmed = std.mem.trim(u8, stdout, &[_]u8{ ' ', '\t', '\n', '\r' });
         if (trimmed.len == 0 or trimmed.len > 45) {

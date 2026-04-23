@@ -11,14 +11,13 @@ const linux = std.os.linux;
 
 const constants = @import("../protocol/constants.zig");
 const crypto = @import("../crypto/crypto.zig");
+const http_fetch = @import("../http_fetch.zig");
 const obfuscation = @import("../protocol/obfuscation.zig");
 const middleproxy = @import("../protocol/middleproxy.zig");
 const tls = @import("../protocol/tls.zig");
 const Config = @import("../config.zig").Config;
 
 const log = std.log.scoped(.proxy);
-
-const http_fetch_timeout_sec: u32 = 10;
 
 const tls_header_len = 5;
 const event_loop_wait_ms = 37;
@@ -298,11 +297,6 @@ const MessageQueue = struct {
             self.total_len += take;
             off += take;
         }
-    }
-
-    fn appendOwned(self: *MessageQueue, owned: []u8) !void {
-        defer self.allocator.free(owned);
-        try self.appendCopy(owned);
     }
 
     fn prepareIovecs(self: *const MessageQueue, out: []posix.iovec_const) usize {
@@ -1141,7 +1135,11 @@ pub const ProxyState = struct {
     }
 
     fn refreshMiddleProxyInfo(self: *ProxyState) !void {
-        const cfg_bytes = try fetchUrlBytes(self.allocator, middle_proxy_config_url);
+        const cfg_bytes = try http_fetch.fetchUrlBytes(
+            self.allocator,
+            middle_proxy_config_url,
+            .{ .max_response_bytes = 1 * 1024 * 1024 },
+        );
         defer self.allocator.free(cfg_bytes);
 
         var next_primary: [5]?net.Address = [_]?net.Address{null} ** 5;
@@ -1201,7 +1199,11 @@ pub const ProxyState = struct {
         }
         const next_addr_203 = if (count_203 == 0) null else candidates_203[0];
 
-        const next_secret = try fetchUrlBytes(self.allocator, middle_proxy_secret_url);
+        const next_secret = try http_fetch.fetchUrlBytes(
+            self.allocator,
+            middle_proxy_secret_url,
+            .{ .max_response_bytes = 1 * 1024 * 1024 },
+        );
         defer self.allocator.free(next_secret);
 
         if (next_secret.len < 16 or next_secret.len > self.middle_proxy_secret.len) {
@@ -1663,7 +1665,7 @@ const EventLoop = struct {
 
     fn onClientWritable(self: *EventLoop, slot: *ConnectionSlot) void {
         const had_pending = slot.hasClientPending();
-        if (flushClientPending(slot, self.state.allocator)) |progressed| {
+        if (flushClientPending(slot)) |progressed| {
             if (!progressed) {}
         } else |err| {
             log.debug("[{d}] client flush error: {any}", .{ slot.conn_id, err });
@@ -1713,7 +1715,7 @@ const EventLoop = struct {
             .connecting_upstream => self.onUpstreamConnectComplete(slot),
             .writing_dc_nonce, .relaying, .mask_relaying, .middle_proxy_handshake => {
                 const had_pending = slot.hasUpstreamPending();
-                if (flushUpstreamPending(slot, self.state.allocator)) |_| {} else |err| {
+                if (flushUpstreamPending(slot)) |_| {} else |err| {
                     log.debug("[{d}] upstream flush error: {any}", .{ slot.conn_id, err });
                     self.closeSlot(slot, "upstream flush error");
                     return;
@@ -1743,7 +1745,7 @@ const EventLoop = struct {
 
     fn onDcNonceWritable(self: *EventLoop, slot: *ConnectionSlot) void {
         if (slot.dc_initial_tail) |tail| {
-            if (queueUpstream(slot, self.state.allocator, tail)) |_| {
+            if (queueUpstream(slot, tail)) |_| {
                 self.state.allocator.free(tail);
                 slot.dc_initial_tail = null;
             } else |err| {
@@ -1888,14 +1890,14 @@ const EventLoop = struct {
         if (self.state.config.desync and slot.server_hello.?.len > 1) {
             slot.phase = .writing_server_hello_first;
             const one = slot.server_hello.?[0..1];
-            if (queueClient(slot, self.state.allocator, one)) |_| {} else |_| {
+            if (queueClient(slot, one)) |_| {} else |_| {
                 self.closeSlot(slot, "queue first desync byte failed");
                 return;
             }
             slot.server_hello_off = 1;
         } else {
             slot.phase = .writing_server_hello_rest;
-            if (queueClient(slot, self.state.allocator, slot.server_hello.?)) |_| {} else |_| {
+            if (queueClient(slot, slot.server_hello.?)) |_| {} else |_| {
                 self.closeSlot(slot, "queue server hello failed");
                 return;
             }
@@ -2151,7 +2153,7 @@ const EventLoop = struct {
 
         if (slot.upstream_kind == .mask) {
             if (slot.mask_prebuffer) |pre| {
-                if (queueUpstream(slot, self.state.allocator, pre)) |_| {
+                if (queueUpstream(slot, pre)) |_| {
                     self.state.allocator.free(pre);
                     slot.mask_prebuffer = null;
                 } else |err| {
@@ -2292,7 +2294,7 @@ const EventLoop = struct {
         @memcpy(nonce_to_send[0..constants.proto_tag_pos], tg_nonce[0..constants.proto_tag_pos]);
         @memcpy(nonce_to_send[constants.proto_tag_pos..], encrypted_nonce[constants.proto_tag_pos..]);
 
-        if (queueUpstream(slot, self.state.allocator, &nonce_to_send)) |_| {} else |err| {
+        if (queueUpstream(slot, &nonce_to_send)) |_| {} else |err| {
             log.debug("[{d}] queue dc nonce failed: {any}", .{ slot.conn_id, err });
             self.closeSlot(slot, "queue dc nonce failed");
             return;
@@ -2365,14 +2367,14 @@ const EventLoop = struct {
                     return;
                 };
                 if (out_data.len > 0) {
-                    _ = queueUpstream(slot, self.state.allocator, out_data) catch {
+                    _ = queueUpstream(slot, out_data) catch {
                         self.closeSlot(slot, "queue pipelined middleproxy payload failed");
                         return;
                     };
                 }
             } else if (slot.tg_encryptor) |*enc| {
                 enc.apply(buf);
-                _ = queueUpstream(slot, self.state.allocator, buf) catch {
+                _ = queueUpstream(slot, buf) catch {
                     self.closeSlot(slot, "queue pipelined direct payload failed");
                     return;
                 };
@@ -2444,7 +2446,7 @@ const EventLoop = struct {
             return;
         }
 
-        _ = queueUpstream(slot, self.state.allocator, read_buf[0..n]) catch {
+        _ = queueUpstream(slot, read_buf[0..n]) catch {
             slot.phase = .closing;
             return;
         };
@@ -2468,7 +2470,7 @@ const EventLoop = struct {
             return;
         }
 
-        _ = queueClient(slot, self.state.allocator, read_buf[0..n]) catch {
+        _ = queueClient(slot, read_buf[0..n]) catch {
             slot.phase = .closing;
             return;
         };
@@ -2842,7 +2844,7 @@ const EventLoop = struct {
             try slot.mp_enc.?.encryptInPlace(plain[0..frame_len]);
         }
 
-        _ = try queueUpstream(slot, self.state.allocator, plain[0..frame_len]);
+        _ = try queueUpstream(slot, plain[0..frame_len]);
     }
 
     fn mpTryReadFrame(self: *EventLoop, slot: *ConnectionSlot, encrypted: bool) !?[]const u8 {
@@ -3007,7 +3009,7 @@ const EventLoop = struct {
                 slot.phase = .writing_server_hello_rest;
                 if (slot.server_hello) |sh| {
                     if (slot.server_hello_off < sh.len) {
-                        if (queueClient(slot, self.state.allocator, sh[slot.server_hello_off..])) |_| {} else |_| {
+                        if (queueClient(slot, sh[slot.server_hello_off..])) |_| {} else |_| {
                             self.closeSlot(slot, "desync rest write failed");
                             continue;
                         }
@@ -3303,11 +3305,11 @@ fn relayClientToUpstreamStep(self: *EventLoop, slot: *ConnectionSlot) !RelayProg
             const scratch = try self.ensureMpC2sScratch(required);
             const out_data = try mp.encapsulateC2S(payload, scratch);
             if (out_data.len > 0) {
-                _ = try queueUpstream(slot, allocator, out_data);
+                _ = try queueUpstream(slot, out_data);
             }
         } else if (slot.tg_encryptor) |*enc| {
             enc.apply(payload);
-            _ = try queueUpstream(slot, allocator, payload);
+            _ = try queueUpstream(slot, payload);
         }
 
         slot.c2s_bytes += payload.len;
@@ -3338,7 +3340,7 @@ fn relayUpstreamToClientStep(slot: *ConnectionSlot, allocator: std.mem.Allocator
         const payload = try mp.decapsulateS2C(raw, scratch);
         if (payload.len == 0) return .partial;
         if (slot.client_encryptor) |*enc| enc.apply(payload);
-        try queueTlsAppRecords(slot, allocator, payload);
+        try queueTlsAppRecords(slot, payload);
         slot.s2c_bytes += payload.len;
         return .forwarded;
     }
@@ -3348,12 +3350,12 @@ fn relayUpstreamToClientStep(slot: *ConnectionSlot, allocator: std.mem.Allocator
         if (slot.client_encryptor) |*enc| enc.apply(raw);
     }
 
-    try queueTlsAppRecords(slot, allocator, raw);
+    try queueTlsAppRecords(slot, raw);
     slot.s2c_bytes += raw.len;
     return .forwarded;
 }
 
-fn queueTlsAppRecords(slot: *ConnectionSlot, allocator: std.mem.Allocator, payload: []u8) !void {
+fn queueTlsAppRecords(slot: *ConnectionSlot, payload: []u8) !void {
     var off: usize = 0;
     var header: [tls_header_len]u8 = undefined;
 
@@ -3365,7 +3367,7 @@ fn queueTlsAppRecords(slot: *ConnectionSlot, allocator: std.mem.Allocator, paylo
         header[2] = constants.tls_version[1];
         std.mem.writeInt(u16, header[3..5], @intCast(chunk_len), .big);
 
-        _ = try slotQueueClientPair(slot, allocator, header[0..], payload[off .. off + chunk_len]);
+        _ = try slotQueueClientPair(slot, header[0..], payload[off .. off + chunk_len]);
         slot.drs.recordSent(chunk_len);
         off += chunk_len;
     }
@@ -3498,37 +3500,6 @@ fn ensureMpFrameBuf(slot: *ConnectionSlot, allocator: std.mem.Allocator) ![]u8 {
     return buf;
 }
 
-fn fetchUrlBytes(allocator: std.mem.Allocator, url: []const u8) ![]u8 {
-    const uri = try std.Uri.parse(url);
-
-    var client: std.http.Client = .{ .allocator = allocator };
-    defer client.deinit();
-
-    var req = try client.request(.GET, uri, .{
-        .redirect_behavior = @enumFromInt(3),
-        .keep_alive = false,
-        .headers = .{
-            .accept_encoding = .{ .override = "identity" },
-        },
-    });
-    defer req.deinit();
-    if (req.connection) |connection| {
-        setSendTimeout(connection.stream_reader.getStream().handle, http_fetch_timeout_sec);
-        const tv = posix.timeval{ .sec = @intCast(http_fetch_timeout_sec), .usec = 0 };
-        posix.setsockopt(connection.stream_reader.getStream().handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
-    }
-
-    try req.sendBodiless();
-
-    var redirect_buf: [8 * 1024]u8 = undefined;
-    var response = try req.receiveHead(&redirect_buf);
-    if (response.head.status.class() != .success) return error.HttpRequestFailed;
-
-    var transfer_buf: [4 * 1024]u8 = undefined;
-    const reader = response.reader(&transfer_buf);
-    return reader.allocRemaining(allocator, .limited(1 * 1024 * 1024));
-}
-
 fn parseIpv4Literal(text: []const u8) ?[4]u8 {
     var parts = std.mem.splitScalar(u8, text, '.');
     var ip: [4]u8 = undefined;
@@ -3651,7 +3622,11 @@ fn detectPublicIpv4(allocator: std.mem.Allocator) ?[4]u8 {
     };
 
     for (services) |url| {
-        const stdout = fetchUrlBytes(allocator, url) catch continue;
+        const stdout = http_fetch.fetchUrlBytes(
+            allocator,
+            url,
+            .{ .max_response_bytes = 64 * 1024 },
+        ) catch continue;
         const trimmed = std.mem.trim(u8, stdout, &[_]u8{ ' ', '\t', '\r', '\n' });
         const parsed = parseIpv4Literal(trimmed);
         allocator.free(stdout);
@@ -3942,37 +3917,6 @@ fn queueOrWriteMsgPair(fd: posix.fd_t, queue: *MessageQueue, first: []const u8, 
     return false;
 }
 
-fn queueOrWriteOwnedMsg(fd: posix.fd_t, queue: *MessageQueue, owned: []u8) !bool {
-    if (owned.len == 0) {
-        queue.allocator.free(owned);
-        return true;
-    }
-
-    if (queue.isEmpty()) {
-        const n = posix.write(fd, owned) catch |err| {
-            if (err == error.WouldBlock) {
-                try queue.appendOwned(owned);
-                return false;
-            }
-            queue.allocator.free(owned);
-            return err;
-        };
-
-        if (n == owned.len) {
-            queue.allocator.free(owned);
-            return true;
-        }
-
-        const remaining = owned[n..];
-        try queue.appendCopy(remaining);
-        queue.allocator.free(owned);
-        return false;
-    }
-
-    try queue.appendOwned(owned);
-    return false;
-}
-
 fn flushQueue(fd: posix.fd_t, queue: *MessageQueue) !bool {
     if (queue.isEmpty()) return true;
 
@@ -3996,33 +3940,23 @@ fn flushQueue(fd: posix.fd_t, queue: *MessageQueue) !bool {
     return true;
 }
 
-fn slotQueueClient(slot: *ConnectionSlot, allocator: std.mem.Allocator, data: []const u8) !bool {
-    _ = allocator;
+fn slotQueueClient(slot: *ConnectionSlot, data: []const u8) !bool {
     return queueOrWriteMsg(slot.client_fd, &slot.client_queue, data);
 }
 
-fn slotQueueClientPair(slot: *ConnectionSlot, allocator: std.mem.Allocator, first: []const u8, second: []const u8) !bool {
-    _ = allocator;
+fn slotQueueClientPair(slot: *ConnectionSlot, first: []const u8, second: []const u8) !bool {
     return queueOrWriteMsgPair(slot.client_fd, &slot.client_queue, first, second);
 }
 
-fn slotQueueClientOwned(slot: *ConnectionSlot, allocator: std.mem.Allocator, owned: []u8) !bool {
-    _ = allocator;
-    return queueOrWriteOwnedMsg(slot.client_fd, &slot.client_queue, owned);
-}
-
-fn slotQueueUpstream(slot: *ConnectionSlot, allocator: std.mem.Allocator, data: []const u8) !bool {
-    _ = allocator;
+fn slotQueueUpstream(slot: *ConnectionSlot, data: []const u8) !bool {
     return queueOrWriteMsg(slot.upstream_fd, &slot.upstream_queue, data);
 }
 
-fn slotFlushClientPending(slot: *ConnectionSlot, allocator: std.mem.Allocator) !bool {
-    _ = allocator;
+fn slotFlushClientPending(slot: *ConnectionSlot) !bool {
     return flushQueue(slot.client_fd, &slot.client_queue);
 }
 
-fn slotFlushUpstreamPending(slot: *ConnectionSlot, allocator: std.mem.Allocator) !bool {
-    _ = allocator;
+fn slotFlushUpstreamPending(slot: *ConnectionSlot) !bool {
     return flushQueue(slot.upstream_fd, &slot.upstream_queue);
 }
 
@@ -4036,24 +3970,20 @@ fn slotMpReadReset(slot: *ConnectionSlot, encrypted: bool) void {
 }
 
 // Method forwarding helpers (keeps call sites readable)
-fn queueClient(self: *ConnectionSlot, allocator: std.mem.Allocator, data: []const u8) !bool {
-    return slotQueueClient(self, allocator, data);
+fn queueClient(self: *ConnectionSlot, data: []const u8) !bool {
+    return slotQueueClient(self, data);
 }
 
-fn queueClientOwned(self: *ConnectionSlot, allocator: std.mem.Allocator, data: []u8) !bool {
-    return slotQueueClientOwned(self, allocator, data);
+fn queueUpstream(self: *ConnectionSlot, data: []const u8) !bool {
+    return slotQueueUpstream(self, data);
 }
 
-fn queueUpstream(self: *ConnectionSlot, allocator: std.mem.Allocator, data: []const u8) !bool {
-    return slotQueueUpstream(self, allocator, data);
+fn flushClientPending(self: *ConnectionSlot) !bool {
+    return slotFlushClientPending(self);
 }
 
-fn flushClientPending(self: *ConnectionSlot, allocator: std.mem.Allocator) !bool {
-    return slotFlushClientPending(self, allocator);
-}
-
-fn flushUpstreamPending(self: *ConnectionSlot, allocator: std.mem.Allocator) !bool {
-    return slotFlushUpstreamPending(self, allocator);
+fn flushUpstreamPending(self: *ConnectionSlot) !bool {
+    return slotFlushUpstreamPending(self);
 }
 
 fn mpReadReset(self: *ConnectionSlot, encrypted: bool) void {
