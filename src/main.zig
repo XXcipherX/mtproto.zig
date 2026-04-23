@@ -391,7 +391,7 @@ pub fn main() !void {
     cfg.emitWarnings();
 
     // Create shared state (DI — no globals)
-    var state = proxy.ProxyState.init(allocator, cfg);
+    var state = try proxy.ProxyState.init(allocator, cfg);
     defer state.deinit();
 
     // Run the proxy

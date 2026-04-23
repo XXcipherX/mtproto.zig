@@ -29,6 +29,8 @@ pub const ObfuscationParams = struct {
         handshake: *const [constants.handshake_len]u8,
         secrets: []const UserSecret,
     ) ?struct { params: ObfuscationParams, user: []const u8 } {
+        if (!isValidNonce(handshake)) return null;
+
         // Extract decrypt prekey (bytes 8..40) and IV (bytes 40..56)
         const dec_prekey_iv = handshake[constants.skip_len .. constants.skip_len + constants.prekey_len + constants.iv_len];
         const dec_prekey = dec_prekey_iv[0..constants.prekey_len];
@@ -166,6 +168,46 @@ pub fn prepareTgNonce(
 
 // ============= Tests =============
 
+fn buildTestClientHandshake(first_byte: u8, secret: [16]u8) [constants.handshake_len]u8 {
+    var handshake = [_]u8{0x42} ** constants.handshake_len;
+    handshake[0] = first_byte;
+    handshake[4] = 1;
+    handshake[5] = 2;
+    handshake[6] = 3;
+    handshake[7] = 4;
+    for (handshake[constants.skip_len..][0 .. constants.prekey_len + constants.iv_len], 0..) |*byte, idx| {
+        byte.* = @intCast((idx * 7 + 11) & 0xff);
+    }
+
+    const dec_prekey_iv = handshake[constants.skip_len .. constants.skip_len + constants.prekey_len + constants.iv_len];
+    const dec_prekey = dec_prekey_iv[0..constants.prekey_len];
+    const dec_iv_bytes: *const [constants.iv_len]u8 = dec_prekey_iv[constants.prekey_len..][0..constants.iv_len];
+
+    var dec_key_input: [constants.prekey_len + 16]u8 = undefined;
+    @memcpy(dec_key_input[0..constants.prekey_len], dec_prekey);
+    @memcpy(dec_key_input[constants.prekey_len..], &secret);
+    const decrypt_key = crypto.sha256(&dec_key_input);
+    const decrypt_iv = std.mem.readInt(u128, dec_iv_bytes, .big);
+
+    var stream = [_]u8{0} ** constants.handshake_len;
+    var decryptor = crypto.AesCtr.init(&decrypt_key, decrypt_iv);
+    defer decryptor.wipe();
+    decryptor.apply(&stream);
+
+    const tag = constants.ProtoTag.intermediate.toBytes();
+    for (0..tag.len) |idx| {
+        handshake[constants.proto_tag_pos + idx] = tag[idx] ^ stream[constants.proto_tag_pos + idx];
+    }
+
+    var dc_bytes: [2]u8 = undefined;
+    std.mem.writeInt(i16, &dc_bytes, 2, .little);
+    for (0..dc_bytes.len) |idx| {
+        handshake[constants.dc_idx_pos + idx] = dc_bytes[idx] ^ stream[constants.dc_idx_pos + idx];
+    }
+
+    return handshake;
+}
+
 test "isValidNonce" {
     // Valid nonce
     var valid = [_]u8{0x42} ** constants.handshake_len;
@@ -201,6 +243,19 @@ test "generateNonce produces valid nonces" {
     const nonce = generateNonce();
     try std.testing.expect(isValidNonce(&nonce));
     try std.testing.expectEqual(@as(usize, constants.handshake_len), nonce.len);
+}
+
+test "fromHandshake rejects reserved nonce even when encrypted tag is valid" {
+    const secret = [_]u8{0x11} ** 16;
+    const secrets = [_]UserSecret{.{ .name = "alice", .secret = secret }};
+
+    const valid = buildTestClientHandshake(0x42, secret);
+    const parsed = ObfuscationParams.fromHandshake(&valid, &secrets) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(constants.ProtoTag.intermediate, parsed.params.proto_tag);
+    try std.testing.expectEqual(@as(i16, 2), parsed.params.dc_idx);
+
+    const reserved = buildTestClientHandshake(0xef, secret);
+    try std.testing.expect(ObfuscationParams.fromHandshake(&reserved, &secrets) == null);
 }
 
 test "prepareTgNonce - intermediate tag" {

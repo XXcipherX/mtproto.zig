@@ -94,8 +94,8 @@ deploy-tunnel-only:
 	ssh root@$(SERVER) "install -m 0755 /tmp/setup_mask_monitor.sh /opt/mtproto-proxy/setup_mask_monitor.sh 2>/dev/null || true; bash /tmp/setup_tunnel.sh /tmp/awg_client.conf $(TUNNEL_MODE) && rm -f /tmp/awg_client.conf /tmp/setup_tunnel.sh /tmp/setup_mask_monitor.sh"
 
 update-dns:
-	@if [ -z "$(SERVER)" ]; then echo "Usage: make update-dns SERVER=<ip>"; exit 1; fi
-	bash deploy/update_dns.sh $(SERVER)
+	@if [ -z "$(SERVER)" ]; then echo "Usage: make update-dns SERVER=<ip> (DNS_NAME comes from .env)"; exit 1; fi
+	bash deploy/update_dns.sh "$(SERVER)"
 
 # Linux/VPS regression harness (memory/socket churn)
 stability-check:

@@ -101,6 +101,33 @@ get_config_value() {
     ' "$cfg" 2>/dev/null
 }
 
+get_first_user_secret() {
+    local cfg="$1"
+    [[ -f "$cfg" ]] || return 0
+
+    awk '
+        BEGIN { in_users = 0 }
+        /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
+            header = $0
+            gsub(/^[[:space:]]*\[|\][[:space:]]*$/, "", header)
+            in_users = (header == "access.users")
+            next
+        }
+        in_users {
+            line = $0
+            sub(/#.*/, "", line)
+            if (line !~ /=/) next
+            sub(/^[^=]*=/, "", line)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
+            gsub(/^"|"$/, "", line)
+            if (line ~ /^[0-9A-Fa-f]{32}$/) {
+                print tolower(line)
+                exit
+            }
+        }
+    ' "$cfg" 2>/dev/null
+}
+
 # ── Check root ──────────────────────────────────────────────
 [[ $EUID -eq 0 ]] || fail "Run as root: sudo bash install.sh"
 
@@ -200,7 +227,7 @@ EOF
     ok "Generated config with new secret"
 else
     ok "Config already exists, keeping it"
-    SECRET=$(grep -oP '= "\K[0-9a-f]{32}' "$INSTALL_DIR/config.toml" | head -1 || echo "")
+    SECRET="$(get_first_user_secret "$INSTALL_DIR/config.toml")"
     TLS_DOMAIN="${MASK_DOMAIN:-$(get_config_value "$INSTALL_DIR/config.toml" "censorship" "tls_domain" "wb.ru")}"
 fi
 
@@ -387,7 +414,11 @@ TLS_DOMAIN="$(get_config_value "$INSTALL_DIR/config.toml" "censorship" "tls_doma
 
 # Build ee-secret: ee + hex(secret) + hex(tls_domain)
 DOMAIN_HEX=$(echo -n "$TLS_DOMAIN" | xxd -p | tr -d '\n')
-EE_SECRET="ee${SECRET}${DOMAIN_HEX}"
+if [[ -n "$SECRET" ]]; then
+    EE_SECRET="ee${SECRET}${DOMAIN_HEX}"
+else
+    EE_SECRET=""
+fi
 
 echo ""
 echo -e "${BOLD}${CYAN}══════════════════════════════════════════════════${RESET}"
@@ -405,9 +436,13 @@ echo -e "  ${DIM}Monitor:${RESET} systemctl status mtproto-mask-health.timer"
 echo -e "  ${DIM}Mon logs:${RESET} journalctl -t mtproto-mask-health -n 50"
 echo ""
 echo -e "  ${BOLD}Connection link:${RESET}"
+if [[ -n "$EE_SECRET" ]]; then
 echo -e "  ${CYAN}tg://proxy?server=${PUBLIC_IP}&port=${PORT}&secret=${GREEN}${EE_SECRET}${RESET}"
 echo ""
 echo -e "  ${DIM}t.me/proxy?server=${PUBLIC_IP}&port=${PORT}&secret=${EE_SECRET}${RESET}"
+else
+echo -e "  ${RED}Unable to build link:${RESET} no valid 32-hex secret found in [access.users]"
+fi
 echo ""
 echo -e "  ${BOLD}DPI Bypass:${RESET}"
 echo -e "  ${GREEN}✓${RESET} Anti-Replay Cache (ТСПУ Revisor protection)"

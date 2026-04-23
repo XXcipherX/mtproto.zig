@@ -31,6 +31,7 @@ const nofile_fd_overhead: usize = 512;
 const middle_proxy_config_url = "https://core.telegram.org/getProxyConfig";
 const middle_proxy_secret_url = "https://core.telegram.org/getProxySecret";
 const middle_proxy_update_period_ns: u64 = 24 * 60 * 60 * std.time.ns_per_s;
+const middle_proxy_update_stop_poll_ns: u64 = std.time.ns_per_s;
 const tunnel_mask_gateway_ip = "10.200.200.1";
 const min_nofile_soft: usize = 65535;
 const client_hello_inline_size: usize = 512;
@@ -242,6 +243,11 @@ fn blockStorageConst(blk: *const MsgBlock) []const u8 {
 }
 
 const MessageQueue = struct {
+    const max_pending_bytes: usize = 4 * 1024 * 1024;
+    const max_free_tiny_blocks: usize = 128;
+    const max_free_small_blocks: usize = 96;
+    const max_free_standard_blocks: usize = 128;
+
     allocator: std.mem.Allocator,
     tiny_free: std.ArrayListUnmanaged(*MsgBlock) = .{},
     small_free: std.ArrayListUnmanaged(*MsgBlock) = .{},
@@ -282,6 +288,7 @@ const MessageQueue = struct {
 
     fn appendCopy(self: *MessageQueue, data: []const u8) !void {
         if (data.len == 0) return;
+        try self.ensureCanAppend(data.len);
 
         var off: usize = 0;
         while (off < data.len) {
@@ -296,6 +303,12 @@ const MessageQueue = struct {
             try self.blocks.append(self.allocator, blk);
             self.total_len += take;
             off += take;
+        }
+    }
+
+    fn ensureCanAppend(self: *const MessageQueue, additional_len: usize) !void {
+        if (additional_len > max_pending_bytes or self.total_len > max_pending_bytes - additional_len) {
+            return error.PendingQueueOverflow;
         }
     }
 
@@ -396,7 +409,19 @@ const MessageQueue = struct {
             .small => &self.small_free,
             .standard => &self.std_free,
         };
+        if (list.items.len >= freeListLimit(blk.class)) {
+            self.destroyBlock(blk);
+            return;
+        }
         try list.append(self.allocator, blk);
+    }
+
+    fn freeListLimit(class: MsgBlockClass) usize {
+        return switch (class) {
+            .tiny => max_free_tiny_blocks,
+            .small => max_free_small_blocks,
+            .standard => max_free_standard_blocks,
+        };
     }
 
     fn destroyBlock(self: *MessageQueue, blk: *MsgBlock) void {
@@ -515,6 +540,7 @@ const ReplayCache = struct {
     const Entry = struct {
         used: bool = false,
         key: u64 = 0,
+        digest: [32]u8 = [_]u8{0} ** 32,
         last_seen_s: i64 = 0,
     };
 
@@ -557,11 +583,11 @@ const ReplayCache = struct {
             const e = &self.entries[idx];
 
             if (!e.used) {
-                e.* = .{ .used = true, .key = key, .last_seen_s = now_s };
+                e.* = .{ .used = true, .key = key, .digest = digest.*, .last_seen_s = now_s };
                 return false;
             }
 
-            if (e.key == key) {
+            if (e.key == key and std.crypto.timing_safe.eql([32]u8, e.digest, digest.*)) {
                 e.last_seen_s = now_s;
                 return true;
             }
@@ -576,7 +602,7 @@ const ReplayCache = struct {
         }
 
         const victim_idx = first_stale_idx orelse oldest_idx;
-        self.entries[victim_idx] = .{ .used = true, .key = key, .last_seen_s = now_s };
+        self.entries[victim_idx] = .{ .used = true, .key = key, .digest = digest.*, .last_seen_s = now_s };
         return false;
     }
 };
@@ -906,17 +932,22 @@ pub const ProxyState = struct {
     middle_proxy_secret: [256]u8,
     middle_proxy_secret_len: usize,
     middle_proxy_nat_ip4: ?[4]u8,
+    middle_proxy_updater_stop: std.atomic.Value(bool),
+    middle_proxy_updater_thread: ?std.Thread,
 
-    pub fn init(allocator: std.mem.Allocator, cfg: Config) ProxyState {
+    pub fn init(allocator: std.mem.Allocator, cfg: Config) !ProxyState {
         var secrets: std.ArrayList(obfuscation.UserSecret) = .empty;
+        errdefer secrets.deinit(allocator);
         var users = cfg.users;
         var it = users.iterator();
         while (it.next()) |entry| {
-            secrets.append(allocator, .{
+            try secrets.append(allocator, .{
                 .name = entry.key_ptr.*,
                 .secret = entry.value_ptr.*,
-            }) catch continue;
+            });
         }
+        const user_secrets = try secrets.toOwnedSlice(allocator);
+        errdefer allocator.free(user_secrets);
 
         var resolved_addr: ?net.Address = null;
         if (cfg.mask) {
@@ -993,7 +1024,7 @@ pub const ProxyState = struct {
         return .{
             .allocator = allocator,
             .config = cfg,
-            .user_secrets = secrets.toOwnedSlice(allocator) catch &.{},
+            .user_secrets = user_secrets,
             .connection_count = std.atomic.Value(u64).init(0),
             .active_connections = std.atomic.Value(u32).init(0),
             .handshakes_inflight = std.atomic.Value(u32).init(0),
@@ -1018,10 +1049,13 @@ pub const ProxyState = struct {
             .middle_proxy_secret = default_middle_proxy_secret,
             .middle_proxy_secret_len = middleproxy.proxy_secret.len,
             .middle_proxy_nat_ip4 = detected_nat_ip4,
+            .middle_proxy_updater_stop = std.atomic.Value(bool).init(false),
+            .middle_proxy_updater_thread = null,
         };
     }
 
     pub fn deinit(self: *ProxyState) void {
+        self.stopMiddleProxyUpdater();
         self.allocator.free(self.user_secrets);
     }
 
@@ -1060,16 +1094,18 @@ pub const ProxyState = struct {
 
         setNonBlocking(server.stream.handle);
 
+        var middle_proxy_updater_started = false;
+        defer {
+            if (middle_proxy_updater_started) self.stopMiddleProxyUpdater();
+        }
+
         if (self.config.datacenter_override == null and self.config.usesAnyMiddleProxy()) {
             self.refreshMiddleProxyInfo() catch |err| {
                 log.warn("Initial middle-proxy refresh failed, using bundled defaults: {any}", .{err});
             };
 
-            if (std.Thread.spawn(.{}, ProxyState.middleProxyUpdaterMain, .{self})) |updater| {
-                updater.detach();
-            } else |err| {
-                log.warn("Middle-proxy updater thread failed to start: {any}", .{err});
-            }
+            self.startMiddleProxyUpdater();
+            middle_proxy_updater_started = self.middle_proxy_updater_thread != null;
         }
 
         if (getNofileSoftLimit()) |soft| {
@@ -1138,9 +1174,38 @@ pub const ProxyState = struct {
         };
     }
 
+    fn startMiddleProxyUpdater(self: *ProxyState) void {
+        if (self.middle_proxy_updater_thread != null) return;
+        self.middle_proxy_updater_stop.store(false, .release);
+
+        if (std.Thread.spawn(.{}, ProxyState.middleProxyUpdaterMain, .{self})) |updater| {
+            self.middle_proxy_updater_thread = updater;
+        } else |err| {
+            log.warn("Middle-proxy updater thread failed to start: {any}", .{err});
+        }
+    }
+
+    fn stopMiddleProxyUpdater(self: *ProxyState) void {
+        self.middle_proxy_updater_stop.store(true, .release);
+        if (self.middle_proxy_updater_thread) |thread| {
+            thread.join();
+            self.middle_proxy_updater_thread = null;
+        }
+    }
+
+    fn waitMiddleProxyUpdatePeriod(self: *ProxyState) bool {
+        var slept_ns: u64 = 0;
+        while (slept_ns < middle_proxy_update_period_ns) {
+            if (self.middle_proxy_updater_stop.load(.acquire)) return false;
+            const chunk = @min(middle_proxy_update_stop_poll_ns, middle_proxy_update_period_ns - slept_ns);
+            std.Thread.sleep(chunk);
+            slept_ns += chunk;
+        }
+        return !self.middle_proxy_updater_stop.load(.acquire);
+    }
+
     fn middleProxyUpdaterMain(self: *ProxyState) void {
-        while (true) {
-            std.Thread.sleep(middle_proxy_update_period_ns);
+        while (self.waitMiddleProxyUpdatePeriod()) {
             self.refreshMiddleProxyInfo() catch |err| {
                 log.warn("Middle-proxy refresh failed: {any}", .{err});
             };
@@ -2047,7 +2112,7 @@ const EventLoop = struct {
             return;
         };
 
-        const snapshot = if (self.state.config.datacenter_override == null and (self.state.config.use_middle_proxy or dc_abs == 203))
+        const snapshot = if (shouldUseMiddleProxySnapshot(&self.state.config, dc_abs, slot.dc_idx))
             self.state.getMiddleProxySnapshot()
         else
             null;
@@ -3681,6 +3746,14 @@ fn appendUniqueAddress(addrs: *[16]net.Address, count: *usize, addr: net.Address
     count.* += 1;
 }
 
+fn shouldUseMiddleProxySnapshot(cfg: *const Config, dc_abs: usize, dc_idx: i16) bool {
+    if (cfg.datacenter_override != null) return false;
+    if (cfg.use_middle_proxy) return true;
+
+    const is_media_path = (dc_idx < 0) or (dc_abs == 203);
+    return cfg.force_media_middle_proxy and is_media_path;
+}
+
 fn buildDcConnectPlan(
     cfg: *const Config,
     dc_abs: usize,
@@ -3903,6 +3976,7 @@ fn queueOrWriteMsgPair(fd: posix.fd_t, queue: *MessageQueue, first: []const u8, 
         const total_len = first.len + second.len;
         const n = posix.writev(fd, iovecs[0..n_iov]) catch |err| {
             if (err == error.WouldBlock) {
+                try queue.ensureCanAppend(total_len);
                 try queue.appendCopy(first);
                 try queue.appendCopy(second);
                 return false;
@@ -3914,6 +3988,7 @@ fn queueOrWriteMsgPair(fd: posix.fd_t, queue: *MessageQueue, first: []const u8, 
         if (n == total_len) return true;
 
         if (n < first.len) {
+            try queue.ensureCanAppend(first.len - n + second.len);
             try queue.appendCopy(first[n..]);
             try queue.appendCopy(second);
             return false;
@@ -3926,6 +4001,7 @@ fn queueOrWriteMsgPair(fd: posix.fd_t, queue: *MessageQueue, first: []const u8, 
         return false;
     }
 
+    try queue.ensureCanAppend(first.len + second.len);
     try queue.appendCopy(first);
     try queue.appendCopy(second);
     return false;
@@ -3994,6 +4070,76 @@ test "parse middle proxy address for dc203" {
     const addr = parseMiddleProxyAddressForDc(cfg, 203) orelse return error.TestExpectedEqual;
     try std.testing.expect(addr.any.family == posix.AF.INET);
     try std.testing.expectEqual(@as(u16, 443), std.mem.bigToNative(u16, addr.in.sa.port));
+}
+
+fn initProxyStateAndDeinit(allocator: std.mem.Allocator, cfg: Config) !void {
+    var state = try ProxyState.init(allocator, cfg);
+    defer state.deinit();
+}
+
+test "proxy state init propagates user secret allocation failures" {
+    const cfg_text =
+        \\[general]
+        \\use_middle_proxy = false
+        \\force_media_middle_proxy = false
+        \\[server]
+        \\public_ip = "127.0.0.1"
+        \\[censorship]
+        \\mask = false
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+        \\bob = "ffeeddccbbaa99887766554433221100"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, cfg_text);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, initProxyStateAndDeinit, .{cfg});
+}
+
+test "media-only middle-proxy mode requests metadata for negative media DCs" {
+    var cfg = Config{
+        .users = std.StringHashMap([16]u8).init(std.testing.allocator),
+        .direct_users = std.StringHashMap(void).init(std.testing.allocator),
+    };
+    defer cfg.deinit(std.testing.allocator);
+
+    cfg.use_middle_proxy = false;
+    cfg.force_media_middle_proxy = true;
+
+    try std.testing.expect(shouldUseMiddleProxySnapshot(&cfg, 4, -4));
+    try std.testing.expect(shouldUseMiddleProxySnapshot(&cfg, 203, -203));
+    try std.testing.expect(!shouldUseMiddleProxySnapshot(&cfg, 4, 4));
+
+    cfg.force_media_middle_proxy = false;
+    try std.testing.expect(!shouldUseMiddleProxySnapshot(&cfg, 4, -4));
+
+    cfg.use_middle_proxy = true;
+    try std.testing.expect(shouldUseMiddleProxySnapshot(&cfg, 4, 4));
+
+    cfg.datacenter_override = net.Address.initIp4(.{ 127, 0, 0, 1 }, 443);
+    try std.testing.expect(!shouldUseMiddleProxySnapshot(&cfg, 4, -4));
+}
+
+test "middle proxy updater stop joins sleeping thread" {
+    var cfg = Config{
+        .users = std.StringHashMap([16]u8).init(std.testing.allocator),
+        .direct_users = std.StringHashMap(void).init(std.testing.allocator),
+    };
+    defer cfg.deinit(std.testing.allocator);
+
+    cfg.use_middle_proxy = false;
+    cfg.force_media_middle_proxy = false;
+    cfg.mask = false;
+    cfg.datacenter_override = net.Address.initIp4(.{ 127, 0, 0, 1 }, 443);
+
+    var state = try ProxyState.init(std.testing.allocator, cfg);
+    defer state.deinit();
+
+    state.startMiddleProxyUpdater();
+    try std.testing.expect(state.middle_proxy_updater_thread != null);
+    state.stopMiddleProxyUpdater();
+    try std.testing.expect(state.middle_proxy_updater_thread == null);
 }
 
 test "direct users bypass middle-proxy routing" {
@@ -4109,6 +4255,31 @@ test "message queue uses compact block storage per class" {
     try q.appendCopy(&standard_payload);
     try std.testing.expectEqual(MsgBlockClass.standard, q.blocks.items[0].class);
     try std.testing.expectEqual(@as(usize, standard_block_size), blockStorageConst(q.blocks.items[0]).len);
+}
+
+test "message queue rejects pending byte overflow" {
+    var q = MessageQueue{ .allocator = std.testing.allocator };
+    defer q.deinit();
+
+    q.total_len = MessageQueue.max_pending_bytes;
+    try std.testing.expectError(error.PendingQueueOverflow, q.ensureCanAppend(1));
+    q.total_len = 0;
+}
+
+test "message queue trims retained standard free blocks after traffic spike" {
+    var q = MessageQueue{ .allocator = std.testing.allocator };
+    defer q.deinit();
+
+    const payload_len = (MessageQueue.max_free_standard_blocks + 8) * standard_block_size;
+    const payload = try std.testing.allocator.alloc(u8, payload_len);
+    defer std.testing.allocator.free(payload);
+    @memset(payload, 0xA5);
+
+    try q.appendCopy(payload);
+    try q.consume(payload.len);
+
+    try std.testing.expect(q.isEmpty());
+    try std.testing.expect(q.std_free.items.len <= MessageQueue.max_free_standard_blocks);
 }
 
 test "epoll hangup helper" {
@@ -4264,6 +4435,19 @@ test "replay cache accepts distinct digests" {
 
     try std.testing.expect(!cache.checkAndInsert(&digest_a));
     try std.testing.expect(!cache.checkAndInsert(&digest_b));
+}
+
+test "replay cache compares full digest on key collision" {
+    var cache = ReplayCache.init();
+    const digest_a = [_]u8{0x11} ** 32;
+    var digest_b = digest_a;
+    digest_b[31] ^= 0xff;
+
+    try std.testing.expectEqual(ReplayCache.digestKey(&digest_a), ReplayCache.digestKey(&digest_b));
+    try std.testing.expect(!cache.checkAndInsert(&digest_a));
+    try std.testing.expect(!cache.checkAndInsert(&digest_b));
+    try std.testing.expect(cache.checkAndInsert(&digest_a));
+    try std.testing.expect(cache.checkAndInsert(&digest_b));
 }
 
 test "handshakeInProgress - phases" {
