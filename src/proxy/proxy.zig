@@ -909,7 +909,8 @@ pub const ProxyState = struct {
 
     pub fn init(allocator: std.mem.Allocator, cfg: Config) ProxyState {
         var secrets: std.ArrayList(obfuscation.UserSecret) = .empty;
-        var it = @constCast(&cfg.users).iterator();
+        var users = cfg.users;
+        var it = users.iterator();
         while (it.next()) |entry| {
             secrets.append(allocator, .{
                 .name = entry.key_ptr.*,
@@ -1881,8 +1882,8 @@ const EventLoop = struct {
 
         slot.validation_secret = v.secret;
         slot.validation_digest = v.digest;
+        slot.validation_session_id = v.session_id;
         slot.validation_session_id_len = @intCast(v.session_id.len);
-        @memcpy(slot.validation_session_id[0..v.session_id.len], v.session_id);
         const ulen = @min(v.user.len, slot.validation_user.len);
         slot.validation_user_len = @intCast(ulen);
         @memcpy(slot.validation_user[0..ulen], v.user[0..ulen]);
@@ -2568,19 +2569,17 @@ const EventLoop = struct {
                 var dec_keys: struct { [32]u8, [16]u8 } = undefined;
                 var middle_local_addr: net.Address = undefined;
 
-                self.state.middle_proxy_lock.lockShared();
-                {
+                const mp_lock_error: ?[]const u8 = locked: {
+                    self.state.middle_proxy_lock.lockShared();
                     defer self.state.middle_proxy_lock.unlockShared();
 
                     const key_sel = self.state.middle_proxy_secret[0..@min(@as(usize, 4), self.state.middle_proxy_secret_len)];
                     const secret_slice = self.state.middle_proxy_secret[0..self.state.middle_proxy_secret_len];
                     if (!std.mem.eql(u8, payload[4..8], key_sel)) {
-                        self.closeSlot(slot, "mp key selector mismatch");
-                        return;
+                        break :locked "mp key selector mismatch";
                     }
                     if (!std.mem.eql(u8, payload[8..12], &middleproxy.rpc_crypto_aes)) {
-                        self.closeSlot(slot, "mp crypto schema mismatch");
-                        return;
+                        break :locked "mp crypto schema mismatch";
                     }
 
                     slot.mp_rpc_nonce_ans = payload[16..32][0..16].*;
@@ -2591,15 +2590,13 @@ const EventLoop = struct {
                     var peer_addr: net.Address = undefined;
                     var peer_len: posix.socklen_t = @sizeOf(net.Address);
                     posix.getpeername(slot.upstream_fd, &peer_addr.any, &peer_len) catch {
-                        self.closeSlot(slot, "mp getpeername failed");
-                        return;
+                        break :locked "mp getpeername failed";
                     };
 
                     var local_addr: net.Address = undefined;
                     var local_len: posix.socklen_t = @sizeOf(net.Address);
                     posix.getsockname(slot.upstream_fd, &local_addr.any, &local_len) catch {
-                        self.closeSlot(slot, "mp getsockname failed");
-                        return;
+                        break :locked "mp getsockname failed";
                     };
                     middle_local_addr = local_addr;
 
@@ -2641,8 +2638,7 @@ const EventLoop = struct {
                         std.mem.writeInt(u16, &tg_port, std.mem.bigToNative(u16, peer_addr.in6.sa.port), .little);
                         std.mem.writeInt(u16, &my_port, std.mem.bigToNative(u16, local_addr.in6.sa.port), .little);
                     } else {
-                        self.closeSlot(slot, "mp unsupported addr family");
-                        return;
+                        break :locked "mp unsupported addr family";
                     }
 
                     const tg_ip_v4_ptr: ?*const [4]u8 = if (tg_ip_v4_opt) |*ip| ip else null;
@@ -2677,6 +2673,13 @@ const EventLoop = struct {
                         my_ip_v6_ptr,
                         tg_ip_v6_ptr,
                     );
+
+                    break :locked null;
+                };
+
+                if (mp_lock_error) |reason| {
+                    self.closeSlot(slot, reason);
+                    return;
                 }
 
                 slot.mp_enc = crypto.AesCbc.init(&enc_keys[0], &enc_keys[1]);
@@ -3380,7 +3383,7 @@ fn queueTlsAppRecords(slot: *ConnectionSlot, payload: []u8) !void {
         header[2] = constants.tls_version[1];
         std.mem.writeInt(u16, header[3..5], @intCast(chunk_len), .big);
 
-        _ = try slotQueueClientPair(slot, header[0..], payload[off .. off + chunk_len]);
+        _ = try queueClientPair(slot, header[0..], payload[off .. off + chunk_len]);
         slot.drs.recordSent(chunk_len);
         off += chunk_len;
     }
@@ -3953,54 +3956,33 @@ fn flushQueue(fd: posix.fd_t, queue: *MessageQueue) !bool {
     return true;
 }
 
-fn slotQueueClient(slot: *ConnectionSlot, data: []const u8) !bool {
+fn queueClient(slot: *ConnectionSlot, data: []const u8) !bool {
     return queueOrWriteMsg(slot.client_fd, &slot.client_queue, data);
 }
 
-fn slotQueueClientPair(slot: *ConnectionSlot, first: []const u8, second: []const u8) !bool {
+fn queueClientPair(slot: *ConnectionSlot, first: []const u8, second: []const u8) !bool {
     return queueOrWriteMsgPair(slot.client_fd, &slot.client_queue, first, second);
 }
 
-fn slotQueueUpstream(slot: *ConnectionSlot, data: []const u8) !bool {
+fn queueUpstream(slot: *ConnectionSlot, data: []const u8) !bool {
     return queueOrWriteMsg(slot.upstream_fd, &slot.upstream_queue, data);
 }
 
-fn slotFlushClientPending(slot: *ConnectionSlot) !bool {
+fn flushClientPending(slot: *ConnectionSlot) !bool {
     return flushQueue(slot.client_fd, &slot.client_queue);
 }
 
-fn slotFlushUpstreamPending(slot: *ConnectionSlot) !bool {
+fn flushUpstreamPending(slot: *ConnectionSlot) !bool {
     return flushQueue(slot.upstream_fd, &slot.upstream_queue);
 }
 
-fn slotMpReadReset(slot: *ConnectionSlot, encrypted: bool) void {
+fn mpReadReset(slot: *ConnectionSlot, encrypted: bool) void {
     slot.mp_frame_have = 0;
     slot.mp_frame_total_len = 0;
     slot.mp_frame_padded_len = 0;
     slot.mp_frame_encrypted = encrypted;
     slot.mp_frame_first_decrypted = false;
     slot.mp_frame_need = if (encrypted) 16 else 4;
-}
-
-// Method forwarding helpers (keeps call sites readable)
-fn queueClient(self: *ConnectionSlot, data: []const u8) !bool {
-    return slotQueueClient(self, data);
-}
-
-fn queueUpstream(self: *ConnectionSlot, data: []const u8) !bool {
-    return slotQueueUpstream(self, data);
-}
-
-fn flushClientPending(self: *ConnectionSlot) !bool {
-    return slotFlushClientPending(self);
-}
-
-fn flushUpstreamPending(self: *ConnectionSlot) !bool {
-    return slotFlushUpstreamPending(self);
-}
-
-fn mpReadReset(self: *ConnectionSlot, encrypted: bool) void {
-    return slotMpReadReset(self, encrypted);
 }
 
 test "parse middle proxy address for dc203" {

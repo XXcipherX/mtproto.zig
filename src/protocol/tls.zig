@@ -16,8 +16,8 @@ pub const UserSecret = obfuscation.UserSecret;
 pub const TlsValidation = struct {
     /// Username that validated
     user: []const u8,
-    /// Session ID from ClientHello
-    session_id: []const u8,
+    /// Session ID copied from ClientHello.
+    session_id: [32]u8,
     /// Client digest for response generation
     digest: [constants.tls_digest_len]u8,
     /// Canonical HMAC before timestamp XOR masking (for replay protection)
@@ -91,7 +91,7 @@ pub fn validateTlsHandshake(
 
         return .{
             .user = entry.name,
-            .session_id = handshake[session_id_start .. session_id_start + session_id_len],
+            .session_id = handshake[session_id_start..][0..32].*,
             .digest = digest,
             .canonical_hmac = computed,
             .timestamp = timestamp,
@@ -564,8 +564,12 @@ test "validateTlsHandshake - valid handshake" {
 
     const result = try validateTlsHandshake(allocator, &handshake, &secrets, true);
     try std.testing.expect(result != null);
-    try std.testing.expectEqualStrings("bob", result.?.user);
-    try std.testing.expectEqual(@as(u32, 0x12345678), result.?.timestamp);
+    const validation = result.?;
+    try std.testing.expectEqualStrings("bob", validation.user);
+    try std.testing.expectEqual(@as(u32, 0x12345678), validation.timestamp);
+    try std.testing.expectEqualSlices(u8, handshake[44..76], validation.session_id[0..]);
+    handshake[44] = 0x55;
+    try std.testing.expectEqual(@as(u8, 0xaa), validation.session_id[0]);
 }
 
 test "validateTlsHandshake - invalid user" {

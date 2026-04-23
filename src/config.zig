@@ -112,7 +112,8 @@ pub const Config = struct {
 
         if (self.direct_users.count() > 0) {
             const log = std.log.scoped(.config);
-            var it = @constCast(&self.direct_users).iterator();
+            var direct_users = self.direct_users;
+            var it = direct_users.iterator();
             while (it.next()) |entry| {
                 if (!self.users.contains(entry.key_ptr.*)) {
                     log.warn(
@@ -300,20 +301,18 @@ pub const Config = struct {
         return cfg;
     }
 
-    pub fn deinit(self: *const Config, allocator: std.mem.Allocator) void {
-        var users = @constCast(&self.users);
-        var it = users.iterator();
+    pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
+        var it = self.users.iterator();
         while (it.next()) |entry| {
             allocator.free(entry.key_ptr.*);
         }
-        users.deinit();
+        self.users.deinit();
 
-        var direct_users = @constCast(&self.direct_users);
-        var direct_it = direct_users.iterator();
+        var direct_it = self.direct_users.iterator();
         while (direct_it.next()) |entry| {
             allocator.free(entry.key_ptr.*);
         }
-        direct_users.deinit();
+        self.direct_users.deinit();
 
         // Free tls_domain if it was allocated (not the default)
         if (!std.mem.eql(u8, self.tls_domain, "google.com")) {
@@ -330,7 +329,8 @@ pub const Config = struct {
     /// Get user secrets as a flat slice for handshake validation.
     pub fn getUserSecrets(self: *const Config, allocator: std.mem.Allocator) ![]const UserSecret {
         var list: std.ArrayList(UserSecret) = .empty;
-        var it = @constCast(&self.users).iterator();
+        var users = self.users;
+        var it = users.iterator();
         while (it.next()) |entry| {
             try list.append(allocator, .{
                 .name = entry.key_ptr.*,

@@ -298,7 +298,8 @@ fn printBanner(allocator: std.mem.Allocator, cfg: config.Config, capacity_estima
 
     // ─── USERS ──────────────────────────────────────
     writeStdout("  " ++ D ++ "───" ++ R ++ " " ++ B ++ cyan ++ "USERS" ++ R ++ " ({d}) " ++ D ++ "────────────────────────────────────" ++ R ++ "\n", .{cfg.users.count()});
-    var it = @constCast(&cfg.users).iterator();
+    var users = cfg.users;
+    var it = users.iterator();
     while (it.next()) |entry| {
         writeStdout("      " ++ green ++ "●" ++ R ++ " " ++ B ++ "{s}" ++ R ++ "  " ++ D, .{entry.key_ptr.*});
         for (entry.value_ptr.*) |byte| {
@@ -314,7 +315,8 @@ fn printBanner(allocator: std.mem.Allocator, cfg: config.Config, capacity_estima
         writeRaw("      " ++ red ++ "⚠  Could not detect IP. Replace <SERVER_IP> manually." ++ R ++ "\n");
     }
 
-    var it2 = @constCast(&cfg.users).iterator();
+    var users_for_links = cfg.users;
+    var it2 = users_for_links.iterator();
     while (it2.next()) |entry| {
         writeStdout("      " ++ B ++ magenta ++ "{s}" ++ R ++ "\n", .{entry.key_ptr.*});
 
