@@ -48,8 +48,6 @@ fn lockFreeLog(
 
 const log = std.log.scoped(.mtproto);
 
-
-
 // ============= Output Helpers (Zig 0.15 compatible) =============
 
 /// Write a formatted string to stdout via posix write.
