@@ -34,6 +34,27 @@ This workflow documents current build and deploy paths as implemented in `Makefi
 - `make deploy-monitor SERVER=<ip>` : deploy optional monitoring dashboard
 - `make monitor SERVER=<ip>` : open SSH tunnel to optional monitoring dashboard
 
+## CI-Parity Validation
+
+Before merging behavior changes, match the GitHub workflow as closely as practical:
+
+```bash
+zig fmt --check build.zig src test_addr.zig test_al.zig
+python3 -m py_compile test/*.py
+shellcheck --severity=error deploy/*.sh deploy/monitor/*.sh
+zig build test
+zig build -Doptimize=ReleaseSafe test
+zig build
+python3 test/daemon_smoke.py --binary zig-out/bin/mtproto-proxy
+zig build -Doptimize=ReleaseFast
+zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux
+zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux -Dcpu=x86_64_v3
+zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux
+docker build --build-arg ZIG_VERSION=0.15.2 -t mtproto-zig-smoke .
+```
+
+The daemon smoke launches a real localhost proxy, verifies a valid FakeTLS handshake, and checks that the same SNI with a bad secret does not receive a valid FakeTLS response.
+
 ## `make deploy` (current behavior)
 
 1. Builds Linux target: `zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux -Dcpu=x86_64_v3`.

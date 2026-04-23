@@ -20,7 +20,7 @@ Production MTProto proxy implemented in Zig with FakeTLS entry, obfuscated MTPro
 - Relay path is a single-threaded Linux `epoll` event loop.
 - Connections are represented by pooled `ConnectionSlot` state objects.
 - File descriptors are tracked via epoll + fd-to-slot mapping.
-- Recent runtime changes added safer failed-connect cleanup, bounded timer scanning, fd-budget clamping, 90%/80% saturation hysteresis, and low-noise periodic connection stats.
+- Recent runtime changes added safer failed-connect cleanup, bounded timer scanning, fd-budget clamping, 90%/80% saturation hysteresis, low-noise periodic connection stats, classed message-queue blocks, and lazy MiddleProxy stream/scratch buffers.
 - A background updater thread refreshes MiddleProxy metadata from Telegram core endpoints once per 24h.
 
 Code anchors:
@@ -58,6 +58,7 @@ Important behavior:
 - `force_media_middle_proxy=true` is the default, so `direct` only affects regular DC traffic; media path still prefers MiddleProxy when available unless that knob is disabled.
 - `[access.direct_users]` / `[access.admins]` bypass MiddleProxy entirely, including media paths.
 - `server.middle_proxy_nat_ip` can pin the IPv4 used for MiddleProxy NAT/AES derivation when AWG/public-IP detection would choose the wrong address.
+- `middleproxy_buffer_kb` is a per-direction cap. Each MiddleProxy context starts with 16 KiB C2S/S2C buffers and grows on demand up to `min(middleproxy_buffer_kb, 16384)` KiB; event-loop scratch buffers are lazy and reused.
 - Tunnel deployment supports `direct`, `preserve`, and `middleproxy` modes.
 
 ## Fast Mode
@@ -79,8 +80,9 @@ Startup banner computes a safety estimate from host RAM:
 
 ```text
 tls_working_bytes = ~6 KiB
-middleproxy_per_conn_bytes = middleproxy_buffer_kb * 1024 * 2 (if ME enabled)
-middleproxy_shared_bytes   = middleproxy_buffer_kb * 1024 * 2 (if ME enabled)
+effective_mp_cap = min(middleproxy_buffer_kb * 1024, 16 MiB)
+middleproxy_per_conn_bytes = effective_mp_cap * 2 (if ME enabled)
+middleproxy_shared_bytes   = (effective_mp_cap + 256) + effective_mp_cap (if ME enabled)
 overhead_bytes    = ~2 KiB
 per_conn_bytes    = tls_working_bytes + middleproxy_per_conn_bytes + overhead_bytes
 
@@ -89,6 +91,8 @@ reserve_bytes = max(256 MiB, RAM * 10%)
 budget_bytes  = max(0, usable_bytes - reserve_bytes - middleproxy_shared_bytes)
 safe_connections = max(32, budget_bytes / per_conn_bytes)
 ```
+
+Runtime allocation is lazier than this estimate: MiddleProxy per-connection stream buffers start at 16 KiB per direction and grow only when traffic requires it. The capacity estimate intentionally budgets the full effective cap so the startup clamp is conservative under worst-case media traffic.
 
 If `max_connections` exceeds the RAM-safe estimate, startup auto-clamps it before the proxy starts unless `[server].unsafe_override_limits = true`. With the override enabled, startup keeps the configured value and logs a RAM-safety warning. If `/proc/meminfo` cannot be read on Linux, startup logs that the RAM clamp was skipped.
 
@@ -107,6 +111,8 @@ If `max_connections` exceeds the RAM-safe estimate, startup auto-clamps it befor
 
 - `epoll` interests and queue flushing remain non-blocking and symmetric.
 - Direct/MiddleProxy fallback logic still preserves media and non-media expectations.
+- MiddleProxy buffer changes preserve 16 KiB initial allocation, on-demand growth, and the 16 MiB effective cap.
 - Timeout behavior remains controlled by config timers.
+- CI remains green across `zig fmt --check`, Debug tests, ReleaseSafe tests, daemon smoke with positive and bad-secret paths, ReleaseFast builds, cross-builds, ShellCheck, Python syntax checks, Docker build smoke, bench, and soak.
 - Deploy docs remain aligned with current tunnel/direct-mode behavior.
 - Docs remain aligned with code paths and log messages.

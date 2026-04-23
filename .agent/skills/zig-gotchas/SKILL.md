@@ -10,7 +10,7 @@ This file tracks practical pitfalls and current runtime constraints for `mtproto
 ## Current Architecture Baseline
 
 - Relay core is Linux `epoll` event loop, single-threaded on hot path.
-- Connection state is pooled (`ConnectionSlot`) and mostly heap-backed on demand.
+- Connection pools allocate slot indexes/fd maps for the configured cap, while `ConnectionSlot` objects are heap-created on demand.
 - Non-blocking writes are queue-based (`MessageQueue`) and flushed with `writev`.
 - MiddleProxy metadata refresh runs in a detached updater thread.
 
@@ -48,7 +48,9 @@ Do not reintroduce thread-per-connection or blocking relay loops.
 - Endpoints and secret are refreshed from Telegram core endpoints; bundled defaults remain fallback.
 - Candidate rotation and direct fallback behavior are part of normal operation.
 - Direct fallback can happen for both regular and media traffic when MiddleProxy candidates are missing or ME transport fails.
-- `middleproxy_buffer_kb` is not "4x per connection" in current code: there are 2 per-connection buffers plus 2 shared event-loop scratch buffers.
+- `middleproxy_buffer_kb` is a per-direction cap, not an eager allocation. Each MiddleProxy context starts with 16 KiB C2S/S2C buffers and grows on demand up to `min(middleproxy_buffer_kb, 16384)` KiB.
+- The event loop keeps lazy reusable C2S/S2C scratch buffers. C2S scratch is `effective_cap + 256`; S2C scratch is `effective_cap`.
+- The startup capacity clamp intentionally budgets the full effective MiddleProxy cap per direction, so it is more conservative than the idle memory footprint.
 - `force_media_middle_proxy` defaults to true, so media traffic keeps preferring ME unless explicitly disabled.
 - `middle_proxy_nat_ip` can override the IPv4 embedded into MiddleProxy NAT/AES derivation when AWG/public-IP detection is not the address you want.
 
@@ -70,3 +72,4 @@ Do not reintroduce thread-per-connection or blocking relay loops.
 - Use error unions and avoid swallowing critical errors on control-path boundaries.
 - Keep tests close to protocol primitives and relay helpers.
 - For substantial behavior changes, update `README.md` and relevant `.agent` docs in the same change.
+- Keep CI expectations in mind: formatting, Debug tests, ReleaseSafe tests, real daemon smoke (valid FakeTLS plus bad-secret rejection), cross-builds, ShellCheck, Python harness syntax, Docker build smoke, bench, and soak.

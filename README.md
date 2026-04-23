@@ -62,6 +62,7 @@ Connection-capacity methodology and command profiles: `test/README.md`.
 - Handshake and relay lifetimes are controlled by event-loop timers (`idle_timeout_sec`, `handshake_timeout_sec`), not by `SO_RCVTIMEO`.
 - Failed non-blocking upstream connects are reclaimed immediately on fatal hangup events; the relay loop should not spin on dead upstream sockets.
 - Timer maintenance runs on a fixed cadence and scans only the allocated connection-slot prefix; production builds also emit aggregated `conn stats` every 10 seconds.
+- MiddleProxy per-direction C2S/S2C buffers start at 16 KiB and grow on demand up to the effective `middleproxy_buffer_kb` cap; shared event-loop scratch buffers are also allocated lazily and reused.
 
 ## &nbsp; Quick Start
 
@@ -93,6 +94,15 @@ make run
 make test
 ```
 
+CI also runs the stricter local checks below:
+
+```bash
+zig fmt --check build.zig src test_addr.zig test_al.zig
+python3 -m py_compile test/*.py
+shellcheck --severity=error deploy/*.sh deploy/monitor/*.sh
+zig build -Doptimize=ReleaseSafe test
+```
+
 ### Performance & Stability Checks
 
 ```bash
@@ -102,9 +112,16 @@ make bench
 # 30-second multithreaded soak (crash/stability guard)
 make soak
 
+# Real daemon smoke: launches the binary, verifies a valid FakeTLS handshake,
+# and rejects the same SNI with a bad secret
+zig build
+python3 test/daemon_smoke.py --binary zig-out/bin/mtproto-proxy
+
 # Custom soak shape
 zig build -Doptimize=ReleaseFast soak -- --seconds=120 --threads=8 --max-payload=131072
 ```
+
+The GitHub workflow additionally verifies native `ReleaseFast`, Linux `x86_64`, deploy-target `x86_64_v3`, Linux `aarch64`, and Docker build smoke paths.
 
 `bench` prints per-payload throughput (`in_mib_per_s`, `out_mib_per_s`) and `ns_per_op`.
 `soak` prints aggregate `ops/s`, throughput, and `errors`; non-zero errors fail the step.
@@ -598,7 +615,7 @@ port = 443
 public_ip = "proxy.example.com"             # Same domain as tls_domain for self-domain masking links
 # middle_proxy_nat_ip = "203.0.113.10"      # Optional IPv4 override for MiddleProxy NAT/AES derivation
 backlog = 4096                             # TCP listen queue size
-middleproxy_buffer_kb = 1024              # ME C2S/S2C buffers grow on demand up to this cap; event loop keeps shared scratch buffers
+middleproxy_buffer_kb = 1024               # ME C2S/S2C buffers grow on demand up to this cap; runtime caps effective value at 16384 KiB
 max_connections = 512                      # Safe default for small (1 vCPU / ~1 GB) VPS
 idle_timeout_sec = 120
 handshake_timeout_sec = 15
@@ -644,7 +661,7 @@ alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eli
 | `[server]` | `max_connections` | `512` | Concurrent connection cap (small-VPS tuned default). On Linux, startup first auto-clamps this to the RAM-safe estimate unless `unsafe_override_limits=true`; the proxy then clamps again if `RLIMIT_NOFILE` cannot cover the fd budget |
 | `[server]` | `idle_timeout_sec` | `120` | Connection idle timeout in seconds (also used before first client byte) |
 | `[server]` | `handshake_timeout_sec` | `15` | Timeout for completing handshake after first byte |
-| `[server]` | `middleproxy_buffer_kb` | `1024` | MiddleProxy per-direction buffer cap in KiB. Active ME connections now start with small C2S/S2C buffers and grow on demand up to this cap; each event loop also keeps shared scratch buffers. Values below 1024 may still cause `MiddleProxyBufferOverflow` on media-heavy traffic (Stories, video messages) |
+| `[server]` | `middleproxy_buffer_kb` | `1024` | MiddleProxy per-direction buffer cap in KiB. Active ME connections start with 16 KiB C2S/S2C buffers and grow on demand up to `min(middleproxy_buffer_kb, 16384)` KiB; each event loop also keeps lazy shared scratch buffers. Values below 1024 may still cause `MiddleProxyBufferOverflow` on media-heavy traffic (Stories, video messages). Parser lower bound is 64 KiB |
 | `[server]` | `tag` | _(none)_ | Optional 32 hex-char promotion tag from [@MTProxybot](https://t.me/MTProxybot) |
 | `[server]` | `log_level` | `"info"` | Runtime log verbosity: `debug` (all DC routing, relay, close details), `info` (default — connection stats, warnings), `warn`, `err`. Change without recompilation; takes effect on restart |
 | `[server]` | `rate_limit_per_subnet` | `30` | Max new connections per second per /24 (IPv4) or /48 (IPv6) subnet. Blocks scanner/DPI-probe flood. Set `0` to disable |
@@ -670,6 +687,8 @@ alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eli
 
 > **Operational note** &nbsp; On startup, `max_connections` is automatically clamped to a RAM-safe estimate (with a warning). Set `unsafe_override_limits = true` in `[server]` to disable this. The proxy also has built-in admission control: at 90% capacity it pauses `accept()` and resumes at 80%, preventing CPU-wasteful accept→close spin loops.
 
+> **Operational note** &nbsp; The RAM-safety estimate intentionally budgets MiddleProxy at full configured per-direction cap even though active C2S/S2C buffers grow lazily from 16 KiB. Configured `middleproxy_buffer_kb` values above 16384 are accepted but the effective runtime cap is 16 MiB per direction and startup logs a warning.
+
 > **Operational note** &nbsp; The proxy limits new connections to 30/sec per /24 subnet by default (`rate_limit_per_subnet`). This blocks ТСПУ scanners and DPI replay probes without affecting legitimate Telegram clients.
 
 > **Operational note** &nbsp; Self-domain masking expects DNS `A proxy.example.com -> <VPS_IP>`, Cloudflare DNS-only mode if used, public TCP `80` for Let's Encrypt, public TCP `443` for `mtproto-proxy`, and local Nginx TLS on `127.0.0.1:8443` returning `404` for non-proxy requests. By default, `setup_masking.sh` disables `/etc/nginx/sites-enabled/default` and makes `mtproto-masking` the default public `:80` server so unmatched HTTP requests also return `404`. The `ee` link secret changes when `tls_domain` changes, so regenerate client links after changing the domain.
@@ -677,6 +696,8 @@ alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eli
 > **Tip** &nbsp; Generate a random secret: `openssl rand -hex 16`
 
 > **Note** &nbsp; The configuration format is compatible with the Rust-based `telemt` proxy.
+
+> **Note** &nbsp; The parser supports inline `#` / `;` comments after values and treats duplicate owned string/user/direct-user entries as last-write-wins without leaking previous allocations.
 
 > **Note** &nbsp; MiddleProxy settings (regular DC1..5 endpoints + media-path endpoints + shared secret) are refreshed automatically from Telegram (`getProxyConfig`, `getProxySecret`) with bundled defaults as fallback.
 

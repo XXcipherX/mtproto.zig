@@ -32,23 +32,28 @@ port = 443
 # TCP listen queue depth. Higher values absorb connection bursts better.
 # backlog = 4096
 
-# Maximum concurrent client connections. With lazy pool allocation,
-# raising this does NOT increase idle memory — slots are created on demand.
+# Maximum concurrent client connections. The pool allocates slot indexes and
+# fd maps for this cap at startup; ConnectionSlot objects themselves are
+# created on demand. Startup auto-clamps this to a RAM-safe estimate unless
+# unsafe_override_limits=true.
 # max_connections = 65535
 
 # Seconds to wait for the first byte from a new client before dropping.
-# Keep high (300) to accommodate mobile pre-warmed connection pools.
-# idle_timeout_sec = 300
+# Default is 120; raise if your client mix keeps many pre-warmed idle sockets.
+# idle_timeout_sec = 120
 
 # Seconds to complete TLS+MTProto handshake after first byte arrives.
-# handshake_timeout_sec = 60
+# Default is 15; parser enforces a minimum of 5.
+# handshake_timeout_sec = 15
 
-# MiddleProxy stream buffer size in KiB.
-# Current code keeps 2 such buffers per active ME connection and 2 shared
-# scratch buffers in the event loop.
-# 1024 (default) is the validated minimum for reliable media downloads (Stories, video).
+# MiddleProxy per-direction stream buffer cap in KiB.
+# Active ME connections start with 16 KiB C2S/S2C buffers and grow on demand
+# up to min(middleproxy_buffer_kb, 16384) KiB. The event loop also keeps lazy
+# shared scratch buffers; C2S scratch includes a small protocol headroom.
+# 1024 (default) is the validated minimum for reliable media downloads
+# (Stories, video).
 # Values below 1024 may cause MiddleProxyBufferOverflow on media-heavy sessions.
-# Raise to 2048 for high-throughput media; values below 512 are not recommended.
+# Parser lower bound is 64; values above 16384 are accepted but capped at runtime.
 # middleproxy_buffer_kb = 1024
 
 # Runtime log verbosity: debug, info (default), warn, err.
