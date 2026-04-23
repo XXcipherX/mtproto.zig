@@ -49,7 +49,8 @@ pub const Config = struct {
     /// MiddleProxy stream buffer size in KiB.
     /// In current design, each active MiddleProxy connection keeps 2 such
     /// buffers, while EventLoop also keeps shared C2S/S2C scratch space for
-    /// framing and decrypt/encrypt staging.
+    /// framing and decrypt/encrypt staging. The C2S scratch starts near 1x
+    /// buffer size and grows on demand for pathological tiny-packet bursts.
     /// Minimum 1024 recommended — lower values cause MiddleProxyBufferOverflow on media
     /// downloads (Stories, video messages) through middle proxy.
     middleproxy_buffer_kb: u32 = 1024,
@@ -65,7 +66,7 @@ pub const Config = struct {
     /// Test-only hook to redirect upstream connections locally
     datacenter_override: ?std.net.Address = null,
 
-    pub const middle_proxy_c2s_scratch_expansion: usize = 96;
+    pub const middle_proxy_c2s_scratch_headroom: usize = 256;
 
     pub fn middleProxyBufferBytes(self: *const Config) usize {
         return @as(usize, self.middleproxy_buffer_kb) * 1024;
@@ -76,7 +77,7 @@ pub const Config = struct {
     }
 
     pub fn middleProxyC2sScratchBytes(self: *const Config) usize {
-        return self.middleProxyBufferBytes() * middle_proxy_c2s_scratch_expansion + 256;
+        return self.middleProxyBufferBytes() + middle_proxy_c2s_scratch_headroom;
     }
 
     pub fn middleProxySharedScratchBytes(self: *const Config) usize {
@@ -456,8 +457,8 @@ test "middle proxy scratch helpers cover media-only mode" {
     defer cfg.deinit(std.testing.allocator);
 
     try std.testing.expect(cfg.usesAnyMiddleProxy());
-    try std.testing.expectEqual(@as(usize, 1024 * 1024 * 96 + 256), cfg.middleProxyC2sScratchBytes());
-    try std.testing.expectEqual(@as(usize, 1024 * 1024 * 97 + 256), cfg.middleProxySharedScratchBytes());
+    try std.testing.expectEqual(@as(usize, 1024 * 1024 + Config.middle_proxy_c2s_scratch_headroom), cfg.middleProxyC2sScratchBytes());
+    try std.testing.expectEqual(@as(usize, 2 * 1024 * 1024 + Config.middle_proxy_c2s_scratch_headroom), cfg.middleProxySharedScratchBytes());
 }
 
 test "parse config - middleproxy buffer size" {

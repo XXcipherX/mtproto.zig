@@ -213,6 +213,79 @@ pub const MiddleProxyContext = struct {
         allocator.free(self.c2s_buf);
     }
 
+    fn peekBufferedC2sByte(self: *const MiddleProxyContext, client_data: []const u8, idx: usize) u8 {
+        if (idx < self.c2s_len) return self.c2s_buf[idx];
+        return client_data[idx - self.c2s_len];
+    }
+
+    fn c2sFrameEncryptedLen(self: *const MiddleProxyContext, client_payload_len: usize) usize {
+        const extra_len: usize = if (self.ad_tag != null) 28 else 0;
+        const frame_total_len = 68 + extra_len + client_payload_len;
+        const padding_needed = (16 - (frame_total_len % 16)) % 16;
+        return frame_total_len + padding_needed;
+    }
+
+    pub fn requiredC2sScratchCapacity(self: *const MiddleProxyContext, client_data: []const u8) !usize {
+        if (self.c2s_len + client_data.len > self.c2s_buf.len) return error.MiddleProxyBufferOverflow;
+
+        const total_input_len = self.c2s_len + client_data.len;
+        var pos: usize = 0;
+        var total_written: usize = 0;
+
+        while (pos < total_input_len) {
+            var payload_len: usize = 0;
+            var header_len: usize = 0;
+
+            switch (self.proto_tag) {
+                .abridged => {
+                    if (total_input_len - pos < 1) break;
+                    const first = self.peekBufferedC2sByte(client_data, pos);
+                    const len_val = first & 0x7F;
+                    if (len_val < 127) {
+                        header_len = 1;
+                        payload_len = @as(usize, len_val) * 4;
+                    } else {
+                        if (total_input_len - pos < 4) break;
+
+                        var header_buf: [4]u8 = undefined;
+                        for (0..header_buf.len) |i| {
+                            header_buf[i] = self.peekBufferedC2sByte(client_data, pos + i);
+                        }
+
+                        header_len = 4;
+                        payload_len = std.mem.readInt(u32, header_buf[0..4], .little) >> 8;
+                        payload_len *= 4;
+                    }
+                },
+                .intermediate, .secure => {
+                    if (total_input_len - pos < 4) break;
+
+                    var header_buf: [4]u8 = undefined;
+                    for (0..header_buf.len) |i| {
+                        header_buf[i] = self.peekBufferedC2sByte(client_data, pos + i);
+                    }
+
+                    header_len = 4;
+                    var len_u32 = std.mem.readInt(u32, header_buf[0..4], .little);
+                    len_u32 &= 0x7FFFFFFF;
+                    payload_len = len_u32;
+                },
+            }
+
+            if (total_input_len - pos < header_len + payload_len) break;
+
+            var actual_payload_len = payload_len;
+            if (self.proto_tag == .secure) {
+                actual_payload_len -= payload_len % 4;
+            }
+
+            total_written += self.c2sFrameEncryptedLen(actual_payload_len);
+            pos += header_len + payload_len;
+        }
+
+        return total_written;
+    }
+
     /// Takes arbitrary bytes from the client stream, wraps them in RPC_PROXY_REQ,
     /// frames them into MTProtoFrame(s), encrypts with AES-CBC, and stores them in `out_buf`.
     /// Returns the number of bytes written to `out_buf` (which must be sent to the DC).
@@ -654,6 +727,35 @@ test "encapsulated c2s includes ad_tag block when present" {
     try std.testing.expectEqualSlices(u8, &proxy_tag, payload[60..64]);
     try std.testing.expectEqual(@as(u8, 16), payload[64]);
     try std.testing.expectEqualSlices(u8, &ad_tag, payload[65..81]);
+}
+
+test "required c2s scratch capacity accounts for buffered partial frame" {
+    const allocator = std.testing.allocator;
+
+    const key = [_]u8{0} ** 32;
+    const iv = [_]u8{0} ** 16;
+
+    var ctx = try MiddleProxyContext.init(
+        allocator,
+        crypto.AesCbc.init(&key, &iv),
+        crypto.AesCbc.init(&key, &iv),
+        [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 },
+        -2,
+        std.net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
+        std.net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
+        .intermediate,
+        null,
+    );
+    defer ctx.deinit(allocator);
+
+    ctx.c2s_buf[0] = 4;
+    ctx.c2s_buf[1] = 0;
+    ctx.c2s_len = 2;
+
+    const tail = [_]u8{ 0, 0, 0xde, 0xad, 0xbe, 0xef };
+    const required = try ctx.requiredC2sScratchCapacity(tail[0..]);
+
+    try std.testing.expectEqual(ctx.c2sFrameEncryptedLen(4), required);
 }
 
 test "decapsulate s2c skips noop padding words" {
