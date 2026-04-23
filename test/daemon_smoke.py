@@ -151,6 +151,7 @@ def verify_bad_secret_rejected(
             return
         if is_valid_fake_tls_response(got):
             raise RuntimeError("bad secret received a valid FakeTLS response")
+    print("negative bad-secret smoke passed")
 
 
 def write_smoke_config(path: Path, port: int) -> None:
@@ -221,6 +222,7 @@ def main() -> int:
                 hello = build_tls_auth_client_hello(bytes.fromhex(SECRET_HEX), TLS_DOMAIN)
                 sock.sendall(hello)
                 verify_fake_tls_response(sock)
+                print("positive FakeTLS handshake passed")
             verify_bad_secret_rejected(proc, args, build_tls_auth_client_hello)
         except Exception as err:  # noqa: BLE001 - this is a test harness.
             fail(str(err), proc)
