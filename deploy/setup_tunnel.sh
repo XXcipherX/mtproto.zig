@@ -102,6 +102,63 @@ get_mask_port() {
     ' "$cfg" 2>/dev/null
 }
 
+get_config_value() {
+    local cfg="$1"
+    local section="$2"
+    local key="$3"
+    local default_value="${4:-}"
+
+    [[ -f "$cfg" ]] || { printf '%s\n' "$default_value"; return; }
+
+    awk -v want_section="$section" -v want_key="$key" -v fallback="$default_value" '
+        BEGIN { in_section = 0; value = "" }
+        /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
+            header = $0
+            gsub(/^[[:space:]]*\[|\][[:space:]]*$/, "", header)
+            in_section = (header == want_section)
+            next
+        }
+        in_section {
+            line = $0
+            sub(/#.*/, "", line)
+            if (line ~ "^[[:space:]]*" want_key "[[:space:]]*=") {
+                split(line, parts, "=")
+                value = parts[2]
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+                gsub(/^"|"$/, "", value)
+            }
+        }
+        END { print value == "" ? fallback : value }
+    ' "$cfg" 2>/dev/null
+}
+
+get_first_user_secret() {
+    local cfg="$1"
+    [[ -f "$cfg" ]] || return 0
+
+    awk '
+        BEGIN { in_users = 0 }
+        /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
+            header = $0
+            gsub(/^[[:space:]]*\[|\][[:space:]]*$/, "", header)
+            in_users = (header == "access.users")
+            next
+        }
+        in_users {
+            line = $0
+            sub(/[;#].*/, "", line)
+            if (line !~ /=/) next
+            sub(/^[^=]*=/, "", line)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
+            gsub(/^"|"$/, "", line)
+            if (length(line) == 32 && line !~ /[^0-9A-Fa-f]/) {
+                print tolower(line)
+                exit
+            }
+        }
+    ' "$cfg" 2>/dev/null
+}
+
 # ── Argument parsing ────────────────────────────────────────
 AWG_CONF="${1:-}"
 TUNNEL_MODE="${2:-direct}"
@@ -390,10 +447,14 @@ fi
 
 # ── Print result ────────────────────────────────────────────
 # Extract first user secret
-SECRET=$(grep -oP '=\s*"\K[0-9a-f]{32}' "$INSTALL_DIR/config.toml" | head -1)
-TLS_DOMAIN=$(grep -oP 'tls_domain\s*=\s*"\K[^"]+' "$INSTALL_DIR/config.toml" || echo "wb.ru")
+SECRET="$(get_first_user_secret "$INSTALL_DIR/config.toml")"
+TLS_DOMAIN="$(get_config_value "$INSTALL_DIR/config.toml" "censorship" "tls_domain" "wb.ru")"
 DOMAIN_HEX=$(echo -n "$TLS_DOMAIN" | xxd -p | tr -d '\n')
-EE_SECRET="ee${SECRET}${DOMAIN_HEX}"
+if [[ -n "$SECRET" ]]; then
+    EE_SECRET="ee${SECRET}${DOMAIN_HEX}"
+else
+    EE_SECRET=""
+fi
 
 echo ""
 echo -e "${BOLD}${CYAN}══════════════════════════════════════════════════${RESET}"
@@ -407,9 +468,13 @@ echo -e "  ${DIM}Monitor:${RESET} systemctl status mtproto-mask-health.timer"
 echo -e "  ${DIM}Mon logs:${RESET} journalctl -t mtproto-mask-health -n 50"
 echo ""
 echo -e "  ${BOLD}Connection link:${RESET}"
+if [[ -n "$EE_SECRET" ]]; then
 echo -e "  ${CYAN}tg://proxy?server=${PUBLIC_IP}&port=${PORT}&secret=${GREEN}${EE_SECRET}${RESET}"
 echo ""
 echo -e "  ${DIM}t.me/proxy?server=${PUBLIC_IP}&port=${PORT}&secret=${EE_SECRET}${RESET}"
+else
+echo -e "  ${RED}Unable to build link:${RESET} no valid 32-hex secret found in [access.users]"
+fi
 echo ""
 echo -e "  ${BOLD}Architecture:${RESET}"
 echo -e "  ${GREEN}✓${RESET} Proxy runs inside isolated network namespace"

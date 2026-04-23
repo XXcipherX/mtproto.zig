@@ -115,12 +115,12 @@ get_first_user_secret() {
         }
         in_users {
             line = $0
-            sub(/#.*/, "", line)
+            sub(/[;#].*/, "", line)
             if (line !~ /=/) next
             sub(/^[^=]*=/, "", line)
             gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
             gsub(/^"|"$/, "", line)
-            if (line ~ /^[0-9A-Fa-f]{32}$/) {
+            if (length(line) == 32 && line !~ /[^0-9A-Fa-f]/) {
                 print tolower(line)
                 exit
             }
