@@ -103,6 +103,7 @@ pub fn getAesKeyAndIv(
 }
 
 pub const MiddleProxyContext = struct {
+    allocator: std.mem.Allocator,
     encryptor: crypto.AesCbc,
     decryptor: crypto.AesCbc,
     seq_no: i32 = -2,
@@ -122,7 +123,11 @@ pub const MiddleProxyContext = struct {
     c2s_buf: []u8,
     c2s_len: usize = 0,
 
+    buffer_limit: usize,
+
     pub const default_stream_buffer_size: usize = 128 * 1024;
+    pub const initial_stream_buffer_size: usize = 16 * 1024;
+    pub const max_stream_buffer_size: usize = 1 << 24;
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -161,6 +166,9 @@ pub const MiddleProxyContext = struct {
         ad_tag: ?[16]u8,
         buffer_size: usize,
     ) !MiddleProxyContext {
+        const buffer_limit = @min(@max(buffer_size, initial_stream_buffer_size), max_stream_buffer_size);
+        const initial_buffer_size = @min(buffer_limit, initial_stream_buffer_size);
+
         var rip: [20]u8 = undefined;
         var rport: u16 = 0;
         if (remote_addr.any.family == posix.AF.INET) {
@@ -187,13 +195,14 @@ pub const MiddleProxyContext = struct {
         } else return error.UnsupportedAddressType;
         std.mem.writeInt(u32, oip[16..20], std.mem.bigToNative(u16, oport), .little);
 
-        const s2c_buf = try allocator.alloc(u8, buffer_size);
+        const s2c_buf = try allocator.alloc(u8, initial_buffer_size);
         errdefer allocator.free(s2c_buf);
 
-        const c2s_buf = try allocator.alloc(u8, buffer_size);
+        const c2s_buf = try allocator.alloc(u8, initial_buffer_size);
         errdefer allocator.free(c2s_buf);
 
         return .{
+            .allocator = allocator,
             .encryptor = encryptor,
             .decryptor = decryptor,
             .seq_no = initial_seq_no,
@@ -205,12 +214,40 @@ pub const MiddleProxyContext = struct {
             .ad_tag = ad_tag,
             .s2c_buf = s2c_buf,
             .c2s_buf = c2s_buf,
+            .buffer_limit = buffer_limit,
         };
     }
 
-    pub fn deinit(self: *MiddleProxyContext, allocator: std.mem.Allocator) void {
-        allocator.free(self.s2c_buf);
-        allocator.free(self.c2s_buf);
+    pub fn deinit(self: *MiddleProxyContext) void {
+        self.allocator.free(self.s2c_buf);
+        self.allocator.free(self.c2s_buf);
+    }
+
+    fn requiredBufferedCapacity(self: *const MiddleProxyContext, current_len: usize, extra_len: usize) !usize {
+        const needed = try std.math.add(usize, current_len, extra_len);
+        if (needed > self.buffer_limit) return error.MiddleProxyBufferOverflow;
+        return needed;
+    }
+
+    fn nextBufferCapacity(current_capacity: usize, min_capacity: usize, limit: usize) usize {
+        var next = current_capacity;
+        while (next < min_capacity) {
+            if (next >= limit / 2) return limit;
+            next *= 2;
+        }
+        return next;
+    }
+
+    fn ensureC2sCapacity(self: *MiddleProxyContext, min_capacity: usize) !void {
+        if (self.c2s_buf.len >= min_capacity) return;
+        const next_capacity = nextBufferCapacity(self.c2s_buf.len, min_capacity, self.buffer_limit);
+        self.c2s_buf = try self.allocator.realloc(self.c2s_buf, next_capacity);
+    }
+
+    fn ensureS2cCapacity(self: *MiddleProxyContext, min_capacity: usize) !void {
+        if (self.s2c_buf.len >= min_capacity) return;
+        const next_capacity = nextBufferCapacity(self.s2c_buf.len, min_capacity, self.buffer_limit);
+        self.s2c_buf = try self.allocator.realloc(self.s2c_buf, next_capacity);
     }
 
     fn peekBufferedC2sByte(self: *const MiddleProxyContext, client_data: []const u8, idx: usize) u8 {
@@ -226,9 +263,7 @@ pub const MiddleProxyContext = struct {
     }
 
     pub fn requiredC2sScratchCapacity(self: *const MiddleProxyContext, client_data: []const u8) !usize {
-        if (self.c2s_len + client_data.len > self.c2s_buf.len) return error.MiddleProxyBufferOverflow;
-
-        const total_input_len = self.c2s_len + client_data.len;
+        const total_input_len = try self.requiredBufferedCapacity(self.c2s_len, client_data.len);
         var pos: usize = 0;
         var total_written: usize = 0;
 
@@ -290,7 +325,8 @@ pub const MiddleProxyContext = struct {
     /// frames them into MTProtoFrame(s), encrypts with AES-CBC, and stores them in `out_buf`.
     /// Returns the number of bytes written to `out_buf` (which must be sent to the DC).
     pub fn encapsulateC2S(self: *MiddleProxyContext, client_data: []const u8, out_buf: []u8) ![]const u8 {
-        if (self.c2s_len + client_data.len > self.c2s_buf.len) return error.MiddleProxyBufferOverflow;
+        const total_input_len = try self.requiredBufferedCapacity(self.c2s_len, client_data.len);
+        try self.ensureC2sCapacity(total_input_len);
         @memcpy(self.c2s_buf[self.c2s_len .. self.c2s_len + client_data.len], client_data);
         self.c2s_len += client_data.len;
 
@@ -358,6 +394,10 @@ pub const MiddleProxyContext = struct {
         }
 
         return out_buf[0..total_written];
+    }
+
+    pub fn requiredS2cScratchCapacity(self: *const MiddleProxyContext, dc_chunk: []const u8) !usize {
+        return self.requiredBufferedCapacity(self.s2c_len, dc_chunk.len);
     }
 
     pub fn encapsulateSingleMessageC2S(self: *MiddleProxyContext, client_data: []const u8, is_quickack: bool, out_buf: []u8) !usize {
@@ -454,7 +494,8 @@ pub const MiddleProxyContext = struct {
     /// Takes raw AES-CBC bytes from DC, decrypts them block by block, parses MTProtoFrames,
     /// strips RPC_PROXY_ANS, and writes the inner payload into `out_buf`.
     pub fn decapsulateS2C(self: *MiddleProxyContext, dc_chunk: []const u8, out_buf: []u8) ![]u8 {
-        if (self.s2c_len + dc_chunk.len > self.s2c_buf.len) return error.MiddleProxyBufferOverflow;
+        const total_input_len = try self.requiredBufferedCapacity(self.s2c_len, dc_chunk.len);
+        try self.ensureS2cCapacity(total_input_len);
         @memcpy(self.s2c_buf[self.s2c_len .. self.s2c_len + dc_chunk.len], dc_chunk);
         self.s2c_len += dc_chunk.len;
 
@@ -603,7 +644,7 @@ test "encapsulated c2s keeps rpc_proxy_req header" {
         .intermediate,
         null,
     );
-    defer ctx.deinit(allocator);
+    defer ctx.deinit();
 
     const client_data = [_]u8{ 0xde, 0xad, 0xbe, 0xef };
     var encrypted_out: [512]u8 = undefined;
@@ -639,7 +680,7 @@ test "encapsulated c2s omits ad_tag block when absent" {
         .intermediate,
         null,
     );
-    defer ctx.deinit(allocator);
+    defer ctx.deinit();
 
     const client_data = [_]u8{ 0xde, 0xad, 0xbe, 0xef };
     var encrypted_out: [512]u8 = undefined;
@@ -675,7 +716,7 @@ test "encapsulate c2s rejects unaligned payload length" {
         .intermediate,
         null,
     );
-    defer ctx.deinit(allocator);
+    defer ctx.deinit();
 
     const client_data = [_]u8{ 0xde, 0xad, 0xbe };
     var encrypted_out: [128]u8 = undefined;
@@ -704,7 +745,7 @@ test "encapsulated c2s includes ad_tag block when present" {
         .intermediate,
         ad_tag,
     );
-    defer ctx.deinit(allocator);
+    defer ctx.deinit();
 
     const client_data = [_]u8{ 0xde, 0xad, 0xbe, 0xef };
     var encrypted_out: [512]u8 = undefined;
@@ -746,7 +787,7 @@ test "required c2s scratch capacity accounts for buffered partial frame" {
         .intermediate,
         null,
     );
-    defer ctx.deinit(allocator);
+    defer ctx.deinit();
 
     ctx.c2s_buf[0] = 4;
     ctx.c2s_buf[1] = 0;
@@ -775,7 +816,7 @@ test "decapsulate s2c skips noop padding words" {
         .intermediate,
         null,
     );
-    defer ctx.deinit(allocator);
+    defer ctx.deinit();
 
     // Build plaintext stream:
     // - one full 16-byte NO-OP block (4x uint32(4))
@@ -835,7 +876,7 @@ test "decapsulate s2c validates seq and checksum" {
         .intermediate,
         null,
     );
-    defer ctx.deinit(allocator);
+    defer ctx.deinit();
 
     // Build one plaintext RPC_PROXY_ANS frame with seq=0 and 4-byte body.
     var plain: [32]u8 = undefined;
@@ -891,7 +932,7 @@ test "decapsulate s2c rejects invalid frame length instead of resyncing" {
         .intermediate,
         null,
     );
-    defer ctx.deinit(allocator);
+    defer ctx.deinit();
 
     var plain: [16]u8 = undefined;
     std.mem.writeInt(u32, plain[0..4], 8, .little);
@@ -922,7 +963,7 @@ test "encapsulate c2s supports payloads larger than 64KiB" {
         .intermediate,
         null,
     );
-    defer ctx.deinit(allocator);
+    defer ctx.deinit();
 
     const payload_len = 96 * 1024;
     const payload = try allocator.alloc(u8, payload_len);
@@ -943,4 +984,118 @@ test "encapsulate c2s supports payloads larger than 64KiB" {
 
     const rpc_payload = out_buf[8 .. total_len - 4];
     try std.testing.expectEqualSlices(u8, &rpc_proxy_req, rpc_payload[0..4]);
+}
+
+test "middle proxy context grows c2s buffer on demand within configured cap" {
+    const allocator = std.testing.allocator;
+    const key = [_]u8{0} ** 32;
+    const iv = [_]u8{0} ** 16;
+
+    var ctx = try MiddleProxyContext.initWithBuffer(
+        allocator,
+        crypto.AesCbc.init(&key, &iv),
+        crypto.AesCbc.init(&key, &iv),
+        [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 },
+        -2,
+        std.net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
+        std.net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
+        .intermediate,
+        null,
+        128 * 1024,
+    );
+    defer ctx.deinit();
+
+    try std.testing.expectEqual(MiddleProxyContext.initial_stream_buffer_size, ctx.c2s_buf.len);
+
+    const payload_len = 96 * 1024;
+    const packet = try allocator.alloc(u8, 4 + payload_len);
+    defer allocator.free(packet);
+    std.mem.writeInt(u32, packet[0..4], payload_len, .little);
+    @memset(packet[4..], 0x42);
+
+    const required = try ctx.requiredC2sScratchCapacity(packet);
+    const out_buf = try allocator.alloc(u8, required);
+    defer allocator.free(out_buf);
+
+    const out = try ctx.encapsulateC2S(packet, out_buf);
+    try std.testing.expect(out.len > payload_len);
+    try std.testing.expect(ctx.c2s_buf.len >= packet.len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.c2s_len);
+}
+
+test "middle proxy context still enforces configured c2s cap" {
+    const allocator = std.testing.allocator;
+    const key = [_]u8{0} ** 32;
+    const iv = [_]u8{0} ** 16;
+
+    var ctx = try MiddleProxyContext.initWithBuffer(
+        allocator,
+        crypto.AesCbc.init(&key, &iv),
+        crypto.AesCbc.init(&key, &iv),
+        [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 },
+        -2,
+        std.net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
+        std.net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
+        .intermediate,
+        null,
+        64 * 1024,
+    );
+    defer ctx.deinit();
+
+    const payload_len = 96 * 1024;
+    const packet = try allocator.alloc(u8, 4 + payload_len);
+    defer allocator.free(packet);
+    std.mem.writeInt(u32, packet[0..4], payload_len, .little);
+    @memset(packet[4..], 0x42);
+
+    try std.testing.expectError(error.MiddleProxyBufferOverflow, ctx.requiredC2sScratchCapacity(packet));
+}
+
+test "middle proxy context grows s2c buffer on demand within configured cap" {
+    const allocator = std.testing.allocator;
+    const key = [_]u8{0} ** 32;
+    const iv = [_]u8{0} ** 16;
+
+    var ctx = try MiddleProxyContext.initWithBuffer(
+        allocator,
+        crypto.AesCbc.init(&key, &iv),
+        crypto.AesCbc.init(&key, &iv),
+        [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 },
+        -2,
+        std.net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
+        std.net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
+        .intermediate,
+        null,
+        128 * 1024,
+    );
+    defer ctx.deinit();
+
+    try std.testing.expectEqual(MiddleProxyContext.initial_stream_buffer_size, ctx.s2c_buf.len);
+
+    const conn_data_len = 96 * 1024;
+    const total_len: usize = 28 + conn_data_len;
+    const padded_len = (total_len + 15) & ~@as(usize, 15);
+    const plain = try allocator.alloc(u8, padded_len);
+    defer allocator.free(plain);
+    @memset(plain, 0);
+
+    std.mem.writeInt(u32, plain[0..4], @intCast(total_len), .little);
+    std.mem.writeInt(i32, plain[4..8], 0, .little);
+    @memcpy(plain[8..12], &rpc_proxy_ans);
+    std.mem.writeInt(u32, plain[12..16], 0, .little);
+    @memset(plain[16..24], 0);
+    @memset(plain[24 .. 24 + conn_data_len], 0x5a);
+    const checksum = crc32(plain[0 .. total_len - 4]);
+    std.mem.writeInt(u32, plain[total_len - 4 .. total_len], checksum, .little);
+
+    var enc = crypto.AesCbc.init(&key, &iv);
+    try enc.encryptInPlace(plain);
+
+    const required = try ctx.requiredS2cScratchCapacity(plain);
+    const out_buf = try allocator.alloc(u8, required);
+    defer allocator.free(out_buf);
+
+    const out = try ctx.decapsulateS2C(plain, out_buf);
+    try std.testing.expectEqual(@as(usize, 4 + conn_data_len), out.len);
+    try std.testing.expect(ctx.s2c_buf.len >= plain.len);
 }

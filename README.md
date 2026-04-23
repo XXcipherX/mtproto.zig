@@ -598,7 +598,7 @@ port = 443
 public_ip = "proxy.example.com"             # Same domain as tls_domain for self-domain masking links
 # middle_proxy_nat_ip = "203.0.113.10"      # Optional IPv4 override for MiddleProxy NAT/AES derivation
 backlog = 4096                             # TCP listen queue size
-middleproxy_buffer_kb = 1024              # ME uses 2 per-conn buffers; event loop keeps 2 shared scratch buffers
+middleproxy_buffer_kb = 1024              # ME C2S/S2C buffers grow on demand up to this cap; event loop keeps shared scratch buffers
 max_connections = 512                      # Safe default for small (1 vCPU / ~1 GB) VPS
 idle_timeout_sec = 120
 handshake_timeout_sec = 15
@@ -644,7 +644,7 @@ alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eli
 | `[server]` | `max_connections` | `512` | Concurrent connection cap (small-VPS tuned default). On Linux, startup first auto-clamps this to the RAM-safe estimate unless `unsafe_override_limits=true`; the proxy then clamps again if `RLIMIT_NOFILE` cannot cover the fd budget |
 | `[server]` | `idle_timeout_sec` | `120` | Connection idle timeout in seconds (also used before first client byte) |
 | `[server]` | `handshake_timeout_sec` | `15` | Timeout for completing handshake after first byte |
-| `[server]` | `middleproxy_buffer_kb` | `1024` | MiddleProxy buffer size in KiB. Current code keeps 2 such buffers per active ME connection and 2 shared scratch buffers per event loop. Values below 1024 may cause `MiddleProxyBufferOverflow` on media-heavy traffic (Stories, video messages) |
+| `[server]` | `middleproxy_buffer_kb` | `1024` | MiddleProxy per-direction buffer cap in KiB. Active ME connections now start with small C2S/S2C buffers and grow on demand up to this cap; each event loop also keeps shared scratch buffers. Values below 1024 may still cause `MiddleProxyBufferOverflow` on media-heavy traffic (Stories, video messages) |
 | `[server]` | `tag` | _(none)_ | Optional 32 hex-char promotion tag from [@MTProxybot](https://t.me/MTProxybot) |
 | `[server]` | `log_level` | `"info"` | Runtime log verbosity: `debug` (all DC routing, relay, close details), `info` (default — connection stats, warnings), `warn`, `err`. Change without recompilation; takes effect on restart |
 | `[server]` | `rate_limit_per_subnet` | `30` | Max new connections per second per /24 (IPv4) or /48 (IPv6) subnet. Blocks scanner/DPI-probe flood. Set `0` to disable |

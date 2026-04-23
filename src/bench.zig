@@ -59,7 +59,7 @@ fn runBench(allocator: std.mem.Allocator) !void {
 
     for (sizes) |payload_size| {
         var ctx = try initContext(allocator, .intermediate);
-        defer ctx.deinit(allocator);
+        defer ctx.deinit();
 
         const payload = try allocator.alloc(u8, payload_size);
         defer allocator.free(payload);
@@ -163,7 +163,7 @@ fn soakWorker(args: WorkerArgs) void {
         _ = args.shared.errors.fetchAdd(1, .monotonic);
         return;
     };
-    defer ctx.deinit(allocator);
+    defer ctx.deinit();
 
     const payload_buf = allocator.alloc(u8, args.max_payload) catch {
         _ = args.shared.errors.fetchAdd(1, .monotonic);

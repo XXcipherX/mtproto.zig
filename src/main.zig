@@ -154,7 +154,7 @@ fn detectTotalRamBytes(allocator: std.mem.Allocator) ?u64 {
 fn estimateCapacity(cfg: *const config.Config, total_ram_bytes: u64) CapacityEstimate {
     // Approximate per-connection user-space working set in the epoll model:
     // - preallocated slot state and small relay buffers
-    // - optional middle-proxy stream buffers (2 per-connection buffers)
+    // - optional middle-proxy stream buffers (budgeted as 2 per-connection caps)
     // - allocator/socket bookkeeping cushion
     const tls_working_bytes: u64 = @intCast(6 * 1024);
     const uses_middle_proxy = cfg.usesAnyMiddleProxy();

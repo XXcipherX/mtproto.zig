@@ -740,7 +740,7 @@ const ConnectionSlot = struct {
         if (self.dc_initial_tail) |buf| allocator.free(buf);
         self.dc_initial_tail = null;
 
-        if (self.middle_ctx) |*mp| mp.deinit(allocator);
+        if (self.middle_ctx) |*mp| mp.deinit();
         self.middle_ctx = null;
 
         if (self.upstream_candidates) |buf| allocator.free(buf);
@@ -2419,15 +2419,7 @@ const EventLoop = struct {
     fn relayUpstreamToClient(self: *EventLoop, slot: *ConnectionSlot) void {
         if (slot.hasClientPending()) return;
 
-        const mp_s2c_scratch = if (slot.middle_ctx != null)
-            self.ensureMpS2cScratch() catch {
-                self.closeSlot(slot, "alloc middleproxy s2c scratch failed");
-                return;
-            }
-        else
-            null;
-
-        const progress = relayUpstreamToClientStep(slot, self.state.allocator, mp_s2c_scratch) catch |err| {
+        const progress = relayUpstreamToClientStep(self, slot) catch |err| {
             if (slot.is_media_path) {
                 log.debug("[{d}] relay s2c error: dc_idx={d} err={any} c2s={d} s2c={d}", .{
                     slot.conn_id, slot.dc_idx, err, slot.c2s_bytes, slot.s2c_bytes,
@@ -3152,11 +3144,16 @@ const EventLoop = struct {
         return next;
     }
 
-    fn ensureMpS2cScratch(self: *EventLoop) ![]u8 {
-        if (self.mp_s2c_scratch) |buf| return buf;
-        const buf = try self.state.allocator.alloc(u8, self.state.config.middleProxyBufferBytes());
-        self.mp_s2c_scratch = buf;
-        return buf;
+    fn ensureMpS2cScratch(self: *EventLoop, min_capacity: usize) ![]u8 {
+        const target_capacity = @max(self.state.config.middleProxyBufferBytes(), min_capacity);
+        if (self.mp_s2c_scratch) |buf| {
+            if (buf.len >= target_capacity) return buf;
+        }
+
+        const next = try self.state.allocator.alloc(u8, target_capacity);
+        if (self.mp_s2c_scratch) |prev| self.state.allocator.free(prev);
+        self.mp_s2c_scratch = next;
+        return next;
     }
 
     fn closeSlot(self: *EventLoop, slot: *ConnectionSlot, reason: []const u8) void {
@@ -3341,8 +3338,8 @@ fn relayClientToUpstreamStep(self: *EventLoop, slot: *ConnectionSlot) !RelayProg
     }
 }
 
-fn relayUpstreamToClientStep(slot: *ConnectionSlot, allocator: std.mem.Allocator, mp_s2c_scratch: ?[]u8) !RelayProgress {
-    const read_buf = try ensureReadBuf(slot, allocator);
+fn relayUpstreamToClientStep(self: *EventLoop, slot: *ConnectionSlot) !RelayProgress {
+    const read_buf = try ensureReadBuf(slot, self.state.allocator);
     const n = posix.read(slot.upstream_fd, read_buf) catch |err| {
         if (err == error.WouldBlock) return .none;
         return err;
@@ -3352,7 +3349,8 @@ fn relayUpstreamToClientStep(slot: *ConnectionSlot, allocator: std.mem.Allocator
     const raw = read_buf[0..n];
 
     if (slot.middle_ctx) |*mp| {
-        const scratch = mp_s2c_scratch orelse return error.MissingMiddleProxyScratch;
+        const required = try mp.requiredS2cScratchCapacity(raw);
+        const scratch = try self.ensureMpS2cScratch(required);
         const payload = try mp.decapsulateS2C(raw, scratch);
         if (payload.len == 0) return .partial;
         if (slot.client_encryptor) |*enc| enc.apply(payload);
