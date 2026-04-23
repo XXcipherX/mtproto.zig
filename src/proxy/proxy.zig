@@ -371,9 +371,21 @@ const MessageQueue = struct {
         }
 
         return switch (class) {
-            .tiny => &((try self.allocator.create(TinyMsgBlock)).header),
-            .small => &((try self.allocator.create(SmallMsgBlock)).header),
-            .standard => &((try self.allocator.create(StandardMsgBlock)).header),
+            .tiny => blk: {
+                const tiny = try self.allocator.create(TinyMsgBlock);
+                tiny.* = .{};
+                break :blk &tiny.header;
+            },
+            .small => blk: {
+                const small = try self.allocator.create(SmallMsgBlock);
+                small.* = .{};
+                break :blk &small.header;
+            },
+            .standard => blk: {
+                const standard = try self.allocator.create(StandardMsgBlock);
+                standard.* = .{};
+                break :blk &standard.header;
+            },
         };
     }
 
@@ -2820,6 +2832,7 @@ const EventLoop = struct {
     }
 
     fn mpWriteFrame(self: *EventLoop, slot: *ConnectionSlot, payload: []const u8, encrypted: bool) !void {
+        _ = self;
         var plain: [mp_handshake_frame_buf_size]u8 = undefined;
         const total_len: usize = payload.len + 12;
         if (total_len > plain.len) return error.BadMiddleProxyFrameSize;

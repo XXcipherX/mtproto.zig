@@ -36,6 +36,11 @@ pub fn fetchUrlBytes(allocator: std.mem.Allocator, url: []const u8, options: Fet
 
     try req.sendBodiless();
 
+    // Some std.http paths establish the socket lazily on send.
+    if (req.connection) |connection| {
+        setSocketTimeouts(connection.stream_reader.getStream().handle, options.timeout_sec);
+    }
+
     var redirect_buf: [8 * 1024]u8 = undefined;
     var response = try req.receiveHead(&redirect_buf);
     if (response.head.status.class() != .success) return error.HttpRequestFailed;
