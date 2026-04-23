@@ -85,12 +85,10 @@ def recv_until(sock: socket.socket, size: int, timeout_sec: float) -> bytes:
     return data
 
 
-def verify_fake_tls_response(sock: socket.socket) -> None:
+def read_fake_tls_response(sock: socket.socket) -> bytes:
     got = recv_until(sock, 11, 1.0)
     if len(got) < 11:
-        raise RuntimeError(f"short response: got {len(got)} bytes")
-    if got[0:3] != b"\x16\x03\x03":
-        raise RuntimeError(f"unexpected ServerHello record header: {got[0:3].hex()}")
+        return got
 
     server_hello_len = int.from_bytes(got[3:5], "big")
     ccs_start = 5 + server_hello_len
@@ -99,18 +97,60 @@ def verify_fake_tls_response(sock: socket.socket) -> None:
 
     if len(got) < need:
         got += recv_until(sock, need - len(got), 1.0)
+    return got
+
+
+def is_valid_fake_tls_response(got: bytes) -> bool:
+    if len(got) < 11:
+        return False
+    if got[0:3] != b"\x16\x03\x03":
+        return False
+
+    server_hello_len = int.from_bytes(got[3:5], "big")
+    ccs_start = 5 + server_hello_len
+    app_start = ccs_start + 6
+    need = app_start + 5
     if len(got) < need:
-        raise RuntimeError(f"incomplete FakeTLS response: got {len(got)}, need {need}")
+        return False
 
     ccs = got[ccs_start : ccs_start + 6]
     if ccs != b"\x14\x03\x03\x00\x01\x01":
-        raise RuntimeError(f"unexpected ChangeCipherSpec record: {ccs.hex()}")
+        return False
 
     app_header = got[app_start : app_start + 5]
     if app_header[0:3] != b"\x17\x03\x03":
-        raise RuntimeError(f"unexpected ApplicationData header: {app_header.hex()}")
-    if int.from_bytes(app_header[3:5], "big") == 0:
-        raise RuntimeError("ApplicationData record has zero length")
+        return False
+    return int.from_bytes(app_header[3:5], "big") > 0
+
+
+def verify_fake_tls_response(sock: socket.socket) -> None:
+    got = read_fake_tls_response(sock)
+    if not is_valid_fake_tls_response(got):
+        raise RuntimeError(f"invalid FakeTLS response: got {len(got)} bytes")
+
+
+def verify_bad_secret_rejected(
+    proc: subprocess.Popen[str],
+    args: argparse.Namespace,
+    build_tls_auth_client_hello,
+) -> None:
+    bad_secret = bytearray(bytes.fromhex(SECRET_HEX))
+    bad_secret[0] ^= 0xFF
+
+    with wait_for_port(
+        proc,
+        ["127.0.0.1", "::1"],
+        args.port,
+        args.startup_timeout_sec,
+    ) as sock:
+        hello = build_tls_auth_client_hello(bytes(bad_secret), TLS_DOMAIN)
+        sock.sendall(hello)
+        try:
+            got = read_fake_tls_response(sock)
+        except OSError:
+            return
+        if is_valid_fake_tls_response(got):
+            raise RuntimeError("bad secret received a valid FakeTLS response")
 
 
 def write_smoke_config(path: Path, port: int) -> None:
@@ -181,6 +221,7 @@ def main() -> int:
                 hello = build_tls_auth_client_hello(bytes.fromhex(SECRET_HEX), TLS_DOMAIN)
                 sock.sendall(hello)
                 verify_fake_tls_response(sock)
+            verify_bad_secret_rejected(proc, args, build_tls_auth_client_hello)
         except Exception as err:  # noqa: BLE001 - this is a test harness.
             fail(str(err), proc)
         finally:

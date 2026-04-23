@@ -21,6 +21,12 @@ jobs:
       - name: Check Zig formatting
         run: zig fmt --check build.zig src test_addr.zig test_al.zig
 
+      - name: Check Python harness syntax
+        run: python3 -m py_compile test/*.py
+
+      - name: ShellCheck deploy scripts
+        run: shellcheck --severity=error deploy/*.sh deploy/monitor/*.sh
+
       - name: Run tests
         run: zig build test
 
@@ -49,6 +55,9 @@ jobs:
         run: |
           ls -lh zig-out/bin/mtproto-proxy
           file zig-out/bin/mtproto-proxy
+
+      - name: Docker build smoke
+        run: docker build --build-arg ZIG_VERSION=0.15.2 -t mtproto-zig-smoke .
 
   bench:
     name: Bench & Soak
