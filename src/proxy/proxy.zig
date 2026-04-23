@@ -1060,7 +1060,7 @@ pub const ProxyState = struct {
 
         setNonBlocking(server.stream.handle);
 
-        if (self.config.datacenter_override == null) {
+        if (self.config.datacenter_override == null and self.config.usesAnyMiddleProxy()) {
             self.refreshMiddleProxyInfo() catch |err| {
                 log.warn("Initial middle-proxy refresh failed, using bundled defaults: {any}", .{err});
             };
