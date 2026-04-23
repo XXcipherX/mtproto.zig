@@ -164,15 +164,30 @@ const MsgBlockClass = enum(u2) {
     standard = 2,
 };
 
-const MsgBlock = struct {
-    class: MsgBlockClass,
-    len: usize,
-    data: [standard_block_size]u8,
-};
-
 const tiny_block_size: usize = 64;
 const small_block_size: usize = 512;
 const standard_block_size: usize = 2048;
+
+const MsgBlock = struct {
+    class: MsgBlockClass,
+    len: usize,
+};
+
+const TinyMsgBlock = struct {
+    header: MsgBlock = .{ .class = .tiny, .len = 0 },
+    data: [tiny_block_size]u8 = undefined,
+};
+
+const SmallMsgBlock = struct {
+    header: MsgBlock = .{ .class = .small, .len = 0 },
+    data: [small_block_size]u8 = undefined,
+};
+
+const StandardMsgBlock = struct {
+    header: MsgBlock = .{ .class = .standard, .len = 0 },
+    data: [standard_block_size]u8 = undefined,
+};
+
 const max_scatter_parts: usize = 64;
 
 fn hasFatalEpollHangup(events: u32) bool {
@@ -193,6 +208,40 @@ fn chooseClass(size: usize) MsgBlockClass {
     return .standard;
 }
 
+fn blockStorage(blk: *MsgBlock) []u8 {
+    return switch (blk.class) {
+        .tiny => blk: {
+            const tiny: *TinyMsgBlock = @fieldParentPtr("header", blk);
+            break :blk tiny.data[0..];
+        },
+        .small => blk: {
+            const small: *SmallMsgBlock = @fieldParentPtr("header", blk);
+            break :blk small.data[0..];
+        },
+        .standard => blk: {
+            const standard: *StandardMsgBlock = @fieldParentPtr("header", blk);
+            break :blk standard.data[0..];
+        },
+    };
+}
+
+fn blockStorageConst(blk: *const MsgBlock) []const u8 {
+    return switch (blk.class) {
+        .tiny => blk: {
+            const tiny: *const TinyMsgBlock = @fieldParentPtr("header", blk);
+            break :blk tiny.data[0..];
+        },
+        .small => blk: {
+            const small: *const SmallMsgBlock = @fieldParentPtr("header", blk);
+            break :blk small.data[0..];
+        },
+        .standard => blk: {
+            const standard: *const StandardMsgBlock = @fieldParentPtr("header", blk);
+            break :blk standard.data[0..];
+        },
+    };
+}
+
 const MessageQueue = struct {
     allocator: std.mem.Allocator,
     tiny_free: std.ArrayListUnmanaged(*MsgBlock) = .{},
@@ -206,9 +255,9 @@ const MessageQueue = struct {
     fn deinit(self: *MessageQueue) void {
         self.clear();
 
-        for (self.tiny_free.items) |blk| self.allocator.destroy(blk);
-        for (self.small_free.items) |blk| self.allocator.destroy(blk);
-        for (self.std_free.items) |blk| self.allocator.destroy(blk);
+        for (self.tiny_free.items) |blk| self.destroyBlock(blk);
+        for (self.small_free.items) |blk| self.destroyBlock(blk);
+        for (self.std_free.items) |blk| self.destroyBlock(blk);
 
         self.tiny_free.deinit(self.allocator);
         self.small_free.deinit(self.allocator);
@@ -219,7 +268,7 @@ const MessageQueue = struct {
     fn clear(self: *MessageQueue) void {
         for (self.blocks.items[self.head_idx..]) |blk| {
             self.recycleBlock(blk) catch {
-                self.allocator.destroy(blk);
+                self.destroyBlock(blk);
             };
         }
         self.blocks.clearRetainingCapacity();
@@ -244,7 +293,7 @@ const MessageQueue = struct {
 
             var blk = try self.acquireBlock(class);
             blk.len = take;
-            @memcpy(blk.data[0..take], data[off .. off + take]);
+            @memcpy(blockStorage(blk)[0..take], data[off .. off + take]);
             try self.blocks.append(self.allocator, blk);
             self.total_len += take;
             off += take;
@@ -269,7 +318,8 @@ const MessageQueue = struct {
                 continue;
             }
 
-            out[count] = .{ .base = blk.data[local_off..blk.len].ptr, .len = blk.len - local_off };
+            const storage = blockStorageConst(blk);
+            out[count] = .{ .base = storage[local_off..blk.len].ptr, .len = blk.len - local_off };
             count += 1;
             local_off = 0;
         }
@@ -296,7 +346,7 @@ const MessageQueue = struct {
             self.offset = 0;
             self.head_idx += 1;
             self.recycleBlock(blk) catch {
-                self.allocator.destroy(blk);
+                self.destroyBlock(blk);
             };
         }
 
@@ -326,13 +376,11 @@ const MessageQueue = struct {
             return list.pop().?;
         }
 
-        const blk = try self.allocator.create(MsgBlock);
-        blk.* = .{
-            .class = class,
-            .len = 0,
-            .data = undefined,
+        return switch (class) {
+            .tiny => &((try self.allocator.create(TinyMsgBlock)).header),
+            .small => &((try self.allocator.create(SmallMsgBlock)).header),
+            .standard => &((try self.allocator.create(StandardMsgBlock)).header),
         };
-        return blk;
     }
 
     fn recycleBlock(self: *MessageQueue, blk: *MsgBlock) !void {
@@ -343,6 +391,23 @@ const MessageQueue = struct {
             .standard => &self.std_free,
         };
         try list.append(self.allocator, blk);
+    }
+
+    fn destroyBlock(self: *MessageQueue, blk: *MsgBlock) void {
+        switch (blk.class) {
+            .tiny => {
+                const tiny: *TinyMsgBlock = @fieldParentPtr("header", blk);
+                self.allocator.destroy(tiny);
+            },
+            .small => {
+                const small: *SmallMsgBlock = @fieldParentPtr("header", blk);
+                self.allocator.destroy(small);
+            },
+            .standard => {
+                const standard: *StandardMsgBlock = @fieldParentPtr("header", blk);
+                self.allocator.destroy(standard);
+            },
+        }
     }
 };
 
@@ -4094,6 +4159,31 @@ test "message queue consume is stable" {
     try std.testing.expect(q.isEmpty());
     try std.testing.expectEqual(@as(usize, 0), q.offset);
     try std.testing.expectEqual(@as(usize, 0), q.head_idx);
+}
+
+test "message queue uses compact block storage per class" {
+    try std.testing.expect(@sizeOf(TinyMsgBlock) < @sizeOf(StandardMsgBlock));
+    try std.testing.expect(@sizeOf(SmallMsgBlock) < @sizeOf(StandardMsgBlock));
+
+    var q = MessageQueue{ .allocator = std.testing.allocator };
+    defer q.deinit();
+
+    var tiny_payload: [tiny_block_size]u8 = [_]u8{0} ** tiny_block_size;
+    try q.appendCopy(&tiny_payload);
+    try std.testing.expectEqual(MsgBlockClass.tiny, q.blocks.items[0].class);
+    try std.testing.expectEqual(@as(usize, tiny_block_size), blockStorageConst(q.blocks.items[0]).len);
+    q.clear();
+
+    var small_payload: [small_block_size]u8 = [_]u8{1} ** small_block_size;
+    try q.appendCopy(&small_payload);
+    try std.testing.expectEqual(MsgBlockClass.small, q.blocks.items[0].class);
+    try std.testing.expectEqual(@as(usize, small_block_size), blockStorageConst(q.blocks.items[0]).len);
+    q.clear();
+
+    var standard_payload: [small_block_size + 1]u8 = [_]u8{2} ** (small_block_size + 1);
+    try q.appendCopy(&standard_payload);
+    try std.testing.expectEqual(MsgBlockClass.standard, q.blocks.items[0].class);
+    try std.testing.expectEqual(@as(usize, standard_block_size), blockStorageConst(q.blocks.items[0]).len);
 }
 
 test "epoll hangup helper" {
