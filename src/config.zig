@@ -48,13 +48,13 @@ pub const Config = struct {
     drs: bool = false,
     /// Fast mode: skip S2C encryption by passing client keys to DC directly
     fast_mode: bool = false,
-    /// MiddleProxy stream buffer size in KiB.
-    /// In current design, each active MiddleProxy connection keeps 2 such
-    /// buffers, while EventLoop also keeps shared C2S/S2C scratch space for
+    /// MiddleProxy stream buffer cap in KiB.
+    /// Per-connection C2S/S2C buffers now start small and grow on demand up to
+    /// this limit, while EventLoop keeps shared C2S/S2C scratch space for
     /// framing and decrypt/encrypt staging. The C2S scratch starts near 1x
     /// buffer size and grows on demand for pathological tiny-packet bursts.
-    /// Minimum 1024 recommended — lower values cause MiddleProxyBufferOverflow on media
-    /// downloads (Stories, video messages) through middle proxy.
+    /// Minimum 1024 recommended — lower caps still risk MiddleProxyBufferOverflow
+    /// on media downloads (Stories, video messages) through middle proxy.
     middleproxy_buffer_kb: u32 = 1024,
     /// Runtime log level: "debug", "info" (default), "warn", "err"
     log_level: std.log.Level = .info,
@@ -106,7 +106,7 @@ pub const Config = struct {
             const mem_per_conn_mb = (self.middleProxyBufferBytes() * 2) / (1024 * 1024);
             const shared_mb = self.middleProxySharedScratchBytes() / (1024 * 1024);
             log.warn(
-                "max_connections={d} with middleproxy_buffer_kb={d} may require " ++
+                "max_connections={d} with middleproxy_buffer_kb={d} should still plan for " ++
                     "up to {d} MB + {d} MB shared RAM at full capacity. Ensure your VPS has sufficient memory.",
                 .{ self.max_connections, self.middleproxy_buffer_kb, mem_per_conn_mb * self.max_connections, shared_mb },
             );
@@ -163,11 +163,37 @@ pub const Config = struct {
         return std.mem.trimRight(u8, value, &[_]u8{ ' ', '\t' });
     }
 
+    fn replaceOwnedOptionalString(allocator: std.mem.Allocator, field: *?[]const u8, value: []const u8) !void {
+        if (field.*) |prev| allocator.free(prev);
+        field.* = null;
+        field.* = try allocator.dupe(u8, value);
+    }
+
+    fn upsertOwnedEntry(
+        comptime V: type,
+        allocator: std.mem.Allocator,
+        map: *std.StringHashMap(V),
+        key: []const u8,
+        value: V,
+    ) !void {
+        const owned_key = try allocator.dupe(u8, key);
+        errdefer allocator.free(owned_key);
+
+        const gop = try map.getOrPut(owned_key);
+        if (gop.found_existing) {
+            allocator.free(owned_key);
+        }
+        if (V != void) {
+            gop.value_ptr.* = value;
+        }
+    }
+
     pub fn parse(allocator: std.mem.Allocator, content: []const u8) !Config {
         var cfg = Config{
             .users = std.StringHashMap([16]u8).init(allocator),
             .direct_users = std.StringHashMap(void).init(allocator),
         };
+        errdefer cfg.deinit(allocator);
 
         var lines = std.mem.splitScalar(u8, content, '\n');
         var in_users_section = false;
@@ -209,15 +235,13 @@ pub const Config = struct {
                     if (value.len != 32) continue;
                     var secret: [16]u8 = undefined;
                     _ = std.fmt.hexToBytes(&secret, value) catch continue;
-                    const name = try allocator.dupe(u8, key);
-                    try cfg.users.put(name, secret);
+                    try upsertOwnedEntry([16]u8, allocator, &cfg.users, key, secret);
                 } else if (in_direct_users_section) {
                     const enabled = std.mem.eql(u8, value, "true") or
                         std.mem.eql(u8, value, "1") or
                         std.mem.eql(u8, value, "yes");
                     if (!enabled) continue;
-                    const name = try allocator.dupe(u8, key);
-                    try cfg.direct_users.put(name, {});
+                    try upsertOwnedEntry(void, allocator, &cfg.direct_users, key, {});
                 } else if (in_general_section) {
                     if (std.mem.eql(u8, key, "use_middle_proxy")) {
                         cfg.use_middle_proxy = std.mem.eql(u8, value, "true");
@@ -259,9 +283,9 @@ pub const Config = struct {
                             } else |_| {}
                         }
                     } else if (std.mem.eql(u8, key, "public_ip")) {
-                        cfg.public_ip = try allocator.dupe(u8, value);
+                        try replaceOwnedOptionalString(allocator, &cfg.public_ip, value);
                     } else if (std.mem.eql(u8, key, "middle_proxy_nat_ip")) {
-                        cfg.middle_proxy_nat_ip = try allocator.dupe(u8, value);
+                        try replaceOwnedOptionalString(allocator, &cfg.middle_proxy_nat_ip, value);
                     } else if (std.mem.eql(u8, key, "fast_mode")) {
                         cfg.fast_mode = std.mem.eql(u8, value, "true");
                     } else if (std.mem.eql(u8, key, "middleproxy_buffer_kb")) {
@@ -287,6 +311,7 @@ pub const Config = struct {
                         if (cfg.tls_domain_owned) {
                             allocator.free(cfg.tls_domain);
                         }
+                        cfg.tls_domain_owned = false;
                         cfg.tls_domain = try allocator.dupe(u8, value);
                         cfg.tls_domain_owned = true;
                     } else if (std.mem.eql(u8, key, "mask")) {
@@ -891,6 +916,69 @@ test "parse config - deinit frees explicitly configured default tls_domain" {
 
     try std.testing.expectEqualStrings("google.com", cfg.tls_domain);
     try std.testing.expect(cfg.tls_domain_owned);
+}
+
+fn parseConfigAndDeinit(allocator: std.mem.Allocator, content: []const u8) !void {
+    var cfg = try Config.parse(allocator, content);
+    defer cfg.deinit(allocator);
+}
+
+test "parse config - repeated owned fields replace previous values" {
+    const content =
+        \\[server]
+        \\public_ip = "one.example.com"
+        \\public_ip = "two.example.com"
+        \\middle_proxy_nat_ip = "203.0.113.10"
+        \\middle_proxy_nat_ip = "203.0.113.11"
+        \\[censorship]
+        \\tls_domain = "one.example.com"
+        \\tls_domain = "two.example.com"
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("two.example.com", cfg.public_ip.?);
+    try std.testing.expectEqualStrings("203.0.113.11", cfg.middle_proxy_nat_ip.?);
+    try std.testing.expectEqualStrings("two.example.com", cfg.tls_domain);
+}
+
+test "parse config - duplicate user entries overwrite without leaking keys" {
+    const content =
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+        \\alice = "ffeeddccbbaa99887766554433221100"
+        \\[access.direct_users]
+        \\alice = true
+        \\alice = true
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.users.count());
+    try std.testing.expectEqual(@as(usize, 1), cfg.direct_users.count());
+    try std.testing.expect(cfg.userBypassesMiddleProxy("alice"));
+    try std.testing.expectEqual([_]u8{ 0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa, 0x99, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x00 }, cfg.users.get("alice").?);
+}
+
+test "parse config - allocation failures clean up partial state" {
+    const content =
+        \\[server]
+        \\public_ip = "proxy.example.com"
+        \\middle_proxy_nat_ip = "203.0.113.10"
+        \\[censorship]
+        \\tls_domain = "proxy.example.com"
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+        \\bob = "ffeeddccbbaa99887766554433221100"
+        \\[access.direct_users]
+        \\alice = true
+    ;
+
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, parseConfigAndDeinit, .{content});
 }
 
 test "parse config - multiple users" {
