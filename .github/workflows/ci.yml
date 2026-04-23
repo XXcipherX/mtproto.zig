@@ -24,6 +24,9 @@ jobs:
       - name: Run tests
         run: zig build test
 
+      - name: Run ReleaseSafe tests
+        run: zig build -Doptimize=ReleaseSafe test
+
       - name: Debug build
         run: zig build
 
