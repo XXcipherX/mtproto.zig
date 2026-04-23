@@ -32,6 +32,8 @@ pub const Config = struct {
     handshake_timeout_sec: u32 = 15,
     tag: ?[16]u8 = null,
     tls_domain: []const u8 = "google.com",
+    /// True when tls_domain was duplicated by the parser and must be freed.
+    tls_domain_owned: bool = false,
     users: std.StringHashMap([16]u8),
     /// Users that always bypass MiddleProxy and connect to DC directly.
     /// Section: [access.direct_users] (alias: [access.admins])
@@ -282,7 +284,11 @@ pub const Config = struct {
                     }
                 } else if (in_censorship_section) {
                     if (std.mem.eql(u8, key, "tls_domain")) {
+                        if (cfg.tls_domain_owned) {
+                            allocator.free(cfg.tls_domain);
+                        }
                         cfg.tls_domain = try allocator.dupe(u8, value);
+                        cfg.tls_domain_owned = true;
                     } else if (std.mem.eql(u8, key, "mask")) {
                         cfg.mask = std.mem.eql(u8, value, "true");
                     } else if (std.mem.eql(u8, key, "mask_port")) {
@@ -314,8 +320,7 @@ pub const Config = struct {
         }
         self.direct_users.deinit();
 
-        // Free tls_domain if it was allocated (not the default)
-        if (!std.mem.eql(u8, self.tls_domain, "google.com")) {
+        if (self.tls_domain_owned) {
             allocator.free(self.tls_domain);
         }
         if (self.public_ip) |ip| {
@@ -871,6 +876,21 @@ test "parse config - censorship section booleans" {
     try std.testing.expect(!cfg.desync);
     try std.testing.expect(cfg.drs);
     try std.testing.expect(cfg.fast_mode);
+}
+
+test "parse config - deinit frees explicitly configured default tls_domain" {
+    const content =
+        \\[censorship]
+        \\tls_domain = "google.com"
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("google.com", cfg.tls_domain);
+    try std.testing.expect(cfg.tls_domain_owned);
 }
 
 test "parse config - multiple users" {
