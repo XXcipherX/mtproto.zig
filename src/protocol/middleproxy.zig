@@ -1,6 +1,7 @@
 const std = @import("std");
 const net = std.net;
 const posix = std.posix;
+const config = @import("../config.zig");
 const crypto = @import("../crypto/crypto.zig");
 const constants = @import("constants.zig");
 
@@ -127,7 +128,7 @@ pub const MiddleProxyContext = struct {
 
     pub const default_stream_buffer_size: usize = 128 * 1024;
     pub const initial_stream_buffer_size: usize = 16 * 1024;
-    pub const max_stream_buffer_size: usize = 1 << 24;
+    pub const max_stream_buffer_size: usize = config.Config.middle_proxy_stream_buffer_cap_bytes;
 
     pub fn init(
         allocator: std.mem.Allocator,

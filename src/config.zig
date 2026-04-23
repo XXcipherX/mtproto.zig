@@ -69,9 +69,14 @@ pub const Config = struct {
     datacenter_override: ?std.net.Address = null,
 
     pub const middle_proxy_c2s_scratch_headroom: usize = 256;
+    pub const middle_proxy_stream_buffer_cap_bytes: usize = 1 << 24;
+
+    pub fn middleProxyConfiguredBufferBytes(self: *const Config) usize {
+        return @as(usize, self.middleproxy_buffer_kb) * 1024;
+    }
 
     pub fn middleProxyBufferBytes(self: *const Config) usize {
-        return @as(usize, self.middleproxy_buffer_kb) * 1024;
+        return @min(self.middleProxyConfiguredBufferBytes(), middle_proxy_stream_buffer_cap_bytes);
     }
 
     pub fn usesAnyMiddleProxy(self: *const Config) bool {
@@ -99,6 +104,18 @@ pub const Config = struct {
                     "This may cause MiddleProxyBufferOverflow errors on media-heavy " ++
                     "traffic (Stories, video downloads). Consider increasing to 1024+.",
                 .{self.middleproxy_buffer_kb},
+            );
+        }
+        if (self.usesAnyMiddleProxy() and self.middleProxyConfiguredBufferBytes() > middle_proxy_stream_buffer_cap_bytes) {
+            const log = std.log.scoped(.config);
+            log.warn(
+                "middleproxy_buffer_kb={d} exceeds runtime cap ({d} KiB); " ++
+                    "effective per-direction buffer cap is {d} KiB.",
+                .{
+                    self.middleproxy_buffer_kb,
+                    middle_proxy_stream_buffer_cap_bytes / 1024,
+                    middle_proxy_stream_buffer_cap_bytes / 1024,
+                },
             );
         }
         if (self.usesAnyMiddleProxy() and self.max_connections > 2000) {
@@ -518,6 +535,21 @@ test "parse config - middleproxy buffer lower bound" {
     defer cfg.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u32, 64), cfg.middleproxy_buffer_kb);
+}
+
+test "parse config - middleproxy buffer runtime cap" {
+    const content =
+        \\[server]
+        \\middleproxy_buffer_kb = 32768
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 32768), cfg.middleproxy_buffer_kb);
+    try std.testing.expectEqual(Config.middle_proxy_stream_buffer_cap_bytes, cfg.middleProxyBufferBytes());
 }
 
 test "parse config - log_level debug" {
