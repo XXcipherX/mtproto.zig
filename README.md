@@ -250,7 +250,7 @@ This will:
 6. Apply **TCPMSS=88** iptables rule (passive DPI bypass)
 7. Set up self-domain Nginx 404 masking on `127.0.0.1:8443`, including Let's Encrypt on TCP/80 and the masking health timer
 8. Attempt OS-level `zapret` / `nfqws` TCP desync setup
-9. Install **IPv6 hop script** (optional cron auto-rotation with `CF_TOKEN`+`CF_ZONE`)
+9. Install **IPv6 hop script** (optional cron auto-rotation with `CF_TOKEN`+`CF_ZONE`+`IPV6_PREFIX`)
 10. Print a ready-to-use `tg://` connection link
 
 ### Self-Domain 404 Masking
@@ -279,7 +279,7 @@ sudo systemctl restart mtproto-proxy
 
 The Nginx backend intentionally does not publish a site body. Only `/.well-known/acme-challenge/` on port `80` is served for Let's Encrypt; all other HTTP/HTTPS requests receive `404`. The masking setup also disables Debian's default Nginx site and makes `mtproto-masking` the default `:80` server so unmatched HTTP `Host`/IP requests return `404` too; set `MASK_KEEP_NGINX_DEFAULT=1` only if you intentionally want to keep an existing default site.
 
-To enable IPv6 auto-hopping (Cloudflare DNS rotation on ban detection), you must provide Cloudflare API credentials. The script uses these to update your domain's AAAA record to a new random IPv6 address from your server's `/64` pool when it detects DPI active probing.
+To enable IPv6 auto-hopping (Cloudflare DNS rotation on ban detection), provide Cloudflare API credentials plus your routed `/64` prefix. The installer stores these values in `/opt/mtproto-proxy/env.sh`, and the cron-launched hop script sources that file before updating your domain's AAAA record.
 
 #### Obtaining Cloudflare Credentials
 
@@ -292,6 +292,9 @@ To enable IPv6 auto-hopping (Cloudflare DNS rotation on ban detection), you must
    - Permissions: `Zone` | `DNS` | `Edit`.
    - Zone Resources: `Include` | `Specific zone` | `<Your Domain>`.
    - Create the token and copy the secret string.
+3. **`IPV6_PREFIX`**:
+   - Use the routed `/64` prefix assigned to your VPS, without a trailing `::` (for example, `2001:db8:1234:5678`).
+   - Optionally set `IPV6_INTERFACE` if your public interface is not `eth0`.
 
 #### Enabling the Bypass during Installation
 
@@ -299,7 +302,7 @@ You can either pass variables directly inline:
 
 ```bash
 curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/install.sh | \
-  sudo CF_TOKEN=<your_cf_token> CF_ZONE=<your_zone_id> bash
+  sudo CF_TOKEN=<your_cf_token> CF_ZONE=<your_zone_id> DNS_NAME=proxy.example.com IPV6_PREFIX=2001:db8:1234:5678 bash
 ```
 
 Or, for a cleaner and more secure approach, create a `.env` file first (you can copy `.env.example` as a template):

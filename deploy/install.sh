@@ -16,7 +16,7 @@
 #   4. Creates a systemd service
 #   5. Opens configured proxy port in ufw (if active)
 #   6. Applies TCPMSS clamping (DPI bypass: splits ClientHello into tiny packets)
-#   7. Installs IPv6 address hopping script + cron job (optional, requires CF_TOKEN + CF_ZONE)
+#   7. Installs IPv6 address hopping script + cron job (optional, requires CF_TOKEN + CF_ZONE + IPV6_PREFIX)
 #   8. Installs masking self-healing monitor (nginx + timer watchdog)
 #   9. Prints the ready-to-use tg:// link
 
@@ -135,7 +135,7 @@ get_first_user_secret() {
 # NOTE: All apt-get calls use < /dev/null to prevent dpkg hooks from
 # consuming stdin when this script is run via 'curl | bash'.
 apt-get update -qq < /dev/null || true
-apt-get install -y iptables xxd git curl openssl tar xz-utils < /dev/null >/dev/null 2>&1 || true
+apt-get install -y iptables xxd git curl jq openssl tar xz-utils < /dev/null >/dev/null 2>&1 || true
 
 # ── Install Zig ─────────────────────────────────────────────
 if command -v zig &>/dev/null && zig version 2>/dev/null | grep -q "$ZIG_VERSION"; then
@@ -193,7 +193,7 @@ chmod +x "$INSTALL_DIR/monitor/install.sh"
 if [[ ! -f "$INSTALL_DIR/config.toml" ]]; then
     SECRET=$(openssl rand -hex 16)
     # ee-secret format: ee + hex(user_secret) + hex(tls_domain)
-    TLS_DOMAIN="${MASK_DOMAIN:-}"
+    TLS_DOMAIN="${MASK_DOMAIN:-${DNS_NAME:-}}"
     if [[ -z "$TLS_DOMAIN" ]]; then
         # Read domain from terminal (stdin is busy with curl pipe, so use /dev/tty)
         echo ""
@@ -288,24 +288,32 @@ fi
 # ── IPv6 Hopping (Cloudflare API) ───────────────────────────
 if [[ -n "${CF_TOKEN:-}" && -n "${CF_ZONE:-}" ]]; then
     info "Setting up IPv6 auto-hopping..."
-    cp "$TMPBUILD/deploy/ipv6-hop.sh" "$INSTALL_DIR/"
-    chmod +x "$INSTALL_DIR/ipv6-hop.sh"
-    
-    # Save credentials securely
-    cat > "$INSTALL_DIR/env.sh" << EOF
+    DNS_NAME="${DNS_NAME:-$TLS_DOMAIN}"
+    if [[ -z "${IPV6_PREFIX:-}" ]]; then
+        warn "Skipping IPv6 hopping setup: set IPV6_PREFIX=<your /64 prefix, e.g. 2001:db8:1234:5678> together with CF_TOKEN/CF_ZONE"
+    else
+        cp "$TMPBUILD/deploy/ipv6-hop.sh" "$INSTALL_DIR/"
+        chmod +x "$INSTALL_DIR/ipv6-hop.sh"
+
+        # Save credentials and routing settings securely for cron/systemd contexts.
+        cat > "$INSTALL_DIR/env.sh" << EOF
 export CF_TOKEN="${CF_TOKEN}"
 export CF_ZONE="${CF_ZONE}"
+export DNS_NAME="${DNS_NAME}"
+export IPV6_PREFIX="${IPV6_PREFIX}"
+export IPV6_INTERFACE="${IPV6_INTERFACE:-eth0}"
 EOF
-    chmod 600 "$INSTALL_DIR/env.sh"
-    
-    # Set up cron job (every 5 minutes)
-    cat > /etc/cron.d/mtproto-ipv6 << EOF
+        chmod 600 "$INSTALL_DIR/env.sh"
+
+        # Set up cron job (every 5 minutes)
+        cat > /etc/cron.d/mtproto-ipv6 << EOF
 */5 * * * * root $INSTALL_DIR/ipv6-hop.sh >> /var/log/mtproto-ipv6-hop.log 2>&1
 EOF
-    chmod 644 /etc/cron.d/mtproto-ipv6
-    # Run the first hop immediately to ensure it works
-    $INSTALL_DIR/ipv6-hop.sh >/dev/null 2>&1 || true
-    ok "IPv6 auto-hopping configured (via Cloudflare)"
+        chmod 644 /etc/cron.d/mtproto-ipv6
+        # Run the first hop immediately to ensure it works
+        $INSTALL_DIR/ipv6-hop.sh >/dev/null 2>&1 || true
+        ok "IPv6 auto-hopping configured for ${DNS_NAME} via Cloudflare"
+    fi
 else
     info "Skipping IPv6 hopping setup (CF_TOKEN and CF_ZONE not set)"
 fi
@@ -461,6 +469,6 @@ fi
 if [[ -f /etc/cron.d/mtproto-ipv6 ]]; then
 echo -e "  ${GREEN}✓${RESET} IPv6 auto-hopping every 5 min"
 else
-echo -e "  ${DIM}○ IPv6 auto-hopping (set CF_TOKEN + CF_ZONE to enable)${RESET}"
+echo -e "  ${DIM}○ IPv6 auto-hopping (set CF_TOKEN + CF_ZONE + IPV6_PREFIX to enable)${RESET}"
 fi
 echo ""

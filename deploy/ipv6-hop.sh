@@ -20,18 +20,35 @@
 set -euo pipefail
 
 # ── Configuration ────────────────────────────────────────────────
-IPV6_PREFIX="2a01:48a0:4301:bf"   # Your /64 prefix (no trailing ::)
-INTERFACE="eth0"
-DNS_NAME="proxy.xxcipherx.ru"
-CLOUDFLARE_TOKEN="${CF_TOKEN:-}"   # export CF_TOKEN=your_token
-CF_ZONE_ID="${CF_ZONE:-}"          # export CF_ZONE=your_zone_id
-STATE_FILE="/tmp/mtproto-ipv6-current"
-LOG_FILE="/var/log/mtproto-ipv6-hop.log"
-PROXY_SERVICE="mtproto-proxy"
-BAN_THRESHOLD=10   # Rotate if >N "Handshake timeout" in last 60 seconds
+INSTALL_DIR="${INSTALL_DIR:-/opt/mtproto-proxy}"
+ENV_FILE="${ENV_FILE:-${INSTALL_DIR}/env.sh}"
+
+if [[ -f "$ENV_FILE" ]]; then
+    # shellcheck source=/dev/null
+    source "$ENV_FILE"
+fi
+
+IPV6_PREFIX="${IPV6_PREFIX:-}"     # Your /64 prefix, e.g. 2001:db8:1234:5678
+IPV6_PREFIX="${IPV6_PREFIX%::}"
+IPV6_PREFIX="${IPV6_PREFIX%:}"
+INTERFACE="${IPV6_INTERFACE:-${INTERFACE:-eth0}}"
+DNS_NAME="${DNS_NAME:-${MASK_DOMAIN:-}}"
+CLOUDFLARE_TOKEN="${CLOUDFLARE_TOKEN:-${CF_TOKEN:-}}"   # export CF_TOKEN=your_token
+CF_ZONE_ID="${CF_ZONE_ID:-${CF_ZONE:-}}"                # export CF_ZONE=your_zone_id
+STATE_FILE="${STATE_FILE:-/tmp/mtproto-ipv6-current}"
+LOG_FILE="${LOG_FILE:-/var/log/mtproto-ipv6-hop.log}"
+PROXY_SERVICE="${PROXY_SERVICE:-mtproto-proxy}"
+BAN_THRESHOLD="${BAN_THRESHOLD:-10}"   # Rotate if >N "Handshake timeout" in last 60 seconds
 # ─────────────────────────────────────────────────────────────────
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"; }
+
+require_ipv6_prefix() {
+    if [[ -z "$IPV6_PREFIX" ]]; then
+        log "ERROR: IPV6_PREFIX is not set. Use your routed /64 prefix, e.g. export IPV6_PREFIX=2001:db8:1234:5678"
+        exit 1
+    fi
+}
 
 # Generate a random IPv6 in our /64
 random_ipv6() {
@@ -73,6 +90,11 @@ update_dns() {
         log "WARNING: CF_TOKEN or CF_ZONE not set — skipping DNS update"
         log "  Set:  export CF_TOKEN=<your_cloudflare_api_token>"
         log "  Set:  export CF_ZONE=<your_zone_id>"
+        return 0
+    fi
+    if [[ -z "$DNS_NAME" ]]; then
+        log "WARNING: DNS_NAME not set — skipping DNS update"
+        log "  Set:  export DNS_NAME=proxy.example.com"
         return 0
     fi
 
@@ -130,6 +152,7 @@ case "${1:-}" in
         ;;
 
     --auto)
+        require_ipv6_prefix
         log "Auto-hop mode started (ban threshold: ${BAN_THRESHOLD} timeouts/60s)"
         while true; do
             if is_likely_banned; then
@@ -148,6 +171,7 @@ case "${1:-}" in
 
     *)
         # Manual rotation
+        require_ipv6_prefix
         log "Manual IPv6 rotation triggered"
         remove_old_ipv6
         new_ip=$(add_new_ipv6)
