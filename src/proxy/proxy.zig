@@ -4069,6 +4069,21 @@ fn mpReadReset(slot: *ConnectionSlot, encrypted: bool) void {
     slot.mp_frame_need = if (encrypted) 16 else 4;
 }
 
+fn writePlainMiddleProxyTestFrame(fd: posix.fd_t, seq_no: i32, payload: []const u8) !void {
+    var frame: [mp_handshake_frame_buf_size]u8 = undefined;
+    const total_len = payload.len + 12;
+    if (total_len > frame.len) return error.BadMiddleProxyFrameSize;
+
+    std.mem.writeInt(u32, frame[0..4], @intCast(total_len), .little);
+    std.mem.writeInt(i32, frame[4..8], seq_no, .little);
+    @memcpy(frame[8 .. 8 + payload.len], payload);
+    const checksum = middleproxy.crc32(frame[0 .. 8 + payload.len]);
+    std.mem.writeInt(u32, frame[8 + payload.len ..][0..4], checksum, .little);
+
+    const written = try posix.write(fd, frame[0..total_len]);
+    try std.testing.expectEqual(total_len, written);
+}
+
 test "parse middle proxy address for dc203" {
     const cfg =
         "# force_probability 10 10\n" ++
@@ -4080,6 +4095,94 @@ test "parse middle proxy address for dc203" {
     const addr = parseMiddleProxyAddressForDc(cfg, 203) orelse return error.TestExpectedEqual;
     try std.testing.expect(addr.any.family == posix.AF.INET);
     try std.testing.expectEqual(@as(u16, 443), std.mem.bigToNative(u16, addr.in.sa.port));
+}
+
+test "middle proxy nonce response failures fall back to direct path" {
+    var cfg = Config{
+        .users = std.StringHashMap([16]u8).init(std.testing.allocator),
+        .direct_users = std.StringHashMap(void).init(std.testing.allocator),
+        .mask = false,
+        .datacenter_override = net.Address.initIp4(.{ 127, 0, 0, 1 }, 443),
+    };
+    defer cfg.deinit(std.testing.allocator);
+
+    var state = try ProxyState.init(std.testing.allocator, cfg);
+    defer state.deinit();
+
+    var fds: [2]posix.fd_t = undefined;
+    try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0, &fds);
+    defer posix.close(fds[1]);
+
+    const epoll_fd = try epollCreate();
+    defer posix.close(epoll_fd);
+
+    var loop = EventLoop{
+        .state = &state,
+        .epoll_fd = epoll_fd,
+        .listen_fd = -1,
+        .pool = try ConnectionPool.init(std.testing.allocator, 4),
+        .accept_paused = false,
+        .accept_resume_ns = 0,
+        .saturation_paused = false,
+        .timer_scan_cursor = 0,
+        .stats_next_log_ns = 0,
+        .accepted_since_log = 0,
+        .closed_since_log = 0,
+        .subnet_limiter = SubnetRateLimit.init(),
+        .prev_dropped_cap = 0,
+        .prev_dropped_saturation = 0,
+        .prev_dropped_rate_limit = 0,
+        .prev_dropped_hs_budget = 0,
+        .prev_hs_timeout = 0,
+        .prev_mp_fallback = 0,
+        .mp_c2s_scratch = null,
+        .mp_s2c_scratch = null,
+    };
+    defer loop.pool.deinit();
+
+    const slot = loop.pool.acquire() orelse return error.TestExpectedEqual;
+    defer {
+        if (slot.phase != .idle) {
+            if (slot.upstream_fd != -1) {
+                posix.close(slot.upstream_fd);
+                slot.upstream_fd = -1;
+            }
+            slot.resetOwnedBuffers(state.allocator);
+            loop.pool.release(slot);
+        }
+    };
+
+    const fallback_addr = net.Address.initIp4(.{ 149, 154, 167, 50 }, 443);
+    slot.conn_id = 42;
+    slot.upstream_fd = fds[0];
+    slot.phase = .middle_proxy_handshake;
+    slot.mp_step = .waiting_rpc_nonce_response;
+    slot.mp_read_seq_no = -2;
+    slot.use_middle_proxy = true;
+    slot.direct_fallback_addr = fallback_addr;
+    slot.current_upstream_addr = fallback_addr;
+    slot.dc_abs = 4;
+    slot.obf_params = .{
+        .decrypt_key = [_]u8{0} ** constants.key_len,
+        .decrypt_iv = 0,
+        .encrypt_key = [_]u8{0} ** constants.key_len,
+        .encrypt_iv = 0,
+        .proto_tag = .intermediate,
+        .dc_idx = 4,
+    };
+    mpReadReset(slot, false);
+
+    var bad_nonce_payload = [_]u8{0} ** 32;
+    @memcpy(bad_nonce_payload[0..4], &middleproxy.rpc_proxy_ans);
+    try writePlainMiddleProxyTestFrame(fds[1], -2, &bad_nonce_payload);
+
+    loop.middleProxyOnReadable(slot);
+
+    try std.testing.expect(slot.direct_fallback_used);
+    try std.testing.expect(!slot.use_middle_proxy);
+    try std.testing.expectEqual(MiddleProxyHandshakeStep.none, slot.mp_step);
+    try std.testing.expectEqual(ConnectionPhase.writing_dc_nonce, slot.phase);
+    try std.testing.expectEqual(@as(u64, 1), state.stats_mp_fallback.load(.monotonic));
 }
 
 fn initProxyStateAndDeinit(allocator: std.mem.Allocator, cfg: Config) !void {
