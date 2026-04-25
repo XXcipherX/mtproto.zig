@@ -2577,7 +2577,9 @@ const EventLoop = struct {
         @memcpy(msg[16..32], &slot.mp_nonce);
 
         self.mpWriteFrame(slot, msg[0..], false) catch {
-            self.closeSlot(slot, "mp send nonce failed");
+            if (!self.fallbackFromMiddleProxyToDirect(slot)) {
+                self.closeSlot(slot, "mp send nonce failed");
+            }
             return;
         };
 
@@ -2609,16 +2611,22 @@ const EventLoop = struct {
             .waiting_rpc_nonce_response => {
                 const payload = self.mpTryReadFrame(slot, false) catch |err| {
                     log.debug("[{d}] mp nonce frame read failed: {any}", .{ slot.conn_id, err });
-                    self.closeSlot(slot, "mp read nonce ans failed");
+                    if (!self.fallbackFromMiddleProxyToDirect(slot)) {
+                        self.closeSlot(slot, "mp read nonce ans failed");
+                    }
                     return;
                 } orelse return;
 
                 if (payload.len != 32) {
-                    self.closeSlot(slot, "mp bad nonce ans len");
+                    if (!self.fallbackFromMiddleProxyToDirect(slot)) {
+                        self.closeSlot(slot, "mp bad nonce ans len");
+                    }
                     return;
                 }
                 if (!std.mem.eql(u8, payload[0..4], &middleproxy.rpc_nonce_req)) {
-                    self.closeSlot(slot, "mp bad nonce ans type");
+                    if (!self.fallbackFromMiddleProxyToDirect(slot)) {
+                        self.closeSlot(slot, "mp bad nonce ans type");
+                    }
                     return;
                 }
 
@@ -2735,7 +2743,9 @@ const EventLoop = struct {
                 };
 
                 if (mp_lock_error) |reason| {
-                    self.closeSlot(slot, reason);
+                    if (!self.fallbackFromMiddleProxyToDirect(slot)) {
+                        self.closeSlot(slot, reason);
+                    }
                     return;
                 }
 
