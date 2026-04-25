@@ -303,13 +303,25 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+PermissionsStartOnly=true
+User=mtproto
+Group=mtproto
+WorkingDirectory=/opt/mtproto-proxy
 ExecStartPre=/usr/local/bin/setup_netns.sh
 ExecStart=/sbin/ip netns exec tg_proxy_ns /opt/mtproto-proxy/mtproto-proxy /opt/mtproto-proxy/config.toml
-Restart=on-failure
-RestartSec=5
+Restart=always
+RestartSec=3
 
 # Capabilities needed for netns + privileged port binding
 AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_SYS_ADMIN
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadOnlyPaths=/opt/mtproto-proxy
 
 # Limits
 LimitNOFILE=131582
