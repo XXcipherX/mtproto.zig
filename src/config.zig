@@ -205,6 +205,12 @@ pub const Config = struct {
         }
     }
 
+    fn removeOwnedVoidEntry(allocator: std.mem.Allocator, map: *std.StringHashMap(void), key: []const u8) void {
+        if (map.fetchRemove(key)) |entry| {
+            allocator.free(entry.key);
+        }
+    }
+
     pub fn parse(allocator: std.mem.Allocator, content: []const u8) !Config {
         var cfg = Config{
             .users = std.StringHashMap([16]u8).init(allocator),
@@ -257,8 +263,14 @@ pub const Config = struct {
                     const enabled = std.mem.eql(u8, value, "true") or
                         std.mem.eql(u8, value, "1") or
                         std.mem.eql(u8, value, "yes");
-                    if (!enabled) continue;
-                    try upsertOwnedEntry(void, allocator, &cfg.direct_users, key, {});
+                    const disabled = std.mem.eql(u8, value, "false") or
+                        std.mem.eql(u8, value, "0") or
+                        std.mem.eql(u8, value, "no");
+                    if (enabled) {
+                        try upsertOwnedEntry(void, allocator, &cfg.direct_users, key, {});
+                    } else if (disabled) {
+                        removeOwnedVoidEntry(allocator, &cfg.direct_users, key);
+                    }
                 } else if (in_general_section) {
                     if (std.mem.eql(u8, key, "use_middle_proxy")) {
                         cfg.use_middle_proxy = std.mem.eql(u8, value, "true");
@@ -477,6 +489,22 @@ test "parse config - direct users allowlist" {
     try std.testing.expect(cfg.userBypassesMiddleProxy("admin"));
     try std.testing.expect(!cfg.userBypassesMiddleProxy("regular"));
     try std.testing.expect(!cfg.userBypassesMiddleProxy("ghost"));
+}
+
+test "parse config - direct users duplicate false overrides true" {
+    const content =
+        \\[access.users]
+        \\admin = "00112233445566778899aabbccddeeff"
+        \\[access.direct_users]
+        \\admin = true
+        \\admin = false
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), cfg.direct_users.count());
+    try std.testing.expect(!cfg.userBypassesMiddleProxy("admin"));
 }
 
 test "parse config - access admins alias" {
