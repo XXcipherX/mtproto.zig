@@ -4109,9 +4109,12 @@ test "middle proxy nonce response failures fall back to direct path" {
     var state = try ProxyState.init(std.testing.allocator, cfg);
     defer state.deinit();
 
-    var fds: [2]posix.fd_t = undefined;
-    try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0, &fds);
-    defer posix.close(fds[1]);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var upstream_file = try tmp.dir.createFile("middle-proxy-upstream", .{ .read = true });
+    var upstream_file_owned = true;
+    defer if (upstream_file_owned) upstream_file.close();
 
     const epoll_fd = try epollCreate();
     defer posix.close(epoll_fd);
@@ -4150,11 +4153,12 @@ test "middle proxy nonce response failures fall back to direct path" {
             slot.resetOwnedBuffers(state.allocator);
             loop.pool.release(slot);
         }
-    };
+    }
 
     const fallback_addr = net.Address.initIp4(.{ 149, 154, 167, 50 }, 443);
     slot.conn_id = 42;
-    slot.upstream_fd = fds[0];
+    slot.upstream_fd = upstream_file.handle;
+    upstream_file_owned = false;
     slot.phase = .middle_proxy_handshake;
     slot.mp_step = .waiting_rpc_nonce_response;
     slot.mp_read_seq_no = -2;
@@ -4174,7 +4178,8 @@ test "middle proxy nonce response failures fall back to direct path" {
 
     var bad_nonce_payload = [_]u8{0} ** 32;
     @memcpy(bad_nonce_payload[0..4], &middleproxy.rpc_proxy_ans);
-    try writePlainMiddleProxyTestFrame(fds[1], -2, &bad_nonce_payload);
+    try writePlainMiddleProxyTestFrame(upstream_file.handle, -2, &bad_nonce_payload);
+    try upstream_file.seekTo(0);
 
     loop.middleProxyOnReadable(slot);
 
