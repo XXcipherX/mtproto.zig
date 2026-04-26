@@ -97,6 +97,11 @@ pub const Config = struct {
 
     /// Emit startup warnings for configuration values known to cause issues.
     pub fn emitWarnings(self: *const Config) void {
+        if (self.users.count() == 0) {
+            const log = std.log.scoped(.config);
+            log.warn("access.users is empty; no clients can authenticate until at least one user secret is configured", .{});
+        }
+
         if (self.usesAnyMiddleProxy() and self.middleproxy_buffer_kb < 1024) {
             const log = std.log.scoped(.config);
             log.warn(

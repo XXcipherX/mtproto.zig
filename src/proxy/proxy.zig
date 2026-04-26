@@ -20,6 +20,7 @@ const Config = @import("../config.zig").Config;
 const log = std.log.scoped(.proxy);
 
 const tls_header_len = 5;
+// Prime-ish timeout avoids lockstep with the 5 ms timer tick while keeping idle CPU low.
 const event_loop_wait_ms = 37;
 const accept_backoff_ms: i64 = 500;
 const accept_backoff_ns: i128 = @as(i128, accept_backoff_ms) * std.time.ns_per_ms;
@@ -93,9 +94,6 @@ const SubnetRateLimit = struct {
 
         const start = self.indexFor(key);
         var first_stale_idx: ?usize = null;
-        var oldest_idx: usize = start;
-        var oldest_ts: i64 = std.math.maxInt(i64);
-
         var probe: usize = 0;
         while (probe < MAX_PROBES) : (probe += 1) {
             const idx = (start + probe) & (BUCKETS - 1);
@@ -126,15 +124,16 @@ const SubnetRateLimit = struct {
             if (now_s - e.last_refill_s > stale_after_s and first_stale_idx == null) {
                 first_stale_idx = idx;
             }
-            if (e.last_refill_s < oldest_ts) {
-                oldest_ts = e.last_refill_s;
-                oldest_idx = idx;
-            }
         }
 
-        const victim_idx = first_stale_idx orelse oldest_idx;
-        self.entries[victim_idx] = .{ .used = true, .subnet_key = key, .tokens = max_per_sec -| 1, .last_refill_s = now_s };
-        return true;
+        if (first_stale_idx) |victim_idx| {
+            self.entries[victim_idx] = .{ .used = true, .subnet_key = key, .tokens = max_per_sec -| 1, .last_refill_s = now_s };
+            return true;
+        }
+
+        // The probed window is occupied by live buckets; reject this connection
+        // instead of evicting an active subnet and resetting its limiter state.
+        return false;
     }
 
     fn subnetKey(addr: net.Address) u32 {
@@ -902,6 +901,14 @@ const ConnectionPool = struct {
     }
 };
 
+fn freeUserSecrets(allocator: std.mem.Allocator, secrets: []obfuscation.UserSecret) void {
+    for (secrets) |*secret| {
+        @memset(secret.secret[0..], 0);
+        allocator.free(secret.name);
+    }
+    allocator.free(secrets);
+}
+
 fn slotCandidateCount(slot: *const ConnectionSlot) usize {
     if (slot.upstream_candidates) |c| return c.len;
     return 0;
@@ -910,7 +917,7 @@ fn slotCandidateCount(slot: *const ConnectionSlot) usize {
 pub const ProxyState = struct {
     allocator: std.mem.Allocator,
     config: Config,
-    user_secrets: []const obfuscation.UserSecret,
+    user_secrets: []obfuscation.UserSecret,
     connection_count: std.atomic.Value(u64),
     active_connections: std.atomic.Value(u32),
     handshakes_inflight: std.atomic.Value(u32),
@@ -944,17 +951,23 @@ pub const ProxyState = struct {
 
     pub fn init(allocator: std.mem.Allocator, cfg: Config) !ProxyState {
         var secrets: std.ArrayList(obfuscation.UserSecret) = .empty;
-        errdefer secrets.deinit(allocator);
+        errdefer {
+            for (secrets.items) |secret| allocator.free(secret.name);
+            secrets.deinit(allocator);
+        }
         var users = cfg.users;
         var it = users.iterator();
         while (it.next()) |entry| {
+            const user_name = try allocator.dupe(u8, entry.key_ptr.*);
+            errdefer allocator.free(user_name);
             try secrets.append(allocator, .{
-                .name = entry.key_ptr.*,
+                .name = user_name,
                 .secret = entry.value_ptr.*,
             });
         }
         const user_secrets = try secrets.toOwnedSlice(allocator);
-        errdefer allocator.free(user_secrets);
+        secrets = .empty;
+        errdefer freeUserSecrets(allocator, user_secrets);
 
         var resolved_addr: ?net.Address = null;
         if (cfg.mask) {
@@ -1063,7 +1076,11 @@ pub const ProxyState = struct {
 
     pub fn deinit(self: *ProxyState) void {
         self.stopMiddleProxyUpdater();
-        self.allocator.free(self.user_secrets);
+        self.middle_proxy_lock.lock();
+        @memset(self.middle_proxy_secret[0..], 0);
+        self.middle_proxy_secret_len = 0;
+        self.middle_proxy_lock.unlock();
+        freeUserSecrets(self.allocator, self.user_secrets);
     }
 
     pub fn run(self: *ProxyState) !void {
@@ -2519,22 +2536,22 @@ const EventLoop = struct {
         if (slot.hasUpstreamPending()) return;
 
         const read_buf = ensureReadBuf(slot, self.state.allocator) catch {
-            slot.phase = .closing;
+            self.closeSlot(slot, "mask read buffer alloc failed");
             return;
         };
 
         const n = posix.read(slot.client_fd, read_buf) catch |err| {
             if (err == error.WouldBlock) return;
-            slot.phase = .closing;
+            self.closeSlot(slot, "mask client read failed");
             return;
         };
         if (n == 0) {
-            slot.phase = .closing;
+            self.closeSlot(slot, "mask client eof");
             return;
         }
 
         _ = queueUpstream(slot, read_buf[0..n]) catch {
-            slot.phase = .closing;
+            self.closeSlot(slot, "mask queue upstream failed");
             return;
         };
     }
@@ -2543,22 +2560,22 @@ const EventLoop = struct {
         if (slot.hasClientPending()) return;
 
         const read_buf = ensureReadBuf(slot, self.state.allocator) catch {
-            slot.phase = .closing;
+            self.closeSlot(slot, "mask upstream read buffer alloc failed");
             return;
         };
 
         const n = posix.read(slot.upstream_fd, read_buf) catch |err| {
             if (err == error.WouldBlock) return;
-            slot.phase = .closing;
+            self.closeSlot(slot, "mask upstream read failed");
             return;
         };
         if (n == 0) {
-            slot.phase = .closing;
+            self.closeSlot(slot, "mask upstream eof");
             return;
         }
 
         _ = queueClient(slot, read_buf[0..n]) catch {
-            slot.phase = .closing;
+            self.closeSlot(slot, "mask queue client failed");
             return;
         };
     }
@@ -2690,17 +2707,11 @@ const EventLoop = struct {
                     var my_ip_v6_opt: ?[16]u8 = null;
 
                     if (peer_addr.any.family == posix.AF.INET and local_addr.any.family == posix.AF.INET) {
-                        var tg_ip_v4: [4]u8 = undefined;
-                        @memcpy(&tg_ip_v4, std.mem.asBytes(&peer_addr.in.sa.addr));
-                        std.mem.reverse(u8, &tg_ip_v4);
-                        tg_ip_v4_opt = tg_ip_v4;
-
-                        var my_ip_v4: [4]u8 = undefined;
-                        @memcpy(&my_ip_v4, std.mem.asBytes(&local_addr.in.sa.addr));
-                        std.mem.reverse(u8, &my_ip_v4);
+                        tg_ip_v4_opt = ipv4AddressBytesForMiddleProxyKdf(peer_addr);
+                        var my_ip_v4 = ipv4AddressBytesForMiddleProxyKdf(local_addr);
 
                         if (self.state.middle_proxy_nat_ip4) |nat_ip| {
-                            my_ip_v4 = ipv4NetworkToHostBytes(nat_ip);
+                            my_ip_v4 = ipv4BytesForMiddleProxyKdf(nat_ip);
                             middle_local_addr = net.Address.initIp4(nat_ip, std.mem.bigToNative(u16, local_addr.in.sa.port));
                         }
 
@@ -3745,8 +3756,17 @@ fn formatIpv4Bytes(ip: [4]u8, buf: *[16]u8) []const u8 {
     return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ ip[0], ip[1], ip[2], ip[3] }) catch "?.?.?.?";
 }
 
-fn ipv4NetworkToHostBytes(ip: [4]u8) [4]u8 {
-    return .{ ip[3], ip[2], ip[1], ip[0] };
+fn ipv4BytesForMiddleProxyKdf(network_order_ip: [4]u8) [4]u8 {
+    const value = std.mem.readInt(u32, &network_order_ip, .big);
+    var out: [4]u8 = undefined;
+    std.mem.writeInt(u32, &out, value, .little);
+    return out;
+}
+
+fn ipv4AddressBytesForMiddleProxyKdf(addr: net.Address) [4]u8 {
+    var network_order_ip: [4]u8 = undefined;
+    @memcpy(&network_order_ip, std.mem.asBytes(&addr.in.sa.addr));
+    return ipv4BytesForMiddleProxyKdf(network_order_ip);
 }
 
 fn isSameIpEndpoint(a: net.Address, b: net.Address) bool {
@@ -3780,6 +3800,13 @@ fn shouldUseMiddleProxySnapshot(cfg: *const Config, dc_abs: usize, dc_idx: i16) 
     return cfg.force_media_middle_proxy and is_media_path;
 }
 
+fn directDcAddressV4(dc_abs: usize) net.Address {
+    if (!constants.isKnownDcV4(dc_abs)) {
+        log.warn("unknown dc_abs={d}; using modulo DC fallback address", .{dc_abs});
+    }
+    return constants.getDcAddressV4(dc_abs);
+}
+
 fn buildDcConnectPlan(
     cfg: *const Config,
     dc_abs: usize,
@@ -3799,7 +3826,7 @@ fn buildDcConnectPlan(
     }
 
     if (cfg.userBypassesMiddleProxy(user_name)) {
-        plan.candidates[0] = constants.getDcAddressV4(dc_abs);
+        plan.candidates[0] = directDcAddressV4(dc_abs);
         plan.count = 1;
         plan.use_middle_proxy = false;
         plan.direct_fallback = null;
@@ -3821,7 +3848,7 @@ fn buildDcConnectPlan(
         cfg.use_middle_proxy and middle_addr != null;
 
     if (!plan.use_middle_proxy) {
-        plan.candidates[0] = constants.getDcAddressV4(dc_abs);
+        plan.candidates[0] = directDcAddressV4(dc_abs);
         plan.count = 1;
         plan.direct_fallback = null;
         return plan;
@@ -3856,7 +3883,7 @@ fn buildDcConnectPlan(
         // Safety fallback: if cache has no middle-proxy endpoint for this DC,
         // avoid dropping valid users and go direct.
         plan.use_middle_proxy = false;
-        plan.candidates[0] = constants.getDcAddressV4(dc_abs);
+        plan.candidates[0] = directDcAddressV4(dc_abs);
         plan.count = 1;
         plan.direct_fallback = null;
         return plan;
@@ -3865,7 +3892,7 @@ fn buildDcConnectPlan(
     // If middle-proxy connect/handshake fails, retry the same DC via direct mode.
     // This keeps media paths functional in environments where middle-proxy transport
     // itself is degraded (for example due to strict NAT behavior in upstream tunnels).
-    plan.direct_fallback = constants.getDcAddressV4(dc_abs);
+    plan.direct_fallback = directDcAddressV4(dc_abs);
     return plan;
 }
 
@@ -4456,6 +4483,10 @@ test "parse ipv4 literal" {
     try std.testing.expect(parseIpv4Literal("179.43.141.999") == null);
 }
 
+test "middle proxy ipv4 kdf bytes are endian explicit" {
+    try std.testing.expectEqual([4]u8{ 146, 141, 43, 179 }, ipv4BytesForMiddleProxyKdf(.{ 179, 43, 141, 146 }));
+}
+
 test "parse endpoint host" {
     try std.testing.expectEqualStrings("179.43.141.146", parseEndpointHost("179.43.141.146:41182").?);
     try std.testing.expectEqualStrings("vpn.example.com", parseEndpointHost("vpn.example.com:51820").?);
@@ -4549,6 +4580,33 @@ test "subnet rate limit - stale entry resets" {
 
     // Should reset and allow again
     try std.testing.expect(limiter.check(addr, 1));
+}
+
+test "subnet rate limit - live probe window is not evicted" {
+    var limiter = SubnetRateLimit{};
+    const addr = net.Address.initIp4(.{ 203, 0, 113, 42 }, 443);
+    const key = SubnetRateLimit.subnetKey(addr);
+    const start = limiter.indexFor(key);
+    const now_s = @divTrunc(std.time.milliTimestamp(), 1000);
+
+    var probe: usize = 0;
+    while (probe < SubnetRateLimit.MAX_PROBES) : (probe += 1) {
+        const idx = (start + probe) & (SubnetRateLimit.BUCKETS - 1);
+        limiter.entries[idx] = .{
+            .used = true,
+            .subnet_key = 0x80000000 + @as(u32, @intCast(probe)),
+            .tokens = 1,
+            .last_refill_s = now_s,
+        };
+    }
+
+    try std.testing.expect(!limiter.check(addr, 1));
+
+    probe = 0;
+    while (probe < SubnetRateLimit.MAX_PROBES) : (probe += 1) {
+        const idx = (start + probe) & (SubnetRateLimit.BUCKETS - 1);
+        try std.testing.expectEqual(0x80000000 + @as(u32, @intCast(probe)), limiter.entries[idx].subnet_key);
+    }
 }
 
 test "subnet rate limit - different subnets are independent" {

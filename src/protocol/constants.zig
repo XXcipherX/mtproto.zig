@@ -61,6 +61,10 @@ pub fn getDcAddressV4(abs_dc: usize) std.net.Address {
     return tg_datacenters_v4[fallback_idx];
 }
 
+pub fn isKnownDcV4(abs_dc: usize) bool {
+    return abs_dc == 203 or (abs_dc >= 1 and abs_dc <= tg_datacenters_v4.len);
+}
+
 // ============= Protocol Tags =============
 
 pub const ProtoTag = enum(u32) {
@@ -170,4 +174,11 @@ test "invalid proto tag" {
 
 test "getDcAddressV4 handles zero index defensively" {
     try std.testing.expect(getDcAddressV4(0).eql(tg_datacenters_v4[0]));
+}
+
+test "isKnownDcV4 distinguishes fallback-only indices" {
+    try std.testing.expect(isKnownDcV4(1));
+    try std.testing.expect(isKnownDcV4(203));
+    try std.testing.expect(!isKnownDcV4(0));
+    try std.testing.expect(!isKnownDcV4(6));
 }

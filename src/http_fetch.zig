@@ -15,6 +15,12 @@ fn setSocketTimeouts(fd: posix.fd_t, timeout_sec: u32) void {
     posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch return;
 }
 
+fn setConnectionTimeouts(connection: anytype, timeout_sec: u32) void {
+    // Keep std.http transport access localized; the public timeout policy above
+    // should not depend on call sites knowing the current stream_reader shape.
+    setSocketTimeouts(connection.stream_reader.getStream().handle, timeout_sec);
+}
+
 pub fn fetchUrlBytes(allocator: std.mem.Allocator, url: []const u8, options: FetchOptions) ![]u8 {
     const uri = try std.Uri.parse(url);
 
@@ -31,14 +37,14 @@ pub fn fetchUrlBytes(allocator: std.mem.Allocator, url: []const u8, options: Fet
     defer req.deinit();
 
     if (req.connection) |connection| {
-        setSocketTimeouts(connection.stream_reader.getStream().handle, options.timeout_sec);
+        setConnectionTimeouts(connection, options.timeout_sec);
     }
 
     try req.sendBodiless();
 
     // Some std.http paths establish the socket lazily on send.
     if (req.connection) |connection| {
-        setSocketTimeouts(connection.stream_reader.getStream().handle, options.timeout_sec);
+        setConnectionTimeouts(connection, options.timeout_sec);
     }
 
     var redirect_buf: [8 * 1024]u8 = undefined;
