@@ -754,6 +754,8 @@ const ConnectionSlot = struct {
     fn resetOwnedBuffers(self: *ConnectionSlot, allocator: std.mem.Allocator) void {
         self.client_queue.deinit();
         self.upstream_queue.deinit();
+        self.client_queue = .{ .allocator = allocator };
+        self.upstream_queue = .{ .allocator = allocator };
 
         if (self.client_hello_heap) |buf| allocator.free(buf);
         self.client_hello_heap = null;
@@ -847,6 +849,7 @@ const ConnectionPool = struct {
     fn deinit(self: *ConnectionPool) void {
         for (self.slots) |slot_opt| {
             if (slot_opt) |slot_ptr| {
+                slot_ptr.resetOwnedBuffers(self.allocator);
                 self.allocator.destroy(slot_ptr);
             }
         }
