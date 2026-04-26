@@ -473,6 +473,10 @@ fn shouldCloseOnFatalHangup(phase: ConnectionPhase, event_fd: posix.fd_t, upstre
     return !(phase == .connecting_upstream and event_fd == upstream_fd);
 }
 
+fn shouldFallbackMiddleProxyOnFatalHangup(phase: ConnectionPhase, event_fd: posix.fd_t, upstream_fd: posix.fd_t) bool {
+    return phase == .middle_proxy_handshake and event_fd == upstream_fd;
+}
+
 const MiddleProxyHandshakeStep = enum {
     none,
     sending_rpc_nonce,
@@ -1509,6 +1513,11 @@ const EventLoop = struct {
         }
 
         if (fatal_hangup and shouldCloseOnFatalHangup(slot.phase, fd, slot.upstream_fd)) {
+            if (shouldFallbackMiddleProxyOnFatalHangup(slot.phase, fd, slot.upstream_fd) and
+                self.fallbackFromMiddleProxyToDirect(slot))
+            {
+                return;
+            }
             self.closeSlot(slot, "epoll hup/err");
             return;
         }
@@ -1795,6 +1804,7 @@ const EventLoop = struct {
                 const had_pending = slot.hasUpstreamPending();
                 if (flushUpstreamPending(slot)) |_| {} else |err| {
                     log.debug("[{d}] upstream flush error: {any}", .{ slot.conn_id, err });
+                    if (slot.phase == .middle_proxy_handshake and self.fallbackFromMiddleProxyToDirect(slot)) return;
                     self.closeSlot(slot, "upstream flush error");
                     return;
                 }
@@ -4415,6 +4425,16 @@ test "fatal hangup close policy distinguishes client/upstream while connecting" 
     try std.testing.expect(!shouldCloseOnFatalHangup(.connecting_upstream, upstream_fd, upstream_fd));
     try std.testing.expect(shouldCloseOnFatalHangup(.reading_tls_header, client_fd, upstream_fd));
     try std.testing.expect(!shouldCloseOnFatalHangup(.idle, client_fd, upstream_fd));
+}
+
+test "fatal middle-proxy upstream hangup is fallback eligible" {
+    const client_fd: posix.fd_t = 41;
+    const upstream_fd: posix.fd_t = 42;
+
+    try std.testing.expect(shouldFallbackMiddleProxyOnFatalHangup(.middle_proxy_handshake, upstream_fd, upstream_fd));
+    try std.testing.expect(!shouldFallbackMiddleProxyOnFatalHangup(.middle_proxy_handshake, client_fd, upstream_fd));
+    try std.testing.expect(!shouldFallbackMiddleProxyOnFatalHangup(.connecting_upstream, upstream_fd, upstream_fd));
+    try std.testing.expect(shouldCloseOnFatalHangup(.middle_proxy_handshake, upstream_fd, upstream_fd));
 }
 
 test "fd requirement helpers" {
