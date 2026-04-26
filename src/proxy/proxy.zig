@@ -1359,9 +1359,13 @@ pub const ProxyState = struct {
         }
 
         if (changed) {
-            log.info("Middle-proxy cache updated: dc4={any} dc203={any} secret_len={d}", .{
-                self.middle_proxy_addrs_primary[3],
-                self.middle_proxy_addr_203,
+            var dc4_buf: [64]u8 = undefined;
+            var dc203_buf: [64]u8 = undefined;
+            const dc4_str = formatAddress(self.middle_proxy_addrs_primary[3], &dc4_buf);
+            const dc203_str = formatAddress(self.middle_proxy_addr_203, &dc203_buf);
+            log.info("Middle-proxy cache updated: dc4={s} dc203={s} secret_len={d}", .{
+                dc4_str,
+                dc203_str,
                 self.middle_proxy_secret_len,
             });
         }
