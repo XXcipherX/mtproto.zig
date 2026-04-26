@@ -3657,7 +3657,6 @@ fn resolveHostnameIpv4(allocator: std.mem.Allocator, host: []const u8) ?[4]u8 {
         if (addr.any.family == posix.AF.INET) {
             var ip: [4]u8 = undefined;
             @memcpy(&ip, std.mem.asBytes(&addr.in.sa.addr));
-            std.mem.reverse(u8, &ip);
             return ip;
         }
     }
