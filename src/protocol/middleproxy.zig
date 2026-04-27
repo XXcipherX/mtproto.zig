@@ -128,6 +128,7 @@ pub const MiddleProxyContext = struct {
 
     pub const default_stream_buffer_size: usize = 128 * 1024;
     pub const initial_stream_buffer_size: usize = 16 * 1024;
+    pub const shrink_stream_buffer_threshold: usize = initial_stream_buffer_size * 4;
     pub const max_stream_buffer_size: usize = config.Config.middle_proxy_stream_buffer_cap_bytes;
 
     pub fn init(
@@ -249,6 +250,18 @@ pub const MiddleProxyContext = struct {
         if (self.s2c_buf.len >= min_capacity) return;
         const next_capacity = nextBufferCapacity(self.s2c_buf.len, min_capacity, self.buffer_limit);
         self.s2c_buf = try self.allocator.realloc(self.s2c_buf, next_capacity);
+    }
+
+    fn shrinkC2sIfIdle(self: *MiddleProxyContext) void {
+        if (self.c2s_len != 0) return;
+        if (self.c2s_buf.len <= shrink_stream_buffer_threshold) return;
+        self.c2s_buf = self.allocator.realloc(self.c2s_buf, initial_stream_buffer_size) catch return;
+    }
+
+    fn shrinkS2cIfIdle(self: *MiddleProxyContext) void {
+        if (self.s2c_len != 0) return;
+        if (self.s2c_buf.len <= shrink_stream_buffer_threshold) return;
+        self.s2c_buf = self.allocator.realloc(self.s2c_buf, initial_stream_buffer_size) catch return;
     }
 
     fn peekBufferedC2sByte(self: *const MiddleProxyContext, client_data: []const u8, idx: usize) u8 {
@@ -392,6 +405,7 @@ pub const MiddleProxyContext = struct {
                 std.mem.copyForwards(u8, self.c2s_buf[0..remaining], self.c2s_buf[pos..self.c2s_len]);
             }
             self.c2s_len = remaining;
+            self.shrinkC2sIfIdle();
         }
 
         return out_buf[0..total_written];
@@ -618,6 +632,7 @@ pub const MiddleProxyContext = struct {
             }
             self.s2c_len = remaining;
             self.s2c_decrypted_len -= parse_pos;
+            self.shrinkS2cIfIdle();
         }
 
         return out_buf[0..out_pos];
@@ -1020,8 +1035,8 @@ test "middle proxy context grows c2s buffer on demand within configured cap" {
 
     const out = try ctx.encapsulateC2S(packet, out_buf);
     try std.testing.expect(out.len > payload_len);
-    try std.testing.expect(ctx.c2s_buf.len >= packet.len);
     try std.testing.expectEqual(@as(usize, 0), ctx.c2s_len);
+    try std.testing.expectEqual(MiddleProxyContext.initial_stream_buffer_size, ctx.c2s_buf.len);
 }
 
 test "middle proxy context still enforces configured c2s cap" {
@@ -1102,5 +1117,7 @@ test "middle proxy context grows s2c buffer on demand within configured cap" {
 
     const out = try ctx.decapsulateS2C(plain, out_buf);
     try std.testing.expectEqual(@as(usize, 4 + conn_data_len), out.len);
-    try std.testing.expect(ctx.s2c_buf.len >= plain.len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.s2c_len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.s2c_decrypted_len);
+    try std.testing.expectEqual(MiddleProxyContext.initial_stream_buffer_size, ctx.s2c_buf.len);
 }
