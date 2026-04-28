@@ -875,7 +875,7 @@ test "decapsulate s2c skips noop padding words" {
     try std.testing.expectEqualSlices(u8, &confirm, out);
 }
 
-test "decapsulate s2c validates seq and checksum" {
+test "decapsulate s2c validates seq" {
     const allocator = std.testing.allocator;
 
     const key = [_]u8{0} ** 32;
@@ -929,6 +929,44 @@ test "decapsulate s2c validates seq and checksum" {
     try enc.encryptInPlace(wire2[0..]);
 
     try std.testing.expectError(error.BadMiddleProxySeqNo, ctx.decapsulateS2C(wire2[0..], out_buf[0..]));
+}
+
+test "decapsulate s2c rejects checksum mismatch without resyncing" {
+    const allocator = std.testing.allocator;
+
+    const key = [_]u8{0} ** 32;
+    const iv = [_]u8{0} ** 16;
+
+    var ctx = try MiddleProxyContext.init(
+        allocator,
+        crypto.AesCbc.init(&key, &iv),
+        crypto.AesCbc.init(&key, &iv),
+        [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 },
+        -2,
+        std.net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
+        std.net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
+        .intermediate,
+        null,
+    );
+    defer ctx.deinit();
+
+    var plain: [32]u8 = undefined;
+    const total_len: u32 = 32;
+    std.mem.writeInt(u32, plain[0..4], total_len, .little);
+    std.mem.writeInt(i32, plain[4..8], 0, .little);
+    @memcpy(plain[8..12], &rpc_proxy_ans);
+    std.mem.writeInt(u32, plain[12..16], 0, .little);
+    @memset(plain[16..24], 0);
+    std.mem.writeInt(u32, plain[24..28], 0x12345678, .little);
+    const checksum = crc32(plain[0..28]);
+    std.mem.writeInt(u32, plain[28..32], checksum ^ 0x1, .little);
+
+    var enc = crypto.AesCbc.init(&key, &iv);
+    var wire = plain;
+    try enc.encryptInPlace(wire[0..]);
+
+    var out_buf: [128]u8 = undefined;
+    try std.testing.expectError(error.BadMiddleProxyChecksum, ctx.decapsulateS2C(wire[0..], out_buf[0..]));
 }
 
 test "middle proxy sequence counters wrap without panicking" {
