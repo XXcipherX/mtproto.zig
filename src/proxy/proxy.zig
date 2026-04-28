@@ -652,6 +652,7 @@ const ConnectionSlot = struct {
     handshake_buf: [constants.handshake_len]u8 = undefined,
     handshake_pos: u8 = 0,
     pipelined_data: ?[]u8 = null,
+    pipelined_len: usize = 0,
 
     // Obfuscation / relay crypto state
     obf_params: ?obfuscation.ObfuscationParams = null,
@@ -764,6 +765,7 @@ const ConnectionSlot = struct {
 
         if (self.pipelined_data) |buf| allocator.free(buf);
         self.pipelined_data = null;
+        self.pipelined_len = 0;
 
         if (self.mask_prebuffer) |buf| allocator.free(buf);
         self.mask_prebuffer = null;
@@ -2463,10 +2465,11 @@ const EventLoop = struct {
         slot.phase = .relaying;
 
         if (slot.pipelined_data) |buf| {
-            if (slot.client_decryptor) |*dec| dec.apply(buf);
+            const data = buf[0..slot.pipelined_len];
+            if (slot.client_decryptor) |*dec| dec.apply(data);
 
             if (slot.middle_ctx) |*mp| {
-                const required = mp.requiredC2sScratchCapacity(buf) catch {
+                const required = mp.requiredC2sScratchCapacity(data) catch {
                     self.closeSlot(slot, "compute middleproxy pipelined scratch failed");
                     return;
                 };
@@ -2474,7 +2477,7 @@ const EventLoop = struct {
                     self.closeSlot(slot, "alloc middleproxy c2s scratch failed");
                     return;
                 };
-                const out_data = mp.encapsulateC2S(buf, scratch) catch {
+                const out_data = mp.encapsulateC2S(data, scratch) catch {
                     self.closeSlot(slot, "encapsulate pipelined middleproxy payload failed");
                     return;
                 };
@@ -2485,16 +2488,17 @@ const EventLoop = struct {
                     };
                 }
             } else if (slot.tg_encryptor) |*enc| {
-                enc.apply(buf);
-                _ = queueUpstream(slot, buf) catch {
+                enc.apply(data);
+                _ = queueUpstream(slot, data) catch {
                     self.closeSlot(slot, "queue pipelined direct payload failed");
                     return;
                 };
             }
 
-            slot.c2s_bytes += buf.len;
+            slot.c2s_bytes += data.len;
             self.state.allocator.free(buf);
             slot.pipelined_data = null;
+            slot.pipelined_len = 0;
         }
     }
 
@@ -3345,21 +3349,40 @@ const EventLoop = struct {
 
     fn appendPipelined(self: *EventLoop, slot: *ConnectionSlot, extra: []const u8) !void {
         if (extra.len == 0) return;
-        if (slot.pipelined_data == null) {
-            const buf = try self.state.allocator.alloc(u8, extra.len);
-            @memcpy(buf, extra);
+
+        const next_len = try std.math.add(usize, slot.pipelined_len, extra.len);
+        if (next_len > constants.max_tls_ciphertext_size) return error.PipelinedDataTooLarge;
+
+        var buf = slot.pipelined_data orelse blk: {
+            const initial_capacity = pipelinedCapacity(0, next_len);
+            const allocated = try self.state.allocator.alloc(u8, initial_capacity);
+            slot.pipelined_data = allocated;
+            break :blk allocated;
+        };
+
+        if (buf.len < next_len) {
+            const next_capacity = pipelinedCapacity(buf.len, next_len);
+            buf = try self.state.allocator.realloc(buf, next_capacity);
             slot.pipelined_data = buf;
-            return;
         }
 
-        const prev = slot.pipelined_data.?;
-        const next = try self.state.allocator.alloc(u8, prev.len + extra.len);
-        @memcpy(next[0..prev.len], prev);
-        @memcpy(next[prev.len..], extra);
-        self.state.allocator.free(prev);
-        slot.pipelined_data = next;
+        @memcpy(buf[slot.pipelined_len..next_len], extra);
+        slot.pipelined_len = next_len;
     }
 };
+
+fn pipelinedCapacity(current_capacity: usize, required_len: usize) usize {
+    var next = if (current_capacity == 0)
+        @min(@as(usize, read_buf_size), constants.max_tls_ciphertext_size)
+    else
+        current_capacity;
+
+    while (next < required_len) {
+        next = @min(next * 2, constants.max_tls_ciphertext_size);
+    }
+
+    return next;
+}
 
 fn relayClientToUpstreamStep(self: *EventLoop, slot: *ConnectionSlot) !RelayProgress {
     const allocator = self.state.allocator;
