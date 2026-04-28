@@ -452,7 +452,7 @@ pub const MiddleProxyContext = struct {
         out_len += 4;
         std.mem.writeInt(i32, out_buf[out_len..][0..4], self.seq_no, .little);
         out_len += 4;
-        self.seq_no += 1;
+        self.seq_no = self.seq_no +% 1;
 
         @memcpy(out_buf[out_len .. out_len + 4], &rpc_proxy_req);
         out_len += 4;
@@ -558,7 +558,7 @@ pub const MiddleProxyContext = struct {
 
             const frame_seq_no = std.mem.readInt(i32, self.s2c_buf[parse_pos + 4 ..][0..4], .little);
             if (frame_seq_no != self.read_seq_no) return error.BadMiddleProxySeqNo;
-            self.read_seq_no += 1;
+            self.read_seq_no = self.read_seq_no +% 1;
 
             // Payload is after Length (4) and SeqNo (4), and before CRC32 (4)
             const payload = self.s2c_buf[parse_pos + 8 .. frame_end - 4];
@@ -929,6 +929,57 @@ test "decapsulate s2c validates seq and checksum" {
     try enc.encryptInPlace(wire2[0..]);
 
     try std.testing.expectError(error.BadMiddleProxySeqNo, ctx.decapsulateS2C(wire2[0..], out_buf[0..]));
+}
+
+test "middle proxy sequence counters wrap without panicking" {
+    const allocator = std.testing.allocator;
+
+    const key = [_]u8{0} ** 32;
+    const iv = [_]u8{0} ** 16;
+
+    var ctx = try MiddleProxyContext.init(
+        allocator,
+        crypto.AesCbc.init(&key, &iv),
+        crypto.AesCbc.init(&key, &iv),
+        [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 },
+        std.math.maxInt(i32),
+        std.net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
+        std.net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
+        .intermediate,
+        null,
+    );
+    defer ctx.deinit();
+
+    const client_data = [_]u8{ 0xde, 0xad, 0xbe, 0xef };
+    var encrypted_out: [512]u8 = undefined;
+
+    const written = try ctx.encapsulateSingleMessageC2S(client_data[0..], false, encrypted_out[0..]);
+    try std.testing.expectEqual(std.math.minInt(i32), ctx.seq_no);
+
+    var decryptor = crypto.AesCbc.init(&key, &iv);
+    try decryptor.decryptInPlace(encrypted_out[0..written]);
+    try std.testing.expectEqual(std.math.maxInt(i32), std.mem.readInt(i32, encrypted_out[4..8], .little));
+
+    ctx.read_seq_no = std.math.maxInt(i32);
+
+    var plain: [32]u8 = undefined;
+    const total_len: u32 = 32;
+    std.mem.writeInt(u32, plain[0..4], total_len, .little);
+    std.mem.writeInt(i32, plain[4..8], std.math.maxInt(i32), .little);
+    @memcpy(plain[8..12], &rpc_proxy_ans);
+    std.mem.writeInt(u32, plain[12..16], 0, .little);
+    @memset(plain[16..24], 0);
+    std.mem.writeInt(u32, plain[24..28], 0x12345678, .little);
+    const checksum = crc32(plain[0..28]);
+    std.mem.writeInt(u32, plain[28..32], checksum, .little);
+
+    var enc = crypto.AesCbc.init(&key, &iv);
+    var wire = plain;
+    try enc.encryptInPlace(wire[0..]);
+
+    var out_buf: [128]u8 = undefined;
+    _ = try ctx.decapsulateS2C(wire[0..], out_buf[0..]);
+    try std.testing.expectEqual(std.math.minInt(i32), ctx.read_seq_no);
 }
 
 test "decapsulate s2c rejects invalid frame length instead of resyncing" {

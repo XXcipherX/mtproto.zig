@@ -2937,7 +2937,7 @@ const EventLoop = struct {
 
         std.mem.writeInt(u32, plain[0..4], @intCast(total_len), .little);
         std.mem.writeInt(i32, plain[4..8], slot.mp_write_seq_no, .little);
-        slot.mp_write_seq_no += 1;
+        slot.mp_write_seq_no = slot.mp_write_seq_no +% 1;
 
         @memcpy(plain[8 .. 8 + payload.len], payload);
         const checksum = middleproxy.crc32(plain[0 .. 8 + payload.len]);
@@ -3072,7 +3072,7 @@ const EventLoop = struct {
                 });
                 return error.BadMiddleProxySeqNo;
             }
-            slot.mp_read_seq_no += 1;
+            slot.mp_read_seq_no = slot.mp_read_seq_no +% 1;
 
             const expected_checksum = std.mem.readInt(u32, frame[frame.len - 4 ..][0..4], .little);
             const computed_checksum = middleproxy.crc32(frame[0 .. frame.len - 4]);
