@@ -2667,18 +2667,26 @@ const EventLoop = struct {
                 var enc_keys: struct { [32]u8, [16]u8 } = undefined;
                 var dec_keys: struct { [32]u8, [16]u8 } = undefined;
                 var middle_local_addr: net.Address = undefined;
+                var secret_snapshot = [_]u8{0} ** 256;
+                defer @memset(secret_snapshot[0..], 0);
+                var secret_len: usize = 0;
 
-                const mp_lock_error: ?[]const u8 = locked: {
+                {
                     self.state.middle_proxy_lock.lockShared();
                     defer self.state.middle_proxy_lock.unlockShared();
 
-                    const key_sel = self.state.middle_proxy_secret[0..@min(@as(usize, 4), self.state.middle_proxy_secret_len)];
-                    const secret_slice = self.state.middle_proxy_secret[0..self.state.middle_proxy_secret_len];
+                    secret_len = self.state.middle_proxy_secret_len;
+                    @memcpy(secret_snapshot[0..secret_len], self.state.middle_proxy_secret[0..secret_len]);
+                }
+
+                const mp_handshake_error: ?[]const u8 = handshake: {
+                    const key_sel = secret_snapshot[0..@min(@as(usize, 4), secret_len)];
+                    const secret_slice = secret_snapshot[0..secret_len];
                     if (!std.mem.eql(u8, payload[4..8], key_sel)) {
-                        break :locked "mp key selector mismatch";
+                        break :handshake "mp key selector mismatch";
                     }
                     if (!std.mem.eql(u8, payload[8..12], &middleproxy.rpc_crypto_aes)) {
-                        break :locked "mp crypto schema mismatch";
+                        break :handshake "mp crypto schema mismatch";
                     }
 
                     slot.mp_rpc_nonce_ans = payload[16..32][0..16].*;
@@ -2689,13 +2697,13 @@ const EventLoop = struct {
                     var peer_addr: net.Address = undefined;
                     var peer_len: posix.socklen_t = @sizeOf(net.Address);
                     posix.getpeername(slot.upstream_fd, &peer_addr.any, &peer_len) catch {
-                        break :locked "mp getpeername failed";
+                        break :handshake "mp getpeername failed";
                     };
 
                     var local_addr: net.Address = undefined;
                     var local_len: posix.socklen_t = @sizeOf(net.Address);
                     posix.getsockname(slot.upstream_fd, &local_addr.any, &local_len) catch {
-                        break :locked "mp getsockname failed";
+                        break :handshake "mp getsockname failed";
                     };
                     middle_local_addr = local_addr;
 
@@ -2731,7 +2739,7 @@ const EventLoop = struct {
                         std.mem.writeInt(u16, &tg_port, std.mem.bigToNative(u16, peer_addr.in6.sa.port), .little);
                         std.mem.writeInt(u16, &my_port, std.mem.bigToNative(u16, local_addr.in6.sa.port), .little);
                     } else {
-                        break :locked "mp unsupported addr family";
+                        break :handshake "mp unsupported addr family";
                     }
 
                     const tg_ip_v4_ptr: ?*const [4]u8 = if (tg_ip_v4_opt) |*ip| ip else null;
@@ -2767,10 +2775,10 @@ const EventLoop = struct {
                         tg_ip_v6_ptr,
                     );
 
-                    break :locked null;
+                    break :handshake null;
                 };
 
-                if (mp_lock_error) |reason| {
+                if (mp_handshake_error) |reason| {
                     if (!self.fallbackFromMiddleProxyToDirect(slot)) {
                         self.closeSlot(slot, reason);
                     }
