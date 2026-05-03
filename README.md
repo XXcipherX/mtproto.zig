@@ -41,7 +41,7 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 | **Masking** | Connection Cloaking | Forwards unauthenticated clients either to `tls_domain:443` or, for self-domain installs, to a local Nginx 404 backend |
 | **Fast Mode** | Direct-Path S2C Offload | Reduces CPU usage by delegating S2C AES work to Telegram DCs on direct paths (non-MiddleProxy) |
 | **MiddleProxy** | Telemt-Compatible ME | Optional ME transport for DC1..5 (`use_middle_proxy`); media-path traffic prefers ME endpoints with direct fallback when unavailable |
-| **Auto Refresh** | Telegram Metadata | Periodically updates MiddleProxy endpoint and secret from Telegram core endpoints |
+| **Auto Refresh** | Telegram Metadata | Periodically updates regular/media MiddleProxy endpoints and secret from Telegram core endpoints when any ME route is enabled |
 | **Promotion** | Tag Support | Optional promotion tag for sponsored proxy channel registration |
 | **IPv6 Hopping** | DPI Evasion | Auto-rotates IPv6 from /64 subnet on ban detection via Cloudflare API |
 | **TCPMSS=88** | DPI Evasion | Forces ClientHello fragmentation across 6 TCP packets, breaking ISP DPI reassembly |
@@ -58,10 +58,13 @@ Connection-capacity methodology and command profiles: `test/README.md`.
 ## Runtime Model
 
 - Client relay is handled by a single-threaded Linux `epoll` event loop.
-- A background updater thread periodically refreshes MiddleProxy metadata from Telegram core endpoints.
+- When any MiddleProxy path is enabled (`use_middle_proxy` or `force_media_middle_proxy`), a joinable background updater thread periodically refreshes MiddleProxy metadata from Telegram core endpoints.
+- FakeTLS validation expects Telegram-style 32-byte ClientHello Session IDs and copies the Session ID into the synthetic ServerHello.
 - Handshake and relay lifetimes are controlled by event-loop timers (`idle_timeout_sec`, `handshake_timeout_sec`), not by `SO_RCVTIMEO`.
 - Failed non-blocking upstream connects are reclaimed immediately on fatal hangup events; the relay loop should not spin on dead upstream sockets.
 - Timer maintenance runs on a fixed cadence and scans only the allocated connection-slot prefix; production builds also emit aggregated `conn stats` every 10 seconds.
+- Client payload bytes pipelined after the 64-byte MTProto obfuscation nonce are buffered and forwarded once the upstream path is ready.
+- Outbound client/upstream writes use classed block queues, `writev`, and a 4 MiB pending-byte cap per queue.
 - MiddleProxy per-direction C2S/S2C buffers start at 16 KiB and grow on demand up to the effective `middleproxy_buffer_kb` cap; shared event-loop scratch buffers are also allocated lazily and reused.
 
 ## &nbsp; Quick Start
@@ -84,9 +87,14 @@ make build
 # Build (optimized for production)
 make release
 
-# Run with default config.toml
+# Create a local config (replace example secrets/domain before exposing it)
+cp config.toml.example config.toml
+
+# Run with config.toml (or pass CONFIG=<path>)
 make run
 ```
+
+The binary defaults to `config.toml`; the repository intentionally ships `config.toml.example` instead of a real local config.
 
 ### Run Tests
 
@@ -121,7 +129,7 @@ python3 test/daemon_smoke.py --binary zig-out/bin/mtproto-proxy
 zig build -Doptimize=ReleaseFast soak -- --seconds=120 --threads=8 --max-payload=131072
 ```
 
-The GitHub workflow additionally verifies native `ReleaseFast`, Linux `x86_64`, deploy-target `x86_64_v3`, Linux `aarch64`, and Docker build smoke paths.
+The GitHub workflow additionally verifies native `ReleaseFast`, Linux `x86_64`, deploy-target `x86_64_v3`, Linux `aarch64`, Docker build smoke, and bench/soak paths.
 
 `bench` prints per-payload throughput (`in_mib_per_s`, `out_mib_per_s`) and `ns_per_op`.
 `soak` prints aggregate `ops/s`, throughput, and `errors`; non-zero errors fail the step.
@@ -145,7 +153,7 @@ The GitHub workflow additionally verifies native `ReleaseFast`, Linux `x86_64`, 
 | `make fmt` | Format Zig files under `src/` |
 | `make deploy [SERVER=<ip>]` | Cross-compile, upload binary/scripts/config to VPS, restart service |
 | `make migrate SERVER=<ip> [PASSWORD=<pass>]` | Bootstrap server, push local `config.toml`, then run `make deploy` |
-| `make update-dns SERVER=<ip>` | Run the Cloudflare DNS update helper on demand |
+| `make update-dns SERVER=<ip>` | Run the Cloudflare DNS update helper on demand (`DNS_NAME`, `CF_TOKEN`, `CF_ZONE` come from `.env`) |
 | `make deploy-tunnel SERVER=<ip> AWG_CONF=<path> [PASSWORD=<pass>] [TUNNEL_MODE=direct\|preserve\|middleproxy]` | Full migration + AmneziaWG tunnel for blocked regions |
 | `make deploy-tunnel-only SERVER=<ip> AWG_CONF=<path> [TUNNEL_MODE=direct\|preserve\|middleproxy]` | Add AmneziaWG tunnel to existing installation |
 | `make deploy-monitor SERVER=<ip>` | Deploy monitoring dashboard to server |
@@ -161,13 +169,13 @@ To update an already installed proxy, simply re-run the same install command:
 curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/install.sh | sudo bash
 ```
 
-The script is **idempotent**: it rebuilds from latest source, replaces the binary, and preserves your existing `config.toml`. Existing `env.sh` stays untouched unless you rerun install with new `CF_TOKEN` / `CF_ZONE`. User secrets and connection links remain unchanged.
+The script is **idempotent**: it rebuilds from latest source, replaces the binary, and preserves your existing `config.toml`. Existing `env.sh` stays untouched unless you rerun install with new `CF_TOKEN` / `CF_ZONE` / `IPV6_PREFIX` settings. User secrets and connection links remain unchanged.
 
 For a fresh self-domain install, pass `MASK_DOMAIN` as shown below or enter the domain at the installer prompt. Non-interactive bootstrap paths must pass `MASK_DOMAIN` explicitly.
 
 ## Docker image
 
-The repository includes a **multi-stage Dockerfile**: Zig is bootstrapped from the official tarball inside the build stage; the runtime image is Debian **bookworm-slim** with `curl` and CA certs. The proxy binary performs HTTPS public-IP detection itself at startup, so CA certs are required; `curl` is kept for container-side diagnostics and operator convenience. The process runs as **root** inside the container (simple bind to port 443). The image ships `config.toml.example` as `/etc/mtproto-proxy/config.toml` for a quick start; mount your own file for real secrets and settings.
+The repository includes a **multi-stage Dockerfile**: Zig is bootstrapped from the official tarball inside the build stage; the runtime image is Debian **bookworm-slim** with `curl` and CA certs. The proxy binary performs HTTPS public-IP detection and MiddleProxy metadata refresh itself, so CA certs are required; `curl` is kept for container-side diagnostics and operator convenience. The process runs as **root** inside the container (simple bind to port 443). The image ships `config.toml.example` as `/etc/mtproto-proxy/config.toml` for a quick start; mount your own file for real secrets and settings.
 
 ### Build
 
@@ -247,11 +255,12 @@ This will:
 3. Generate a random 16-byte secret on first install
 4. Create a `systemd` service (`mtproto-proxy`)
 5. Open the configured proxy port in `ufw` (if active)
-6. Apply **TCPMSS=88** iptables rule (passive DPI bypass)
-7. Set up self-domain Nginx 404 masking on `127.0.0.1:8443`, including Let's Encrypt on TCP/80 and the masking health timer
-8. Attempt OS-level `zapret` / `nfqws` TCP desync setup
-9. Install **IPv6 hop script** (optional cron auto-rotation with `CF_TOKEN`+`CF_ZONE`+`IPV6_PREFIX`)
-10. Print a ready-to-use `tg://` connection link
+6. Apply **TCPMSS=88** iptables/ip6tables rules when available (passive DPI bypass)
+7. Install **IPv6 hop script** when `CF_TOKEN`+`CF_ZONE`+`IPV6_PREFIX` are provided
+8. Set up self-domain Nginx 404 masking on `127.0.0.1:8443`, including Let's Encrypt on TCP/80 and the masking health timer
+9. Attempt OS-level `zapret` / `nfqws` TCP desync setup
+10. Refresh optional monitor files if `proxy-monitor` already exists
+11. Print a ready-to-use `tg://` connection link when `[access.users]` contains a valid 32-hex secret
 
 ### Self-Domain 404 Masking
 
@@ -279,7 +288,7 @@ sudo systemctl restart mtproto-proxy
 
 The Nginx backend intentionally does not publish a site body. Only `/.well-known/acme-challenge/` on port `80` is served for Let's Encrypt; all other HTTP/HTTPS requests receive `404`. The masking setup also disables Debian's default Nginx site and makes `mtproto-masking` the default `:80` server so unmatched HTTP `Host`/IP requests return `404` too; set `MASK_KEEP_NGINX_DEFAULT=1` only if you intentionally want to keep an existing default site.
 
-To enable IPv6 auto-hopping (Cloudflare DNS rotation on ban detection), provide Cloudflare API credentials plus your routed `/64` prefix. The installer stores these values in `/opt/mtproto-proxy/env.sh`, and the cron-launched hop script sources that file before updating your domain's AAAA record.
+To enable IPv6 auto-hopping (Cloudflare DNS rotation on ban detection), provide Cloudflare API credentials plus your routed `/64` prefix. The installer stores these values in `/opt/mtproto-proxy/env.sh`, and the cron-launched hop script sources that file before updating your domain's AAAA record. `DNS_NAME` defaults to the masking TLS domain when omitted.
 
 #### Obtaining Cloudflare Credentials
 
@@ -362,15 +371,13 @@ sudo tee /opt/mtproto-proxy/config.toml <<EOF
 port = 443
 public_ip = "proxy.example.com"
 # tag = "<your-promotion-tag>"   # Optional: 32 hex-char promotion tag from @MTProxybot
+# max_connections = 10000        # Optional high-capacity override; startup auto-clamps unless unsafe_override_limits=true
 
 [censorship]
 tls_domain = "proxy.example.com"
 mask = true
 mask_port = 8443
 fast_mode = true
-
-# Server tunables for high capacity
-# max_connections = 10000
 
 [access.users]
 user = "$SECRET"
@@ -539,7 +546,7 @@ This will:
 1. Set up SSH key, install deps, build and deploy the proxy (via `make migrate`)
 2. Install **amneziawg-tools** (DKMS kernel module + userspace tools)
 3. Create network namespace `tg_proxy_ns` with AmneziaWG tunnel inside
-4. Set up **DNAT** (incoming `:443` → namespace) and **policy routing** (responses go back to client, not into tunnel)
+4. Set up **DNAT** (incoming proxy port, default `:443`, → namespace) and **policy routing** (responses go back to client, not into tunnel)
 5. Patch the systemd service to run the proxy inside the namespace and apply selected tunnel mode (`direct` by default)
 6. Validate connectivity to all 5 Telegram DCs through the tunnel
 7. Print the ready-to-use `tg://` link
@@ -571,7 +578,7 @@ ssh root@<VPS_IP> 'bash /opt/mtproto-proxy/setup_tunnel.sh /tmp/awg.conf middlep
 |-----------|----------|---------|
 | `awg0` | Inside `tg_proxy_ns` | Encrypted tunnel to Telegram DCs |
 | `veth_main` ↔ `veth_ns` | Host ↔ Namespace | Bridge for client traffic |
-| iptables DNAT | Host | Forwards `:443` → `10.200.200.2:443` |
+| iptables DNAT | Host | Forwards the configured proxy port (default `:443`) to `10.200.200.2:<port>` |
 | Policy routing (`from 10.200.200.2 table 100`) | Inside namespace | Response packets return via veth (not via tunnel) |
 | `mtproto-proxy` | Inside `tg_proxy_ns` | Listens on `:443`, connects to Telegram via `awg0` |
 
@@ -661,9 +668,9 @@ alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eli
 | `[server]` | `public_ip` | _(auto-detect)_ | Override the IP/domain shown in startup links. For self-domain masking, set this to the same domain as `tls_domain`. Tunnel deploy scripts preserve an existing domain instead of replacing it with the tunnel exit IP |
 | `[server]` | `middle_proxy_nat_ip` | _(auto-detect)_ | Optional IPv4 override used in MiddleProxy NAT/AES derivation. Useful when `public_ip` is a hostname or when tunnel egress/detection would choose the wrong IPv4 |
 | `[server]` | `backlog` | `4096` | TCP listen queue size (for high-traffic loads) |
-| `[server]` | `max_connections` | `512` | Concurrent connection cap (small-VPS tuned default). On Linux, startup first auto-clamps this to the RAM-safe estimate unless `unsafe_override_limits=true`; the proxy then clamps again if `RLIMIT_NOFILE` cannot cover the fd budget |
-| `[server]` | `idle_timeout_sec` | `120` | Connection idle timeout in seconds (also used before first client byte) |
-| `[server]` | `handshake_timeout_sec` | `15` | Timeout for completing handshake after first byte |
+| `[server]` | `max_connections` | `512` | Concurrent connection cap (small-VPS tuned default, parser lower bound 32). On Linux, startup first auto-clamps this to the RAM-safe estimate unless `unsafe_override_limits=true`; the proxy then clamps again if `RLIMIT_NOFILE` cannot cover the fd budget |
+| `[server]` | `idle_timeout_sec` | `120` | Connection idle timeout in seconds (also used before first client byte; parser lower bound 5) |
+| `[server]` | `handshake_timeout_sec` | `15` | Timeout for completing handshake after first byte (parser lower bound 5) |
 | `[server]` | `middleproxy_buffer_kb` | `1024` | MiddleProxy per-direction buffer cap in KiB. Active ME connections start with 16 KiB C2S/S2C buffers and grow on demand up to `min(middleproxy_buffer_kb, 16384)` KiB; each event loop also keeps lazy shared scratch buffers. Values below 1024 may still cause `MiddleProxyBufferOverflow` on media-heavy traffic (Stories, video messages). Parser lower bound is 64 KiB |
 | `[server]` | `tag` | _(none)_ | Optional 32 hex-char promotion tag from [@MTProxybot](https://t.me/MTProxybot) |
 | `[server]` | `log_level` | `"info"` | Runtime log verbosity: `debug` (all DC routing, relay, close details), `info` (default — connection stats, warnings), `warn`, `err`. Change without recompilation; takes effect on restart |
@@ -678,13 +685,15 @@ alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eli
 | `[censorship]` | `drs` | `false` | Dynamic Record Sizing: ramp TLS records from 1369→16384 bytes after warmup (mimics Chrome/Firefox) |
 | `[censorship]` | `fast_mode` | `false` | **Recommended** for direct-path traffic. Delegates S2C AES encryption to Telegram DC and reduces proxy CPU/RAM pressure |
 | `[access.users]` | `<name>` | -- | 32 hex-char secret (16 bytes) per user |
-| `[access.direct_users]` | `<name> = true` | _(none)_ | Optional per-user MiddleProxy bypass. `<name>` must match a user from `[access.users]`; such users always connect directly to Telegram DCs (including media paths). Alias section: `[access.admins]` |
+| `[access.direct_users]` | `<name> = true` | _(none)_ | Optional per-user MiddleProxy bypass. `<name>` must match a user from `[access.users]`; such users always connect directly to Telegram DCs (including media paths). Values `false`/`0`/`no` remove a previous duplicate entry. Alias section: `[access.admins]` |
 
 </details>
 
 > **Operational note** &nbsp; High-churn mobile networks can produce many normal disconnects (`ConnectionResetByPeer`/`EndOfStream`). In release builds these are logged at debug level to keep production logs signal-focused.
 
 > **Operational note** &nbsp; `deploy/mtproto-proxy.service` ships with `LimitNOFILE=131582` to allow higher custom caps when needed. Default `max_connections=512` is tuned for small VPS profiles; increase it only after capacity testing.
+
+> **Operational note** &nbsp; The FakeTLS path rejects non-32-byte ClientHello Session IDs. Current Telegram MTProto-over-TLS clients use a 32-byte Session ID, which the proxy echoes in its Nginx-like ServerHello template.
 
 > **Operational note** &nbsp; If `accept()` hits `EMFILE`/`ENFILE`, the listener temporarily disables `EPOLLIN`, waits 500ms, and retries. In periodic `conn stats`, the first `paused=` flag reflects this fd-quota backoff.
 
@@ -699,6 +708,8 @@ alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eli
 > **Tip** &nbsp; Generate a random secret: `openssl rand -hex 16`
 
 > **Note** &nbsp; The configuration format is compatible with the Rust-based `telemt` proxy.
+
+> **Note** &nbsp; For compatibility, `fast_mode` is accepted in `[general]`, `[server]`, or `[censorship]`; all three set the same runtime flag.
 
 > **Note** &nbsp; The parser supports inline `#` / `;` comments after values and treats duplicate owned string/user/direct-user entries as last-write-wins without leaking previous allocations.
 
@@ -726,6 +737,7 @@ Interpretation:
 - `auto-clamping max_connections ...` means startup reduced configured capacity to the RAM-safe estimate. `max_connections clamped ... due to RLIMIT_NOFILE` means runtime reduced it again to fit the process fd limit.
 - `fd quota reached ... pausing accepts for 500ms` means the listener hit `EMFILE`/`ENFILE` and intentionally backed off instead of busy-looping.
 - `conn stats ... paused=<fd_pause>/<saturation_pause>` exposes two pause reasons: fd-quota backoff first, saturation hysteresis second.
+- `drops: ... rate+=...` means the per-subnet rate limiter rejected excess new connections.
 - `drops: ... hs_budget+=...` means the handshake-inflight budget rejected excess new handshakes after the 30%-of-capacity threshold.
 - `drops: ... mp_fallback+=...` means the MiddleProxy path degraded and the proxy recovered by reconnecting directly to the same DC.
 - `connection saturation ...` and `saturation eased ...` are the 90%/80% admission-control logs; if the second `paused=` flag is `true`, raise capacity only after checking RAM and probe results.

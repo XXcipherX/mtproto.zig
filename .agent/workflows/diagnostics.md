@@ -39,6 +39,9 @@ ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy --since "1 hour ago" --no-page
 
 # MiddleProxy metadata refresh state
 ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy --since "24 hours ago" --no-pager | grep -E "Middle-proxy cache updated|Initial middle-proxy refresh failed|Middle-proxy refresh failed"'
+
+# Startup masking / NAT translation decisions
+ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy -n 120 --no-pager | grep -E "Mask target|mask_port=.*netns|middle-proxy NAT translation|auto-detecting middle-proxy NAT IP"'
 ```
 
 Note:
@@ -49,6 +52,7 @@ Note:
 - Fatal hangups during `connecting_upstream` are now cleaned through the connect-completion path; repeated CPU spin on dead upstream sockets should no longer be expected.
 - `drops: ... hs_budget+=...` means the handshake-inflight budget (30% of `max_connections`) rejected excess new handshakes.
 - `drops: ... mp_fallback+=...` means MiddleProxy degraded and the proxy recovered by reconnecting directly to the same DC.
+- `drops: ... rate+=...` means the per-subnet token bucket rejected new connections; IPv4-mapped IPv6 addresses are grouped with their native IPv4 `/24`.
 
 ## IPv6 Hopping and DNS
 
@@ -111,6 +115,9 @@ ssh root@<SERVER_IP> 'cd /root/mtproto.zig && sudo python3 test/capacity_connect
 
 # Stability harness (from a repo checkout on the server)
 ssh root@<SERVER_IP> 'cd /root/mtproto.zig && sudo python3 test/connection_stability_check.py --host 127.0.0.1 --port 443 --pid $(pgrep -f mtproto-proxy | head -n1) --idle-connections 6000 --idle-cycles 3 --churn-total 30000 --churn-concurrency 300'
+
+# Real daemon smoke from a Linux checkout: positive FakeTLS plus bad-secret rejection
+ssh root@<SERVER_IP> 'cd /root/mtproto.zig && zig build && python3 test/daemon_smoke.py --binary zig-out/bin/mtproto-proxy'
 ```
 
 Interpretation helpers:
@@ -119,6 +126,7 @@ Interpretation helpers:
 - `fd quota reached ...` means the listener paused accepts; expect the first `paused=` flag to flip to `true` in nearby `conn stats` lines until the retry window clears.
 - `hs_budget+=...` means connection churn is exhausting the handshake budget before established relays become the bottleneck.
 - `mp_fallback+=...` means users are still being served, but MiddleProxy path quality is degraded enough to trigger direct fallback.
+- A valid Telegram-style FakeTLS ClientHello must have a 32-byte Session ID; non-32-byte test clients are expected to be rejected/masked.
 - `connection saturation ...` / `saturation eased ...` is RAM/capacity admission control, not an fd-limit incident.
 - A healthy idle box should keep both `paused=` flags at `false` and `tracked_fds` close to active socket count plus listener/upstream overhead.
 - For TLS-auth probes, replace `proxy.example.com` with the deployed `[censorship].tls_domain`; SNI mismatch is intentionally masked by the proxy.

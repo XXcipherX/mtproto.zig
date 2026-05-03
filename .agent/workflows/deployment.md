@@ -28,7 +28,7 @@ This workflow documents current build and deploy paths as implemented in `Makefi
 - `make capacity-probe-active` : TLS-auth capacity probe
 - `make deploy SERVER=<ip>` : cross-compile and deploy to VPS
 - `make migrate SERVER=<ip> [PASSWORD=<pass>]` : bootstrap + push config + deploy
-- `make update-dns SERVER=<ip>` : run Cloudflare DNS updater helper
+- `make update-dns SERVER=<ip>` : run Cloudflare DNS updater helper; `.env` must provide `DNS_NAME`, `CF_TOKEN`, and `CF_ZONE`
 - `make deploy-tunnel SERVER=<ip> AWG_CONF=<path> [PASSWORD=<pass>] [TUNNEL_MODE=direct|preserve|middleproxy]` : full migration + AmneziaWG tunnel
 - `make deploy-tunnel-only SERVER=<ip> AWG_CONF=<path> [TUNNEL_MODE=direct|preserve|middleproxy]` : add tunnel to an already-installed node
 - `make deploy-monitor SERVER=<ip>` : deploy optional monitoring dashboard
@@ -51,9 +51,11 @@ zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux
 zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux -Dcpu=x86_64_v3
 zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux
 docker build --build-arg ZIG_VERSION=0.15.2 -t mtproto-zig-smoke .
+zig build -Doptimize=ReleaseFast bench
+zig build -Doptimize=ReleaseFast soak -- --seconds=10
 ```
 
-The daemon smoke launches a real localhost proxy, verifies a valid FakeTLS handshake, and checks that the same SNI with a bad secret does not receive a valid FakeTLS response.
+The daemon smoke launches a real localhost proxy, verifies a valid FakeTLS handshake, and checks that the same SNI with a bad secret does not receive a valid FakeTLS response. CI uses a shorter soak for pull requests and a longer soak on pushes.
 
 ## `make deploy` (current behavior)
 
@@ -75,7 +77,7 @@ Why service stop is required:
 2. Runs `deploy/install.sh` remotely.
 3. Uploads local `config.toml`.
 4. Calls `make deploy`.
-5. Optionally runs `make update-dns` when `UPDATE_DNS=1|true`.
+5. Optionally runs `make update-dns` when `UPDATE_DNS=1|true`; this now requires `DNS_NAME` in `.env`.
 
 Fresh self-domain installs need a masking domain during `deploy/install.sh`. `make migrate` currently streams the installer over non-interactive SSH, so for a brand-new host either run the one-line `MASK_DOMAIN=...` installer first or invoke the installer manually with `ssh root@<ip> 'MASK_DOMAIN=proxy.example.com LE_EMAIL=admin@example.com bash -s' < deploy/install.sh`, then use `make deploy`.
 
@@ -90,10 +92,11 @@ Remote tunnel setup currently:
 - Installs `amneziawg-tools`.
 - Creates network namespace `tg_proxy_ns` plus a `veth_main`/`veth_ns` pair and namespace-local DNS.
 - Brings up `awg0` inside the namespace only.
-- Adds host DNAT `:443 -> 10.200.200.2:443` and namespace policy routing so replies go back through the veth path, not the tunnel.
-- Rewrites the systemd unit to `ip netns exec tg_proxy_ns /opt/mtproto-proxy/mtproto-proxy ...`.
+- Adds host DNAT for the configured proxy port (default `:443`) to `10.200.200.2:<port>` and namespace policy routing so replies go back through the veth path, not the tunnel.
+- Rewrites the systemd unit to run as `mtproto:mtproto` through `ip netns exec tg_proxy_ns /opt/mtproto-proxy/mtproto-proxy ...`, with `Restart=always`, `RestartSec=3`, and the same strict filesystem hardening as the normal unit.
 - Applies one of three modes: `direct` (`use_middle_proxy=false` for regular traffic), `preserve` (leave config as-is), or `middleproxy` (`use_middle_proxy=true`).
 - Preserves an existing promotion `tag`, and may restore it from `env.sh`.
+- Installs/refreshes the masking health monitor helper when available.
 - Validates all 5 Telegram DCs through the tunnel before finishing.
 
 Important operational notes:
@@ -107,7 +110,7 @@ Important operational notes:
 curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/install.sh | sudo bash
 ```
 
-The installer is idempotent and preserves `config.toml` on update; existing `env.sh` stays untouched unless install is rerun with fresh `CF_TOKEN` / `CF_ZONE`.
+The installer is idempotent and preserves `config.toml` on update; existing `env.sh` stays untouched unless install is rerun with fresh `CF_TOKEN` / `CF_ZONE` / `IPV6_PREFIX` settings.
 
 For a fresh self-domain masking install, prefer:
 
@@ -120,6 +123,7 @@ Current installer behavior also:
 - refreshes self-domain Nginx 404 masking (`setup_masking.sh`) and the masking health timer when available;
 - attempts optional `zapret` / `nfqws` setup;
 - refreshes optional `proxy-monitor` files on disk and restarts that service if it is already active.
+- prints a connection link only when it can find a valid 32-hex secret in `[access.users]`.
 
 Self-domain masking notes:
 
@@ -134,8 +138,8 @@ Self-domain masking notes:
 
 ## Systemd Unit Notes (`deploy/mtproto-proxy.service`)
 
-- Default unit ships with `LimitNOFILE=131582` and `TasksMax=65535`.
+- Default and tunnel-patched units run as `mtproto:mtproto`, use `Restart=always` with `RestartSec=3`, and ship with `LimitNOFILE=131582` plus `TasksMax=65535`.
 - Startup first auto-clamps `max_connections` to the RAM-safe estimate from `/proc/meminfo` unless `unsafe_override_limits=true`; `ProxyState.run` then clamps again if `RLIMIT_NOFILE` cannot cover the resulting fd budget.
 - Runtime relay model is still single-thread `epoll` in proxy core.
 - Default unit keeps `ReadOnlyPaths=/opt/mtproto-proxy` and only `CAP_NET_BIND_SERVICE`.
-- Tunnel-patched unit adds `CAP_NET_ADMIN` + `CAP_SYS_ADMIN` and uses `ExecStartPre=/usr/local/bin/setup_netns.sh` to recreate the namespace on every restart.
+- Tunnel-patched unit keeps the hardening settings, adds `CAP_NET_ADMIN` + `CAP_SYS_ADMIN`, and uses `ExecStartPre=/usr/local/bin/setup_netns.sh` to recreate the namespace on every restart.

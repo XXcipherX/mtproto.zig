@@ -14,10 +14,10 @@ Install/update proxy with official installer:
 curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/install.sh | ssh root@<NEW_VPS_IP> "MASK_DOMAIN=proxy.example.com LE_EMAIL=admin@example.com bash"
 ```
 
-If you use IPv6 auto-hopping, provide Cloudflare vars during install:
+If you use IPv6 auto-hopping, provide Cloudflare vars plus the routed `/64` during install:
 
 ```bash
-curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/install.sh | ssh root@<NEW_VPS_IP> "MASK_DOMAIN=proxy.example.com LE_EMAIL=admin@example.com CF_TOKEN='...' CF_ZONE='...' bash"
+curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/install.sh | ssh root@<NEW_VPS_IP> "MASK_DOMAIN=proxy.example.com LE_EMAIL=admin@example.com CF_TOKEN='...' CF_ZONE='...' DNS_NAME=proxy.example.com IPV6_PREFIX=2001:db8:1234:5678 bash"
 ```
 
 ## Step 2: Preserve Access Secrets
@@ -39,6 +39,8 @@ ssh root@<NEW_VPS_IP> 'systemctl restart mtproto-proxy'
 ```bash
 ssh root@<NEW_VPS_IP> '/opt/mtproto-proxy/ipv6-hop.sh'
 ```
+
+The hop script sources `/opt/mtproto-proxy/env.sh`; ensure it contains `DNS_NAME`, `CF_TOKEN`, `CF_ZONE`, `IPV6_PREFIX`, and optional `IPV6_INTERFACE`.
 
 If the target region blocks Telegram, add the tunnel layer before cutover:
 
@@ -66,6 +68,7 @@ Note:
 - `deploy/install.sh` and `make deploy` do not copy `test/` into `/opt/mtproto-proxy`; use a repo checkout or benchmark workspace for the optional Python harnesses above.
 - Replace `/root/mtproto.zig` in the optional probe command with your actual checkout path.
 - Replace `proxy.example.com` in the TLS-auth probe with the deployed `[censorship].tls_domain`.
+- The installer prints a link only when `[access.users]` contains at least one valid 32-hex secret; preserving old secrets is still what keeps existing client links valid.
 
 Operational note:
 

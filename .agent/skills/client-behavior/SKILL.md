@@ -17,6 +17,12 @@ Use this skill when behavior differs by platform (iOS/Android/Desktop) or when t
 
 Current proxy runtime is a Linux single-thread `epoll` event loop with timer-driven stage control (`idle_timeout_sec`, `handshake_timeout_sec`). Interpret client behavior against that model, not legacy `poll` or thread-per-connection assumptions.
 
+Current FakeTLS and MTProto handshake assumptions:
+
+- ClientHello Session ID must be exactly 32 bytes; the proxy echoes it in the synthetic ServerHello.
+- The 64-byte MTProto obfuscation nonce may be split across TLS appdata records.
+- Extra client appdata bytes after that 64-byte nonce may arrive in the same TLS record; the proxy buffers them and forwards them after upstream setup.
+
 ## iOS (Telegram iOS)
 
 Version snapshot:
@@ -50,6 +56,7 @@ Field-capture behavior:
 Proxy implications:
 
 - Continue assembling MTProto handshake until full 64 bytes are collected.
+- Preserve pipelined appdata after the 64-byte MTProto nonce; some clients can send early payload without waiting for a separate relay read.
 - Do not treat short idle prewarmed sockets as protocol failure.
 
 ## Android (Telegram Android)
@@ -80,6 +87,7 @@ Proxy implications:
 
 - Expect parallel connection attempts and frequent connect churn.
 - Keep accept/close path cheap and non-blocking.
+- Subnet rate limiting groups IPv4-mapped IPv6 with native IPv4 `/24`; account for that when testing Android address-family races.
 
 ## Desktop (Telegram Desktop)
 
@@ -110,9 +118,11 @@ Proxy implications:
 
 - Candidate racing and early cancellation are expected patterns.
 - Keep reconnect path cheap and avoid blocking work in event loop callbacks.
+- Non-32-byte TLS Session IDs are not supported by the current FakeTLS template; investigate client-side TLS shape first if Desktop auth suddenly masks instead of authenticating.
 
 ## Practical Checklist
 
 - If only one platform fails, compare that platform's timeout/race model first.
 - Determine failure stage: pre-TLS, MTProto 64-byte assembly, or active relay.
+- Confirm ClientHello Session ID length, SNI/tls_domain, and whether payload was pipelined after the nonce.
 - Validate whether behavior is normal client racing vs proxy regression.
