@@ -8,7 +8,7 @@ This workflow documents current build and deploy paths as implemented in `Makefi
 
 ## Prerequisites
 
-- Zig 0.15.2 for local builds
+- Zig 0.16.0 for local builds
 - SSH access to VPS
 - systemd on target host
 - Ubuntu 24.04 + root access for blocked-region tunnel mode
@@ -50,7 +50,7 @@ zig build -Doptimize=ReleaseFast
 zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux
 zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux -Dcpu=x86_64_v3
 zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux
-docker build --build-arg ZIG_VERSION=0.15.2 -t mtproto-zig-smoke .
+docker build --build-arg ZIG_VERSION=0.16.0 -t mtproto-zig-smoke .
 zig build -Doptimize=ReleaseFast bench
 zig build -Doptimize=ReleaseFast soak -- --seconds=10
 ```

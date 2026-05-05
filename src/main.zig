@@ -7,6 +7,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const constants = @import("protocol/constants.zig");
 const crypto = @import("crypto/crypto.zig");
+const compat = @import("compat.zig");
 const http_fetch = @import("http_fetch.zig");
 const obfuscation = @import("protocol/obfuscation.zig");
 const tls = @import("protocol/tls.zig");
@@ -32,7 +33,7 @@ pub const std_options = std.Options{
 
 fn lockFreeLog(
     comptime message_level: std.log.Level,
-    comptime scope: @Type(.enum_literal),
+    comptime scope: @EnumLiteral(),
     comptime format: []const u8,
     args: anytype,
 ) void {
@@ -43,37 +44,37 @@ fn lockFreeLog(
     const prefix2 = comptime if (scope == .default) ": " else "(" ++ @tagName(scope) ++ "): ";
     var buf: [4096]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, level_txt ++ prefix2 ++ format ++ "\n", args) catch return;
-    _ = std.posix.write(std.posix.STDERR_FILENO, msg) catch return;
+    compat.writeStderr(msg);
 }
 
 const log = std.log.scoped(.mtproto);
 
-// ============= Output Helpers (Zig 0.15 compatible) =============
+// ============= Output Helpers (Zig 0.16 compatible) =============
 
 /// Write a formatted string to stdout via posix write.
 fn writeStdout(comptime fmt: []const u8, args: anytype) void {
     var buf: [4096]u8 = undefined;
     const slice = std.fmt.bufPrint(&buf, fmt, args) catch return;
-    _ = std.posix.write(std.posix.STDOUT_FILENO, slice) catch return;
+    compat.writeStdout(slice);
 }
 
 /// Write a formatted string to stderr.
 fn writeStderr(comptime fmt: []const u8, args: anytype) void {
     var buf: [4096]u8 = undefined;
     const slice = std.fmt.bufPrint(&buf, fmt, args) catch return;
-    _ = std.posix.write(std.posix.STDERR_FILENO, slice) catch return;
+    compat.writeStderr(slice);
 }
 
 /// Write a hex byte to stdout.
 fn writeHexByte(byte: u8) void {
     const hex = "0123456789abcdef";
     const out = [2]u8{ hex[byte >> 4], hex[byte & 0x0f] };
-    _ = std.posix.write(std.posix.STDOUT_FILENO, &out) catch return;
+    compat.writeStdout(&out);
 }
 
 /// Write raw string to stdout.
 fn writeRaw(s: []const u8) void {
-    _ = std.posix.write(std.posix.STDOUT_FILENO, s) catch return;
+    compat.writeStdout(s);
 }
 
 // ============= Public IP Detection =============
@@ -127,10 +128,7 @@ const CapacityEstimate = struct {
 fn detectTotalRamBytes(allocator: std.mem.Allocator) ?u64 {
     if (builtin.os.tag != .linux) return null;
 
-    const file = std.fs.openFileAbsolute("/proc/meminfo", .{}) catch return null;
-    defer file.close();
-
-    const content = file.readToEndAlloc(allocator, 16 * 1024) catch return null;
+    const content = compat.readFileAbsoluteAlloc(allocator, "/proc/meminfo", 16 * 1024) catch return null;
     defer allocator.free(content);
 
     const key = "MemTotal:";
@@ -345,14 +343,14 @@ fn printBanner(allocator: std.mem.Allocator, cfg: config.Config, capacity_estima
     writeRaw("  " ++ B ++ cyan ++ "⏳ Waiting for connections..." ++ R ++ "\n\n");
 }
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     // Use page_allocator instead of GeneralPurposeAllocator for production.
     // GPA has an internal mutex that causes deadlocks under heavy thread contention
     // (1000+ simultaneous connections all doing TLS validation allocations).
     const allocator = std.heap.page_allocator;
 
     // Parse config path from args
-    var args = try std.process.argsWithAllocator(allocator);
+    var args = try init.minimal.args.iterateAllocator(allocator);
     defer args.deinit();
     _ = args.next(); // skip program name
     const config_path = args.next() orelse "config.toml";

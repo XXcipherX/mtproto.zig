@@ -9,8 +9,8 @@ Production MTProto proxy implemented in Zig with FakeTLS entry, obfuscated MTPro
 
 ## Tech Stack
 
-- Language: Zig 0.15.2
-- Networking: `std.net` sockets + Linux `epoll`
+- Language: Zig 0.16.0
+- Networking: Linux sockets + `epoll` via a local Zig 0.16 `net_compat` facade
 - Cryptography: `std.crypto` primitives (SHA256/HMAC/AES-CTR/AES-CBC) plus project protocol layers
 - HTTP metadata fetch: `src/http_fetch.zig` wraps `std.http` with bounded response sizes and whole-request timeout behavior
 - Build: `build.zig` + `Makefile`

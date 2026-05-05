@@ -5,12 +5,13 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const net = std.net;
+const net = @import("../net_compat.zig");
 const posix = std.posix;
 const linux = std.os.linux;
 
 const constants = @import("../protocol/constants.zig");
 const crypto = @import("../crypto/crypto.zig");
+const compat = @import("../compat.zig");
 const http_fetch = @import("../http_fetch.zig");
 const obfuscation = @import("../protocol/obfuscation.zig");
 const middleproxy = @import("../protocol/middleproxy.zig");
@@ -39,6 +40,179 @@ const client_hello_inline_size: usize = 512;
 const mp_handshake_frame_buf_size: usize = 2048;
 const read_buf_size: usize = 4096;
 
+const invalid_fd: posix.fd_t = switch (builtin.os.tag) {
+    .windows => std.os.windows.INVALID_HANDLE_VALUE,
+    else => -1,
+};
+
+fn isInvalidFd(fd: posix.fd_t) bool {
+    return fd == invalid_fd;
+}
+
+fn fakeFd(value: usize) posix.fd_t {
+    return switch (builtin.os.tag) {
+        .windows => @ptrFromInt(value),
+        else => @intCast(value),
+    };
+}
+
+fn closeFd(fd: posix.fd_t) void {
+    if (builtin.os.tag == .linux) {
+        _ = linux.close(fd);
+    } else if (builtin.os.tag == .windows) {
+        std.os.windows.CloseHandle(fd);
+    }
+}
+
+fn acceptFd(fd: posix.fd_t, addr: *posix.sockaddr, len: *posix.socklen_t) !posix.fd_t {
+    if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
+
+    const rc = linux.accept4(fd, addr, len, linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK);
+    return switch (posix.errno(rc)) {
+        .SUCCESS => @intCast(rc),
+        .AGAIN => error.WouldBlock,
+        .CONNABORTED => error.ConnectionAborted,
+        .CONNRESET => error.ConnectionResetByPeer,
+        .MFILE => error.ProcessFdQuotaExceeded,
+        .NFILE => error.SystemFdQuotaExceeded,
+        .NOBUFS, .NOMEM => error.SystemResources,
+        else => error.Unexpected,
+    };
+}
+
+fn socketTcpNonblocking(family: posix.sa_family_t) !posix.fd_t {
+    if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
+
+    const rc = linux.socket(
+        @intCast(family),
+        linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC,
+        linux.IPPROTO.TCP,
+    );
+    return switch (posix.errno(rc)) {
+        .SUCCESS => @intCast(rc),
+        .ACCES, .PERM => error.PermissionDenied,
+        .AFNOSUPPORT => error.AddressFamilyNotSupported,
+        .MFILE => error.ProcessFdQuotaExceeded,
+        .NFILE => error.SystemFdQuotaExceeded,
+        .NOBUFS, .NOMEM => error.SystemResources,
+        else => error.Unexpected,
+    };
+}
+
+fn connectFd(fd: posix.fd_t, addr: *const posix.sockaddr, len: posix.socklen_t) !void {
+    if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
+
+    const rc = linux.connect(fd, addr, @intCast(len));
+    switch (posix.errno(rc)) {
+        .SUCCESS, .ISCONN => {},
+        .AGAIN => return error.WouldBlock,
+        .INPROGRESS, .ALREADY => return error.ConnectionPending,
+        .CONNREFUSED => return error.ConnectionRefused,
+        .HOSTUNREACH, .NETUNREACH => return error.NetworkUnreachable,
+        .TIMEDOUT => return error.ConnectionTimedOut,
+        else => return error.Unexpected,
+    }
+}
+
+fn getpeernameFd(fd: posix.fd_t, addr: *posix.sockaddr, len: *posix.socklen_t) !void {
+    if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
+
+    const rc = linux.getpeername(fd, addr, len);
+    switch (posix.errno(rc)) {
+        .SUCCESS => {},
+        else => return error.Unexpected,
+    }
+}
+
+fn getsocknameFd(fd: posix.fd_t, addr: *posix.sockaddr, len: *posix.socklen_t) !void {
+    if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
+
+    const rc = linux.getsockname(fd, addr, len);
+    switch (posix.errno(rc)) {
+        .SUCCESS => {},
+        else => return error.Unexpected,
+    }
+}
+
+fn getsockoptErrorFd(fd: posix.fd_t) !void {
+    if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
+
+    var err_code: i32 = 0;
+    var err_len: linux.socklen_t = @sizeOf(i32);
+    const err_bytes = std.mem.asBytes(&err_code);
+    const rc = linux.getsockopt(fd, linux.SOL.SOCKET, linux.SO.ERROR, err_bytes.ptr, &err_len);
+    switch (posix.errno(rc)) {
+        .SUCCESS => {},
+        else => return error.Unexpected,
+    }
+    if (err_code == 0) return;
+
+    const err: @TypeOf(posix.errno(rc)) = @enumFromInt(err_code);
+    switch (err) {
+        .CONNREFUSED => return error.ConnectionRefused,
+        .HOSTUNREACH, .NETUNREACH => return error.NetworkUnreachable,
+        .TIMEDOUT => return error.ConnectionTimedOut,
+        else => return error.Unexpected,
+    }
+}
+
+fn writeFd(fd: posix.fd_t, data: []const u8) !usize {
+    if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
+    if (data.len == 0) return 0;
+
+    while (true) {
+        const rc = linux.write(fd, data.ptr, data.len);
+        switch (posix.errno(rc)) {
+            .SUCCESS => return rc,
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            .CONNRESET => return error.ConnectionResetByPeer,
+            .PIPE => return error.BrokenPipe,
+            .NOBUFS, .NOMEM => return error.SystemResources,
+            else => return error.Unexpected,
+        }
+    }
+}
+
+fn writevFd(fd: posix.fd_t, iovecs: []const posix.iovec_const) !usize {
+    if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
+    if (iovecs.len == 0) return 0;
+
+    while (true) {
+        const rc = linux.writev(fd, iovecs.ptr, iovecs.len);
+        switch (posix.errno(rc)) {
+            .SUCCESS => return rc,
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            .CONNRESET => return error.ConnectionResetByPeer,
+            .PIPE => return error.BrokenPipe,
+            .NOBUFS, .NOMEM => return error.SystemResources,
+            else => return error.Unexpected,
+        }
+    }
+}
+
+fn setSockOptBytes(fd: posix.fd_t, level: i32, optname: u32, bytes: []const u8) void {
+    if (builtin.os.tag != .linux) return;
+
+    const rc = linux.setsockopt(fd, level, optname, bytes.ptr, @intCast(bytes.len));
+    switch (posix.errno(rc)) {
+        .SUCCESS => {},
+        else => return,
+    }
+}
+
+fn seekFdToStart(fd: posix.fd_t) !void {
+    if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
+
+    const rc = linux.lseek(fd, 0, linux.SEEK.SET);
+    switch (posix.errno(rc)) {
+        .SUCCESS => {},
+        .SPIPE => return error.Unseekable,
+        else => return error.Unexpected,
+    }
+}
+
 /// Per-/24 (IPv4) or /48 (IPv6) subnet rate limiter.
 /// Fixed-size open-addressed hash table — zero heap allocation.
 /// Token bucket per subnet: each second refills up to max_per_sec tokens.
@@ -59,7 +233,7 @@ const SubnetRateLimit = struct {
 
     fn init() SubnetRateLimit {
         return .{
-            .hash_seed = std.crypto.random.int(u64),
+            .hash_seed = crypto.randomInt(u64),
         };
     }
 
@@ -90,7 +264,7 @@ const SubnetRateLimit = struct {
     fn check(self: *SubnetRateLimit, addr: net.Address, max_per_sec: u8) bool {
         if (max_per_sec == 0) return true;
         const key = subnetKey(addr);
-        const now_s = @divTrunc(std.time.milliTimestamp(), 1000);
+        const now_s = @divTrunc(compat.milliTimestamp(), 1000);
 
         const start = self.indexFor(key);
         var first_stale_idx: ?usize = null;
@@ -248,10 +422,10 @@ const MessageQueue = struct {
     const max_free_standard_blocks: usize = 128;
 
     allocator: std.mem.Allocator,
-    tiny_free: std.ArrayListUnmanaged(*MsgBlock) = .{},
-    small_free: std.ArrayListUnmanaged(*MsgBlock) = .{},
-    std_free: std.ArrayListUnmanaged(*MsgBlock) = .{},
-    blocks: std.ArrayListUnmanaged(*MsgBlock) = .{},
+    tiny_free: std.ArrayList(*MsgBlock) = .empty,
+    small_free: std.ArrayList(*MsgBlock) = .empty,
+    std_free: std.ArrayList(*MsgBlock) = .empty,
+    blocks: std.ArrayList(*MsgBlock) = .empty,
     head_idx: usize = 0,
     offset: usize = 0,
     total_len: usize = 0,
@@ -499,6 +673,26 @@ const DcConnectPlan = struct {
     direct_fallback: ?net.Address = null,
 };
 
+const MiddleProxyLock = struct {
+    mutex: compat.Mutex = .{},
+
+    fn lock(self: *MiddleProxyLock) void {
+        self.mutex.lock();
+    }
+
+    fn unlock(self: *MiddleProxyLock) void {
+        self.mutex.unlock();
+    }
+
+    fn lockShared(self: *MiddleProxyLock) void {
+        self.lock();
+    }
+
+    fn unlockShared(self: *MiddleProxyLock) void {
+        self.unlock();
+    }
+};
+
 const DynamicRecordSizer = struct {
     current_size: usize,
     records_sent: u32,
@@ -552,7 +746,7 @@ const ReplayCache = struct {
 
     fn init() ReplayCache {
         return .{
-            .hash_seed = std.crypto.random.int(u64),
+            .hash_seed = crypto.randomInt(u64),
         };
     }
 
@@ -573,7 +767,7 @@ const ReplayCache = struct {
 
     pub fn checkAndInsert(self: *ReplayCache, digest: *const [32]u8) bool {
         const key = digestKey(digest);
-        const now_s = @divTrunc(std.time.milliTimestamp(), 1000);
+        const now_s = @divTrunc(compat.milliTimestamp(), 1000);
         const start = self.indexFor(key);
 
         var first_stale_idx: ?usize = null;
@@ -614,8 +808,8 @@ const ConnectionSlot = struct {
     index: u32 = 0,
     conn_id: u64 = 0,
 
-    client_fd: posix.fd_t = -1,
-    upstream_fd: posix.fd_t = -1,
+    client_fd: posix.fd_t = invalid_fd,
+    upstream_fd: posix.fd_t = invalid_fd,
     upstream_kind: UpstreamKind = .none,
     peer_addr: net.Address = undefined,
 
@@ -935,7 +1129,7 @@ pub const ProxyState = struct {
     stats_hs_timeout: std.atomic.Value(u64),
     stats_mp_fallback: std.atomic.Value(u64),
 
-    middle_proxy_lock: std.Thread.RwLock = .{},
+    middle_proxy_lock: MiddleProxyLock = .{},
     middle_proxy_addrs_primary: [5]net.Address,
     middle_proxy_addrs_media_primary: [5]net.Address,
     middle_proxy_addr_203: net.Address,
@@ -1224,7 +1418,7 @@ pub const ProxyState = struct {
         while (slept_ns < middle_proxy_update_period_ns) {
             if (self.middle_proxy_updater_stop.load(.acquire)) return false;
             const chunk = @min(middle_proxy_update_stop_poll_ns, middle_proxy_update_period_ns - slept_ns);
-            std.Thread.sleep(chunk);
+            compat.sleep(chunk);
             slept_ns += chunk;
         }
         return !self.middle_proxy_updater_stop.load(.acquire);
@@ -1419,7 +1613,7 @@ const EventLoop = struct {
 
     fn init(state: *ProxyState, listen_fd: posix.fd_t) !EventLoop {
         const epoll_fd = try epollCreate();
-        errdefer posix.close(epoll_fd);
+        errdefer closeFd(epoll_fd);
 
         var loop = EventLoop{
             .state = state,
@@ -1430,7 +1624,7 @@ const EventLoop = struct {
             .accept_resume_ns = 0,
             .saturation_paused = false,
             .timer_scan_cursor = 0,
-            .stats_next_log_ns = std.time.nanoTimestamp() + stats_log_interval_ns,
+            .stats_next_log_ns = compat.nanoTimestamp() + stats_log_interval_ns,
             .accepted_since_log = 0,
             .closed_since_log = 0,
             .subnet_limiter = SubnetRateLimit.init(),
@@ -1462,13 +1656,13 @@ const EventLoop = struct {
         if (self.mp_s2c_scratch) |buf| self.state.allocator.free(buf);
 
         self.pool.deinit();
-        posix.close(self.epoll_fd);
+        closeFd(self.epoll_fd);
     }
 
     fn run(self: *EventLoop) !void {
         var events: [256]linux.epoll_event = undefined;
         const timer_tick_ns: i128 = 5 * std.time.ns_per_ms;
-        var next_timer_tick_ns: i128 = std.time.nanoTimestamp();
+        var next_timer_tick_ns: i128 = compat.nanoTimestamp();
 
         while (true) {
             const rc = linux.epoll_wait(self.epoll_fd, events[0..].ptr, @intCast(events.len), event_loop_wait_ms);
@@ -1493,7 +1687,7 @@ const EventLoop = struct {
                 self.processSlotEvent(slot, fd, ev_flags);
             }
 
-            const now_ns = std.time.nanoTimestamp();
+            const now_ns = compat.nanoTimestamp();
             if (self.accept_paused and now_ns >= self.accept_resume_ns) {
                 self.resumeAccepting();
             }
@@ -1573,7 +1767,7 @@ const EventLoop = struct {
         while (accepted_this_round < accept_batch_limit) {
             var client_addr: net.Address = undefined;
             var client_len: posix.socklen_t = @sizeOf(net.Address);
-            const cfd = posix.accept(self.listen_fd, &client_addr.any, &client_len, posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK) catch |err| {
+            const cfd = acceptFd(self.listen_fd, &client_addr.any, &client_len) catch |err| {
                 switch (err) {
                     error.WouldBlock => return,
                     error.ConnectionAborted, error.ConnectionResetByPeer => continue,
@@ -1592,7 +1786,7 @@ const EventLoop = struct {
             // Per-/24 subnet rate limit (before we allocate any slot)
             if (!self.subnet_limiter.check(client_addr, self.state.config.rate_limit_per_subnet)) {
                 _ = self.state.stats_dropped_rate_limit.fetchAdd(1, .monotonic);
-                posix.close(cfd);
+                closeFd(cfd);
                 continue;
             }
 
@@ -1600,7 +1794,7 @@ const EventLoop = struct {
             if (active_before >= self.state.config.max_connections) {
                 _ = self.state.active_connections.fetchSub(1, .monotonic);
                 _ = self.state.stats_dropped_cap.fetchAdd(1, .monotonic);
-                posix.close(cfd);
+                closeFd(cfd);
                 continue;
             }
 
@@ -1612,14 +1806,14 @@ const EventLoop = struct {
                 _ = self.state.handshakes_inflight.fetchSub(1, .monotonic);
                 _ = self.state.active_connections.fetchSub(1, .monotonic);
                 _ = self.state.stats_dropped_hs_budget.fetchAdd(1, .monotonic);
-                posix.close(cfd);
+                closeFd(cfd);
                 continue;
             }
 
             const slot = self.pool.acquire() orelse {
                 _ = self.state.handshakes_inflight.fetchSub(1, .monotonic);
                 _ = self.state.active_connections.fetchSub(1, .monotonic);
-                posix.close(cfd);
+                closeFd(cfd);
                 continue;
             };
 
@@ -1628,7 +1822,7 @@ const EventLoop = struct {
             slot.client_fd = cfd;
             slot.peer_addr = client_addr;
             slot.phase = .reading_tls_header;
-            slot.created_at_ms = std.time.milliTimestamp();
+            slot.created_at_ms = compat.milliTimestamp();
             slot.last_activity_ms = slot.created_at_ms;
             slot.drs = DynamicRecordSizer.init(self.state.config.drs);
 
@@ -1701,7 +1895,7 @@ const EventLoop = struct {
     }
 
     fn pauseAccepting(self: *EventLoop, err: anyerror) void {
-        self.accept_resume_ns = std.time.nanoTimestamp() + accept_backoff_ns;
+        self.accept_resume_ns = compat.nanoTimestamp() + accept_backoff_ns;
         if (self.accept_paused) return;
 
         self.modFd(self.listen_fd, false, false) catch |mod_err| {
@@ -1722,7 +1916,7 @@ const EventLoop = struct {
         if (!self.accept_paused) return;
 
         self.modFd(self.listen_fd, true, false) catch |err| {
-            self.accept_resume_ns = std.time.nanoTimestamp() + accept_backoff_ns;
+            self.accept_resume_ns = compat.nanoTimestamp() + accept_backoff_ns;
             log.warn("failed to resume accepts; retry in {d}ms: {any}", .{ accept_backoff_ms, err });
             return;
         };
@@ -1764,7 +1958,7 @@ const EventLoop = struct {
     }
 
     fn onClientReadable(self: *EventLoop, slot: *ConnectionSlot) void {
-        slot.last_activity_ms = std.time.milliTimestamp();
+        slot.last_activity_ms = compat.milliTimestamp();
 
         switch (slot.phase) {
             .reading_tls_header => self.readTlsHeader(slot),
@@ -1786,14 +1980,14 @@ const EventLoop = struct {
             return;
         }
         if (had_pending and !slot.hasClientPending()) {
-            slot.last_activity_ms = std.time.milliTimestamp();
+            slot.last_activity_ms = compat.milliTimestamp();
         }
 
         switch (slot.phase) {
             .writing_server_hello_first => {
                 if (!slot.hasClientPending()) {
                     slot.phase = .desync_wait;
-                    slot.desync_deadline_ns = std.time.nanoTimestamp() + (3 * std.time.ns_per_ms);
+                    slot.desync_deadline_ns = compat.nanoTimestamp() + (3 * std.time.ns_per_ms);
                 }
             },
             .writing_server_hello_rest => {
@@ -1813,7 +2007,7 @@ const EventLoop = struct {
     }
 
     fn onUpstreamReadable(self: *EventLoop, slot: *ConnectionSlot) void {
-        slot.last_activity_ms = std.time.milliTimestamp();
+        slot.last_activity_ms = compat.milliTimestamp();
 
         switch (slot.phase) {
             .middle_proxy_handshake => self.middleProxyOnReadable(slot),
@@ -1835,7 +2029,7 @@ const EventLoop = struct {
                     return;
                 }
                 if (had_pending and !slot.hasUpstreamPending()) {
-                    slot.last_activity_ms = std.time.milliTimestamp();
+                    slot.last_activity_ms = compat.milliTimestamp();
                 }
 
                 if (slot.phase == .writing_dc_nonce and !slot.hasUpstreamPending()) {
@@ -1886,10 +2080,10 @@ const EventLoop = struct {
                 return;
             }
             if (slot.first_byte_at_ms == 0) {
-                slot.first_byte_at_ms = std.time.milliTimestamp();
+                slot.first_byte_at_ms = compat.milliTimestamp();
             }
             slot.tls_hdr_pos += @intCast(n);
-            slot.last_activity_ms = std.time.milliTimestamp();
+            slot.last_activity_ms = compat.milliTimestamp();
         }
 
         if (!tls.isTlsHandshake(slot.tls_hdr_buf[0..])) {
@@ -1938,7 +2132,7 @@ const EventLoop = struct {
                 return;
             }
             slot.tls_body_pos += @intCast(n);
-            slot.last_activity_ms = std.time.milliTimestamp();
+            slot.last_activity_ms = compat.milliTimestamp();
         }
 
         const client_hello = hello_buf[0..slot.client_hello_len];
@@ -2215,8 +2409,8 @@ const EventLoop = struct {
     }
 
     fn startConnectUpstream(self: *EventLoop, slot: *ConnectionSlot, addr: net.Address, kind: UpstreamKind) !void {
-        const fd = try posix.socket(addr.any.family, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP);
-        errdefer posix.close(fd);
+        const fd = try socketTcpNonblocking(addr.any.family);
+        errdefer closeFd(fd);
 
         try self.addFd(fd, false, true);
         errdefer _ = self.delFd(fd) catch {};
@@ -2229,12 +2423,12 @@ const EventLoop = struct {
         slot.current_upstream_addr = addr;
         slot.phase = .connecting_upstream;
         errdefer {
-            slot.upstream_fd = -1;
+            slot.upstream_fd = invalid_fd;
             slot.upstream_kind = .none;
             slot.current_upstream_addr = null;
         }
 
-        posix.connect(fd, &addr.any, addr.getOsSockLen()) catch |err| switch (err) {
+        connectFd(fd, &addr.any, addr.getOsSockLen()) catch |err| switch (err) {
             error.WouldBlock, error.ConnectionPending => return,
             else => return err,
         };
@@ -2243,7 +2437,7 @@ const EventLoop = struct {
     }
 
     fn onUpstreamConnectComplete(self: *EventLoop, slot: *ConnectionSlot) void {
-        if (posix.getsockoptError(slot.upstream_fd)) |_| {} else |err| {
+        if (getsockoptErrorFd(slot.upstream_fd)) |_| {} else |err| {
             const failed_kind = slot.upstream_kind;
             const failed_addr = slot.current_upstream_addr;
             self.cleanupFailedUpstreamConnect(slot);
@@ -2291,12 +2485,12 @@ const EventLoop = struct {
     }
 
     fn cleanupFailedUpstreamConnect(self: *EventLoop, slot: *ConnectionSlot) void {
-        if (slot.upstream_fd != -1) {
+        if (!isInvalidFd(slot.upstream_fd)) {
             const fd = slot.upstream_fd;
             _ = self.delFd(fd) catch {};
             self.pool.unmapFd(fd);
-            posix.close(fd);
-            slot.upstream_fd = -1;
+            closeFd(fd);
+            slot.upstream_fd = invalid_fd;
         }
         slot.upstream_kind = .none;
         slot.current_upstream_addr = null;
@@ -2515,7 +2709,7 @@ const EventLoop = struct {
             return;
         };
         if (progress == .forwarded or progress == .partial) {
-            slot.last_activity_ms = std.time.milliTimestamp();
+            slot.last_activity_ms = compat.milliTimestamp();
         }
     }
 
@@ -2532,7 +2726,7 @@ const EventLoop = struct {
             return;
         };
         if (progress == .forwarded or progress == .partial) {
-            slot.last_activity_ms = std.time.milliTimestamp();
+            slot.last_activity_ms = compat.milliTimestamp();
         }
     }
 
@@ -2595,7 +2789,7 @@ const EventLoop = struct {
         slot.mp_dec = null;
 
         crypto.randomBytes(&slot.mp_nonce);
-        const ts: u32 = @intCast(@mod(std.time.timestamp(), 4294967296));
+        const ts: u32 = @intCast(@mod(compat.timestamp(), 4294967296));
         slot.mp_timestamp = ts;
 
         var crypto_ts: [4]u8 = undefined;
@@ -2700,13 +2894,13 @@ const EventLoop = struct {
 
                     var peer_addr: net.Address = undefined;
                     var peer_len: posix.socklen_t = @sizeOf(net.Address);
-                    posix.getpeername(slot.upstream_fd, &peer_addr.any, &peer_len) catch {
+                    getpeernameFd(slot.upstream_fd, &peer_addr.any, &peer_len) catch {
                         break :handshake "mp getpeername failed";
                     };
 
                     var local_addr: net.Address = undefined;
                     var local_len: posix.socklen_t = @sizeOf(net.Address);
-                    posix.getsockname(slot.upstream_fd, &local_addr.any, &local_len) catch {
+                    getsocknameFd(slot.upstream_fd, &local_addr.any, &local_len) catch {
                         break :handshake "mp getsockname failed";
                     };
                     middle_local_addr = local_addr;
@@ -2841,7 +3035,7 @@ const EventLoop = struct {
 
                 var local_addr: net.Address = undefined;
                 var local_len: posix.socklen_t = @sizeOf(net.Address);
-                posix.getsockname(slot.upstream_fd, &local_addr.any, &local_len) catch {
+                getsocknameFd(slot.upstream_fd, &local_addr.any, &local_len) catch {
                     if (!self.fallbackFromMiddleProxyToDirect(slot)) {
                         self.closeSlot(slot, "mp getsockname failed");
                     }
@@ -3109,8 +3303,8 @@ const EventLoop = struct {
     }
 
     fn runTimers(self: *EventLoop) void {
-        const now_ms = std.time.milliTimestamp();
-        const now_ns = std.time.nanoTimestamp();
+        const now_ms = compat.milliTimestamp();
+        const now_ns = compat.nanoTimestamp();
 
         const hi: usize = @intCast(self.pool.allocated_hi);
         if (hi == 0) return;
@@ -3230,7 +3424,7 @@ const EventLoop = struct {
             else => {},
         }
 
-        if (slot.client_fd != -1) {
+        if (!isInvalidFd(slot.client_fd)) {
             if (slot.client_interest_in != want_client_in or slot.client_interest_out != want_client_out) {
                 try self.modFd(slot.client_fd, want_client_in, want_client_out);
                 slot.client_interest_in = want_client_in;
@@ -3238,7 +3432,7 @@ const EventLoop = struct {
             }
         }
 
-        if (slot.upstream_fd != -1) {
+        if (!isInvalidFd(slot.upstream_fd)) {
             if (slot.upstream_interest_in != want_upstream_in or slot.upstream_interest_out != want_upstream_out) {
                 try self.modFd(slot.upstream_fd, want_upstream_in, want_upstream_out);
                 slot.upstream_interest_in = want_upstream_in;
@@ -3283,18 +3477,18 @@ const EventLoop = struct {
             slot.s2c_bytes,
         });
 
-        if (slot.client_fd != -1) {
+        if (!isInvalidFd(slot.client_fd)) {
             _ = self.delFd(slot.client_fd) catch {};
             self.pool.unmapFd(slot.client_fd);
-            posix.close(slot.client_fd);
-            slot.client_fd = -1;
+            closeFd(slot.client_fd);
+            slot.client_fd = invalid_fd;
         }
 
-        if (slot.upstream_fd != -1) {
+        if (!isInvalidFd(slot.upstream_fd)) {
             _ = self.delFd(slot.upstream_fd) catch {};
             self.pool.unmapFd(slot.upstream_fd);
-            posix.close(slot.upstream_fd);
-            slot.upstream_fd = -1;
+            closeFd(slot.upstream_fd);
+            slot.upstream_fd = invalid_fd;
         }
 
         slot.resetOwnedBuffers(self.state.allocator);
@@ -3567,10 +3761,20 @@ fn checkNofileLimit(required: usize, max_connections: u32) void {
 }
 
 fn setNonBlocking(fd: posix.fd_t) void {
-    var fl_flags = posix.fcntl(fd, posix.F.GETFL, 0) catch return;
-    const nonblock: @TypeOf(fl_flags) = @bitCast(@as(u64, @as(u32, @bitCast(posix.O{ .NONBLOCK = true }))));
+    if (builtin.os.tag != .linux) return;
+
+    const get_rc = linux.fcntl(fd, linux.F.GETFL, 0);
+    var fl_flags = switch (posix.errno(get_rc)) {
+        .SUCCESS => get_rc,
+        else => return,
+    };
+    const nonblock: @TypeOf(fl_flags) = @as(usize, 1) << @bitOffsetOf(linux.O, "NONBLOCK");
     fl_flags |= nonblock;
-    _ = posix.fcntl(fd, posix.F.SETFL, fl_flags) catch return;
+    const set_rc = linux.fcntl(fd, linux.F.SETFL, fl_flags);
+    switch (posix.errno(set_rc)) {
+        .SUCCESS => {},
+        else => return,
+    }
 }
 
 fn secondsToMs(sec: u32) i64 {
@@ -3579,28 +3783,28 @@ fn secondsToMs(sec: u32) i64 {
 
 fn setSendTimeout(fd: posix.fd_t, timeout_sec: u32) void {
     const tv = posix.timeval{ .sec = @intCast(timeout_sec), .usec = 0 };
-    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch return;
+    setSockOptBytes(fd, linux.SOL.SOCKET, linux.SO.SNDTIMEO, std.mem.asBytes(&tv));
 }
 
 fn setTcpKeepalive(fd: posix.fd_t) void {
     const sol_tcp: i32 = 6;
 
     const enable: c_int = 1;
-    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.KEEPALIVE, std.mem.asBytes(&enable)) catch return;
+    setSockOptBytes(fd, linux.SOL.SOCKET, linux.SO.KEEPALIVE, std.mem.asBytes(&enable));
 
     const idle: c_int = 60;
-    posix.setsockopt(fd, sol_tcp, 4, std.mem.asBytes(&idle)) catch return;
+    setSockOptBytes(fd, sol_tcp, 4, std.mem.asBytes(&idle));
 
     const interval: c_int = 10;
-    posix.setsockopt(fd, sol_tcp, 5, std.mem.asBytes(&interval)) catch return;
+    setSockOptBytes(fd, sol_tcp, 5, std.mem.asBytes(&interval));
 
     const count: c_int = 3;
-    posix.setsockopt(fd, sol_tcp, 6, std.mem.asBytes(&count)) catch return;
+    setSockOptBytes(fd, sol_tcp, 6, std.mem.asBytes(&count));
 }
 
 fn setTcpNoDelay(fd: posix.fd_t) void {
     const enable: c_int = 1;
-    posix.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.NODELAY, std.mem.asBytes(&enable)) catch return;
+    setSockOptBytes(fd, linux.IPPROTO.TCP, linux.TCP.NODELAY, std.mem.asBytes(&enable));
 }
 
 fn configureRelaySocket(fd: posix.fd_t) void {
@@ -3666,11 +3870,16 @@ fn parseIpv4Literal(text: []const u8) ?[4]u8 {
 }
 
 fn isRunningInNonInitNetns() bool {
+    if (builtin.os.tag != .linux) return false;
+
     var self_buf: [std.fs.max_path_bytes]u8 = undefined;
     var init_buf: [std.fs.max_path_bytes]u8 = undefined;
 
-    const self_ns = std.fs.readLinkAbsolute("/proc/self/ns/net", &self_buf) catch return false;
-    const init_ns = std.fs.readLinkAbsolute("/proc/1/ns/net", &init_buf) catch return false;
+    const local_io = compat.io();
+    const self_len = std.Io.Dir.readLinkAbsolute(local_io, "/proc/self/ns/net", &self_buf) catch return false;
+    const init_len = std.Io.Dir.readLinkAbsolute(local_io, "/proc/1/ns/net", &init_buf) catch return false;
+    const self_ns = self_buf[0..self_len];
+    const init_ns = init_buf[0..init_len];
 
     return !std.mem.eql(u8, self_ns, init_ns);
 }
@@ -3714,7 +3923,7 @@ fn parseAwgEndpointIpv4FromConfig(allocator: std.mem.Allocator, content: []const
     var lines = std.mem.splitScalar(u8, content, '\n');
 
     while (lines.next()) |raw_line| {
-        const line_no_cr = std.mem.trimRight(u8, raw_line, "\r");
+        const line_no_cr = std.mem.trimEnd(u8, raw_line, "\r");
         const line = std.mem.trim(u8, line_no_cr, &[_]u8{ ' ', '\t' });
         if (line.len == 0 or line[0] == '#' or line[0] == ';') continue;
 
@@ -3742,6 +3951,8 @@ fn parseAwgEndpointIpv4FromConfig(allocator: std.mem.Allocator, content: []const
 }
 
 fn detectAwgEndpointIpv4(allocator: std.mem.Allocator) ?[4]u8 {
+    if (builtin.os.tag != .linux) return null;
+
     const paths = [_][]const u8{
         "/etc/amnezia/amneziawg/awg0.conf",
         "/etc/amnezia/amneziawg/wg0.conf",
@@ -3749,10 +3960,7 @@ fn detectAwgEndpointIpv4(allocator: std.mem.Allocator) ?[4]u8 {
     };
 
     for (paths) |path| {
-        const file = std.fs.openFileAbsolute(path, .{}) catch continue;
-        defer file.close();
-
-        const content = file.readToEndAlloc(allocator, 64 * 1024) catch continue;
+        const content = compat.readFileAbsoluteAlloc(allocator, path, 64 * 1024) catch continue;
         defer allocator.free(content);
 
         if (parseAwgEndpointIpv4FromConfig(allocator, content)) |ip| return ip;
@@ -3994,23 +4202,44 @@ fn addressesEqual(a: []const net.Address, b: []const net.Address) bool {
 }
 
 fn isAddressReachable(address: net.Address, timeout_ms: i32) bool {
-    const sock_flags = posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK;
-    const fd = posix.socket(address.any.family, sock_flags, posix.IPPROTO.TCP) catch return false;
-    defer posix.close(fd);
+    if (builtin.os.tag != .linux) return false;
 
-    posix.connect(fd, &address.any, address.getOsSockLen()) catch |err| switch (err) {
-        error.WouldBlock, error.ConnectionPending => {},
+    const sock_flags = linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK;
+    const socket_rc = linux.socket(@intCast(address.any.family), sock_flags, linux.IPPROTO.TCP);
+    const fd: linux.fd_t = switch (posix.errno(socket_rc)) {
+        .SUCCESS => @intCast(socket_rc),
         else => return false,
     };
+    defer _ = linux.close(fd);
 
-    var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
-    const ready = posix.poll(&fds, timeout_ms) catch return false;
+    const connect_rc = linux.connect(fd, &address.any, @intCast(address.getOsSockLen()));
+    switch (posix.errno(connect_rc)) {
+        .SUCCESS => {},
+        .AGAIN, .INPROGRESS => {},
+        else => return false,
+    }
+
+    var fds = [_]linux.pollfd{.{ .fd = fd, .events = linux.POLL.OUT, .revents = 0 }};
+    const poll_rc = linux.poll(&fds, fds.len, timeout_ms);
+    const ready = switch (posix.errno(poll_rc)) {
+        .SUCCESS => poll_rc,
+        else => return false,
+    };
     if (ready == 0) return false;
+
     const revents = fds[0].revents;
-    if ((revents & posix.POLL.OUT) == 0) return false;
-    if ((revents & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL)) != 0) return false;
-    posix.getsockoptError(fd) catch return false;
-    return true;
+    if ((revents & linux.POLL.OUT) == 0) return false;
+    if ((revents & (linux.POLL.ERR | linux.POLL.HUP | linux.POLL.NVAL)) != 0) return false;
+
+    var err_code: i32 = 0;
+    var err_len: linux.socklen_t = @sizeOf(i32);
+    const err_bytes = std.mem.asBytes(&err_code);
+    const opt_rc = linux.getsockopt(fd, linux.SOL.SOCKET, linux.SO.ERROR, err_bytes.ptr, &err_len);
+    switch (posix.errno(opt_rc)) {
+        .SUCCESS => {},
+        else => return false,
+    }
+    return err_code == 0;
 }
 
 fn parseMiddleProxyAddressForDc(config_text: []const u8, target_dc: i16) ?net.Address {
@@ -4025,7 +4254,7 @@ fn queueOrWriteMsg(fd: posix.fd_t, queue: *MessageQueue, data: []const u8) !bool
     if (data.len == 0) return true;
 
     if (queue.isEmpty()) {
-        const n = posix.write(fd, data) catch |err| {
+        const n = writeFd(fd, data) catch |err| {
             if (err == error.WouldBlock) {
                 try queue.appendCopy(data);
                 return false;
@@ -4058,7 +4287,7 @@ fn queueOrWriteMsgPair(fd: posix.fd_t, queue: *MessageQueue, first: []const u8, 
         }
 
         const total_len = first.len + second.len;
-        const n = posix.writev(fd, iovecs[0..n_iov]) catch |err| {
+        const n = writevFd(fd, iovecs[0..n_iov]) catch |err| {
             if (err == error.WouldBlock) {
                 try queue.ensureCanAppend(total_len);
                 try queue.appendCopy(first);
@@ -4100,7 +4329,7 @@ fn flushQueue(fd: posix.fd_t, queue: *MessageQueue) !bool {
         const n_iov = queue.prepareIovecs(iovecs[0..]);
         if (n_iov == 0) return true;
 
-        const n = posix.writev(fd, iovecs[0..n_iov]) catch |err| {
+        const n = writevFd(fd, iovecs[0..n_iov]) catch |err| {
             if (err == error.WouldBlock) return false;
             return err;
         };
@@ -4154,7 +4383,7 @@ fn writePlainMiddleProxyTestFrame(fd: posix.fd_t, seq_no: i32, payload: []const 
     const checksum = middleproxy.crc32(frame[0 .. 8 + payload.len]);
     std.mem.writeInt(u32, frame[8 + payload.len ..][0..4], checksum, .little);
 
-    const written = try posix.write(fd, frame[0..total_len]);
+    const written = try writeFd(fd, frame[0..total_len]);
     try std.testing.expectEqual(total_len, written);
 }
 
@@ -4172,6 +4401,8 @@ test "parse middle proxy address for dc203" {
 }
 
 test "middle proxy nonce response failures fall back to direct path" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
     var cfg = Config{
         .users = std.StringHashMap([16]u8).init(std.testing.allocator),
         .direct_users = std.StringHashMap(void).init(std.testing.allocator),
@@ -4186,17 +4417,17 @@ test "middle proxy nonce response failures fall back to direct path" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var upstream_file = try tmp.dir.createFile("middle-proxy-upstream", .{ .read = true });
+    var upstream_file = try tmp.dir.createFile(compat.io(), "middle-proxy-upstream", .{ .read = true });
     var upstream_file_owned = true;
-    defer if (upstream_file_owned) upstream_file.close();
+    defer if (upstream_file_owned) upstream_file.close(compat.io());
 
     const epoll_fd = try epollCreate();
-    defer posix.close(epoll_fd);
+    defer closeFd(epoll_fd);
 
     var loop = EventLoop{
         .state = &state,
         .epoll_fd = epoll_fd,
-        .listen_fd = -1,
+        .listen_fd = invalid_fd,
         .pool = try ConnectionPool.init(std.testing.allocator, 4),
         .accept_paused = false,
         .accept_resume_ns = 0,
@@ -4220,9 +4451,9 @@ test "middle proxy nonce response failures fall back to direct path" {
     const slot = loop.pool.acquire() orelse return error.TestExpectedEqual;
     defer {
         if (slot.phase != .idle) {
-            if (slot.upstream_fd != -1) {
-                posix.close(slot.upstream_fd);
-                slot.upstream_fd = -1;
+            if (!isInvalidFd(slot.upstream_fd)) {
+                closeFd(slot.upstream_fd);
+                slot.upstream_fd = invalid_fd;
             }
             slot.resetOwnedBuffers(state.allocator);
             loop.pool.release(slot);
@@ -4253,7 +4484,7 @@ test "middle proxy nonce response failures fall back to direct path" {
     var bad_nonce_payload = [_]u8{0} ** 32;
     @memcpy(bad_nonce_payload[0..4], &middleproxy.rpc_proxy_ans);
     try writePlainMiddleProxyTestFrame(upstream_file.handle, -2, &bad_nonce_payload);
-    try upstream_file.seekTo(0);
+    try seekFdToStart(upstream_file.handle);
 
     loop.middleProxyOnReadable(slot);
 
@@ -4482,8 +4713,8 @@ test "epoll hangup helper" {
 }
 
 test "fatal hangup close policy distinguishes client/upstream while connecting" {
-    const client_fd: posix.fd_t = 41;
-    const upstream_fd: posix.fd_t = 42;
+    const client_fd = fakeFd(41);
+    const upstream_fd = fakeFd(42);
 
     try std.testing.expect(shouldCloseOnFatalHangup(.connecting_upstream, client_fd, upstream_fd));
     try std.testing.expect(!shouldCloseOnFatalHangup(.connecting_upstream, upstream_fd, upstream_fd));
@@ -4492,8 +4723,8 @@ test "fatal hangup close policy distinguishes client/upstream while connecting" 
 }
 
 test "fatal middle-proxy upstream hangup is fallback eligible" {
-    const client_fd: posix.fd_t = 41;
-    const upstream_fd: posix.fd_t = 42;
+    const client_fd = fakeFd(41);
+    const upstream_fd = fakeFd(42);
 
     try std.testing.expect(shouldFallbackMiddleProxyOnFatalHangup(.middle_proxy_handshake, upstream_fd, upstream_fd));
     try std.testing.expect(!shouldFallbackMiddleProxyOnFatalHangup(.middle_proxy_handshake, client_fd, upstream_fd));
@@ -4618,7 +4849,7 @@ test "subnet rate limit - live probe window is not evicted" {
     const addr = net.Address.initIp4(.{ 203, 0, 113, 42 }, 443);
     const key = SubnetRateLimit.subnetKey(addr);
     const start = limiter.indexFor(key);
-    const now_s = @divTrunc(std.time.milliTimestamp(), 1000);
+    const now_s = @divTrunc(compat.milliTimestamp(), 1000);
 
     var probe: usize = 0;
     while (probe < SubnetRateLimit.MAX_PROBES) : (probe += 1) {

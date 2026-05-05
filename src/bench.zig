@@ -1,5 +1,6 @@
 const std = @import("std");
-const net = std.net;
+const net = @import("net_compat.zig");
+const compat = @import("compat.zig");
 const crypto = @import("crypto/crypto.zig");
 const middleproxy = @import("protocol/middleproxy.zig");
 const constants = @import("protocol/constants.zig");
@@ -32,10 +33,10 @@ const WorkerArgs = struct {
 
 const payload_alignment: usize = 4;
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     const allocator = std.heap.page_allocator;
 
-    const opts = parseArgs(allocator) catch |err| {
+    const opts = parseArgs(allocator, init.minimal.args) catch |err| {
         if (err != error.ShowHelp) {
             std.debug.print("error: {any}\n\n", .{err});
         }
@@ -79,7 +80,7 @@ fn runBench(allocator: std.mem.Allocator) !void {
             _ = try ctx.encapsulateSingleMessageC2S(payload, (w & 1) == 1, out_buf);
         }
 
-        var timer = try std.time.Timer.start();
+        const start_ns = compat.nanoTimestamp();
 
         var produced_out_bytes: u64 = 0;
         var i: usize = 0;
@@ -89,7 +90,7 @@ fn runBench(allocator: std.mem.Allocator) !void {
             produced_out_bytes += @as(u64, @intCast(written));
         }
 
-        const elapsed_ns = timer.read();
+        const elapsed_ns = positiveElapsedNs(start_ns);
         const total_in_bytes = @as(u64, @intCast(payload_size)) * @as(u64, @intCast(iters));
         const ns_per_op = elapsedNsPerOp(elapsed_ns, iters);
 
@@ -103,8 +104,14 @@ fn runBench(allocator: std.mem.Allocator) !void {
     }
 }
 
+fn positiveElapsedNs(start_ns: i128) u64 {
+    const elapsed_ns = compat.nanoTimestamp() - start_ns;
+    if (elapsed_ns <= 0) return 1;
+    return @intCast(elapsed_ns);
+}
+
 fn runSoak(allocator: std.mem.Allocator, opts: Options) !void {
-    const start_ms = std.time.milliTimestamp();
+    const start_ms = compat.milliTimestamp();
     const duration_ms = @as(i64, @intCast(opts.seconds)) * 1000;
 
     var shared = SoakShared{
@@ -134,7 +141,7 @@ fn runSoak(allocator: std.mem.Allocator, opts: Options) !void {
         thread.join();
     }
 
-    const end_ms = std.time.milliTimestamp();
+    const end_ms = compat.milliTimestamp();
     const elapsed_ms_i64 = @max(@as(i64, 1), end_ms - start_ms);
     const elapsed_ms: u64 = @intCast(elapsed_ms_i64);
 
@@ -180,7 +187,7 @@ fn soakWorker(args: WorkerArgs) void {
 
     var rng_state = makeSeed(args.worker_id);
 
-    while (std.time.milliTimestamp() < args.shared.deadline_ms) {
+    while (compat.milliTimestamp() < args.shared.deadline_ms) {
         const payload_len = nextPayloadLen(&rng_state, args.max_payload);
         payload_buf[0] +%= 1;
         const quickack = (nextRand(&rng_state) & 1) == 1;
@@ -219,10 +226,10 @@ fn fillPayload(buf: []u8) void {
     }
 }
 
-fn parseArgs(allocator: std.mem.Allocator) !Options {
+fn parseArgs(allocator: std.mem.Allocator, process_args: std.process.Args) !Options {
     var opts = Options{};
 
-    var args = try std.process.argsWithAllocator(allocator);
+    var args = try process_args.iterateAllocator(allocator);
     defer args.deinit();
 
     _ = args.next();
@@ -316,7 +323,7 @@ fn bytesPerSecToMiBMs(bytes: u64, elapsed_ms: u64) u64 {
 }
 
 fn makeSeed(worker_id: usize) u64 {
-    const now_ms = std.time.milliTimestamp();
+    const now_ms = compat.milliTimestamp();
     const base: u64 = if (now_ms >= 0)
         @intCast(now_ms)
     else

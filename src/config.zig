@@ -4,6 +4,8 @@
 //! Format is compatible with the Rust telemt config.toml.
 
 const std = @import("std");
+const net = @import("net_compat.zig");
+const compat = @import("compat.zig");
 
 pub const Config = struct {
     pub const UserSecret = struct { name: []const u8, secret: [16]u8 };
@@ -66,7 +68,7 @@ pub const Config = struct {
     /// Use only if you know your host has enough memory for the configured limits.
     unsafe_override_limits: bool = false,
     /// Test-only hook to redirect upstream connections locally
-    datacenter_override: ?std.net.Address = null,
+    datacenter_override: ?net.Address = null,
 
     pub const middle_proxy_c2s_scratch_headroom: usize = 256;
     pub const middle_proxy_stream_buffer_cap_bytes: usize = 1 << 24;
@@ -150,9 +152,7 @@ pub const Config = struct {
     }
 
     pub fn loadFromFile(allocator: std.mem.Allocator, path: []const u8) !Config {
-        const file = try std.fs.cwd().openFile(path, .{});
-        defer file.close();
-        const content = try file.readToEndAlloc(allocator, 1024 * 1024);
+        const content = try compat.readFileAlloc(allocator, path, 1024 * 1024);
         defer allocator.free(content);
         return parse(allocator, content);
     }
@@ -178,11 +178,11 @@ pub const Config = struct {
             }
 
             if (!in_quotes and (ch == '#' or ch == ';')) {
-                return std.mem.trimRight(u8, value[0..idx], &[_]u8{ ' ', '\t' });
+                return std.mem.trimEnd(u8, value[0..idx], &[_]u8{ ' ', '\t' });
             }
         }
 
-        return std.mem.trimRight(u8, value, &[_]u8{ ' ', '\t' });
+        return std.mem.trimEnd(u8, value, &[_]u8{ ' ', '\t' });
     }
 
     fn replaceOwnedOptionalString(allocator: std.mem.Allocator, field: *?[]const u8, value: []const u8) !void {

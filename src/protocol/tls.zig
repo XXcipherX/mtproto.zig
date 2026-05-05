@@ -4,6 +4,7 @@
 //! builds fake ServerHello responses for domain fronting.
 
 const std = @import("std");
+const compat = @import("../compat.zig");
 const constants = @import("constants.zig");
 const crypto = @import("../crypto/crypto.zig");
 const obfuscation = @import("obfuscation.zig");
@@ -59,7 +60,7 @@ pub fn validateTlsHandshake(
     const zero_digest = [_]u8{0} ** constants.tls_digest_len;
 
     const now: i64 = if (!ignore_time_skew)
-        @intCast(std.time.timestamp())
+        compat.timestamp()
     else
         0;
 
@@ -214,7 +215,7 @@ const nginx_template: [nginx_template_len]u8 = blk: {
 };
 
 pub fn buildServerHelloTemplate(seed: ?u64) [nginx_template_len]u8 {
-    const actual_seed = seed orelse std.crypto.random.int(u64);
+    const actual_seed = seed orelse crypto.randomInt(u64);
     return buildNginxTemplate(actual_seed);
 }
 

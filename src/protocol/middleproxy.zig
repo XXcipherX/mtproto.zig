@@ -1,5 +1,5 @@
 const std = @import("std");
-const net = std.net;
+const net = @import("../net_compat.zig");
 const posix = std.posix;
 const config = @import("../config.zig");
 const crypto = @import("../crypto/crypto.zig");
@@ -578,9 +578,9 @@ pub const MiddleProxyContext = struct {
                 var pad_len: usize = 0;
                 var pad_buf: [15]u8 = undefined;
                 if (self.proto_tag == .secure) {
-                    pad_len = std.crypto.random.intRangeLessThan(usize, 0, 16);
+                    pad_len = crypto.randomRange(usize, 16);
                     if (pad_len > 0) {
-                        std.crypto.random.bytes(pad_buf[0..pad_len]);
+                        crypto.randomBytes(pad_buf[0..pad_len]);
                     }
                 }
 
@@ -655,8 +655,8 @@ test "encapsulated c2s keeps rpc_proxy_req header" {
         crypto.AesCbc.init(&key, &iv),
         [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 },
         -2,
-        std.net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
-        std.net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
+        net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
+        net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
         .intermediate,
         null,
     );
@@ -691,8 +691,8 @@ test "encapsulated c2s omits ad_tag block when absent" {
         crypto.AesCbc.init(&key, &iv),
         [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 },
         -2,
-        std.net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
-        std.net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
+        net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
+        net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
         .intermediate,
         null,
     );
@@ -727,8 +727,8 @@ test "encapsulate c2s rejects unaligned payload length" {
         crypto.AesCbc.init(&key, &iv),
         [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 },
         -2,
-        std.net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
-        std.net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
+        net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
+        net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
         .intermediate,
         null,
     );
@@ -756,8 +756,8 @@ test "encapsulated c2s includes ad_tag block when present" {
         crypto.AesCbc.init(&key, &iv),
         [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 },
         -2,
-        std.net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
-        std.net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
+        net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
+        net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
         .intermediate,
         ad_tag,
     );
@@ -798,8 +798,8 @@ test "required c2s scratch capacity accounts for buffered partial frame" {
         crypto.AesCbc.init(&key, &iv),
         [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 },
         -2,
-        std.net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
-        std.net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
+        net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
+        net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
         .intermediate,
         null,
     );
@@ -827,8 +827,8 @@ test "decapsulate s2c skips noop padding words" {
         crypto.AesCbc.init(&key, &iv),
         [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 },
         -2,
-        std.net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
-        std.net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
+        net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
+        net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
         .intermediate,
         null,
     );
@@ -887,8 +887,8 @@ test "decapsulate s2c validates seq" {
         crypto.AesCbc.init(&key, &iv),
         [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 },
         -2,
-        std.net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
-        std.net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
+        net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
+        net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
         .intermediate,
         null,
     );
@@ -943,8 +943,8 @@ test "decapsulate s2c rejects checksum mismatch without resyncing" {
         crypto.AesCbc.init(&key, &iv),
         [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 },
         -2,
-        std.net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
-        std.net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
+        net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
+        net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
         .intermediate,
         null,
     );
@@ -981,8 +981,8 @@ test "middle proxy sequence counters wrap without panicking" {
         crypto.AesCbc.init(&key, &iv),
         [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 },
         std.math.maxInt(i32),
-        std.net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
-        std.net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
+        net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
+        net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
         .intermediate,
         null,
     );
@@ -1032,8 +1032,8 @@ test "decapsulate s2c rejects invalid frame length instead of resyncing" {
         crypto.AesCbc.init(&key, &iv),
         [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 },
         -2,
-        std.net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
-        std.net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
+        net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
+        net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
         .intermediate,
         null,
     );
@@ -1063,8 +1063,8 @@ test "encapsulate c2s supports payloads larger than 64KiB" {
         crypto.AesCbc.init(&key, &iv),
         [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 },
         -2,
-        std.net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
-        std.net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
+        net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
+        net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
         .intermediate,
         null,
     );
@@ -1102,8 +1102,8 @@ test "middle proxy context grows c2s buffer on demand within configured cap" {
         crypto.AesCbc.init(&key, &iv),
         [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 },
         -2,
-        std.net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
-        std.net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
+        net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
+        net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
         .intermediate,
         null,
         128 * 1024,
@@ -1139,8 +1139,8 @@ test "middle proxy context still enforces configured c2s cap" {
         crypto.AesCbc.init(&key, &iv),
         [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 },
         -2,
-        std.net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
-        std.net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
+        net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
+        net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
         .intermediate,
         null,
         64 * 1024,
@@ -1167,8 +1167,8 @@ test "middle proxy context grows s2c buffer on demand within configured cap" {
         crypto.AesCbc.init(&key, &iv),
         [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 },
         -2,
-        std.net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
-        std.net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
+        net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
+        net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
         .intermediate,
         null,
         128 * 1024,

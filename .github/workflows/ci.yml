@@ -16,7 +16,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.15.2
+          version: 0.16.0
 
       - name: Check Zig formatting
         run: zig fmt --check build.zig src test_addr.zig test_al.zig
@@ -57,7 +57,7 @@ jobs:
           file zig-out/bin/mtproto-proxy
 
       - name: Docker build smoke
-        run: docker build --build-arg ZIG_VERSION=0.15.2 -t mtproto-zig-smoke .
+        run: docker build --build-arg ZIG_VERSION=0.16.0 -t mtproto-zig-smoke .
 
   bench:
     name: Bench & Soak
@@ -69,7 +69,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.15.2
+          version: 0.16.0
 
       - name: Run microbenchmark
         run: zig build -Doptimize=ReleaseFast bench 2>&1 | tee bench-output.txt

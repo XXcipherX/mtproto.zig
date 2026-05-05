@@ -11,7 +11,7 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 </p>
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Zig](https://img.shields.io/badge/zig-0.15.2-f7a41d.svg?logo=zig&logoColor=white)](https://ziglang.org)
+[![Zig](https://img.shields.io/badge/zig-0.16.0-f7a41d.svg?logo=zig&logoColor=white)](https://ziglang.org)
 [![Platform](https://img.shields.io/badge/platform-linux-blueviolet.svg?logo=linux&logoColor=white)](#-quick-start)
 [![Dependencies](https://img.shields.io/badge/dependencies-0-success)](build.zig)
 
@@ -72,7 +72,7 @@ Connection-capacity methodology and command profiles: `test/README.md`.
 ### Prerequisites
 
 - **Linux** (x86_64 or aarch64) — the proxy uses `epoll` and does not support macOS, FreeBSD, or OpenBSD at runtime
-- [Zig](https://ziglang.org/download/) **0.15.2** or later (macOS is fine for cross-compilation)
+- [Zig](https://ziglang.org/download/) **0.16.0** or later (macOS is fine for cross-compilation)
 
 ### Build & Run locally
 
@@ -187,13 +187,13 @@ docker build -t mtproto-zig .
 
 | Argument       | Default   | Description |
 |----------------|-----------|-------------|
-| `ZIG_VERSION`  | `0.15.2`  | Version string passed to `ziglang.org/download/…/zig-<arch>-linux-<version>.tar.xz`. Must match a published Zig release. |
+| `ZIG_VERSION`  | `0.16.0`  | Version string passed to `ziglang.org/download/…/zig-<arch>-linux-<version>.tar.xz`. Must match a published Zig release. |
 | `ZIG_SHA256`   | _(empty)_ | Optional pinned SHA256 for the downloaded Zig tarball. If set, Docker build verifies integrity before extraction. |
 
 Example:
 
 ```bash
-docker build --build-arg ZIG_VERSION=0.15.2 -t mtproto-zig .
+docker build --build-arg ZIG_VERSION=0.16.0 -t mtproto-zig .
 ```
 
 ### Architecture (`TARGETARCH`)
@@ -250,7 +250,7 @@ curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/in
 ```
 
 This will:
-1. Install **Zig 0.15.2** (if not present)
+1. Install **Zig 0.16.0** (if not present)
 2. Clone and build the proxy with `ReleaseFast`
 3. Generate a random 16-byte secret on first install
 4. Create a `systemd` service (`mtproto-proxy`)
@@ -330,12 +330,12 @@ curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/in
 
 ```bash
 # x86_64
-curl -sSfL https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz | \
+curl -sSfL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz | \
   sudo tar xJ -C /usr/local
-sudo ln -sf /usr/local/zig-x86_64-linux-0.15.2/zig /usr/local/bin/zig
+sudo ln -sf /usr/local/zig-x86_64-linux-0.16.0/zig /usr/local/bin/zig
 
 # Verify
-zig version   # → 0.15.2
+zig version   # → 0.16.0
 ```
 
 **2. Build the proxy**

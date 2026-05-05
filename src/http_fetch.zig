@@ -1,5 +1,5 @@
 const std = @import("std");
-const posix = std.posix;
+const compat = @import("compat.zig");
 
 pub const default_timeout_sec: u32 = 10;
 
@@ -12,23 +12,11 @@ pub const FetchOptions = struct {
 const FetchWorkerState = struct {
     url: []u8,
     options: FetchOptions,
-    mutex: std.Thread.Mutex = .{},
+    mutex: compat.Mutex = .{},
     done: bool = false,
     detached: bool = false,
     result: anyerror![]u8 = error.HttpRequestTimedOut,
 };
-
-fn setSocketTimeouts(fd: posix.fd_t, timeout_sec: u32) void {
-    const tv = posix.timeval{ .sec = @intCast(timeout_sec), .usec = 0 };
-    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch return;
-    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch return;
-}
-
-fn setConnectionTimeouts(connection: anytype, timeout_sec: u32) void {
-    // Keep std.http transport access localized; the public timeout policy above
-    // should not depend on call sites knowing the current stream_reader shape.
-    setSocketTimeouts(connection.stream_reader.getStream().handle, timeout_sec);
-}
 
 pub fn fetchUrlBytes(allocator: std.mem.Allocator, url: []const u8, options: FetchOptions) ![]u8 {
     if (options.timeout_sec == 0) return fetchUrlBytesBlocking(allocator, url, options);
@@ -51,10 +39,10 @@ pub fn fetchUrlBytes(allocator: std.mem.Allocator, url: []const u8, options: Fet
         return err;
     };
 
-    const deadline_ns = std.time.nanoTimestamp() + @as(i128, options.timeout_sec) * std.time.ns_per_s;
+    const deadline_ns = compat.nanoTimestamp() + @as(i128, options.timeout_sec) * std.time.ns_per_s;
     const poll_interval_ns: u64 = 10 * std.time.ns_per_ms;
     while (!isFetchWorkerDone(state)) {
-        if (std.time.nanoTimestamp() >= deadline_ns) {
+        if (compat.nanoTimestamp() >= deadline_ns) {
             if (markFetchWorkerDetached(state)) {
                 thread.join();
                 return finishJoinedFetchWorker(allocator, state);
@@ -62,7 +50,7 @@ pub fn fetchUrlBytes(allocator: std.mem.Allocator, url: []const u8, options: Fet
             thread.detach();
             return error.HttpRequestTimedOut;
         }
-        std.Thread.sleep(poll_interval_ns);
+        compat.sleep(poll_interval_ns);
     }
 
     thread.join();
@@ -121,7 +109,10 @@ fn freeFetchWorkerState(state: *FetchWorkerState) void {
 fn fetchUrlBytesBlocking(allocator: std.mem.Allocator, url: []const u8, options: FetchOptions) ![]u8 {
     const uri = try std.Uri.parse(url);
 
-    var client: std.http.Client = .{ .allocator = allocator };
+    var client: std.http.Client = .{
+        .allocator = allocator,
+        .io = std.Io.Threaded.global_single_threaded.io(),
+    };
     defer client.deinit();
 
     var req = try client.request(.GET, uri, .{
@@ -133,16 +124,7 @@ fn fetchUrlBytesBlocking(allocator: std.mem.Allocator, url: []const u8, options:
     });
     defer req.deinit();
 
-    if (req.connection) |connection| {
-        setConnectionTimeouts(connection, options.timeout_sec);
-    }
-
     try req.sendBodiless();
-
-    // Some std.http paths establish the socket lazily on send.
-    if (req.connection) |connection| {
-        setConnectionTimeouts(connection, options.timeout_sec);
-    }
 
     var redirect_buf: [8 * 1024]u8 = undefined;
     var response = try req.receiveHead(&redirect_buf);
