@@ -191,6 +191,54 @@ pub const Config = struct {
         field.* = try allocator.dupe(u8, value);
     }
 
+    fn warnInvalidValue(key: []const u8, value: []const u8, expected: []const u8) void {
+        const log = std.log.scoped(.config);
+        log.warn("invalid config value for {s}: '{s}' (expected {s}); keeping previous/default", .{
+            key,
+            value,
+            expected,
+        });
+    }
+
+    fn parseBoolSetting(key: []const u8, value: []const u8) ?bool {
+        if (std.mem.eql(u8, value, "true") or
+            std.mem.eql(u8, value, "1") or
+            std.mem.eql(u8, value, "yes") or
+            std.mem.eql(u8, value, "on"))
+        {
+            return true;
+        }
+        if (std.mem.eql(u8, value, "false") or
+            std.mem.eql(u8, value, "0") or
+            std.mem.eql(u8, value, "no") or
+            std.mem.eql(u8, value, "off"))
+        {
+            return false;
+        }
+        warnInvalidValue(key, value, "true/false");
+        return null;
+    }
+
+    fn parseIntSetting(comptime T: type, key: []const u8, value: []const u8) ?T {
+        return std.fmt.parseInt(T, value, 10) catch {
+            warnInvalidValue(key, value, "decimal integer");
+            return null;
+        };
+    }
+
+    fn parseHex16Setting(key: []const u8, value: []const u8) ?[16]u8 {
+        if (value.len != 32) {
+            warnInvalidValue(key, value, "32 hex characters");
+            return null;
+        }
+        var out: [16]u8 = undefined;
+        _ = std.fmt.hexToBytes(&out, value) catch {
+            warnInvalidValue(key, value, "32 hex characters");
+            return null;
+        };
+        return out;
+    }
+
     fn upsertOwnedEntry(
         comptime V: type,
         allocator: std.mem.Allocator,
@@ -260,71 +308,66 @@ pub const Config = struct {
 
                 if (in_users_section) {
                     // Parse user secret (32 hex chars = 16 bytes)
-                    if (value.len != 32) continue;
-                    var secret: [16]u8 = undefined;
-                    _ = std.fmt.hexToBytes(&secret, value) catch continue;
-                    try upsertOwnedEntry([16]u8, allocator, &cfg.users, key, secret);
+                    if (parseHex16Setting(key, value)) |secret| {
+                        try upsertOwnedEntry([16]u8, allocator, &cfg.users, key, secret);
+                    }
                 } else if (in_direct_users_section) {
-                    const enabled = std.mem.eql(u8, value, "true") or
-                        std.mem.eql(u8, value, "1") or
-                        std.mem.eql(u8, value, "yes");
-                    const disabled = std.mem.eql(u8, value, "false") or
-                        std.mem.eql(u8, value, "0") or
-                        std.mem.eql(u8, value, "no");
-                    if (enabled) {
-                        try upsertOwnedEntry(void, allocator, &cfg.direct_users, key, {});
-                    } else if (disabled) {
-                        removeOwnedVoidEntry(allocator, &cfg.direct_users, key);
+                    if (parseBoolSetting(key, value)) |enabled| {
+                        if (enabled) {
+                            try upsertOwnedEntry(void, allocator, &cfg.direct_users, key, {});
+                        } else {
+                            removeOwnedVoidEntry(allocator, &cfg.direct_users, key);
+                        }
                     }
                 } else if (in_general_section) {
                     if (std.mem.eql(u8, key, "use_middle_proxy")) {
-                        cfg.use_middle_proxy = std.mem.eql(u8, value, "true");
+                        if (parseBoolSetting(key, value)) |parsed| cfg.use_middle_proxy = parsed;
                     } else if (std.mem.eql(u8, key, "force_media_middle_proxy")) {
-                        cfg.force_media_middle_proxy = std.mem.eql(u8, value, "true");
+                        if (parseBoolSetting(key, value)) |parsed| cfg.force_media_middle_proxy = parsed;
                     } else if (std.mem.eql(u8, key, "fast_mode")) {
                         // telemt compatibility: [general].fast_mode
-                        cfg.fast_mode = std.mem.eql(u8, value, "true");
+                        if (parseBoolSetting(key, value)) |parsed| cfg.fast_mode = parsed;
                     } else if (std.mem.eql(u8, key, "ad_tag")) {
                         // telemt compatibility: [general].ad_tag
                         // If [server].tag is present and valid, it has priority.
-                        if (!server_tag_set and value.len == 32) {
-                            var tag: [16]u8 = undefined;
-                            if (std.fmt.hexToBytes(&tag, value)) |_| {
+                        if (!server_tag_set) {
+                            if (parseHex16Setting(key, value)) |tag| {
                                 cfg.tag = tag;
-                            } else |_| {}
+                            }
                         }
                     }
                 } else if (in_server_section) {
                     if (std.mem.eql(u8, key, "port")) {
-                        cfg.port = std.fmt.parseInt(u16, value, 10) catch 443;
+                        if (parseIntSetting(u16, key, value)) |parsed| cfg.port = parsed;
                     } else if (std.mem.eql(u8, key, "backlog")) {
-                        cfg.backlog = std.fmt.parseInt(u32, value, 10) catch 4096;
+                        if (parseIntSetting(u32, key, value)) |parsed| cfg.backlog = parsed;
                     } else if (std.mem.eql(u8, key, "max_connections")) {
-                        const parsed = std.fmt.parseInt(u32, value, 10) catch cfg.max_connections;
-                        cfg.max_connections = @max(@as(u32, 32), parsed);
+                        if (parseIntSetting(u32, key, value)) |parsed| {
+                            cfg.max_connections = @max(@as(u32, 32), parsed);
+                        }
                     } else if (std.mem.eql(u8, key, "idle_timeout_sec")) {
-                        const parsed = std.fmt.parseInt(u32, value, 10) catch cfg.idle_timeout_sec;
-                        cfg.idle_timeout_sec = @max(@as(u32, 5), parsed);
+                        if (parseIntSetting(u32, key, value)) |parsed| {
+                            cfg.idle_timeout_sec = @max(@as(u32, 5), parsed);
+                        }
                     } else if (std.mem.eql(u8, key, "handshake_timeout_sec")) {
-                        const parsed = std.fmt.parseInt(u32, value, 10) catch cfg.handshake_timeout_sec;
-                        cfg.handshake_timeout_sec = @max(@as(u32, 5), parsed);
+                        if (parseIntSetting(u32, key, value)) |parsed| {
+                            cfg.handshake_timeout_sec = @max(@as(u32, 5), parsed);
+                        }
                     } else if (std.mem.eql(u8, key, "tag")) {
-                        if (value.len == 32) {
-                            var tag: [16]u8 = undefined;
-                            if (std.fmt.hexToBytes(&tag, value)) |_| {
-                                cfg.tag = tag;
-                                server_tag_set = true;
-                            } else |_| {}
+                        if (parseHex16Setting(key, value)) |tag| {
+                            cfg.tag = tag;
+                            server_tag_set = true;
                         }
                     } else if (std.mem.eql(u8, key, "public_ip")) {
                         try replaceOwnedOptionalString(allocator, &cfg.public_ip, value);
                     } else if (std.mem.eql(u8, key, "middle_proxy_nat_ip")) {
                         try replaceOwnedOptionalString(allocator, &cfg.middle_proxy_nat_ip, value);
                     } else if (std.mem.eql(u8, key, "fast_mode")) {
-                        cfg.fast_mode = std.mem.eql(u8, value, "true");
+                        if (parseBoolSetting(key, value)) |parsed| cfg.fast_mode = parsed;
                     } else if (std.mem.eql(u8, key, "middleproxy_buffer_kb")) {
-                        const parsed = std.fmt.parseInt(u32, value, 10) catch cfg.middleproxy_buffer_kb;
-                        cfg.middleproxy_buffer_kb = @max(@as(u32, 64), parsed);
+                        if (parseIntSetting(u32, key, value)) |parsed| {
+                            cfg.middleproxy_buffer_kb = @max(@as(u32, 64), parsed);
+                        }
                     } else if (std.mem.eql(u8, key, "log_level")) {
                         if (std.mem.eql(u8, value, "debug")) {
                             cfg.log_level = .debug;
@@ -334,11 +377,13 @@ pub const Config = struct {
                             cfg.log_level = .warn;
                         } else if (std.mem.eql(u8, value, "err")) {
                             cfg.log_level = .err;
+                        } else {
+                            warnInvalidValue(key, value, "debug/info/warn/err");
                         }
                     } else if (std.mem.eql(u8, key, "rate_limit_per_subnet")) {
-                        cfg.rate_limit_per_subnet = std.fmt.parseInt(u8, value, 10) catch cfg.rate_limit_per_subnet;
+                        if (parseIntSetting(u8, key, value)) |parsed| cfg.rate_limit_per_subnet = parsed;
                     } else if (std.mem.eql(u8, key, "unsafe_override_limits")) {
-                        cfg.unsafe_override_limits = std.mem.eql(u8, value, "true");
+                        if (parseBoolSetting(key, value)) |parsed| cfg.unsafe_override_limits = parsed;
                     }
                 } else if (in_censorship_section) {
                     if (std.mem.eql(u8, key, "tls_domain")) {
@@ -349,15 +394,15 @@ pub const Config = struct {
                         cfg.tls_domain = try allocator.dupe(u8, value);
                         cfg.tls_domain_owned = true;
                     } else if (std.mem.eql(u8, key, "mask")) {
-                        cfg.mask = std.mem.eql(u8, value, "true");
+                        if (parseBoolSetting(key, value)) |parsed| cfg.mask = parsed;
                     } else if (std.mem.eql(u8, key, "mask_port")) {
-                        cfg.mask_port = std.fmt.parseInt(u16, value, 10) catch 443;
+                        if (parseIntSetting(u16, key, value)) |parsed| cfg.mask_port = parsed;
                     } else if (std.mem.eql(u8, key, "desync")) {
-                        cfg.desync = std.mem.eql(u8, value, "true");
+                        if (parseBoolSetting(key, value)) |parsed| cfg.desync = parsed;
                     } else if (std.mem.eql(u8, key, "drs")) {
-                        cfg.drs = std.mem.eql(u8, value, "true");
+                        if (parseBoolSetting(key, value)) |parsed| cfg.drs = parsed;
                     } else if (std.mem.eql(u8, key, "fast_mode")) {
-                        cfg.fast_mode = std.mem.eql(u8, value, "true");
+                        if (parseBoolSetting(key, value)) |parsed| cfg.fast_mode = parsed;
                     }
                 }
             }
