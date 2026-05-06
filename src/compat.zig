@@ -68,25 +68,33 @@ pub fn timestamp() i64 {
 }
 
 pub fn randomBytes(buf: []u8) void {
+    randomBytesSecure(buf) catch @panic("secure random entropy unavailable");
+}
+
+fn randomBytesSecure(buf: []u8) !void {
+    if (builtin.os.tag == .linux) {
+        try randomBytesSecureLinux(buf);
+        return;
+    }
+
     var threaded_io = initThreadedIo();
     defer threaded_io.deinit();
-    const local_io = threaded_io.io();
-    local_io.randomSecure(buf) catch local_io.random(buf);
+    try threaded_io.io().randomSecure(buf);
 }
 
 pub fn randomInt(comptime T: type) T {
-    var threaded_io = initThreadedIo();
-    defer threaded_io.deinit();
-    var source = std.Random.IoSource{ .io = threaded_io.io() };
-    return source.interface().int(T);
+    var bytes: [@sizeOf(T)]u8 = undefined;
+    randomBytes(bytes[0..]);
+    return std.mem.readInt(T, bytes[0..], .little);
 }
 
 pub fn randomRange(comptime T: type, max: T) T {
     if (max == 0) return 0;
-    var threaded_io = initThreadedIo();
-    defer threaded_io.deinit();
-    var source = std.Random.IoSource{ .io = threaded_io.io() };
-    return source.interface().intRangeLessThan(T, 0, max);
+    const upper_bound = std.math.maxInt(T) - (std.math.maxInt(T) % max);
+    while (true) {
+        const value = randomInt(T);
+        if (value < upper_bound) return value % max;
+    }
 }
 
 pub fn writeStdout(bytes: []const u8) void {
@@ -137,6 +145,22 @@ fn sleepLinux(ns: u64) void {
             .SUCCESS => return,
             .INTR => req = rem,
             else => return,
+        }
+    }
+}
+
+fn randomBytesSecureLinux(buf: []u8) !void {
+    const linux = std.os.linux;
+    var offset: usize = 0;
+    while (offset < buf.len) {
+        const rc = linux.getrandom(buf[offset..].ptr, buf.len - offset, 0);
+        switch (posix.errno(rc)) {
+            .SUCCESS => {
+                if (rc == 0) return error.EntropyUnavailable;
+                offset += rc;
+            },
+            .INTR => continue,
+            else => return error.EntropyUnavailable,
         }
     }
 }
