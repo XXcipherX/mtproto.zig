@@ -1894,16 +1894,23 @@ const EventLoop = struct {
         }
     }
 
+    fn wantsAcceptInterest(self: *const EventLoop) bool {
+        return shouldAcceptListen(self.accept_paused, self.saturation_paused);
+    }
+
+    fn syncAcceptInterest(self: *EventLoop) !void {
+        try self.modFd(self.listen_fd, self.wantsAcceptInterest(), false);
+    }
+
     fn pauseAccepting(self: *EventLoop, err: anyerror) void {
         self.accept_resume_ns = compat.nanoTimestamp() + accept_backoff_ns;
         if (self.accept_paused) return;
 
-        self.modFd(self.listen_fd, false, false) catch |mod_err| {
+        self.accept_paused = true;
+        self.syncAcceptInterest() catch |mod_err| {
             log.err("failed to pause accepts after fd quota error: {any}", .{mod_err});
-            return;
         };
 
-        self.accept_paused = true;
         const needed = requiredFdsForConnections(self.state.config.max_connections);
         log.warn("fd quota reached ({any}); pausing accepts for {d}ms (recommended LimitNOFILE >= {d})", .{
             err,
@@ -1915,25 +1922,27 @@ const EventLoop = struct {
     fn resumeAccepting(self: *EventLoop) void {
         if (!self.accept_paused) return;
 
-        self.modFd(self.listen_fd, true, false) catch |err| {
-            self.accept_resume_ns = compat.nanoTimestamp() + accept_backoff_ns;
-            log.warn("failed to resume accepts; retry in {d}ms: {any}", .{ accept_backoff_ms, err });
-            return;
-        };
-
         self.accept_paused = false;
         self.accept_resume_ns = 0;
+
+        self.syncAcceptInterest() catch |err| {
+            if (!self.saturation_paused) {
+                self.accept_paused = true;
+                self.accept_resume_ns = compat.nanoTimestamp() + accept_backoff_ns;
+            }
+            log.warn("failed to update accept interest after fd quota resume: {any}", .{err});
+            return;
+        };
     }
 
     fn pauseSaturation(self: *EventLoop) void {
         if (self.saturation_paused) return;
 
-        self.modFd(self.listen_fd, false, false) catch |mod_err| {
+        self.saturation_paused = true;
+        self.syncAcceptInterest() catch |mod_err| {
             log.err("failed to pause accepts for saturation: {any}", .{mod_err});
-            return;
         };
 
-        self.saturation_paused = true;
         const active = self.state.active_connections.load(.monotonic);
         const max = self.state.config.max_connections;
         log.warn(
@@ -1947,14 +1956,21 @@ const EventLoop = struct {
     fn resumeSaturation(self: *EventLoop) void {
         if (!self.saturation_paused) return;
 
-        self.modFd(self.listen_fd, true, false) catch |err| {
-            log.warn("failed to resume accepts after saturation ease: {any}", .{err});
+        self.saturation_paused = false;
+        self.syncAcceptInterest() catch |err| {
+            if (!self.accept_paused) {
+                self.saturation_paused = true;
+            }
+            log.warn("failed to update accept interest after saturation ease: {any}", .{err});
             return;
         };
 
-        self.saturation_paused = false;
         const active = self.state.active_connections.load(.monotonic);
-        log.info("saturation eased: active={d}/{d}; resuming accepts", .{ active, self.state.config.max_connections });
+        if (self.wantsAcceptInterest()) {
+            log.info("saturation eased: active={d}/{d}; resuming accepts", .{ active, self.state.config.max_connections });
+        } else {
+            log.info("saturation eased: active={d}/{d}; accepts remain paused for fd quota", .{ active, self.state.config.max_connections });
+        }
     }
 
     fn onClientReadable(self: *EventLoop, slot: *ConnectionSlot) void {
@@ -3718,6 +3734,10 @@ fn requiredFdsForConnections(max_connections: u32) usize {
     return @as(usize, max_connections) * 2 + nofile_fd_overhead;
 }
 
+fn shouldAcceptListen(accept_paused: bool, saturation_paused: bool) bool {
+    return !accept_paused and !saturation_paused;
+}
+
 fn maxConnectionsForNofile(soft_nofile: usize) u32 {
     if (soft_nofile <= nofile_fd_overhead + 2) return 32;
 
@@ -4745,6 +4765,13 @@ test "fd requirement helpers" {
     try std.testing.expectEqual(@as(usize, 131582), requiredFdsForConnections(65535));
     try std.testing.expectEqual(@as(u32, 65535), maxConnectionsForNofile(131582));
     try std.testing.expectEqual(@as(u32, 32511), maxConnectionsForNofile(65535));
+}
+
+test "accept listen interest stays disabled while any pause reason is active" {
+    try std.testing.expect(shouldAcceptListen(false, false));
+    try std.testing.expect(!shouldAcceptListen(true, false));
+    try std.testing.expect(!shouldAcceptListen(false, true));
+    try std.testing.expect(!shouldAcceptListen(true, true));
 }
 
 test "parse ipv4 literal" {
