@@ -3101,16 +3101,7 @@ const EventLoop = struct {
         slot.tg_encryptor = null;
         slot.tg_decryptor = null;
 
-        // If current connected endpoint is already the direct fallback, continue inline.
         const fallback = slot.direct_fallback_addr.?;
-        if (slot.current_upstream_addr) |cur| {
-            if (isSameIpEndpoint(cur, fallback)) {
-                self.sendDcNonce(slot);
-                return true;
-            }
-        }
-
-        // Otherwise reconnect to direct fallback endpoint.
         self.cleanupFailedUpstreamConnect(slot);
         slot.upstream_candidate_next = 1;
 
@@ -4460,7 +4451,16 @@ test "middle proxy nonce response failures fall back to direct path" {
         }
     }
 
-    const fallback_addr = net.Address.initIp4(.{ 149, 154, 167, 50 }, 443);
+    var fallback_server = try net.Address.initIp4(.{ 127, 0, 0, 1 }, 0).listen(.{
+        .reuse_address = true,
+        .kernel_backlog = 1,
+    });
+    defer fallback_server.deinit();
+
+    var fallback_addr: net.Address = undefined;
+    var fallback_len: posix.socklen_t = @sizeOf(net.Address);
+    try getsocknameFd(fallback_server.stream.handle, &fallback_addr.any, &fallback_len);
+
     slot.conn_id = 42;
     slot.upstream_fd = upstream_file.handle;
     upstream_file_owned = false;
@@ -4491,7 +4491,10 @@ test "middle proxy nonce response failures fall back to direct path" {
     try std.testing.expect(slot.direct_fallback_used);
     try std.testing.expect(!slot.use_middle_proxy);
     try std.testing.expectEqual(MiddleProxyHandshakeStep.none, slot.mp_step);
-    try std.testing.expectEqual(ConnectionPhase.writing_dc_nonce, slot.phase);
+    try std.testing.expectEqual(UpstreamKind.dc, slot.upstream_kind);
+    try std.testing.expect(slot.upstream_candidates != null);
+    try std.testing.expect(slot.current_upstream_addr.?.eql(fallback_addr));
+    try std.testing.expect(slot.phase == .connecting_upstream or slot.phase == .writing_dc_nonce);
     try std.testing.expectEqual(@as(u64, 1), state.stats_mp_fallback.load(.monotonic));
 }
 
