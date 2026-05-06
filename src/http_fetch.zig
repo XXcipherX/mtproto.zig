@@ -109,9 +109,12 @@ fn freeFetchWorkerState(state: *FetchWorkerState) void {
 fn fetchUrlBytesBlocking(allocator: std.mem.Allocator, url: []const u8, options: FetchOptions) ![]u8 {
     const uri = try std.Uri.parse(url);
 
+    var threaded_io = compat.initThreadedIo();
+    defer threaded_io.deinit();
+
     var client: std.http.Client = .{
         .allocator = allocator,
-        .io = std.Io.Threaded.global_single_threaded.io(),
+        .io = threaded_io.io(),
     };
     defer client.deinit();
 

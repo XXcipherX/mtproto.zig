@@ -3866,7 +3866,9 @@ fn isRunningInNonInitNetns() bool {
     var self_buf: [std.fs.max_path_bytes]u8 = undefined;
     var init_buf: [std.fs.max_path_bytes]u8 = undefined;
 
-    const local_io = compat.io();
+    var threaded_io = compat.initThreadedIo();
+    defer threaded_io.deinit();
+    const local_io = threaded_io.io();
     const self_len = std.Io.Dir.readLinkAbsolute(local_io, "/proc/self/ns/net", &self_buf) catch return false;
     const init_len = std.Io.Dir.readLinkAbsolute(local_io, "/proc/1/ns/net", &init_buf) catch return false;
     const self_ns = self_buf[0..self_len];
@@ -4408,9 +4410,13 @@ test "middle proxy nonce response failures fall back to direct path" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var upstream_file = try tmp.dir.createFile(compat.io(), "middle-proxy-upstream", .{ .read = true });
+    var tmp_io_state = compat.initThreadedIo();
+    defer tmp_io_state.deinit();
+    const tmp_io = tmp_io_state.io();
+
+    var upstream_file = try tmp.dir.createFile(tmp_io, "middle-proxy-upstream", .{ .read = true });
     var upstream_file_owned = true;
-    defer if (upstream_file_owned) upstream_file.close(compat.io());
+    defer if (upstream_file_owned) upstream_file.close(tmp_io);
 
     const epoll_fd = try epollCreate();
     defer closeFd(epoll_fd);

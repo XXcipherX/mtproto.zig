@@ -7,6 +7,7 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
+const compat = @import("compat.zig");
 const posix = std.posix;
 
 pub const Address = extern union {
@@ -127,7 +128,9 @@ pub fn getAddressList(allocator: std.mem.Allocator, host: []const u8, port: u16)
 
     try std.Io.net.HostName.validate(host);
 
-    const io = std.Io.Threaded.global_single_threaded.io();
+    var threaded_io = compat.initThreadedIo();
+    defer threaded_io.deinit();
+    const io = threaded_io.io();
     const host_name: std.Io.net.HostName = .{ .bytes = host };
     var lookup_storage: [32]std.Io.net.HostName.LookupResult = undefined;
     var lookup_queue: std.Io.Queue(std.Io.net.HostName.LookupResult) = .init(&lookup_storage);
