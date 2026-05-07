@@ -2679,7 +2679,14 @@ const EventLoop = struct {
             if (slot.client_decryptor) |*dec| dec.apply(data);
 
             if (slot.middle_ctx) |*mp| {
-                const required = mp.requiredC2sScratchCapacity(data) catch {
+                const required = mp.requiredC2sScratchCapacity(data) catch |err| {
+                    log.debug("[{d}] middleproxy pipelined scratch sizing failed: proto={s} pipelined={d} buffered={d} err={any}", .{
+                        slot.conn_id,
+                        @tagName(slot.proto_tag),
+                        data.len,
+                        mp.c2s_len,
+                        err,
+                    });
                     self.closeSlot(slot, "compute middleproxy pipelined scratch failed");
                     return;
                 };

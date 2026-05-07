@@ -305,7 +305,6 @@ pub const MiddleProxyContext = struct {
         };
         if (actual_len > frame_payload_len) return error.InvalidPayloadLength;
         if (frame_payload_len - actual_len > 15) return error.InvalidPayloadLength;
-        if ((actual_len & 3) != 0) return error.InvalidPayloadLength;
         return actual_len;
     }
 
@@ -482,7 +481,7 @@ pub const MiddleProxyContext = struct {
     }
 
     pub fn encapsulateSingleMessageC2S(self: *MiddleProxyContext, client_data: []const u8, is_quickack: bool, out_buf: []u8) !usize {
-        if ((client_data.len & 3) != 0) return error.InvalidPayloadLength;
+        if (self.proto_tag != .secure and (client_data.len & 3) != 0) return error.InvalidPayloadLength;
 
         var flags = Flag.magic | Flag.extmode2;
         if (self.ad_tag != null) {
@@ -781,7 +780,7 @@ test "encapsulated c2s omits ad_tag block when absent" {
     try std.testing.expectEqual(@as(usize, 56 + client_data.len), payload.len);
 }
 
-test "encapsulate c2s rejects unaligned payload length" {
+test "encapsulate c2s rejects unaligned non-secure payload length" {
     const allocator = std.testing.allocator;
 
     const key = [_]u8{0} ** 32;
@@ -957,6 +956,55 @@ test "secure c2s strips plain padded-intermediate padding" {
     std.mem.writeInt(u32, packet[0..4], @intCast(packet.len - 4), .little);
     @memcpy(packet[4 .. 4 + mtproto_payload.len], &mtproto_payload);
     @memset(packet[4 + mtproto_payload.len ..], 0x5d);
+
+    const required = try ctx.requiredC2sScratchCapacity(packet[0..]);
+    try std.testing.expectEqual(ctx.c2sFrameEncryptedLen(mtproto_payload.len), required);
+
+    var encrypted_out: [512]u8 = undefined;
+    const out = try ctx.encapsulateC2S(packet[0..], encrypted_out[0..]);
+    try std.testing.expectEqual(@as(usize, 0), ctx.c2s_len);
+
+    var decryptor = crypto.AesCbc.init(&key, &iv);
+    try decryptor.decryptInPlace(encrypted_out[0..out.len]);
+
+    const total_len = std.mem.readInt(u32, encrypted_out[0..4], .little);
+    const rpc_payload = encrypted_out[8 .. total_len - 4];
+    const flags = std.mem.readInt(u32, rpc_payload[4..8], .little);
+    try std.testing.expect((flags & Flag.pad) != 0);
+    try std.testing.expect((flags & Flag.not_encrypted) != 0);
+    try std.testing.expectEqual(@as(usize, 56 + mtproto_payload.len), rpc_payload.len);
+    try std.testing.expectEqualSlices(u8, &mtproto_payload, rpc_payload[56..]);
+}
+
+test "secure c2s accepts unaligned plain mtproto payload data" {
+    const allocator = std.testing.allocator;
+
+    const key = [_]u8{0} ** 32;
+    const iv = [_]u8{0} ** 16;
+
+    var ctx = try MiddleProxyContext.init(
+        allocator,
+        crypto.AesCbc.init(&key, &iv),
+        crypto.AesCbc.init(&key, &iv),
+        [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 },
+        -2,
+        net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
+        net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
+        .secure,
+        null,
+    );
+    defer ctx.deinit();
+
+    var mtproto_payload: [33]u8 = undefined;
+    @memset(mtproto_payload[0..8], 0);
+    @memset(mtproto_payload[8..16], 0x22);
+    std.mem.writeInt(u32, mtproto_payload[16..20], 13, .little);
+    @memset(mtproto_payload[20..], 0xdd);
+
+    var packet: [4 + mtproto_payload.len + 5]u8 = undefined;
+    std.mem.writeInt(u32, packet[0..4], @intCast(packet.len - 4), .little);
+    @memcpy(packet[4 .. 4 + mtproto_payload.len], &mtproto_payload);
+    @memset(packet[4 + mtproto_payload.len ..], 0xa7);
 
     const required = try ctx.requiredC2sScratchCapacity(packet[0..]);
     try std.testing.expectEqual(ctx.c2sFrameEncryptedLen(mtproto_payload.len), required);
