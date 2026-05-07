@@ -296,11 +296,17 @@ fn printBanner(allocator: std.mem.Allocator, cfg: config.Config, capacity_estima
     writeRaw(R ++ "\n\n");
 
     if (capacity_estimate) |est| {
+        const capacity_mode = if (cfg.use_middle_proxy)
+            "middleproxy mode"
+        else if (cfg.force_media_middle_proxy)
+            "media middleproxy mode"
+        else
+            "direct mode";
         writeRaw("  " ++ D ++ "───" ++ R ++ " " ++ B ++ cyan ++ "CAPACITY" ++ R ++ " " ++ D ++ "────────────────────────────────────" ++ R ++ "\n");
         writeStdout("      Host RAM     " ++ B ++ "{d} MiB" ++ R ++ "\n", .{est.total_ram_bytes / (1024 * 1024)});
         writeStdout("      Per conn     ~{d} KiB ({s})\n", .{
             est.per_conn_bytes / 1024,
-            if (cfg.use_middle_proxy) "middleproxy mode" else "direct mode",
+            capacity_mode,
         });
         writeStdout("      Safe cap     " ++ B ++ "~{d}" ++ R ++ " connections\n", .{est.safe_connections});
         if (cfg.max_connections > est.safe_connections) {
