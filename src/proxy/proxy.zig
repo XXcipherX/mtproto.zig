@@ -992,11 +992,15 @@ const ConnectionSlot = struct {
         if (self.client_decryptor) |*c| c.wipe();
         if (self.tg_encryptor) |*c| c.wipe();
         if (self.tg_decryptor) |*c| c.wipe();
+        if (self.mp_enc) |*c| c.wipe();
+        if (self.mp_dec) |*c| c.wipe();
 
         self.client_encryptor = null;
         self.client_decryptor = null;
         self.tg_encryptor = null;
         self.tg_decryptor = null;
+        self.mp_enc = null;
+        self.mp_dec = null;
     }
 
     fn clientHelloBuf(self: *ConnectionSlot) []u8 {
@@ -3108,6 +3112,8 @@ const EventLoop = struct {
         _ = self.state.stats_mp_fallback.fetchAdd(1, .monotonic);
         slot.use_middle_proxy = false;
         slot.mp_step = .none;
+        if (slot.mp_enc) |*enc| enc.wipe();
+        if (slot.mp_dec) |*dec| dec.wipe();
         slot.mp_enc = null;
         slot.mp_dec = null;
 
