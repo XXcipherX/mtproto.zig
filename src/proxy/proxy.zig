@@ -3116,6 +3116,8 @@ const EventLoop = struct {
         if (slot.mp_dec) |*dec| dec.wipe();
         slot.mp_enc = null;
         slot.mp_dec = null;
+        if (slot.middle_ctx) |*mp| mp.deinit();
+        slot.middle_ctx = null;
 
         slot.use_fast_mode = self.state.config.fast_mode and
             (slot.dc_abs >= 1 and slot.dc_abs <= constants.tg_datacenters_v4.len);
