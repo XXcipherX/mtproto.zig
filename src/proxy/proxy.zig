@@ -674,7 +674,7 @@ const DcConnectPlan = struct {
 };
 
 const MiddleProxyLock = struct {
-    mutex: compat.Mutex = .{},
+    mutex: compat.BlockingMutex = .{},
 
     fn lock(self: *MiddleProxyLock) void {
         self.mutex.lock();
@@ -1512,81 +1512,92 @@ pub const ProxyState = struct {
             return error.BadMiddleProxySecret;
         }
 
-        self.middle_proxy_lock.lock();
-        defer self.middle_proxy_lock.unlock();
-
         var changed = false;
+        var changed_dc4: net.Address = undefined;
+        var changed_dc203: net.Address = undefined;
+        var changed_secret_len: usize = 0;
 
-        for (0..next_primary.len) |i| {
-            if (next_primary[i]) |addr| {
-                if (!self.middle_proxy_addrs_primary[i].eql(addr)) {
-                    self.middle_proxy_addrs_primary[i] = addr;
-                    changed = true;
-                }
-            }
-            if (next_media_primary[i]) |addr| {
-                if (!self.middle_proxy_addrs_media_primary[i].eql(addr)) {
-                    self.middle_proxy_addrs_media_primary[i] = addr;
-                    changed = true;
-                }
-            }
-        }
-
-        if (next_addr_203) |addr| {
-            if (!self.middle_proxy_addr_203.eql(addr)) {
-                self.middle_proxy_addr_203 = addr;
-                changed = true;
-            }
-        }
-
-        if (next_dc4_candidates_len > 0) {
-            if (self.middle_proxy_addrs_dc4_len != next_dc4_candidates_len or
-                !addressesEqual(self.middle_proxy_addrs_dc4[0..next_dc4_candidates_len], next_dc4_candidates[0..next_dc4_candidates_len]))
-            {
-                @memcpy(self.middle_proxy_addrs_dc4[0..next_dc4_candidates_len], next_dc4_candidates[0..next_dc4_candidates_len]);
-                self.middle_proxy_addrs_dc4_len = next_dc4_candidates_len;
-                changed = true;
-            }
-        }
-
-        if (next_media_dc4_candidates_len > 0) {
-            if (self.middle_proxy_addrs_media_dc4_len != next_media_dc4_candidates_len or
-                !addressesEqual(self.middle_proxy_addrs_media_dc4[0..next_media_dc4_candidates_len], next_media_dc4_candidates[0..next_media_dc4_candidates_len]))
-            {
-                @memcpy(self.middle_proxy_addrs_media_dc4[0..next_media_dc4_candidates_len], next_media_dc4_candidates[0..next_media_dc4_candidates_len]);
-                self.middle_proxy_addrs_media_dc4_len = next_media_dc4_candidates_len;
-                changed = true;
-            }
-        }
-
-        if (next_203_candidates_len > 0) {
-            if (self.middle_proxy_addrs_203_len != next_203_candidates_len or
-                !addressesEqual(self.middle_proxy_addrs_203[0..next_203_candidates_len], next_203_candidates[0..next_203_candidates_len]))
-            {
-                @memcpy(self.middle_proxy_addrs_203[0..next_203_candidates_len], next_203_candidates[0..next_203_candidates_len]);
-                self.middle_proxy_addrs_203_len = next_203_candidates_len;
-                changed = true;
-            }
-        }
-
-        if (self.middle_proxy_secret_len != next_secret.len or
-            !std.mem.eql(u8, self.middle_proxy_secret[0..self.middle_proxy_secret_len], next_secret))
         {
-            @memset(self.middle_proxy_secret[0..], 0);
-            @memcpy(self.middle_proxy_secret[0..next_secret.len], next_secret);
-            self.middle_proxy_secret_len = next_secret.len;
-            changed = true;
+            self.middle_proxy_lock.lock();
+            defer self.middle_proxy_lock.unlock();
+
+            for (0..next_primary.len) |i| {
+                if (next_primary[i]) |addr| {
+                    if (!self.middle_proxy_addrs_primary[i].eql(addr)) {
+                        self.middle_proxy_addrs_primary[i] = addr;
+                        changed = true;
+                    }
+                }
+                if (next_media_primary[i]) |addr| {
+                    if (!self.middle_proxy_addrs_media_primary[i].eql(addr)) {
+                        self.middle_proxy_addrs_media_primary[i] = addr;
+                        changed = true;
+                    }
+                }
+            }
+
+            if (next_addr_203) |addr| {
+                if (!self.middle_proxy_addr_203.eql(addr)) {
+                    self.middle_proxy_addr_203 = addr;
+                    changed = true;
+                }
+            }
+
+            if (next_dc4_candidates_len > 0) {
+                if (self.middle_proxy_addrs_dc4_len != next_dc4_candidates_len or
+                    !addressesEqual(self.middle_proxy_addrs_dc4[0..next_dc4_candidates_len], next_dc4_candidates[0..next_dc4_candidates_len]))
+                {
+                    @memcpy(self.middle_proxy_addrs_dc4[0..next_dc4_candidates_len], next_dc4_candidates[0..next_dc4_candidates_len]);
+                    self.middle_proxy_addrs_dc4_len = next_dc4_candidates_len;
+                    changed = true;
+                }
+            }
+
+            if (next_media_dc4_candidates_len > 0) {
+                if (self.middle_proxy_addrs_media_dc4_len != next_media_dc4_candidates_len or
+                    !addressesEqual(self.middle_proxy_addrs_media_dc4[0..next_media_dc4_candidates_len], next_media_dc4_candidates[0..next_media_dc4_candidates_len]))
+                {
+                    @memcpy(self.middle_proxy_addrs_media_dc4[0..next_media_dc4_candidates_len], next_media_dc4_candidates[0..next_media_dc4_candidates_len]);
+                    self.middle_proxy_addrs_media_dc4_len = next_media_dc4_candidates_len;
+                    changed = true;
+                }
+            }
+
+            if (next_203_candidates_len > 0) {
+                if (self.middle_proxy_addrs_203_len != next_203_candidates_len or
+                    !addressesEqual(self.middle_proxy_addrs_203[0..next_203_candidates_len], next_203_candidates[0..next_203_candidates_len]))
+                {
+                    @memcpy(self.middle_proxy_addrs_203[0..next_203_candidates_len], next_203_candidates[0..next_203_candidates_len]);
+                    self.middle_proxy_addrs_203_len = next_203_candidates_len;
+                    changed = true;
+                }
+            }
+
+            if (self.middle_proxy_secret_len != next_secret.len or
+                !std.mem.eql(u8, self.middle_proxy_secret[0..self.middle_proxy_secret_len], next_secret))
+            {
+                @memset(self.middle_proxy_secret[0..], 0);
+                @memcpy(self.middle_proxy_secret[0..next_secret.len], next_secret);
+                self.middle_proxy_secret_len = next_secret.len;
+                changed = true;
+            }
+
+            if (changed) {
+                changed_dc4 = self.middle_proxy_addrs_primary[3];
+                changed_dc203 = self.middle_proxy_addr_203;
+                changed_secret_len = self.middle_proxy_secret_len;
+            }
         }
 
         if (changed) {
             var dc4_buf: [64]u8 = undefined;
             var dc203_buf: [64]u8 = undefined;
-            const dc4_str = formatAddress(self.middle_proxy_addrs_primary[3], &dc4_buf);
-            const dc203_str = formatAddress(self.middle_proxy_addr_203, &dc203_buf);
+            const dc4_str = formatAddress(changed_dc4, &dc4_buf);
+            const dc203_str = formatAddress(changed_dc203, &dc203_buf);
             log.info("Middle-proxy cache updated: dc4={s} dc203={s} secret_len={d}", .{
                 dc4_str,
                 dc203_str,
-                self.middle_proxy_secret_len,
+                changed_secret_len,
             });
         }
     }

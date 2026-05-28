@@ -123,6 +123,59 @@ pub const Mutex = struct {
     }
 };
 
+pub const BlockingMutex = struct {
+    state: std.atomic.Value(u32) = .init(unlocked),
+
+    const unlocked: u32 = 0;
+    const locked: u32 = 1;
+    const contended: u32 = 2;
+
+    pub fn lock(self: *BlockingMutex) void {
+        if (self.state.cmpxchgWeak(unlocked, locked, .acquire, .monotonic) == null) return;
+
+        while (self.state.swap(contended, .acquire) != unlocked) {
+            futexWait(&self.state, contended);
+        }
+    }
+
+    pub fn unlock(self: *BlockingMutex) void {
+        if (self.state.swap(unlocked, .release) == contended) {
+            futexWake(&self.state, 1);
+        }
+    }
+};
+
+fn futexWait(ptr: *const std.atomic.Value(u32), expect: u32) void {
+    if (builtin.os.tag != .linux) {
+        while (ptr.load(.monotonic) == expect) std.atomic.spinLoopHint();
+        return;
+    }
+
+    const linux = std.os.linux;
+    const rc = linux.futex_4arg(ptr, .{ .cmd = .WAIT, .private = true }, expect, null);
+    switch (linux.errno(rc)) {
+        .SUCCESS, .INTR, .AGAIN, .INVAL => {},
+        .TIMEDOUT => unreachable,
+        .FAULT => unreachable,
+        else => {},
+    }
+}
+
+fn futexWake(ptr: *const std.atomic.Value(u32), max_waiters: u32) void {
+    if (builtin.os.tag != .linux) return;
+
+    const linux = std.os.linux;
+    const rc = linux.futex_3arg(
+        &ptr.raw,
+        .{ .cmd = .WAKE, .private = true },
+        @min(max_waiters, std.math.maxInt(i32)),
+    );
+    switch (linux.errno(rc)) {
+        .SUCCESS, .INVAL, .FAULT => {},
+        else => {},
+    }
+}
+
 fn nanoTimestampLinux() i128 {
     const linux = std.os.linux;
     var ts: linux.timespec = undefined;
