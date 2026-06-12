@@ -42,6 +42,13 @@ port = 443
 # Default is 120; raise if your client mix keeps many pre-warmed idle sockets.
 # idle_timeout_sec = 120
 
+# Close an established relay where the server's last reply has gone unanswered
+# by the client for this many seconds. This bounds an iOS MtProtoKit bad_salt
+# wedge where "Updating" hangs until the DC closes the socket. Fires only after
+# the client has sent relay payload and the last relayed payload was server->client.
+# 0 = disabled (default). If enabled, start around 10-15 and tune to taste.
+# client_silence_close_sec = 0
+
 # Seconds to complete TLS+MTProto handshake after first byte arrives.
 # Default is 15; parser enforces a minimum of 5.
 # handshake_timeout_sec = 15

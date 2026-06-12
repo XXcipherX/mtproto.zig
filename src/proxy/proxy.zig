@@ -819,6 +819,10 @@ const ConnectionSlot = struct {
     created_at_ms: i64 = 0,
     first_byte_at_ms: i64 = 0,
     last_activity_ms: i64 = 0,
+    /// Last relayed payload time in each direction. If the server spoke more
+    /// recently than the client, the server reply is unanswered.
+    last_client_byte_ms: i64 = 0,
+    last_server_byte_ms: i64 = 0,
     desync_deadline_ns: i128 = 0,
 
     // Initial TLS handshake reassembly
@@ -1839,6 +1843,8 @@ const EventLoop = struct {
             slot.phase = .reading_tls_header;
             slot.created_at_ms = compat.milliTimestamp();
             slot.last_activity_ms = slot.created_at_ms;
+            slot.last_client_byte_ms = 0;
+            slot.last_server_byte_ms = 0;
             slot.drs = DynamicRecordSizer.init(self.state.config.drs);
 
             if (self.addFd(cfd, true, false)) |_| {
@@ -2728,6 +2734,8 @@ const EventLoop = struct {
             }
 
             slot.c2s_bytes += data.len;
+            slot.last_activity_ms = compat.milliTimestamp();
+            slot.last_client_byte_ms = slot.last_activity_ms;
             self.state.allocator.free(buf);
             slot.pipelined_data = null;
             slot.pipelined_len = 0;
@@ -2748,6 +2756,7 @@ const EventLoop = struct {
         };
         if (progress == .forwarded or progress == .partial) {
             slot.last_activity_ms = compat.milliTimestamp();
+            slot.last_client_byte_ms = slot.last_activity_ms;
         }
     }
 
@@ -2765,6 +2774,7 @@ const EventLoop = struct {
         };
         if (progress == .forwarded or progress == .partial) {
             slot.last_activity_ms = compat.milliTimestamp();
+            slot.last_server_byte_ms = slot.last_activity_ms;
         }
     }
 
@@ -3385,6 +3395,17 @@ const EventLoop = struct {
                     continue;
                 }
             } else if (slot.phase == .relaying or slot.phase == .mask_relaying) {
+                // Break an iOS MtProtoKit bad_salt wedge: after a server reply,
+                // the client may stop sending until the DC closes the socket.
+                if (slot.phase == .relaying and self.state.config.client_silence_close_sec > 0 and
+                    slot.last_client_byte_ms > 0 and
+                    slot.last_server_byte_ms > slot.last_client_byte_ms and
+                    now_ms - slot.last_server_byte_ms > secondsToMs(self.state.config.client_silence_close_sec))
+                {
+                    log.info("[{d}] closing relay: server reply unanswered {d}s (iOS bad_salt wedge breaker)", .{ slot.conn_id, self.state.config.client_silence_close_sec });
+                    self.closeSlot(slot, "client silence wedge breaker");
+                    continue;
+                }
                 if (now_ms - slot.last_activity_ms > secondsToMs(self.state.config.idle_timeout_sec)) {
                     self.closeSlot(slot, "relay idle timeout");
                     continue;

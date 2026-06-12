@@ -30,6 +30,10 @@ pub const Config = struct {
     max_connections: u32 = 512,
     /// Pre-handshake idle timeout: wait for first client byte
     idle_timeout_sec: u32 = 120,
+    /// Close a relay when the server has replied but the client stays silent for
+    /// this many seconds; 0 = disabled. This bounds an iOS MtProtoKit bad_salt
+    /// wedge where the client stops sending until the DC closes the socket.
+    client_silence_close_sec: u32 = 0,
     /// Handshake read timeout after first byte arrives
     handshake_timeout_sec: u32 = 15,
     tag: ?[16]u8 = null,
@@ -348,6 +352,10 @@ pub const Config = struct {
                     } else if (std.mem.eql(u8, key, "idle_timeout_sec")) {
                         if (parseIntSetting(u32, key, value)) |parsed| {
                             cfg.idle_timeout_sec = @max(@as(u32, 5), parsed);
+                        }
+                    } else if (std.mem.eql(u8, key, "client_silence_close_sec")) {
+                        if (parseIntSetting(u32, key, value)) |parsed| {
+                            cfg.client_silence_close_sec = parsed;
                         }
                     } else if (std.mem.eql(u8, key, "handshake_timeout_sec")) {
                         if (parseIntSetting(u32, key, value)) |parsed| {

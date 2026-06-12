@@ -372,6 +372,7 @@ port = 443
 public_ip = "proxy.example.com"
 # tag = "<your-promotion-tag>"   # Optional: 32 hex-char promotion tag from @MTProxybot
 # max_connections = 10000        # Optional high-capacity override; startup auto-clamps unless unsafe_override_limits=true
+# client_silence_close_sec = 0    # Close relays whose last server reply is unanswered by the client for N seconds; 0 = off
 
 [censorship]
 tls_domain = "proxy.example.com"
@@ -628,6 +629,7 @@ backlog = 4096                             # TCP listen queue size
 middleproxy_buffer_kb = 1024               # ME C2S/S2C buffers grow on demand up to this cap; runtime caps effective value at 16384 KiB
 max_connections = 512                      # Safe default for small (1 vCPU / ~1 GB) VPS
 idle_timeout_sec = 120
+# client_silence_close_sec = 0             # Close relays whose last server reply is unanswered by the client for N seconds
 handshake_timeout_sec = 15
 tag = "1234567890abcdef1234567890abcdef"   # Optional: promotion tag from @MTProxybot
 log_level = "info"                         # Runtime log level: debug, info, warn, err
@@ -670,6 +672,7 @@ alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eli
 | `[server]` | `backlog` | `4096` | TCP listen queue size (for high-traffic loads) |
 | `[server]` | `max_connections` | `512` | Concurrent connection cap (small-VPS tuned default, parser lower bound 32). On Linux, startup first auto-clamps this to the RAM-safe estimate unless `unsafe_override_limits=true`; the proxy then clamps again if `RLIMIT_NOFILE` cannot cover the fd budget |
 | `[server]` | `idle_timeout_sec` | `120` | Connection idle timeout in seconds (also used before first client byte; parser lower bound 5) |
+| `[server]` | `client_silence_close_sec` | `0` | Close an established relay when the server's last reply has gone unanswered by the client for N seconds. This bounds an iOS MtProtoKit bad_salt wedge where "Updating" can hang until the DC closes the socket. Fires only when the last relayed payload was server→client and the client has sent relay payload before. `0` disables it; if enabled, start around `10`-`15` and tune to taste |
 | `[server]` | `handshake_timeout_sec` | `15` | Timeout for completing handshake after first byte (parser lower bound 5) |
 | `[server]` | `middleproxy_buffer_kb` | `1024` | MiddleProxy per-direction buffer cap in KiB. Active ME connections start with 16 KiB C2S/S2C buffers and grow on demand up to `min(middleproxy_buffer_kb, 16384)` KiB; each event loop also keeps lazy shared scratch buffers. Values below 1024 may still cause `MiddleProxyBufferOverflow` on media-heavy traffic (Stories, video messages). Parser lower bound is 64 KiB |
 | `[server]` | `tag` | _(none)_ | Optional 32 hex-char promotion tag from [@MTProxybot](https://t.me/MTProxybot) |
