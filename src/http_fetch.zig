@@ -1,6 +1,8 @@
 const std = @import("std");
 const compat = @import("compat.zig");
 
+const log = std.log.scoped(.http_fetch);
+
 pub const default_timeout_sec: u32 = 10;
 
 pub const FetchOptions = struct {
@@ -27,7 +29,7 @@ pub fn fetchUrlBytes(allocator: std.mem.Allocator, url: []const u8, options: Fet
     defer threaded_io.deinit();
 
     const io = threaded_io.io();
-    if (options.timeout_sec == 0) return fetchUrlBytesWithIo(allocator, url, options, io);
+    if (options.timeout_sec == 0) return fetchUrlBytesWithFallback(allocator, url, options, io);
 
     const worker_allocator = std.heap.page_allocator;
     const url_copy = try worker_allocator.dupe(u8, url);
@@ -76,7 +78,7 @@ pub fn fetchUrlBytes(allocator: std.mem.Allocator, url: []const u8, options: Fet
 }
 
 fn fetchUrlBytesSignaled(task: FetchTask) ![]u8 {
-    const result = fetchUrlBytesWithIo(
+    const result = fetchUrlBytesWithFallback(
         task.allocator,
         task.url,
         task.options,
@@ -84,6 +86,21 @@ fn fetchUrlBytesSignaled(task: FetchTask) ![]u8 {
     );
     task.queue.putOneUncancelable(task.io, .fetch) catch {};
     return result;
+}
+
+fn fetchUrlBytesWithFallback(
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    options: FetchOptions,
+    io: std.Io,
+) ![]u8 {
+    return fetchUrlBytesWithIo(allocator, url, options, io) catch |err| {
+        if (std.mem.eql(u8, @errorName(err), "ResolvConfParseFailed")) {
+            log.warn("std.http resolver failed for {s} with ResolvConfParseFailed; retrying via curl", .{url});
+            return runCurlFetch(allocator, url, options, io);
+        }
+        return err;
+    };
 }
 
 fn fetchTimeoutSignaled(
@@ -151,4 +168,57 @@ fn fetchUrlBytesWithIo(
     var transfer_buf: [4 * 1024]u8 = undefined;
     const reader = response.reader(&transfer_buf);
     return reader.allocRemaining(allocator, .limited(options.max_response_bytes));
+}
+
+fn runCurlFetch(
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    options: FetchOptions,
+    io: std.Io,
+) ![]u8 {
+    var timeout_buf: [16]u8 = undefined;
+    const timeout = if (options.timeout_sec == 0) default_timeout_sec else options.timeout_sec;
+    const timeout_arg = try std.fmt.bufPrint(&timeout_buf, "{d}", .{timeout});
+
+    const argv = [_][]const u8{
+        "curl",
+        "--silent",
+        "--fail",
+        "--show-error",
+        "--location",
+        "--max-time",
+        timeout_arg,
+        url,
+    };
+
+    const result = std.process.run(allocator, io, .{
+        .argv = &argv,
+        .stdout_limit = std.Io.Limit.limited(options.max_response_bytes),
+        .stderr_limit = std.Io.Limit.limited(1 * 1024 * 1024),
+    }) catch |err| {
+        log.warn("curl fetch failed to start for {s}: {any}", .{ url, err });
+        return err;
+    };
+    defer allocator.free(result.stderr);
+
+    switch (result.term) {
+        .exited => |code| {
+            if (code != 0) {
+                log.warn("curl fetch {s} exited with {d}: {s}", .{
+                    url,
+                    code,
+                    std.mem.trim(u8, result.stderr, " \t\r\n"),
+                });
+                allocator.free(result.stdout);
+                return error.HttpRequestFailed;
+            }
+        },
+        else => {
+            log.warn("curl fetch {s} terminated abnormally", .{url});
+            allocator.free(result.stdout);
+            return error.HttpRequestFailed;
+        },
+    }
+
+    return result.stdout;
 }

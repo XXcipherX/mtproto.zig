@@ -23,7 +23,7 @@ Production MTProto proxy implemented in Zig with FakeTLS entry, obfuscated MTPro
 - File descriptors are tracked via epoll + fd-to-slot mapping.
 - Recent runtime changes added safer failed-connect cleanup, bounded timer scanning, fd-budget clamping, 90%/80% saturation hysteresis, low-noise periodic connection stats, classed message-queue blocks, and lazy MiddleProxy stream/scratch buffers.
 - Outbound data uses `MessageQueue` block classes (64/512/2048 byte storage) with `writev` flushing and a 4 MiB pending-byte cap per direction queue.
-- When any MiddleProxy path is enabled (`use_middle_proxy` or `force_media_middle_proxy`), a joinable background updater thread refreshes MiddleProxy metadata from Telegram core endpoints once per 24h and is stopped on `ProxyState.deinit`.
+- When any MiddleProxy path is enabled (`use_middle_proxy` or `force_media_middle_proxy`), a joinable background updater thread refreshes MiddleProxy metadata from Telegram core endpoints hourly, can wake early after stalled MiddleProxy handshakes, and is stopped on `ProxyState.deinit`.
 
 Code anchors:
 
@@ -51,7 +51,7 @@ Code anchors:
 
 - Config text source: `https://core.telegram.org/getProxyConfig`
 - Secret source: `https://core.telegram.org/getProxySecret`
-- Refresh cadence: every 24h in updater thread.
+- Refresh cadence: hourly in the updater thread, with debounced reactive refresh after stalled MiddleProxy handshakes.
 - Bundled defaults are used when refresh fails.
 - Candidate sets are kept separately for regular DC1..5, media-path DC1..5, DC4 candidate lists, and DC203; selection can test reachability.
 

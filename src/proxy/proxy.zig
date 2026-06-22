@@ -32,7 +32,10 @@ const timer_scan_budget: usize = 512;
 const nofile_fd_overhead: usize = 512;
 const middle_proxy_config_url = "https://core.telegram.org/getProxyConfig";
 const middle_proxy_secret_url = "https://core.telegram.org/getProxySecret";
-const middle_proxy_update_period_ns: u64 = 24 * 60 * 60 * std.time.ns_per_s;
+// Telegram can rotate MiddleProxy endpoints/secrets within a day. Hourly
+// best-effort refresh bounds stale metadata without adding meaningful load.
+const middle_proxy_update_period_ns: u64 = 60 * 60 * std.time.ns_per_s;
+const middle_proxy_reactive_cooldown_ns: u64 = 60 * std.time.ns_per_s;
 const middle_proxy_update_stop_poll_ns: u64 = std.time.ns_per_s;
 const tunnel_mask_gateway_ip = "10.200.200.1";
 const min_nofile_soft: usize = 65535;
@@ -657,6 +660,17 @@ const MiddleProxyHandshakeStep = enum {
     sending_rpc_handshake,
     waiting_rpc_handshake_response,
     done,
+
+    fn awaitingMiddleProxy(self: MiddleProxyHandshakeStep) bool {
+        return switch (self) {
+            .sending_rpc_nonce,
+            .waiting_rpc_nonce_response,
+            .sending_rpc_handshake,
+            .waiting_rpc_handshake_response,
+            => true,
+            .none, .done => false,
+        };
+    }
 };
 
 const RelayProgress = enum {
@@ -664,6 +678,15 @@ const RelayProgress = enum {
     partial,
     forwarded,
 };
+
+test "MiddleProxyHandshakeStep.awaitingMiddleProxy gates reactive refresh" {
+    try std.testing.expect(!MiddleProxyHandshakeStep.none.awaitingMiddleProxy());
+    try std.testing.expect(MiddleProxyHandshakeStep.sending_rpc_nonce.awaitingMiddleProxy());
+    try std.testing.expect(MiddleProxyHandshakeStep.waiting_rpc_nonce_response.awaitingMiddleProxy());
+    try std.testing.expect(MiddleProxyHandshakeStep.sending_rpc_handshake.awaitingMiddleProxy());
+    try std.testing.expect(MiddleProxyHandshakeStep.waiting_rpc_handshake_response.awaitingMiddleProxy());
+    try std.testing.expect(!MiddleProxyHandshakeStep.done.awaitingMiddleProxy());
+}
 
 const DcConnectPlan = struct {
     candidates: [16]net.Address = undefined,
@@ -1151,6 +1174,7 @@ pub const ProxyState = struct {
     middle_proxy_secret_len: usize,
     middle_proxy_nat_ip4: ?[4]u8,
     middle_proxy_updater_stop: std.atomic.Value(bool),
+    middle_proxy_refresh_requested: std.atomic.Value(bool),
     middle_proxy_updater_thread: ?std.Thread,
 
     pub fn init(allocator: std.mem.Allocator, cfg: Config) !ProxyState {
@@ -1274,6 +1298,7 @@ pub const ProxyState = struct {
             .middle_proxy_secret_len = middleproxy.proxy_secret.len,
             .middle_proxy_nat_ip4 = detected_nat_ip4,
             .middle_proxy_updater_stop = std.atomic.Value(bool).init(false),
+            .middle_proxy_refresh_requested = std.atomic.Value(bool).init(false),
             .middle_proxy_updater_thread = null,
         };
     }
@@ -1421,10 +1446,20 @@ pub const ProxyState = struct {
         }
     }
 
+    fn requestMiddleProxyRefresh(self: *ProxyState) void {
+        self.middle_proxy_refresh_requested.store(true, .release);
+    }
+
     fn waitMiddleProxyUpdatePeriod(self: *ProxyState) bool {
         var slept_ns: u64 = 0;
         while (slept_ns < middle_proxy_update_period_ns) {
             if (self.middle_proxy_updater_stop.load(.acquire)) return false;
+            if (slept_ns >= middle_proxy_reactive_cooldown_ns and
+                self.middle_proxy_refresh_requested.swap(false, .acq_rel))
+            {
+                log.info("Middle-proxy reactive refresh: stalled handshake(s) suggest stale metadata", .{});
+                return true;
+            }
             const chunk = @min(middle_proxy_update_stop_poll_ns, middle_proxy_update_period_ns - slept_ns);
             compat.sleep(chunk);
             slept_ns += chunk;
@@ -3391,6 +3426,9 @@ const EventLoop = struct {
                     }
                 } else if (now_ms - slot.first_byte_at_ms > secondsToMs(self.state.config.handshake_timeout_sec)) {
                     _ = self.state.stats_hs_timeout.fetchAdd(1, .monotonic);
+                    if (slot.phase == .middle_proxy_handshake and slot.mp_step.awaitingMiddleProxy()) {
+                        self.state.requestMiddleProxyRefresh();
+                    }
                     self.closeSlot(slot, "handshake timeout");
                     continue;
                 }

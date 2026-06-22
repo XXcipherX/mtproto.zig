@@ -58,7 +58,7 @@ Connection-capacity methodology and command profiles: `test/README.md`.
 ## Runtime Model
 
 - Client relay is handled by a single-threaded Linux `epoll` event loop.
-- When any MiddleProxy path is enabled (`use_middle_proxy` or `force_media_middle_proxy`), a joinable background updater thread periodically refreshes MiddleProxy metadata from Telegram core endpoints.
+- When any MiddleProxy path is enabled (`use_middle_proxy` or `force_media_middle_proxy`), a joinable background updater thread refreshes MiddleProxy metadata from Telegram core endpoints hourly and can wake early after stalled MiddleProxy handshakes.
 - FakeTLS validation expects Telegram-style 32-byte ClientHello Session IDs and copies the Session ID into the synthetic ServerHello.
 - Handshake and relay lifetimes are controlled by event-loop timers (`idle_timeout_sec`, `handshake_timeout_sec`), not by `SO_RCVTIMEO`.
 - Failed non-blocking upstream connects are reclaimed immediately on fatal hangup events; the relay loop should not spin on dead upstream sockets.
@@ -175,7 +175,7 @@ For a fresh self-domain install, pass `MASK_DOMAIN` as shown below or enter the 
 
 ## Docker image
 
-The repository includes a **multi-stage Dockerfile**: Zig is bootstrapped from the official tarball inside the build stage; the runtime image is Debian **bookworm-slim** with `curl` and CA certs. The proxy binary performs HTTPS public-IP detection and MiddleProxy metadata refresh itself, so CA certs are required; `curl` is kept for container-side diagnostics and operator convenience. The process runs as **root** inside the container (simple bind to port 443). The image ships `config.toml.example` as `/etc/mtproto-proxy/config.toml` for a quick start; mount your own file for real secrets and settings.
+The repository includes a **multi-stage Dockerfile**: Zig is bootstrapped from the official tarball inside the build stage; the runtime image is Debian **bookworm-slim** with `curl` and CA certs. The proxy binary performs HTTPS public-IP detection and MiddleProxy metadata refresh itself, so CA certs are required; `curl` is kept for container-side diagnostics and as a fallback when the Zig resolver rejects a malformed `/etc/resolv.conf`. The process runs as **root** inside the container (simple bind to port 443). The image ships `config.toml.example` as `/etc/mtproto-proxy/config.toml` for a quick start; mount your own file for real secrets and settings.
 
 ### Build
 
@@ -716,7 +716,7 @@ alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eli
 
 > **Note** &nbsp; The parser supports inline `#` / `;` comments after values and treats duplicate owned string/user/direct-user entries as last-write-wins without leaking previous allocations.
 
-> **Note** &nbsp; MiddleProxy settings (regular DC1..5 endpoints + media-path endpoints + shared secret) are refreshed automatically from Telegram (`getProxyConfig`, `getProxySecret`) with bundled defaults as fallback.
+> **Note** &nbsp; MiddleProxy settings (regular DC1..5 endpoints + media-path endpoints + shared secret) are refreshed automatically from Telegram (`getProxyConfig`, `getProxySecret`) every hour, with reactive early refresh after stalled MiddleProxy handshakes and bundled defaults as fallback.
 
 ## &nbsp; Troubleshooting ("Updating...")
 
