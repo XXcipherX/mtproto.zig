@@ -224,6 +224,25 @@ docker buildx build \
   --push .
 ```
 
+### Publish from GitHub Actions
+
+The repository includes a manual workflow: **Actions -> Publish Docker image -> Run workflow**.
+It builds the Dockerfile with Buildx and pushes to GitHub Container Registry:
+
+```text
+ghcr.io/<owner>/<repo>:latest
+ghcr.io/<owner>/<repo>:<tag>
+ghcr.io/<owner>/<repo>:sha-<commit>
+```
+
+For this repository, the default public image name is:
+
+```text
+ghcr.io/xxcipherx/mtproto.zig:latest
+```
+
+The workflow lowercases the repository path automatically because GHCR image names must be lowercase. If the package is private, log in on the server before pulling, or pass `GHCR_USER` and `GHCR_TOKEN` to the Compose installer below.
+
 ### Run
 
 Publish the listen port from your config (the bundled example listens on `443`). For production, mount your `config.toml` over the default:
@@ -240,6 +259,38 @@ docker run --rm \
 If your config sets `server.port = 8443`, publish `-p 8443:8443` instead.
 
 OS-level mitigations from `deploy/` (iptables `TCPMSS`, `nfqws`, etc.) are **not** applied inside the container; only the proxy binary runs there.
+
+### Docker Compose install
+
+For VPS installs from a prebuilt image, use the Docker Compose installer. It mirrors the one-line source installer for host-level setup: creates `/opt/mtproto-proxy/config.toml`, writes `/opt/mtproto-proxy/compose.yml`, installs a `mtproto-proxy.service` Docker Compose wrapper, configures self-domain Nginx masking, applies TCPMSS, installs nfqws, pulls the image, starts the container, and prints the `tg://` link:
+
+```bash
+curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/install_docker_compose.sh \
+  | sudo env TLS_DOMAIN=proxy.example.com IMAGE=ghcr.io/xxcipherx/mtproto.zig:latest bash
+```
+
+Useful environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `IMAGE` | `ghcr.io/xxcipherx/mtproto.zig:latest` | Docker image to pull |
+| `TLS_DOMAIN` | _(required on first install)_ | Domain encoded into the `ee` secret and used as FakeTLS SNI |
+| `PUBLIC_IP` | `TLS_DOMAIN` | Host/domain shown in generated Telegram links |
+| `PORT` | `443` | Listen port in generated config |
+| `SECRET` | random | 32-hex user secret; generated once when config is absent |
+| `USE_MIDDLE_PROXY` | `true` | Initial `use_middle_proxy` value |
+| `ENABLE_MASKING` | `true` | Install Nginx/certbot masking and set `mask = true` |
+| `MASK_PORT` | `8443` | Local Nginx HTTPS masking backend port |
+| `GHCR_USER` / `GHCR_TOKEN` | _(empty)_ | Optional login for private GHCR packages |
+
+The installer requires Docker Compose v2 (`docker compose`) and installs Docker Engine + the Compose plugin via Docker's convenience script if either Docker or the plugin is missing. The Compose service uses `network_mode: host`, so the container binds the configured port directly on the VPS. Re-run the installer to pull and restart with a newer image, or update manually:
+
+```bash
+cd /opt/mtproto-proxy
+docker compose --env-file .env -f compose.yml pull
+sudo systemctl restart mtproto-proxy
+docker compose --env-file .env -f compose.yml logs -f
+```
 
 ## &nbsp; Deploy to Server
 
