@@ -262,7 +262,7 @@ OS-level mitigations from `deploy/` (iptables `TCPMSS`, `nfqws`, etc.) are **not
 
 ### Docker Compose install
 
-For VPS installs from a prebuilt image, use the Docker Compose installer. It mirrors the one-line source installer for host-level setup: creates `/opt/mtproto-proxy/config.toml`, writes `/opt/mtproto-proxy/compose.yml`, installs a `mtproto-proxy.service` Docker Compose wrapper, configures self-domain Nginx masking, applies TCPMSS, installs nfqws, pulls the image, starts the container, and prints the `tg://` link:
+For VPS installs from a prebuilt image, use the Docker Compose installer. It mirrors the one-line source installer for host-level setup: creates `/opt/mtproto-proxy/config.toml`, writes `/opt/mtproto-proxy/compose.yml`, installs a `mtproto-proxy.service` Docker Compose wrapper, configures self-domain Nginx masking, applies TCPMSS, installs inbound SYN pacing, installs nfqws, pulls the image, starts the container, and prints the `tg://` link:
 
 ```bash
 curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/install_docker_compose.sh \
@@ -307,11 +307,12 @@ This will:
 4. Create a `systemd` service (`mtproto-proxy`)
 5. Open the configured proxy port in `ufw` (if active)
 6. Apply **TCPMSS=88** iptables/ip6tables rules when available (passive DPI bypass)
-7. Install **IPv6 hop script** when `CF_TOKEN`+`CF_ZONE`+`IPV6_PREFIX` are provided
-8. Set up self-domain Nginx 404 masking on `127.0.0.1:8443`, including Let's Encrypt on TCP/80 and the masking health timer
-9. Attempt OS-level `zapret` / `nfqws` TCP desync setup
-10. Refresh optional monitor files if `proxy-monitor` already exists
-11. Print a ready-to-use `tg://` connection link when `[access.users]` contains a valid 32-hex secret
+7. Install inbound SYN pacing for Android/Desktop handshake stability
+8. Install **IPv6 hop script** when `CF_TOKEN`+`CF_ZONE`+`IPV6_PREFIX` are provided
+9. Set up self-domain Nginx 404 masking on `127.0.0.1:8443`, including Let's Encrypt on TCP/80 and the masking health timer
+10. Attempt OS-level `zapret` / `nfqws` TCP desync setup
+11. Refresh optional monitor files if `proxy-monitor` already exists
+12. Print a ready-to-use `tg://` connection link when `[access.users]` contains a valid 32-hex secret
 
 ### Self-Domain 404 Masking
 

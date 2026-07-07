@@ -16,9 +16,10 @@
 #   4. Creates a systemd service
 #   5. Opens configured proxy port in ufw (if active)
 #   6. Applies TCPMSS clamping (DPI bypass: splits ClientHello into tiny packets)
-#   7. Installs IPv6 address hopping script + cron job (optional, requires CF_TOKEN + CF_ZONE + IPV6_PREFIX)
-#   8. Installs masking self-healing monitor (nginx + timer watchdog)
-#   9. Prints the ready-to-use tg:// link
+#   7. Installs inbound SYN pacing for Android/Desktop handshake stability
+#   8. Installs IPv6 address hopping script + cron job (optional, requires CF_TOKEN + CF_ZONE + IPV6_PREFIX)
+#   9. Installs masking self-healing monitor (nginx + timer watchdog)
+#   10. Prints the ready-to-use tg:// link
 
 set -euo pipefail
 
@@ -323,6 +324,7 @@ fi
 # the final banner from being displayed.
 
 MASKING_OK=false
+SYNFIX_OK=false
 NFQWS_OK=false
 
 info "Setting up Self-domain Nginx Masking (zero-RTT)..."
@@ -330,6 +332,13 @@ if MASK_DOMAIN="$TLS_DOMAIN" bash "$TMPBUILD/deploy/setup_masking.sh" "$TLS_DOMA
     MASKING_OK=true
 else
     warn "Masking setup failed (non-critical, proxy still works). Check DNS A record, TCP/80, and run: sudo env MASK_DOMAIN=${TLS_DOMAIN} bash ${INSTALL_DIR}/setup_masking.sh"
+fi
+
+info "Setting up inbound SYN pacing..."
+if PORT="$PORT" bash "$TMPBUILD/deploy/setup_synfix.sh" < /dev/null 2>&1; then
+    SYNFIX_OK=true
+else
+    warn "SYN pacing setup failed (non-critical, proxy still works)"
 fi
 
 info "Setting up zapret nfqws TCP desync..."
@@ -455,6 +464,11 @@ echo ""
 echo -e "  ${BOLD}DPI Bypass:${RESET}"
 echo -e "  ${GREEN}✓${RESET} Anti-Replay Cache (ТСПУ Revisor protection)"
 echo -e "  ${GREEN}✓${RESET} TCPMSS=88 (ClientHello fragmentation)"
+if $SYNFIX_OK; then
+echo -e "  ${GREEN}✓${RESET} Inbound SYN pacing (Android/Desktop handshake stability)"
+else
+echo -e "  ${RED}✗${RESET} Inbound SYN pacing (setup failed)"
+fi
 if $MASKING_OK; then
 echo -e "  ${GREEN}✓${RESET} Self-domain Nginx Masking (Zero-RTT Active Probe defense)"
 else

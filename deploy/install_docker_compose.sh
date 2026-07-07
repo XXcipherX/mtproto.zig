@@ -32,6 +32,7 @@ CONFIG_FILE="${INSTALL_DIR}/config.toml"
 SERVICE_NAME="mtproto-proxy"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 MASKING_OK=false
+SYNFIX_OK=false
 NFQWS_OK=false
 
 RED='\033[0;31m'
@@ -167,7 +168,7 @@ install_packages() {
 fetch_helper_scripts() {
     info "Fetching deployment helper scripts..."
     local file
-    for file in setup_masking.sh setup_nfqws.sh setup_mask_monitor.sh ipv6-hop.sh update_dns.sh; do
+    for file in setup_masking.sh setup_nfqws.sh setup_synfix.sh setup_mask_monitor.sh ipv6-hop.sh update_dns.sh; do
         curl -fsSL "${REPO_RAW_URL}/deploy/${file}" -o "${INSTALL_DIR}/${file}" \
             || fail "Failed to download deploy/${file}"
         chmod 0755 "${INSTALL_DIR}/${file}"
@@ -383,6 +384,14 @@ setup_masking_and_desync() {
         warn "Self-domain Nginx Masking disabled by ENABLE_MASKING=false"
     fi
 
+    info "Setting up inbound SYN pacing..."
+    if PORT="$PORT" bash "${INSTALL_DIR}/setup_synfix.sh" < /dev/null; then
+        SYNFIX_OK=true
+        ok "Inbound SYN pacing configured"
+    else
+        warn "Inbound SYN pacing setup failed"
+    fi
+
     info "Setting up zapret nfqws TCP desync..."
     if bash "${INSTALL_DIR}/setup_nfqws.sh" < /dev/null; then
         NFQWS_OK=true
@@ -445,6 +454,11 @@ print_summary() {
     echo -e "  ${BOLD}DPI Bypass:${RESET}"
     echo -e "  ${GREEN}+${RESET} Anti-Replay Cache"
     echo -e "  ${GREEN}+${RESET} TCPMSS=88"
+    if $SYNFIX_OK; then
+        echo -e "  ${GREEN}+${RESET} Inbound SYN pacing"
+    else
+        echo -e "  ${RED}!${RESET} Inbound SYN pacing"
+    fi
     if $MASKING_OK; then
         echo -e "  ${GREEN}+${RESET} Self-domain Nginx Masking"
     else
