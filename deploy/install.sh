@@ -5,6 +5,9 @@
 # Usage (fresh install or update):
 #   curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/install.sh | sudo bash
 #
+# Optional environment:
+#   ENABLE_SYNFIX=true   # install inbound SYN pacing rules for filtered routes
+#
 # The script is idempotent:
 #   - On first run: installs Zig, builds proxy, generates config, sets up systemd + DPI bypass.
 #   - On subsequent runs: rebuilds from latest source, replaces binary, preserves config.toml.
@@ -16,7 +19,7 @@
 #   4. Creates a systemd service
 #   5. Opens configured proxy port in ufw (if active)
 #   6. Applies TCPMSS clamping (DPI bypass: splits ClientHello into tiny packets)
-#   7. Installs inbound SYN pacing for Android/Desktop handshake stability
+#   7. Optionally installs inbound SYN pacing for Android/Desktop handshake stability
 #   8. Installs IPv6 address hopping script + cron job (optional, requires CF_TOKEN + CF_ZONE + IPV6_PREFIX)
 #   9. Installs masking self-healing monitor (nginx + timer watchdog)
 #   10. Prints the ready-to-use tg:// link
@@ -29,6 +32,7 @@ REPO_URL="https://github.com/XXcipherX/mtproto.zig.git"
 SERVICE_NAME="mtproto-proxy"
 SERVICE_FILE="/etc/systemd/system/mtproto-proxy.service"
 FORCE_SERVICE_UPDATE="${FORCE_SERVICE_UPDATE:-0}"
+ENABLE_SYNFIX="${ENABLE_SYNFIX:-false}"
 IS_UPDATE=false
 [[ -f "$INSTALL_DIR/mtproto-proxy" ]] && IS_UPDATE=true
 
@@ -43,6 +47,13 @@ info()  { echo -e "${CYAN}▸${RESET} $*"; }
 ok()    { echo -e "${GREEN}✓${RESET} $*"; }
 warn()  { echo -e "${RED}⚠${RESET} $*"; }
 fail()  { echo -e "${RED}✗${RESET} $*" >&2; exit 1; }
+
+is_true() {
+    case "${1,,}" in
+        1|true|yes|on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
 
 is_tunnel_service_unit() {
     local unit_path="$1"
@@ -334,11 +345,15 @@ else
     warn "Masking setup failed (non-critical, proxy still works). Check DNS A record, TCP/80, and run: sudo env MASK_DOMAIN=${TLS_DOMAIN} bash ${INSTALL_DIR}/setup_masking.sh"
 fi
 
-info "Setting up inbound SYN pacing..."
-if PORT="$PORT" bash "$TMPBUILD/deploy/setup_synfix.sh" < /dev/null 2>&1; then
-    SYNFIX_OK=true
+if is_true "$ENABLE_SYNFIX"; then
+    info "Setting up inbound SYN pacing..."
+    if PORT="$PORT" bash "$TMPBUILD/deploy/setup_synfix.sh" < /dev/null 2>&1; then
+        SYNFIX_OK=true
+    else
+        warn "SYN pacing setup failed (non-critical, proxy still works)"
+    fi
 else
-    warn "SYN pacing setup failed (non-critical, proxy still works)"
+    info "Skipping inbound SYN pacing (set ENABLE_SYNFIX=true to install)"
 fi
 
 info "Setting up zapret nfqws TCP desync..."
@@ -466,8 +481,10 @@ echo -e "  ${GREEN}✓${RESET} Anti-Replay Cache (ТСПУ Revisor protection)"
 echo -e "  ${GREEN}✓${RESET} TCPMSS=88 (ClientHello fragmentation)"
 if $SYNFIX_OK; then
 echo -e "  ${GREEN}✓${RESET} Inbound SYN pacing (Android/Desktop handshake stability)"
-else
+elif is_true "$ENABLE_SYNFIX"; then
 echo -e "  ${RED}✗${RESET} Inbound SYN pacing (setup failed)"
+else
+echo -e "  ${DIM}○ Inbound SYN pacing (optional; set ENABLE_SYNFIX=true)${RESET}"
 fi
 if $MASKING_OK; then
 echo -e "  ${GREEN}✓${RESET} Self-domain Nginx Masking (Zero-RTT Active Probe defense)"

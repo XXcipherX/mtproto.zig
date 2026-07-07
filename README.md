@@ -262,7 +262,7 @@ OS-level mitigations from `deploy/` (iptables `TCPMSS`, `nfqws`, etc.) are **not
 
 ### Docker Compose install
 
-For VPS installs from a prebuilt image, use the Docker Compose installer. It mirrors the one-line source installer for host-level setup: creates `/opt/mtproto-proxy/config.toml`, writes `/opt/mtproto-proxy/compose.yml`, installs a `mtproto-proxy.service` Docker Compose wrapper, configures self-domain Nginx masking, applies TCPMSS, installs inbound SYN pacing, installs nfqws, pulls the image, starts the container, and prints the `tg://` link:
+For VPS installs from a prebuilt image, use the Docker Compose installer. It mirrors the one-line source installer for host-level setup: creates `/opt/mtproto-proxy/config.toml`, writes `/opt/mtproto-proxy/compose.yml`, installs a `mtproto-proxy.service` Docker Compose wrapper, configures self-domain Nginx masking, applies TCPMSS, optionally installs inbound SYN pacing, installs nfqws, pulls the image, starts the container, and prints the `tg://` link:
 
 ```bash
 curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/install_docker_compose.sh \
@@ -280,6 +280,7 @@ Useful environment variables:
 | `SECRET` | random | 32-hex user secret; generated once when config is absent |
 | `USE_MIDDLE_PROXY` | `true` | Initial `use_middle_proxy` value |
 | `ENABLE_MASKING` | `true` | Install Nginx/certbot masking and set `mask = true` |
+| `ENABLE_SYNFIX` | `false` | Install inbound SYN pacing rules for Android/Desktop routes that need it |
 | `MASK_PORT` | `8443` | Local Nginx HTTPS masking backend port |
 | `GHCR_USER` / `GHCR_TOKEN` | _(empty)_ | Optional login for private GHCR packages |
 
@@ -307,12 +308,19 @@ This will:
 4. Create a `systemd` service (`mtproto-proxy`)
 5. Open the configured proxy port in `ufw` (if active)
 6. Apply **TCPMSS=88** iptables/ip6tables rules when available (passive DPI bypass)
-7. Install inbound SYN pacing for Android/Desktop handshake stability
+7. Optionally install inbound SYN pacing for Android/Desktop handshake stability (`ENABLE_SYNFIX=true`)
 8. Install **IPv6 hop script** when `CF_TOKEN`+`CF_ZONE`+`IPV6_PREFIX` are provided
 9. Set up self-domain Nginx 404 masking on `127.0.0.1:8443`, including Let's Encrypt on TCP/80 and the masking health timer
 10. Attempt OS-level `zapret` / `nfqws` TCP desync setup
 11. Refresh optional monitor files if `proxy-monitor` already exists
 12. Print a ready-to-use `tg://` connection link when `[access.users]` contains a valid 32-hex secret
+
+Inbound SYN pacing is disabled by default. Enable it only on filtered routes where Android/Desktop clients open too many parallel handshakes:
+
+```bash
+curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/install.sh \
+  | sudo env ENABLE_SYNFIX=true bash
+```
 
 ### Self-Domain 404 Masking
 

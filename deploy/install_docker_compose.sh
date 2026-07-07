@@ -14,6 +14,7 @@
 #   SECRET=<32 hex chars>
 #   USE_MIDDLE_PROXY=true|false
 #   ENABLE_MASKING=true|false
+#   ENABLE_SYNFIX=true|false
 #   MASK_PORT=8443
 #   GHCR_USER=<user> GHCR_TOKEN=<token>   # for private GHCR packages
 
@@ -25,6 +26,7 @@ IMAGE="${IMAGE:-ghcr.io/xxcipherx/mtproto.zig:latest}"
 PORT="${PORT:-443}"
 USE_MIDDLE_PROXY="${USE_MIDDLE_PROXY:-true}"
 ENABLE_MASKING="${ENABLE_MASKING:-true}"
+ENABLE_SYNFIX="${ENABLE_SYNFIX:-false}"
 MASK_PORT="${MASK_PORT:-8443}"
 COMPOSE_FILE="${INSTALL_DIR}/compose.yml"
 ENV_FILE="${INSTALL_DIR}/.env"
@@ -384,12 +386,16 @@ setup_masking_and_desync() {
         warn "Self-domain Nginx Masking disabled by ENABLE_MASKING=false"
     fi
 
-    info "Setting up inbound SYN pacing..."
-    if PORT="$PORT" bash "${INSTALL_DIR}/setup_synfix.sh" < /dev/null; then
-        SYNFIX_OK=true
-        ok "Inbound SYN pacing configured"
+    if is_true "$ENABLE_SYNFIX"; then
+        info "Setting up inbound SYN pacing..."
+        if PORT="$PORT" bash "${INSTALL_DIR}/setup_synfix.sh" < /dev/null; then
+            SYNFIX_OK=true
+            ok "Inbound SYN pacing configured"
+        else
+            warn "Inbound SYN pacing setup failed"
+        fi
     else
-        warn "Inbound SYN pacing setup failed"
+        info "Skipping inbound SYN pacing (set ENABLE_SYNFIX=true to install)"
     fi
 
     info "Setting up zapret nfqws TCP desync..."
@@ -456,8 +462,10 @@ print_summary() {
     echo -e "  ${GREEN}+${RESET} TCPMSS=88"
     if $SYNFIX_OK; then
         echo -e "  ${GREEN}+${RESET} Inbound SYN pacing"
-    else
+    elif is_true "$ENABLE_SYNFIX"; then
         echo -e "  ${RED}!${RESET} Inbound SYN pacing"
+    else
+        echo -e "  ${DIM}o Inbound SYN pacing (optional; set ENABLE_SYNFIX=true)${RESET}"
     fi
     if $MASKING_OK; then
         echo -e "  ${GREEN}+${RESET} Self-domain Nginx Masking"
