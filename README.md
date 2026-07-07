@@ -129,7 +129,7 @@ python3 test/daemon_smoke.py --binary zig-out/bin/mtproto-proxy
 zig build -Doptimize=ReleaseFast soak -- --seconds=120 --threads=8 --max-payload=131072
 ```
 
-The GitHub workflow additionally verifies native `ReleaseFast`, Linux `x86_64`, deploy-target `x86_64_v3`, Linux `aarch64`, Docker build smoke, and bench/soak paths.
+The GitHub workflow additionally verifies native `ReleaseFast`, Linux `x86_64`, deploy-target `x86_64_v3+aes`, Linux `aarch64`, Docker build smoke, and bench/soak paths.
 
 `bench` prints per-payload throughput (`in_mib_per_s`, `out_mib_per_s`) and `ns_per_op`.
 `soak` prints aggregate `ops/s`, throughput, and `errors`; non-zero errors fail the step.
@@ -189,11 +189,13 @@ docker build -t mtproto-zig .
 |----------------|-----------|-------------|
 | `ZIG_VERSION`  | `0.16.0`  | Version string passed to `ziglang.org/download/…/zig-<arch>-linux-<version>.tar.xz`. Must match a published Zig release. |
 | `ZIG_SHA256`   | _(empty)_ | Optional pinned SHA256 for the downloaded Zig tarball. If set, Docker build verifies integrity before extraction. |
+| `MTPROTO_CPU`  | `x86_64` on `amd64`, Zig default on `arm64` | Optional Zig CPU baseline. Use `x86_64_v3+aes` on modern `amd64` hosts to enable hardware AES and avoid software-only AES builds. |
 
 Example:
 
 ```bash
 docker build --build-arg ZIG_VERSION=0.16.0 -t mtproto-zig .
+docker build --platform linux/amd64 --build-arg MTPROTO_CPU=x86_64_v3+aes -t mtproto-zig:amd64-v3 .
 ```
 
 ### Architecture (`TARGETARCH`)
@@ -233,6 +235,8 @@ It builds the Dockerfile with Buildx and pushes to GitHub Container Registry:
 ghcr.io/<owner>/<repo>:latest
 ghcr.io/<owner>/<repo>:<tag>
 ghcr.io/<owner>/<repo>:sha-<commit>
+ghcr.io/<owner>/<repo>:latest-amd64-v3
+ghcr.io/<owner>/<repo>:<tag>-amd64-v3
 ```
 
 For this repository, the default public image name is:
@@ -241,7 +245,7 @@ For this repository, the default public image name is:
 ghcr.io/xxcipherx/mtproto.zig:latest
 ```
 
-The workflow lowercases the repository path automatically because GHCR image names must be lowercase. If the package is private, log in on the server before pulling, or pass `GHCR_USER` and `GHCR_TOKEN` to the Compose installer below.
+The `*-amd64-v3` tags are built with `-Dcpu=x86_64_v3+aes` for modern x86_64 CPUs and enable Zig's hardware AES backend. The generic tags stay baseline-compatible. The workflow lowercases the repository path automatically because GHCR image names must be lowercase. If the package is private, log in on the server before pulling, or pass `GHCR_USER` and `GHCR_TOKEN` to the Compose installer below.
 
 ### Run
 
@@ -273,7 +277,8 @@ Useful environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `IMAGE` | `ghcr.io/xxcipherx/mtproto.zig:latest` | Docker image to pull |
+| `IMAGE` | auto | Explicit Docker image to pull; when set, disables automatic CPU image selection |
+| `AUTO_IMAGE_CPU_VARIANT` | `true` | When `IMAGE` is not set, use `latest-amd64-v3` automatically on compatible x86_64 hosts |
 | `TLS_DOMAIN` | _(required on first install)_ | Domain encoded into the `ee` secret and used as FakeTLS SNI |
 | `PUBLIC_IP` | `TLS_DOMAIN` | Host/domain shown in generated Telegram links |
 | `PORT` | `443` | Listen port in generated config |
@@ -284,7 +289,7 @@ Useful environment variables:
 | `MASK_PORT` | `8443` | Local Nginx HTTPS masking backend port |
 | `GHCR_USER` / `GHCR_TOKEN` | _(empty)_ | Optional login for private GHCR packages |
 
-The installer requires Docker Compose v2 (`docker compose`) and installs Docker Engine + the Compose plugin via Docker's convenience script if either Docker or the plugin is missing. The Compose service uses `network_mode: host`, so the container binds the configured port directly on the VPS. Re-run the installer to pull and restart with a newer image, or update manually:
+The installer requires Docker Compose v2 (`docker compose`) and installs Docker Engine + the Compose plugin via Docker's convenience script if either Docker or the plugin is missing. When `IMAGE` is not set, compatible x86_64 hosts automatically pull the `latest-amd64-v3` image; if that tag is unavailable, the installer falls back to generic `latest`. The Compose service uses `network_mode: host`, so the container binds the configured port directly on the VPS. Re-run the installer to pull and restart with a newer image, or update manually:
 
 ```bash
 cd /opt/mtproto-proxy
@@ -303,7 +308,7 @@ curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/in
 
 This will:
 1. Install **Zig 0.16.0** (if not present)
-2. Clone and build the proxy with `ReleaseFast`
+2. Clone and build the proxy with `ReleaseFast` for the native CPU
 3. Generate a random 16-byte secret on first install
 4. Create a `systemd` service (`mtproto-proxy`)
 5. Open the configured proxy port in `ufw` (if active)

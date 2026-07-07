@@ -3,6 +3,7 @@
 # Build (see README "Docker image" for --platform and build-args):
 #   docker build -t mtproto-zig .
 #   docker build --platform linux/amd64 --build-arg ZIG_VERSION=0.16.0 -t mtproto-zig .
+#   docker build --platform linux/amd64 --build-arg MTPROTO_CPU=x86_64_v3+aes -t mtproto-zig:amd64-v3 .
 #
 # Run (default config from image listens on 443; override with a volume for production):
 #   docker run --rm -p 443:443 mtproto-zig
@@ -12,10 +13,12 @@
 
 ARG ZIG_VERSION=0.16.0
 ARG ZIG_SHA256=
+ARG MTPROTO_CPU=
 
 FROM debian:bookworm-slim AS builder
 ARG ZIG_VERSION
 ARG ZIG_SHA256
+ARG MTPROTO_CPU
 ARG TARGETARCH
 
 RUN apt-get update \
@@ -50,17 +53,18 @@ RUN set -eu \
     && case "$arch" in \
         amd64|x86_64) \
             target="x86_64-linux"; \
-            cpu="x86_64"; \
+            default_cpu="x86_64"; \
             ;; \
         arm64|aarch64) \
             target="aarch64-linux"; \
-            cpu=""; \
+            default_cpu=""; \
             ;; \
         *) \
             echo "unsupported TARGETARCH=$arch" >&2; \
             exit 1; \
             ;; \
        esac \
+    && cpu="${MTPROTO_CPU:-$default_cpu}" \
     && if [ -n "$cpu" ]; then \
          zig build -Doptimize=ReleaseFast -Dtarget="$target" -Dcpu="$cpu"; \
        else \

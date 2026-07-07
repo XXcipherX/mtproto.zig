@@ -46,7 +46,7 @@ jobs:
         run: zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux
 
       - name: Cross-compile deploy target
-        run: zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux -Dcpu=x86_64_v3
+        run: zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux -Dcpu=x86_64_v3+aes
 
       - name: Cross-compile for Linux aarch64
         run: zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux

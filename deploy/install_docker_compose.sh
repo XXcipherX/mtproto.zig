@@ -8,6 +8,7 @@
 #
 # Optional environment:
 #   IMAGE=ghcr.io/xxcipherx/mtproto.zig:latest
+#   AUTO_IMAGE_CPU_VARIANT=true|false
 #   INSTALL_DIR=/opt/mtproto-proxy
 #   PORT=443
 #   PUBLIC_IP=proxy.example.com
@@ -22,7 +23,10 @@ set -euo pipefail
 
 INSTALL_DIR="${INSTALL_DIR:-/opt/mtproto-proxy}"
 REPO_RAW_URL="${REPO_RAW_URL:-https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main}"
-IMAGE="${IMAGE:-ghcr.io/xxcipherx/mtproto.zig:latest}"
+DEFAULT_IMAGE_REPO="${DEFAULT_IMAGE_REPO:-ghcr.io/xxcipherx/mtproto.zig}"
+DEFAULT_IMAGE_TAG="${DEFAULT_IMAGE_TAG:-latest}"
+IMAGE="${IMAGE:-}"
+AUTO_IMAGE_CPU_VARIANT="${AUTO_IMAGE_CPU_VARIANT:-true}"
 PORT="${PORT:-443}"
 USE_MIDDLE_PROXY="${USE_MIDDLE_PROXY:-true}"
 ENABLE_MASKING="${ENABLE_MASKING:-true}"
@@ -36,6 +40,7 @@ SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 MASKING_OK=false
 SYNFIX_OK=false
 NFQWS_OK=false
+AUTO_SELECTED_CPU_IMAGE=false
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -61,6 +66,36 @@ bool_literal() {
         printf 'true'
     else
         printf 'false'
+    fi
+}
+
+host_supports_amd64_v3() {
+    local arch flags
+    arch="$(uname -m 2>/dev/null || true)"
+    case "$arch" in
+        x86_64|amd64) ;;
+        *) return 1 ;;
+    esac
+
+    [[ -r /proc/cpuinfo ]] || return 1
+    flags="$(awk -F: '/flags/ { print " " tolower($2) " "; exit }' /proc/cpuinfo 2>/dev/null)"
+    [[ -n "$flags" ]] || return 1
+
+    local flag
+    for flag in aes avx avx2 bmi1 bmi2 f16c fma movbe xsave sse4_1 sse4_2 ssse3 popcnt; do
+        [[ "$flags" == *" ${flag} "* ]] || return 1
+    done
+}
+
+select_default_image() {
+    if [[ -n "$IMAGE" ]]; then
+        return
+    fi
+
+    IMAGE="${DEFAULT_IMAGE_REPO}:${DEFAULT_IMAGE_TAG}"
+    if is_true "$AUTO_IMAGE_CPU_VARIANT" && host_supports_amd64_v3; then
+        IMAGE="${DEFAULT_IMAGE_REPO}:${DEFAULT_IMAGE_TAG}-amd64-v3"
+        AUTO_SELECTED_CPU_IMAGE=true
     fi
 }
 
@@ -484,6 +519,7 @@ print_summary() {
 
 declare -a COMPOSE
 
+select_default_image
 mkdir -p "$INSTALL_DIR"
 install_packages
 fetch_helper_scripts
@@ -494,7 +530,18 @@ write_compose_service
 docker_login_if_needed
 
 info "Pulling ${IMAGE}"
-"${COMPOSE[@]}" --env-file "$ENV_FILE" -f "$COMPOSE_FILE" pull
+if ! "${COMPOSE[@]}" --env-file "$ENV_FILE" -f "$COMPOSE_FILE" pull; then
+    if $AUTO_SELECTED_CPU_IMAGE; then
+        warn "Pull failed for auto-selected CPU image ${IMAGE}; falling back to ${DEFAULT_IMAGE_REPO}:${DEFAULT_IMAGE_TAG}"
+        IMAGE="${DEFAULT_IMAGE_REPO}:${DEFAULT_IMAGE_TAG}"
+        AUTO_SELECTED_CPU_IMAGE=false
+        write_compose_file
+        info "Pulling ${IMAGE}"
+        "${COMPOSE[@]}" --env-file "$ENV_FILE" -f "$COMPOSE_FILE" pull || fail "Docker image pull failed"
+    else
+        fail "Docker image pull failed"
+    fi
+fi
 
 apply_firewall_and_tcpmss
 setup_ipv6_hopping

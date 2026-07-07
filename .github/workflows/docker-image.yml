@@ -20,6 +20,11 @@ on:
         required: true
         type: boolean
         default: true
+      publish_amd64_v3:
+        description: Also publish linux/amd64 image built with -Dcpu=x86_64_v3+aes
+        required: true
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -63,7 +68,18 @@ jobs:
             type=raw,value=latest,enable=${{ inputs.push_latest }}
             type=sha,prefix=sha-
 
-      - name: Build and push image
+      - name: Docker metadata (amd64-v3)
+        id: meta_amd64_v3
+        if: ${{ inputs.publish_amd64_v3 }}
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=raw,value=${{ inputs.tag }}-amd64-v3
+            type=raw,value=latest-amd64-v3,enable=${{ inputs.push_latest }}
+            type=sha,prefix=sha-,suffix=-amd64-v3
+
+      - name: Build and push generic image
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -73,13 +89,34 @@ jobs:
             ZIG_VERSION=${{ inputs.zig_version }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=docker-generic
+          cache-to: type=gha,scope=docker-generic,mode=max
+
+      - name: Build and push amd64-v3 image
+        if: ${{ inputs.publish_amd64_v3 }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            ZIG_VERSION=${{ inputs.zig_version }}
+            MTPROTO_CPU=x86_64_v3+aes
+          tags: ${{ steps.meta_amd64_v3.outputs.tags }}
+          labels: ${{ steps.meta_amd64_v3.outputs.labels }}
+          cache-from: type=gha,scope=docker-amd64-v3
+          cache-to: type=gha,scope=docker-amd64-v3,mode=max
 
       - name: Summary
         run: |
           {
-            echo "### Published image"
+            echo "### Published generic image"
             echo ""
             echo '${{ steps.meta.outputs.tags }}' | sed 's/^/- `/' | sed 's/$/`/'
+            if [ "${{ inputs.publish_amd64_v3 }}" = "true" ]; then
+              echo ""
+              echo "### Published amd64-v3 image"
+              echo ""
+              echo '${{ steps.meta_amd64_v3.outputs.tags }}' | sed 's/^/- `/' | sed 's/$/`/'
+            fi
           } >> "$GITHUB_STEP_SUMMARY"

@@ -179,7 +179,7 @@ info "Building mtproto-proxy..."
 TMPBUILD=$(mktemp -d)
 git clone --depth 1 "$REPO_URL" "$TMPBUILD"
 cd "$TMPBUILD"
-zig build -Doptimize=ReleaseFast
+zig build -Doptimize=ReleaseFast -Dcpu=native
 ok "Build complete"
 
 # ── Install binary ──────────────────────────────────────────
