@@ -40,6 +40,19 @@ docker_caddy_configured() {
         | grep -qx 'mtproto-mask-caddy'
 }
 
+docker_caddy_running() {
+    docker inspect -f '{{.State.Running}}' mtproto-mask-caddy 2>/dev/null | grep -qx true
+}
+
+wait_for_docker_caddy() {
+    local attempt
+    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+        docker_caddy_running && return 0
+        sleep 1
+    done
+    return 1
+}
+
 DOCKER_CADDY=false
 if docker_caddy_configured; then
     DOCKER_CADDY=true
@@ -286,9 +299,14 @@ else
     warn "Masking health timer is not enabled"
 fi
 
-if $DOCKER_CADDY && docker inspect -f '{{.State.Running}}' mtproto-mask-caddy 2>/dev/null | grep -qx true; then
-    ok "Caddy masking container is active"
-elif ! $DOCKER_CADDY && systemctl is-active --quiet "$MASK_CADDY_SERVICE"; then
+if $DOCKER_CADDY; then
+    if wait_for_docker_caddy; then
+        ok "Caddy masking container is active"
+    else
+        docker logs --tail=40 mtproto-mask-caddy 2>/dev/null || true
+        warn "Caddy masking backend is not active"
+    fi
+elif systemctl is-active --quiet "$MASK_CADDY_SERVICE"; then
     ok "Caddy masking service is active"
 else
     warn "Caddy masking backend is not active"
