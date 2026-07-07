@@ -96,20 +96,20 @@ port = 443
 [censorship]
 # Self-domain masking domain. Point this domain's DNS A record to this VPS.
 # Public :443 is handled by mtproto-proxy; ordinary HTTPS clients are forwarded
-# to local Nginx on mask_port and receive 404.
+# to local Caddy on mask_port and receive 404.
 # Since June 2026, the masking TLS backend for this domain should negotiate
 # X25519MLKEM768 (post-quantum group 0x11ec) in one round. A classical-x25519-only
 # backend can mark iOS clients and other users sharing their NAT IP for blocking.
-# setup_masking.sh probes the local backend and warns when OpenSSL/backend support
-# is missing. Changing tls_domain changes every ee-secret link.
+# setup_masking.sh configures Caddy with X25519MLKEM768 first and probes the
+# local backend. Changing tls_domain changes every ee-secret link.
 tls_domain = "proxy.example.com"
 
-# Forward unauthenticated / invalid connections to the self-domain Nginx 404 backend
+# Forward unauthenticated / invalid connections to the self-domain Caddy 404 backend
 # (active probing defense).
 mask = true
 
-# Local Nginx HTTPS backend. setup_masking.sh obtains a Let's Encrypt cert via
-# HTTP-01 on public :80, then configures Nginx on 127.0.0.1:8443. In tunnel
+# Local Caddy HTTPS backend. setup_masking.sh obtains a Let's Encrypt cert via
+# HTTP-01 on public :80, then configures Caddy on 127.0.0.1:8443. In tunnel
 # netns mode, the runtime automatically targets 10.200.200.1:8443.
 mask_port = 8443
 

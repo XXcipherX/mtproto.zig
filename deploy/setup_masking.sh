@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #
-# setup_masking.sh - Install self-domain Nginx 404 masking for mtproto-proxy.
+# setup_masking.sh - Install self-domain Caddy 404 masking for mtproto-proxy.
 #
 # Public :443 stays owned by mtproto-proxy. Regular HTTPS browsers and active
 # probers that do not present a valid MTProto secret are relayed by the proxy to
-# this local Nginx backend on 127.0.0.1:8443. Use your own domain here: its DNS A
+# this local Caddy backend on 127.0.0.1:8443. Use your own domain here: its DNS A
 # record should point to the same VPS. The masking backend returns 404 for all
-# non-ACME requests; valid MTProto clients never reach Nginx.
+# non-ACME requests; valid MTProto clients never reach Caddy.
 #
 # Usage:
 #   sudo env MASK_DOMAIN=proxy.example.com bash deploy/setup_masking.sh
@@ -19,29 +19,40 @@
 #   LE_EMAIL=admin@example.com                # Let's Encrypt account email
 #   MASK_ALLOW_SELF_SIGNED=1                  # dev/test fallback only
 #   MASK_SET_PUBLIC_IP=0                      # do not set [server].public_ip
-#   MASK_KEEP_NGINX_DEFAULT=1                 # keep existing sites-enabled/default
 #   CHECK_PQ_DOMAIN=false                     # skip X25519MLKEM768 masking probe
 #
 # What it does:
-#   1. Installs Nginx and certbot if needed.
+#   1. Installs Caddy and certbot if needed. Docker installs run Caddy as a
+#      Compose service; source installs run it as a host systemd service.
 #   2. Creates/keeps an ACME webroot for the masking domain.
-#   3. Makes the masking site the default public :80 server unless opted out.
-#   4. Serves HTTP-01 ACME on public :80, because public :443 is the proxy.
-#   5. Obtains or reuses a Let's Encrypt certificate for the domain.
-#   6. Configures Nginx on 127.0.0.1:8443 (and 10.200.200.1 in tunnel mode).
-#   7. Updates config.toml with public_ip, tls_domain, mask=true, mask_port.
-#   8. Installs the masking health monitor timer.
+#   3. Serves HTTP-01 ACME on public :80, because public :443 is the proxy.
+#   4. Obtains or reuses a Let's Encrypt certificate for the domain.
+#   5. Configures Caddy on 127.0.0.1:8443 with X25519MLKEM768 first.
+#   6. Updates config.toml with public_ip, tls_domain, mask=true, mask_port.
+#   7. Installs the masking health monitor timer.
 
 set -euo pipefail
 
 INSTALL_DIR="${INSTALL_DIR:-/opt/mtproto-proxy}"
 CONFIG_FILE="${INSTALL_DIR}/config.toml"
 SERVICE_FILE="/etc/systemd/system/mtproto-proxy.service"
-NGINX_PORT="${MASK_PORT:-8443}"
+MASK_PORT="${MASK_PORT:-}"
 MASK_SET_PUBLIC_IP="${MASK_SET_PUBLIC_IP:-1}"
 MASK_ALLOW_SELF_SIGNED="${MASK_ALLOW_SELF_SIGNED:-0}"
 CHECK_PQ_DOMAIN="${CHECK_PQ_DOMAIN:-true}"
 ACME_ROOT="${MASK_ACME_ROOT:-${MASK_SITE_ROOT:-/var/www/certbot}}"
+CADDY_SERVICE="mtproto-mask-caddy.service"
+COMPOSE_FILE="${COMPOSE_FILE:-${INSTALL_DIR}/compose.yml}"
+ENV_FILE="${ENV_FILE:-${INSTALL_DIR}/.env}"
+case "${MTPROTO_DOCKER_INSTALL:-0}" in
+    1|true|yes|on) CADDY_RUNTIME="docker" ;;
+    *) CADDY_RUNTIME="host" ;;
+esac
+if [[ "$CADDY_RUNTIME" == "docker" ]]; then
+    CADDYFILE="${MASK_CADDYFILE:-${INSTALL_DIR}/Caddyfile.mask}"
+else
+    CADDYFILE="${MASK_CADDYFILE:-/etc/caddy/mtproto-mask.Caddyfile}"
+fi
 TUNNEL_HOST_IP=""
 
 read_config_value() {
@@ -90,13 +101,20 @@ if [[ ! "$TLS_DOMAIN" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; then
     exit 1
 fi
 
-if [[ ! "$NGINX_PORT" =~ ^[0-9]+$ ]] || (( NGINX_PORT < 1 || NGINX_PORT > 65535 )); then
-    echo "Invalid MASK_PORT: ${NGINX_PORT}" >&2
+if [[ -z "$MASK_PORT" ]]; then
+    MASK_PORT="$(read_config_value "censorship" "mask_port" "8443")"
+fi
+
+if [[ ! "$MASK_PORT" =~ ^[0-9]+$ ]] || (( MASK_PORT < 1 || MASK_PORT > 65535 )); then
+    echo "Invalid MASK_PORT: ${MASK_PORT}" >&2
     exit 1
 fi
 
-CERT_DIR="${MASK_CERT_DIR:-/etc/nginx/ssl/mtproto-mask/${TLS_DOMAIN}}"
-MASKING_SITE="/etc/nginx/sites-available/mtproto-masking"
+if [[ "$CADDY_RUNTIME" == "docker" ]]; then
+    CERT_DIR="${MASK_CERT_DIR:-${INSTALL_DIR}/caddy/ssl/mtproto-mask/${TLS_DOMAIN}}"
+else
+    CERT_DIR="${MASK_CERT_DIR:-/etc/caddy/ssl/mtproto-mask/${TLS_DOMAIN}}"
+fi
 
 if [[ "$ACME_ROOT" != /* || "$ACME_ROOT" =~ [[:space:]] ]]; then
     echo "MASK_ACME_ROOT/MASK_SITE_ROOT must be an absolute path without spaces: ${ACME_ROOT}" >&2
@@ -174,8 +192,8 @@ check_pq_fronting_backend() {
         -tls1_3 2>&1 || true)"
 
     if grep -q "Server Temp Key" <<<"$legacy_out"; then
-        warn "Couldn't test X25519MLKEM768, but x25519 works. This host may have OpenSSL older than 3.5 or the backend rejects the hybrid group"
-        warn "Verify ${servername} with @Sni_checker_bot or an OpenSSL 3.5+ client before sharing links"
+        warn "Couldn't test X25519MLKEM768, but x25519 works. This host may have OpenSSL older than 3.5"
+        warn "Verify ${servername} with @Sni_checker_bot before sharing links"
     else
         warn "Could not verify TLS group support for masking backend ${host}:${port}"
     fi
@@ -255,103 +273,263 @@ set_config_value() {
     fi
 }
 
-write_nginx_config() {
-    local cert_ready="$1"
-    local extra_listen_line=""
-    local http_listen="    listen 80 default_server;"
-    local http_ipv6_listen=""
-    local http_server_name="    server_name ${TLS_DOMAIN} _;"
-    if [[ -n "$TUNNEL_HOST_IP" && "$cert_ready" == "1" ]]; then
-        extra_listen_line="    listen ${TUNNEL_HOST_IP}:${NGINX_PORT} ssl;"
-    fi
-    if [[ -s /proc/net/if_inet6 ]]; then
-        http_ipv6_listen="    listen [::]:80 default_server;"
-    fi
-    if [[ "${MASK_KEEP_NGINX_DEFAULT:-0}" == "1" ]]; then
-        http_listen="    listen 80;"
-        if [[ -s /proc/net/if_inet6 ]]; then
-            http_ipv6_listen="    listen [::]:80;"
-        fi
-        http_server_name="    server_name ${TLS_DOMAIN};"
-    fi
+install_caddy() {
+    local caddy_needs_install=true
+    local caddy_version caddy_minor
 
-    cat > "$MASKING_SITE" << NGINXEOF
-# mtproto-proxy self-domain 404 masking backend.
-# Public :443 is owned by mtproto-proxy. Nginx is only the 404 masking backend.
-
-server {
-${http_listen}
-${http_ipv6_listen}
-${http_server_name}
-
-    location ^~ /.well-known/acme-challenge/ {
-        root ${ACME_ROOT};
-        default_type text/plain;
-        try_files \$uri =404;
-    }
-
-    location / {
-        return 404;
-    }
-}
-NGINXEOF
-
-    if [[ "$cert_ready" == "1" ]]; then
-        cat >> "$MASKING_SITE" << NGINXEOF
-
-server {
-    listen 127.0.0.1:${NGINX_PORT} ssl;
-${extra_listen_line}
-
-    server_name ${TLS_DOMAIN};
-
-    ssl_certificate     ${CERT_DIR}/cert.pem;
-    ssl_certificate_key ${CERT_DIR}/key.pem;
-
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_prefer_server_ciphers off;
-
-    location / {
-        return 404;
-    }
-
-    access_log /var/log/nginx/mtproto-mask-access.log;
-    error_log /var/log/nginx/mtproto-mask-error.log warn;
-}
-NGINXEOF
-    fi
-}
-
-disable_default_nginx_site() {
-    if [[ "${MASK_KEEP_NGINX_DEFAULT:-0}" == "1" ]]; then
+    if [[ "$CADDY_RUNTIME" == "docker" ]]; then
+        info "Preparing Docker Caddy masking backend..."
+        apt-get update -qq < /dev/null || true
+        apt-get install -y ca-certificates curl certbot openssl < /dev/null >/dev/null 2>&1 || true
+        command -v docker >/dev/null 2>&1 || fail "docker command not found"
+        docker compose version >/dev/null 2>&1 || fail "Docker Compose v2 plugin is not installed"
+        command -v certbot >/dev/null 2>&1 || fail "certbot command not found after installation"
+        [[ -f "$COMPOSE_FILE" ]] || fail "Compose file not found: ${COMPOSE_FILE}"
+        ok "Docker Caddy backend is ready"
         return
     fi
 
-    if [[ -e /etc/nginx/sites-enabled/default ]]; then
-        rm -f /etc/nginx/sites-enabled/default
-        ok "Disabled default Nginx site so masking returns 404 on unmatched HTTP requests"
+    info "Installing Caddy and certbot..."
+    apt-get update -qq < /dev/null || true
+    apt-get install -y debian-keyring debian-archive-keyring apt-transport-https ca-certificates curl gnupg certbot openssl < /dev/null >/dev/null 2>&1 || true
+
+    if command -v caddy >/dev/null 2>&1; then
+        caddy_version="$(caddy version 2>/dev/null | awk '{print $1}' | head -1)"
+        if [[ "$caddy_version" =~ ^v?2\.([0-9]+)\. ]]; then
+            caddy_minor="${BASH_REMATCH[1]}"
+            if (( caddy_minor >= 10 )); then
+                caddy_needs_install=false
+            fi
+        fi
+    fi
+
+    if $caddy_needs_install; then
+        mkdir -p /usr/share/keyrings /etc/apt/sources.list.d
+        if curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/gpg.key \
+            | gpg --dearmor > /usr/share/keyrings/caddy-stable-archive-keyring.gpg; then
+            curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt \
+                -o /etc/apt/sources.list.d/caddy-stable.list || true
+            apt-get update -qq < /dev/null || true
+        else
+            warn "Could not install Caddy apt repository key; trying distro package"
+        fi
+        apt-get install -y caddy < /dev/null >/dev/null 2>&1 || true
+    fi
+
+    command -v caddy >/dev/null 2>&1 || fail "caddy command not found after installation"
+    command -v certbot >/dev/null 2>&1 || fail "certbot command not found after installation"
+    caddy_version="$(caddy version 2>/dev/null | awk '{print $1}' | head -1)"
+    if [[ "$caddy_version" =~ ^v?2\.([0-9]+)\. ]]; then
+        caddy_minor="${BASH_REMATCH[1]}"
+        if (( caddy_minor < 10 )); then
+            fail "Caddy 2.10+ is required for x25519mlkem768, found ${caddy_version}"
+        fi
+    fi
+    ok "Caddy is ready: $(caddy version 2>/dev/null | head -1)"
+}
+
+remove_legacy_caddy_container() {
+    if command -v docker >/dev/null 2>&1; then
+        if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx 'mtproto-mask-caddy'; then
+            if [[ "$CADDY_RUNTIME" == "docker" ]]; then
+                local existing_id managed_id
+                existing_id="$(docker ps -aq --filter 'name=^/mtproto-mask-caddy$' | head -1)"
+                managed_id="$(docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" ps -q mtproto-mask-caddy 2>/dev/null || true)"
+                if [[ -n "$managed_id" && "$existing_id" == "$managed_id" ]]; then
+                    return
+                fi
+            fi
+            docker rm -f mtproto-mask-caddy >/dev/null 2>&1 || true
+            ok "Removed legacy mtproto-mask-caddy container"
+        fi
     fi
 }
 
-info "Installing Nginx and certbot..."
-apt-get update -qq < /dev/null || true
-apt-get install -y nginx certbot curl openssl < /dev/null >/dev/null 2>&1 || true
+disable_legacy_host_caddy_service() {
+    [[ "$CADDY_RUNTIME" == "docker" ]] || return 0
+    command -v systemctl >/dev/null 2>&1 || return 0
 
-mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
+    systemctl disable --now "$CADDY_SERVICE" >/dev/null 2>&1 || true
+    rm -f "/etc/systemd/system/${CADDY_SERVICE}"
+    rm -f /etc/systemd/system/mtproto-proxy.service.d/10-mask-caddy.conf
+    systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
+write_caddy_config() {
+    local cert_ready="$1"
+    local bind_line="    bind 127.0.0.1"
+
+    if [[ -n "$TUNNEL_HOST_IP" && "$cert_ready" == "1" ]]; then
+        bind_line="    bind 127.0.0.1 ${TUNNEL_HOST_IP}"
+    fi
+
+    mkdir -p "$(dirname "$CADDYFILE")"
+    cat > "$CADDYFILE" << CADDYEOF
+# mtproto-proxy self-domain 404 masking backend.
+# Public :443 is owned by mtproto-proxy. Caddy is only the 404 masking backend.
+
+{
+    auto_https off
+}
+
+http://:80 {
+    root * ${ACME_ROOT}
+    handle /.well-known/acme-challenge/* {
+        file_server
+    }
+    respond 404
+}
+CADDYEOF
+
+    if [[ "$cert_ready" == "1" ]]; then
+        cat >> "$CADDYFILE" << CADDYEOF
+
+https://${TLS_DOMAIN}:${MASK_PORT} {
+${bind_line}
+    tls ${CERT_DIR}/cert.pem ${CERT_DIR}/key.pem {
+        curves x25519mlkem768 x25519
+    }
+    respond 404
+}
+CADDYEOF
+    fi
+
+    chown root:root "$CADDYFILE"
+    chmod 0644 "$CADDYFILE"
+}
+
+write_caddy_service() {
+    if [[ "$CADDY_RUNTIME" == "docker" ]]; then
+        return
+    fi
+
+    mkdir -p /var/lib/caddy /var/log/caddy /etc/caddy
+    chown -R caddy:caddy /var/lib/caddy /var/log/caddy 2>/dev/null || true
+
+    cat > "/etc/systemd/system/${CADDY_SERVICE}" << EOF
+[Unit]
+Description=MTProto Caddy masking backend
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=caddy
+Group=caddy
+ExecStart=/usr/bin/caddy run --environ --config ${CADDYFILE} --adapter caddyfile
+ExecReload=/usr/bin/caddy reload --config ${CADDYFILE} --adapter caddyfile --force
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=5s
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/caddy /var/log/caddy ${CERT_DIR}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl disable --now caddy >/dev/null 2>&1 || true
+    systemctl enable "$CADDY_SERVICE" >/dev/null 2>&1 || true
+}
+
+reload_or_restart_caddy() {
+    if [[ "$CADDY_RUNTIME" == "docker" ]]; then
+        docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" up -d --force-recreate mtproto-mask-caddy >/dev/null
+        sleep 1
+        if docker inspect -f '{{.State.Running}}' mtproto-mask-caddy 2>/dev/null | grep -qx true; then
+            return 0
+        fi
+        docker logs --tail=40 mtproto-mask-caddy 2>/dev/null || true
+        return 1
+    fi
+
+    caddy validate --config "$CADDYFILE" --adapter caddyfile >/dev/null
+    if systemctl is-active --quiet "$CADDY_SERVICE"; then
+        systemctl reload "$CADDY_SERVICE" >/dev/null 2>&1 || systemctl restart "$CADDY_SERVICE"
+    else
+        systemctl restart "$CADDY_SERVICE"
+    fi
+}
+
+install_certificate_files() {
+    local src_cert="$1"
+    local src_key="$2"
+
+    mkdir -p "$CERT_DIR"
+    install -m 0644 "$src_cert" "${CERT_DIR}/cert.pem"
+    install -m 0600 "$src_key" "${CERT_DIR}/key.pem"
+    if [[ "$CADDY_RUNTIME" == "host" ]]; then
+        chown -R caddy:caddy "$CERT_DIR" 2>/dev/null || true
+    fi
+}
+
+write_renewal_hook() {
+    mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+    if [[ "$CADDY_RUNTIME" == "docker" ]]; then
+        cat > /etc/letsencrypt/renewal-hooks/deploy/mtproto-mask-caddy-reload.sh << HOOKEOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+DOMAIN="${TLS_DOMAIN}"
+CERT_DIR="${CERT_DIR}"
+COMPOSE_FILE="${COMPOSE_FILE}"
+ENV_FILE="${ENV_FILE}"
+LE_CERT="/etc/letsencrypt/live/\${DOMAIN}/fullchain.pem"
+LE_KEY="/etc/letsencrypt/live/\${DOMAIN}/privkey.pem"
+
+if [[ -f "\$LE_CERT" && -f "\$LE_KEY" ]]; then
+    install -m 0644 "\$LE_CERT" "\${CERT_DIR}/cert.pem"
+    install -m 0600 "\$LE_KEY" "\${CERT_DIR}/key.pem"
+    docker compose --env-file "\$ENV_FILE" -f "\$COMPOSE_FILE" up -d --force-recreate mtproto-mask-caddy >/dev/null 2>&1 || true
+fi
+HOOKEOF
+    else
+        cat > /etc/letsencrypt/renewal-hooks/deploy/mtproto-mask-caddy-reload.sh << HOOKEOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+DOMAIN="${TLS_DOMAIN}"
+CERT_DIR="${CERT_DIR}"
+CADDY_SERVICE="${CADDY_SERVICE}"
+LE_CERT="/etc/letsencrypt/live/\${DOMAIN}/fullchain.pem"
+LE_KEY="/etc/letsencrypt/live/\${DOMAIN}/privkey.pem"
+
+if [[ -f "\$LE_CERT" && -f "\$LE_KEY" ]]; then
+    install -m 0644 "\$LE_CERT" "\${CERT_DIR}/cert.pem"
+    install -m 0600 "\$LE_KEY" "\${CERT_DIR}/key.pem"
+    chown -R caddy:caddy "\$CERT_DIR" 2>/dev/null || true
+    systemctl reload "\$CADDY_SERVICE" >/dev/null 2>&1 || systemctl restart "\$CADDY_SERVICE" >/dev/null 2>&1 || true
+fi
+HOOKEOF
+    fi
+    chmod 0755 /etc/letsencrypt/renewal-hooks/deploy/mtproto-mask-caddy-reload.sh
+}
+
+install_caddy
 mkdir -p "$ACME_ROOT/.well-known/acme-challenge" "$CERT_DIR"
+if [[ "$CADDY_RUNTIME" == "host" ]]; then
+    chown -R caddy:caddy "$ACME_ROOT" "$CERT_DIR" 2>/dev/null || true
+fi
 ok "Prepared masking/ACME roots"
-disable_default_nginx_site
 
-info "Preparing HTTP-01 ACME challenge on :80 for ${TLS_DOMAIN}..."
-write_nginx_config 0
-ln -sf "$MASKING_SITE" /etc/nginx/sites-enabled/mtproto-masking
-nginx -t 2>/dev/null || fail "Nginx HTTP config test failed"
+remove_legacy_caddy_container
+disable_legacy_host_caddy_service
+
+info "Preparing Caddy HTTP-01 ACME challenge on :80 for ${TLS_DOMAIN}..."
+write_caddy_config 0
+write_caddy_service
 if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "active"; then
     ufw allow 80/tcp >/dev/null 2>&1 || true
     ok "Opened TCP/80 in ufw for Let's Encrypt HTTP-01"
 fi
-systemctl restart nginx || true
-systemctl enable nginx >/dev/null 2>&1 || true
+reload_or_restart_caddy || fail "Caddy HTTP config start failed. Check port 80 conflicts: ss -ltnp 'sport = :80'"
 
 LE_CERT="/etc/letsencrypt/live/${TLS_DOMAIN}/fullchain.pem"
 LE_KEY="/etc/letsencrypt/live/${TLS_DOMAIN}/privkey.pem"
@@ -378,14 +556,8 @@ else
 fi
 
 if $CERT_OK; then
-    ln -sf "$LE_CERT" "${CERT_DIR}/cert.pem"
-    ln -sf "$LE_KEY" "${CERT_DIR}/key.pem"
-    mkdir -p /etc/letsencrypt/renewal-hooks/deploy
-    cat > /etc/letsencrypt/renewal-hooks/deploy/mtproto-mask-nginx-reload.sh << 'HOOKEOF'
-#!/usr/bin/env bash
-systemctl reload nginx >/dev/null 2>&1 || systemctl restart nginx >/dev/null 2>&1 || true
-HOOKEOF
-    chmod 0755 /etc/letsencrypt/renewal-hooks/deploy/mtproto-mask-nginx-reload.sh
+    install_certificate_files "$LE_CERT" "$LE_KEY"
+    write_renewal_hook
 elif [[ "$MASK_ALLOW_SELF_SIGNED" == "1" ]]; then
     warn "Using self-signed certificate because MASK_ALLOW_SELF_SIGNED=1"
     openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
@@ -394,30 +566,33 @@ elif [[ "$MASK_ALLOW_SELF_SIGNED" == "1" ]]; then
         -days 3650 -nodes \
         -subj "/CN=${TLS_DOMAIN}" \
         2>/dev/null
+    if [[ "$CADDY_RUNTIME" == "host" ]]; then
+        chown -R caddy:caddy "$CERT_DIR" 2>/dev/null || true
+    fi
+    chmod 0600 "${CERT_DIR}/key.pem"
 else
     fail "No valid certificate for ${TLS_DOMAIN}. Point DNS to this VPS and open TCP/80, or use DNS-01/copy certs manually."
 fi
 
-info "Configuring local HTTPS masking backend on 127.0.0.1:${NGINX_PORT}..."
-write_nginx_config 1
-nginx -t 2>/dev/null || fail "Nginx full config test failed"
-systemctl restart nginx || true
-ok "Nginx configured for ${TLS_DOMAIN}"
+info "Configuring local HTTPS masking backend on 127.0.0.1:${MASK_PORT}..."
+write_caddy_config 1
+reload_or_restart_caddy || fail "Caddy full config start failed"
+ok "Caddy configured for ${TLS_DOMAIN}"
 if [[ -n "$TUNNEL_HOST_IP" ]]; then
-    ok "Nginx also listens on ${TUNNEL_HOST_IP}:${NGINX_PORT} for tunnel netns"
+    ok "Caddy also listens on ${TUNNEL_HOST_IP}:${MASK_PORT} for tunnel netns"
 fi
 
-if curl -sk --max-time 5 --resolve "${TLS_DOMAIN}:${NGINX_PORT}:127.0.0.1" "https://${TLS_DOMAIN}:${NGINX_PORT}/" >/dev/null 2>&1; then
-    ok "Masking backend responds with SNI ${TLS_DOMAIN} on 127.0.0.1:${NGINX_PORT}"
-    check_pq_fronting_backend "127.0.0.1" "$NGINX_PORT" "$TLS_DOMAIN"
+if curl -sk --max-time 5 --resolve "${TLS_DOMAIN}:${MASK_PORT}:127.0.0.1" "https://${TLS_DOMAIN}:${MASK_PORT}/" >/dev/null 2>&1; then
+    ok "Masking backend responds with SNI ${TLS_DOMAIN} on 127.0.0.1:${MASK_PORT}"
+    check_pq_fronting_backend "127.0.0.1" "$MASK_PORT" "$TLS_DOMAIN"
 else
-    warn "Masking backend probe failed. Check: curl -vk --resolve ${TLS_DOMAIN}:${NGINX_PORT}:127.0.0.1 https://${TLS_DOMAIN}:${NGINX_PORT}/"
+    warn "Masking backend probe failed. Check: curl -vk --resolve ${TLS_DOMAIN}:${MASK_PORT}:127.0.0.1 https://${TLS_DOMAIN}:${MASK_PORT}/"
 fi
 
 if [[ -f "$CONFIG_FILE" ]]; then
     set_config_value "censorship" "tls_domain" "\"${TLS_DOMAIN}\""
     set_config_value "censorship" "mask" "true"
-    set_config_value "censorship" "mask_port" "${NGINX_PORT}"
+    set_config_value "censorship" "mask_port" "${MASK_PORT}"
     if [[ "$MASK_SET_PUBLIC_IP" == "1" ]]; then
         set_config_value "server" "public_ip" "\"${TLS_DOMAIN}\""
     fi
@@ -425,7 +600,7 @@ if [[ -f "$CONFIG_FILE" ]]; then
     info "Restart the proxy to apply: systemctl restart mtproto-proxy"
 else
     warn "Config file not found at ${CONFIG_FILE}"
-    info "Set [server].public_ip, [censorship].tls_domain, mask=true, and mask_port=${NGINX_PORT} manually"
+    info "Set [server].public_ip, [censorship].tls_domain, mask=true, and mask_port=${MASK_PORT} manually"
 fi
 
 MASK_MONITOR_SCRIPT="${INSTALL_DIR}/setup_mask_monitor.sh"
@@ -445,13 +620,17 @@ echo -e "${BOLD}${CYAN}Self-domain 404 masking configured${RESET}"
 echo ""
 echo -e "  ${DIM}Domain:${RESET}      ${TLS_DOMAIN}"
 echo -e "  ${DIM}Public :443:${RESET} mtproto-proxy"
-echo -e "  ${DIM}Nginx TLS:${RESET}   127.0.0.1:${NGINX_PORT}"
+if [[ "$CADDY_RUNTIME" == "docker" ]]; then
+echo -e "  ${DIM}Caddy TLS:${RESET}   Docker mtproto-mask-caddy on 127.0.0.1:${MASK_PORT}"
+else
+echo -e "  ${DIM}Caddy TLS:${RESET}   127.0.0.1:${MASK_PORT}"
+fi
 if [[ -n "$TUNNEL_HOST_IP" ]]; then
-echo -e "  ${DIM}Tunnel TLS:${RESET}  ${TUNNEL_HOST_IP}:${NGINX_PORT}"
+echo -e "  ${DIM}Tunnel TLS:${RESET}  ${TUNNEL_HOST_IP}:${MASK_PORT}"
 fi
 echo -e "  ${DIM}ACME root:${RESET}   ${ACME_ROOT}"
 echo -e "  ${DIM}Cert:${RESET}        ${CERT_DIR}/cert.pem"
 echo -e "  ${DIM}ACME HTTP:${RESET}   ${TLS_DOMAIN}:80"
 echo ""
-echo -e "Browsers and active probes for ${TLS_DOMAIN}:443 are relayed to Nginx and receive 404."
+echo -e "Browsers and active probes for ${TLS_DOMAIN}:443 are relayed to Caddy and receive 404."
 echo -e "Valid MTProto clients with the right secret stay on the proxy path."

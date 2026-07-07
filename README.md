@@ -38,7 +38,7 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 | **DRS** | Dynamic Record Sizing | Mimics real browser TLS behavior (Chrome/Firefox) to resist fingerprinting |
 | **Multi-user** | Access Control | Independent secret-based authentication per user |
 | **Anti-replay** | Timestamp + Digest Cache | Rejects replayed handshakes outside ±2 min window AND detects ТСПУ Revisor active probes |
-| **Masking** | Connection Cloaking | Forwards unauthenticated clients either to `tls_domain:443` or, for self-domain installs, to a local Nginx 404 backend |
+| **Masking** | Connection Cloaking | Forwards unauthenticated clients either to `tls_domain:443` or, for self-domain installs, to a local Caddy 404 backend |
 | **PQ FakeTLS** | DPI Evasion | Echoes `X25519MLKEM768` (`0x11ec`) ServerHello key_share for modern Desktop/Android ClientHellos |
 | **Fast Mode** | Direct-Path S2C Offload | Reduces CPU usage by delegating S2C AES work to Telegram DCs on direct paths (non-MiddleProxy) |
 | **MiddleProxy** | Telemt-Compatible ME | Optional ME transport for DC1..5 (`use_middle_proxy`); media-path traffic prefers ME endpoints with direct fallback when unavailable |
@@ -48,7 +48,7 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 | **TCPMSS=88** | DPI Evasion | Forces ClientHello fragmentation across 6 TCP packets, breaking ISP DPI reassembly |
 | **TCP Desync** | DPI Evasion | Integrated `zapret` (`nfqws`) OS-level desynchronization (fake packets + TTL spoofing) |
 | **Split-TLS** | DPI Evasion | Splits fake `ServerHello` write into `1 byte + short pause + rest` to desynchronize passive DPI |
-| **Zero-RTT** | DPI Evasion | Local self-domain Nginx 404 masking (`127.0.0.1:8443`, with tunnel netns auto-routing) to defeat active probing timing analysis |
+| **Zero-RTT** | DPI Evasion | Local self-domain Caddy 404 masking (`127.0.0.1:8443`, with tunnel netns auto-routing and PQ TLS groups) to defeat active probing timing analysis |
 | **0 deps** | Stdlib Only | No third-party Zig packages (proxy core uses Zig standard library only) |
 | **Explicit State** | Runtime Ownership | Proxy state is passed explicitly; runtime log level is the only mutable global knob |
 
@@ -267,7 +267,7 @@ OS-level mitigations from `deploy/` (iptables `TCPMSS`, `nfqws`, etc.) are **not
 
 ### Docker Compose install
 
-For VPS installs from a prebuilt image, use the Docker Compose installer. It mirrors the one-line source installer for host-level setup: creates `/opt/mtproto-proxy/config.toml`, writes `/opt/mtproto-proxy/compose.yml`, installs a `mtproto-proxy.service` Docker Compose wrapper, configures self-domain Nginx masking, applies TCPMSS, optionally installs inbound SYN pacing, installs nfqws, pulls the image, starts the container, and prints the `tg://` link:
+For VPS installs from a prebuilt image, use the Docker Compose installer. It mirrors the one-line source installer for host-level setup: creates `/opt/mtproto-proxy/config.toml`, writes `/opt/mtproto-proxy/compose.yml`, installs a `mtproto-proxy.service` Docker Compose wrapper, configures self-domain Caddy masking as a Compose service, applies TCPMSS, optionally installs inbound SYN pacing, installs nfqws, pulls the images, starts the proxy and Caddy containers, and prints the `tg://` link:
 
 ```bash
 curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/install_docker_compose.sh \
@@ -285,13 +285,14 @@ Useful environment variables:
 | `PORT` | `443` | Listen port in generated config |
 | `SECRET` | random | 32-hex user secret; generated once when config is absent |
 | `USE_MIDDLE_PROXY` | `true` | Initial `use_middle_proxy` value |
-| `ENABLE_MASKING` | `true` | Install Nginx/certbot masking and set `mask = true` |
+| `ENABLE_MASKING` | `true` | Install Caddy/certbot masking and set `mask = true`; Docker installs run Caddy in Compose |
 | `ENABLE_SYNFIX` | `false` | Install inbound SYN pacing rules for Android/Desktop routes that need it |
 | `SYNFIX_ACTION` | `reject` | Over-limit SYN action: `reject` sends TCP reset for faster retries, `drop` is quieter |
-| `MASK_PORT` | `8443` | Local Nginx HTTPS masking backend port |
+| `MASK_PORT` | `8443` | Local Caddy HTTPS masking backend port |
+| `CADDY_IMAGE` | `caddy:2.10-alpine` | Caddy image used by the Docker Compose installer |
 | `GHCR_USER` / `GHCR_TOKEN` | _(empty)_ | Optional login for private GHCR packages |
 
-The installer requires Docker Compose v2 (`docker compose`) and installs Docker Engine + the Compose plugin via Docker's convenience script if either Docker or the plugin is missing. When `IMAGE` is not set, compatible x86_64 hosts automatically pull the `latest-amd64-v3` image; if that tag is unavailable, the installer falls back to generic `latest`. The Compose service uses `network_mode: host`, so the container binds the configured port directly on the VPS. Re-run the installer to pull and restart with a newer image, or update manually:
+The installer requires Docker Compose v2 (`docker compose`) and installs Docker Engine + the Compose plugin via Docker's convenience script if either Docker or the plugin is missing. When `IMAGE` is not set, compatible x86_64 hosts automatically pull the `latest-amd64-v3` image; if that tag is unavailable, the installer falls back to generic `latest`. The proxy and Caddy Compose services use `network_mode: host`, so the proxy binds public `:443` and Caddy binds local masking/ACME ports directly on the VPS. Re-run the installer to pull and restart with newer images, or update manually:
 
 ```bash
 cd /opt/mtproto-proxy
@@ -317,7 +318,7 @@ This will:
 6. Apply **TCPMSS=88** iptables/ip6tables rules when available (passive DPI bypass)
 7. Optionally install inbound SYN pacing for Android/Desktop handshake stability (`ENABLE_SYNFIX=true`)
 8. Install **IPv6 hop script** when `CF_TOKEN`+`CF_ZONE`+`IPV6_PREFIX` are provided
-9. Set up self-domain Nginx 404 masking on `127.0.0.1:8443`, including Let's Encrypt on TCP/80, X25519MLKEM768 capability warning, and the masking health timer
+9. Set up self-domain Caddy 404 masking on `127.0.0.1:8443`, including Let's Encrypt on TCP/80, X25519MLKEM768 TLS groups, and the masking health timer
 10. Attempt OS-level `zapret` / `nfqws` TCP desync setup
 11. Refresh optional monitor files if `proxy-monitor` already exists
 12. Print a ready-to-use `tg://` connection link when `[access.users]` contains a valid 32-hex secret
@@ -337,7 +338,7 @@ For the recommended Reality-style self-domain masking flow, use a domain you own
 
 1. Create an `A` record, for example `proxy.example.com -> <VPS_IP>`.
 2. If you use Cloudflare, keep this record **DNS only** (gray cloud), not proxied.
-3. Keep public TCP `443` for `mtproto-proxy`; Nginx will answer `404` locally on `127.0.0.1:8443` for non-proxy clients.
+3. Keep public TCP `443` for `mtproto-proxy`; Caddy will answer `404` locally on `127.0.0.1:8443` for non-proxy clients.
 4. Keep public TCP `80` reachable for Let's Encrypt HTTP-01 certificate issuance.
 
 Fresh install with a self-domain masking domain:
@@ -347,7 +348,7 @@ curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/in
   sudo env MASK_DOMAIN=proxy.example.com LE_EMAIL=admin@example.com bash
 ```
 
-The installer writes `server.public_ip = "proxy.example.com"` and `censorship.tls_domain = "proxy.example.com"` on first install, configures Nginx on `127.0.0.1:8443` to return `404` for non-proxy requests, obtains a Let's Encrypt certificate via `:80`, checks whether the masking TLS backend can negotiate X25519MLKEM768 (`0x11ec`), installs a renewal hook that reloads Nginx, and generates links that use the domain. Existing installs can be converted with:
+The installer writes `server.public_ip = "proxy.example.com"` and `censorship.tls_domain = "proxy.example.com"` on first install, configures Caddy on `127.0.0.1:8443` to return `404` for non-proxy requests, obtains a Let's Encrypt certificate via `:80`, configures X25519MLKEM768 (`0x11ec`) before x25519, installs a renewal hook that reloads Caddy, and generates links that use the domain. Docker Compose installs run Caddy as the `mtproto-mask-caddy` container; source installs run it as `mtproto-mask-caddy.service`. Existing installs can be converted with:
 
 ```bash
 sudo env MASK_DOMAIN=proxy.example.com LE_EMAIL=admin@example.com \
@@ -355,7 +356,7 @@ sudo env MASK_DOMAIN=proxy.example.com LE_EMAIL=admin@example.com \
 sudo systemctl restart mtproto-proxy
 ```
 
-The Nginx backend intentionally does not publish a site body. Only `/.well-known/acme-challenge/` on port `80` is served for Let's Encrypt; all other HTTP/HTTPS requests receive `404`. The masking setup also disables Debian's default Nginx site and makes `mtproto-masking` the default `:80` server so unmatched HTTP `Host`/IP requests return `404` too; set `MASK_KEEP_NGINX_DEFAULT=1` only if you intentionally want to keep an existing default site.
+The Caddy backend intentionally does not publish a site body. Only `/.well-known/acme-challenge/` on port `80` is served for Let's Encrypt; all other HTTP/HTTPS requests receive `404`. If another service already owns public `:80`, stop it before running `setup_masking.sh` so Caddy can serve the ACME challenge.
 
 To enable IPv6 auto-hopping (Cloudflare DNS rotation on ban detection), provide Cloudflare API credentials plus your routed `/64` prefix. The installer stores these values in `/opt/mtproto-proxy/env.sh`, and the cron-launched hop script sources that file before updating your domain's AAAA record. `DNS_NAME` defaults to the masking TLS domain when omitted.
 
@@ -484,7 +485,7 @@ sudo env MASK_DOMAIN=proxy.example.com LE_EMAIL=admin@example.com \
 sudo systemctl start mtproto-proxy
 ```
 
-`setup_masking.sh` installs Nginx/certbot, obtains or reuses a Let's Encrypt certificate, configures the local HTTPS masking backend on `127.0.0.1:8443`, and updates `config.toml` for self-domain masking.
+`setup_masking.sh` installs Caddy/certbot, obtains or reuses a Let's Encrypt certificate, configures the local HTTPS masking backend on `127.0.0.1:8443`, and updates `config.toml` for self-domain masking.
 
 **7. Generate connection link**
 
@@ -654,9 +655,9 @@ ssh root@<VPS_IP> 'bash /opt/mtproto-proxy/setup_tunnel.sh /tmp/awg.conf middlep
 
 > **Note** &nbsp; Tunnel setup supports three modes: `direct` (default, regular DC traffic stays direct; media still prefers MiddleProxy when available), `preserve` (keeps current config), and `middleproxy` (sets `use_middle_proxy=true`). Use `middleproxy` if you want full promo-tag parity for regular traffic through the tunnel.
 
-> **Note** &nbsp; For local masking (`mask_port = 8443`) in tunnel netns mode, masking is now auto-routed to host-side Nginx (`10.200.200.1:8443`) by deploy scripts/runtime — no extra config key is required.
+> **Note** &nbsp; For local masking (`mask_port = 8443`) in tunnel netns mode, masking is now auto-routed to host-side Caddy (`10.200.200.1:8443`) by deploy scripts/runtime — no extra config key is required.
 
-> **Note** &nbsp; Deploy scripts also install a self-healing masking monitor (`mtproto-mask-health.timer`) that checks local masking endpoint reachability every minute and restarts `nginx`/`mtproto-proxy` on failures.
+> **Note** &nbsp; Deploy scripts also install a self-healing masking monitor (`mtproto-mask-health.timer`) that checks local masking endpoint reachability every minute and restarts `mtproto-mask-caddy`/`mtproto-proxy` on failures.
 
 > **Note** &nbsp; To check tunnel status: `ssh root@<VPS_IP> 'ip netns exec tg_proxy_ns awg show'`
 
@@ -752,7 +753,7 @@ alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eli
 | `[monitor]` | `port` | `61208` | TCP port for the optional monitoring dashboard HTTP server |
 | `[censorship]` | `tls_domain` | `"google.com"` | FakeTLS SNI domain. With `mask_port=443`, unauthenticated clients are forwarded to this domain directly. For self-domain masking, set it to your own domain and point its DNS A record to the VPS. Since June 2026, the real masking endpoint should negotiate X25519MLKEM768 (`0x11ec`) in one round; classical-x25519-only domains can be a passive marker |
 | `[censorship]` | `mask` | `true` | Forward unauthenticated connections to the configured masking target to defeat active probing |
-| `[censorship]` | `mask_port` | `443` | Masking target port. `443` connects to `tls_domain:443`; non-443 values connect to a local address on that port (`127.0.0.1:<mask_port>`, or `10.200.200.1:<mask_port>` inside tunnel netns), so that port must be served by Nginx or another local backend. Use `8443` for self-domain Nginx so public `443` remains owned by `mtproto-proxy` |
+| `[censorship]` | `mask_port` | `443` | Masking target port. `443` connects to `tls_domain:443`; non-443 values connect to a local address on that port (`127.0.0.1:<mask_port>`, or `10.200.200.1:<mask_port>` inside tunnel netns), so that port must be served by Caddy or another local backend. Use `8443` for self-domain Caddy so public `443` remains owned by `mtproto-proxy` |
 | `[censorship]` | `desync` | `true` | Split fake `ServerHello` into `1 byte + short pause + rest` to desynchronize passive DPI |
 | `[censorship]` | `drs` | `false` | Dynamic Record Sizing: ramp TLS records from 1369→16384 bytes after warmup (mimics Chrome/Firefox) |
 | `[censorship]` | `fast_mode` | `false` | **Recommended** for direct-path traffic. Delegates S2C AES encryption to Telegram DC and reduces proxy CPU/RAM pressure |
@@ -765,7 +766,7 @@ alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eli
 
 > **Operational note** &nbsp; `deploy/mtproto-proxy.service` ships with `LimitNOFILE=131582` to allow higher custom caps when needed. Default `max_connections=512` is tuned for small VPS profiles; increase it only after capacity testing.
 
-> **Operational note** &nbsp; The FakeTLS path rejects non-32-byte ClientHello Session IDs. Current Telegram MTProto-over-TLS clients use a 32-byte Session ID, which the proxy echoes in its Nginx-like ServerHello template.
+> **Operational note** &nbsp; The FakeTLS path rejects non-32-byte ClientHello Session IDs. Current Telegram MTProto-over-TLS clients use a 32-byte Session ID, which the proxy echoes in its TLS-like ServerHello template.
 
 > **Operational note** &nbsp; If `accept()` hits `EMFILE`/`ENFILE`, the listener temporarily disables `EPOLLIN`, waits 500ms, and retries. In periodic `conn stats`, the first `paused=` flag reflects this fd-quota backoff.
 
@@ -775,7 +776,7 @@ alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eli
 
 > **Operational note** &nbsp; The proxy limits new connections to 30/sec per /24 subnet by default (`rate_limit_per_subnet`). This blocks ТСПУ scanners and DPI replay probes without affecting legitimate Telegram clients.
 
-> **Operational note** &nbsp; Self-domain masking expects DNS `A proxy.example.com -> <VPS_IP>`, Cloudflare DNS-only mode if used, public TCP `80` for Let's Encrypt, public TCP `443` for `mtproto-proxy`, and local Nginx TLS on `127.0.0.1:8443` returning `404` for non-proxy requests. By default, `setup_masking.sh` disables `/etc/nginx/sites-enabled/default` and makes `mtproto-masking` the default public `:80` server so unmatched HTTP requests also return `404`. It also probes the local TLS backend for X25519MLKEM768 support and warns if the backend is classical-x25519-only or the local OpenSSL is too old to verify PQ support. The `ee` link secret changes when `tls_domain` changes, so regenerate client links after changing the domain.
+> **Operational note** &nbsp; Self-domain masking expects DNS `A proxy.example.com -> <VPS_IP>`, Cloudflare DNS-only mode if used, public TCP `80` for Let's Encrypt, public TCP `443` for `mtproto-proxy`, and local Caddy TLS on `127.0.0.1:8443` returning `404` for non-proxy requests. Docker Compose installs serve that local Caddy endpoint from the `mtproto-mask-caddy` container; source installs serve it from `mtproto-mask-caddy.service`. `setup_masking.sh` serves ACME HTTP-01 on `:80` and configures Caddy with `x25519mlkem768 x25519` curves. The `ee` link secret changes when `tls_domain` changes, so regenerate client links after changing the domain.
 
 > **Tip** &nbsp; Generate a random secret: `openssl rand -hex 16`
 

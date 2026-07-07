@@ -103,16 +103,15 @@ pub fn validateTlsHandshake(
     return null;
 }
 
-/// Build a fake TLS ServerHello response using a pre-built Nginx/OpenSSL template.
+/// Build a fake TLS ServerHello response using a pre-built TLS 1.3 server template.
 ///
 /// The response consists of three TLS records that the client validates:
 /// 1. ServerHello record (type 0x16) — contains the HMAC digest in the `random` field
 /// 2. Change Cipher Spec record (type 0x14) — fixed 6 bytes
 /// 3. Fake Application Data record (type 0x17) — fixed-size body simulating encrypted cert
 ///
-/// Template approach: instead of hand-crafting bytes (which DPI fingerprints as non-Nginx),
-/// we use a comptime-built template that matches real Nginx/OpenSSL TLS 1.3 fingerprint:
-/// - Extensions in OpenSSL order: supported_versions THEN key_share
+/// Template approach: use a comptime-built normal TLS 1.3 ServerHello shape:
+/// - Extensions in common server order: supported_versions THEN key_share
 /// - Fixed AppData size (consistent like a real certificate, not random)
 /// - Deterministic pseudo-random AppData body (high entropy, same every time)
 ///
@@ -136,7 +135,7 @@ pub fn buildServerHello(
     client_digest: *const [constants.tls_digest_len]u8,
     session_id: []const u8,
 ) ![]u8 {
-    return buildServerHelloWithTemplate(allocator, &nginx_template, secret, client_digest, session_id);
+    return buildServerHelloWithTemplate(allocator, &server_template, secret, client_digest, session_id);
 }
 
 pub fn buildServerHelloWithTemplate(
@@ -157,10 +156,10 @@ pub fn buildServerHelloWithTemplateCipher(
     session_id: []const u8,
     cipher: ?u16,
 ) ![]u8 {
-    if (template.len != nginx_template_len) return error.BadServerHelloTemplate;
+    if (template.len != server_template_len) return error.BadServerHelloTemplate;
     if (session_id.len != 32) return error.InvalidSessionIdLength;
 
-    // 1. Copy the pre-built Nginx template (random and session_id are zeroed in template)
+    // 1. Copy the pre-built template (random and session_id are zeroed in template)
     const response = try allocator.alloc(u8, template.len);
     errdefer allocator.free(response);
     @memcpy(response, template);
@@ -345,13 +344,13 @@ pub fn buildServerHelloPq(
     return response;
 }
 
-// ============= Nginx/OpenSSL TLS 1.3 Template =============
+// ============= Static TLS 1.3 ServerHello Template =============
 //
-// Pre-built at comptime to match the fingerprint of Nginx 1.25+ with OpenSSL 3.x.
+// Pre-built at comptime to match a normal TLS 1.3 server shape.
 // Structure: ServerHello (127 bytes) + CCS (6 bytes) + AppData (5 + 2878 bytes)
 //
 // Key differences from naive FakeTLS that DPI detects:
-// 1. Extension ordering: OpenSSL sends supported_versions (0x002b) BEFORE key_share (0x0033)
+// 1. Extension ordering: supported_versions (0x002b) BEFORE key_share (0x0033)
 // 2. AppData size: fixed 2878 bytes (realistic Let's Encrypt ECDSA cert chain),
 //    NOT random in [1024,4096) which is an entropy fingerprint
 // 3. AppData body: deterministic pseudo-random (same across connections, like a real cert)
@@ -366,7 +365,7 @@ const tmpl_cipher_offset: usize = tmpl_session_id_offset + 32;
 const tmpl_x25519_key_offset: usize = 95;
 
 /// Fake encrypted certificate payload size.
-/// 2878 bytes matches a typical Nginx + Let's Encrypt ECDSA P-256 cert chain:
+/// 2878 bytes matches a typical Let's Encrypt ECDSA P-256 cert chain:
 ///   EncryptedExtensions (~20) + Certificate (~2400) + CertificateVerify (~100) +
 ///   Finished (~36) + AEAD tags (~50) + record layer overhead.
 /// Fixed size eliminates the random-range fingerprint that ТСПУ detects.
@@ -374,27 +373,27 @@ const fake_cert_payload_len: u16 = 2878;
 const fake_cert_payload_size: usize = @as(usize, fake_cert_payload_len);
 
 /// Total template size: ServerHello(127) + CCS(6) + AppData(5 + 2878)
-const nginx_template_len: usize = 127 + 6 + 5 + fake_cert_payload_size;
-pub const server_hello_template_len: usize = nginx_template_len;
+const server_template_len: usize = 127 + 6 + 5 + fake_cert_payload_size;
+pub const server_hello_template_len: usize = server_template_len;
 /// Fixed ServerHello+CCS+AppData-header prefix length.
-const tmpl_appdata_offset: usize = nginx_template_len - fake_cert_payload_size;
+const tmpl_appdata_offset: usize = server_template_len - fake_cert_payload_size;
 pub const server_hello_prefix_len: usize = tmpl_appdata_offset;
 
-const default_template_seed: u64 = 0x4E67_696E_785F_544C;
+const default_template_seed: u64 = 0x5365_7276_546C_7331;
 
 /// The pre-built template, constructed at comptime.
-const nginx_template: [nginx_template_len]u8 = blk: {
+const server_template: [server_template_len]u8 = blk: {
     @setEvalBranchQuota(100_000);
-    break :blk buildNginxTemplate(default_template_seed);
+    break :blk buildStaticServerTemplate(default_template_seed);
 };
 
-pub fn buildServerHelloTemplate(seed: ?u64) [nginx_template_len]u8 {
+pub fn buildServerHelloTemplate(seed: ?u64) [server_template_len]u8 {
     const actual_seed = seed orelse crypto.randomInt(u64);
-    return buildNginxTemplate(actual_seed);
+    return buildStaticServerTemplate(actual_seed);
 }
 
-fn buildNginxTemplate(seed: u64) [nginx_template_len]u8 {
-    var t: [nginx_template_len]u8 = undefined;
+fn buildStaticServerTemplate(seed: u64) [server_template_len]u8 {
+    var t: [server_template_len]u8 = undefined;
     var pos: usize = 0;
 
     // ── Record 1: ServerHello ──────────────────────────────────
@@ -437,7 +436,7 @@ fn buildNginxTemplate(seed: u64) [nginx_template_len]u8 {
     }
     pos += 32;
 
-    // Cipher suite: TLS_AES_128_GCM_SHA256 (0x1301) — most common in Nginx
+    // Cipher suite: TLS_AES_128_GCM_SHA256 (0x1301), common TLS 1.3 default.
     t[pos] = 0x13;
     t[pos + 1] = 0x01;
     pos += 2;
@@ -508,7 +507,7 @@ fn buildNginxTemplate(seed: u64) [nginx_template_len]u8 {
     }
     pos += fake_cert_payload_size;
 
-    if (pos != nginx_template_len) unreachable;
+    if (pos != server_template_len) unreachable;
     return t;
 }
 
@@ -625,7 +624,7 @@ test "timing_safe.eql" {
     try std.testing.expect(!std.crypto.timing_safe.eql([3]u8, a, c));
 }
 
-test "buildServerHello produces valid three-record Nginx template structure" {
+test "buildServerHello produces valid three-record server template structure" {
     const allocator = std.testing.allocator;
     var digest = [_]u8{0x42} ** 32;
     const session_id = [_]u8{0x01} ** 32;
@@ -639,7 +638,7 @@ test "buildServerHello produces valid three-record Nginx template structure" {
     defer allocator.free(response);
 
     // Template produces fixed-size response
-    try std.testing.expectEqual(nginx_template_len, response.len);
+    try std.testing.expectEqual(server_template_len, response.len);
 
     // Record 1: ServerHello (\x16\x03\x03)
     try std.testing.expectEqual(@as(u8, constants.tls_record_handshake), response[0]);
@@ -667,7 +666,7 @@ test "buildServerHello produces valid three-record Nginx template structure" {
     try std.testing.expectEqual(@as(u8, 0x03), response[app_start + 2]);
 
     const len2 = std.mem.readInt(u16, response[app_start + 3 ..][0..2], .big);
-    // AppData is now FIXED size (Nginx template), not random
+    // AppData is now fixed-size, not random-length.
     try std.testing.expectEqual(fake_cert_payload_len, len2);
 
     // Total response length should match all three records
@@ -824,7 +823,7 @@ test "buildServerHelloWithTemplateCipher echoes chosen cipher" {
     var digest = [_]u8{0xAA} ** 32;
     const session_id = [_]u8{0xBB} ** 32;
 
-    const resp = try buildServerHelloWithTemplateCipher(allocator, &nginx_template, &digest, &digest, &session_id, 0x1303);
+    const resp = try buildServerHelloWithTemplateCipher(allocator, &server_template, &digest, &digest, &session_id, 0x1303);
     defer allocator.free(resp);
 
     try std.testing.expectEqual(@as(u16, 0x1303), std.mem.readInt(u16, resp[tmpl_cipher_offset..][0..2], .big));

@@ -476,9 +476,9 @@ async function poll() {
     }
     $('maskTarget').textContent = endpointText;
 
-    const nginxState = (masking.nginx_active ? 'active' : 'down') + ' / ' +
-      (masking.nginx_enabled ? 'enabled' : 'disabled');
-    $('maskNginx').textContent = nginxState;
+    const caddyState = (masking.caddy_active ? 'active' : 'down') + ' / ' +
+      (masking.caddy_enabled ? 'enabled' : 'disabled');
+    $('maskCaddy').textContent = caddyState;
 
     const timerState = (masking.health_timer_active ? 'active' : 'down') + ' / ' +
       (masking.health_timer_enabled ? 'enabled' : 'disabled');

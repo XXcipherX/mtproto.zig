@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# setup_mask_monitor.sh — install masking health self-healing for nginx + mtproto-proxy.
+# setup_mask_monitor.sh - install masking health self-healing for Caddy + mtproto-proxy.
 #
 # Idempotent helper used by install/setup_masking/setup_tunnel scripts.
 
@@ -13,10 +13,12 @@ fi
 
 INSTALL_DIR="/opt/mtproto-proxy"
 CONFIG_FILE="${INSTALL_DIR}/config.toml"
+MASK_CADDY_SERVICE="mtproto-mask-caddy.service"
+COMPOSE_FILE="${INSTALL_DIR}/compose.yml"
+ENV_FILE="${INSTALL_DIR}/.env"
 MASK_HEALTH_SCRIPT="/usr/local/bin/mtproto-mask-health.sh"
 MASK_HEALTH_SERVICE="/etc/systemd/system/mtproto-mask-health.service"
 MASK_HEALTH_TIMER="/etc/systemd/system/mtproto-mask-health.timer"
-NGINX_DROPIN_DIR="/etc/systemd/system/nginx.service.d"
 PROXY_DROPIN_DIR="/etc/systemd/system/mtproto-proxy.service.d"
 
 RED='\033[0;31m'
@@ -24,32 +26,45 @@ GREEN='\033[0;32m'
 CYAN='\033[0;36m'
 RESET='\033[0m'
 
-info()  { [[ $QUIET -eq 1 ]] || echo -e "${CYAN}▸${RESET} $*"; }
-ok()    { [[ $QUIET -eq 1 ]] || echo -e "${GREEN}✓${RESET} $*"; }
-warn()  { echo -e "${RED}⚠${RESET} $*"; }
-fail()  { echo -e "${RED}✗${RESET} $*" >&2; exit 1; }
+info()  { [[ $QUIET -eq 1 ]] || echo -e "${CYAN}>${RESET} $*"; }
+ok()    { [[ $QUIET -eq 1 ]] || echo -e "${GREEN}+${RESET} $*"; }
+warn()  { echo -e "${RED}!${RESET} $*"; }
+fail()  { echo -e "${RED}x${RESET} $*" >&2; exit 1; }
 
 [[ $EUID -eq 0 ]] || fail "Run as root: sudo bash setup_mask_monitor.sh"
 
-mkdir -p "$NGINX_DROPIN_DIR" "$PROXY_DROPIN_DIR"
+docker_caddy_configured() {
+    command -v docker >/dev/null 2>&1 || return 1
+    [[ -f "$COMPOSE_FILE" ]] || return 1
+    docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" config --services 2>/dev/null \
+        | grep -qx 'mtproto-mask-caddy'
+}
 
-cat > "${NGINX_DROPIN_DIR}/restart.conf" << 'EOF'
-[Service]
-Restart=on-failure
-RestartSec=2s
-EOF
+DOCKER_CADDY=false
+if docker_caddy_configured; then
+    DOCKER_CADDY=true
+fi
 
-cat > "${PROXY_DROPIN_DIR}/10-nginx.conf" << 'EOF'
+if $DOCKER_CADDY; then
+    rm -f "${PROXY_DROPIN_DIR}/10-mask-caddy.conf"
+else
+    mkdir -p "$PROXY_DROPIN_DIR"
+    cat > "${PROXY_DROPIN_DIR}/10-mask-caddy.conf" << 'EOF'
 [Unit]
-Wants=nginx.service
-After=nginx.service
+Wants=mtproto-mask-caddy.service
+After=mtproto-mask-caddy.service
 EOF
+fi
 
 cat > "$MASK_HEALTH_SCRIPT" << 'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
 CONFIG_FILE="/opt/mtproto-proxy/config.toml"
+MASK_CADDY_SERVICE="mtproto-mask-caddy.service"
+COMPOSE_FILE="/opt/mtproto-proxy/compose.yml"
+ENV_FILE="/opt/mtproto-proxy/.env"
+CADDY_CONTAINER="mtproto-mask-caddy"
 NS_NAME="tg_proxy_ns"
 NS_HOST_IP="10.200.200.1"
 LOCAL_HOST_IP="127.0.0.1"
@@ -110,6 +125,29 @@ probe_netns_endpoint() {
     ip netns exec "$NS_NAME" curl -sk --max-time 3 --resolve "${domain}:${port}:${host}" "https://${domain}:${port}/" >/dev/null 2>&1
 }
 
+docker_caddy_available() {
+    command -v docker >/dev/null 2>&1 || return 1
+    [[ -f "$COMPOSE_FILE" ]] || return 1
+    docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" config --services 2>/dev/null \
+        | grep -qx 'mtproto-mask-caddy'
+}
+
+caddy_active() {
+    if docker_caddy_available; then
+        docker inspect -f '{{.State.Running}}' "$CADDY_CONTAINER" 2>/dev/null | grep -qx true
+    else
+        systemctl is-active --quiet "$MASK_CADDY_SERVICE"
+    fi
+}
+
+restart_caddy() {
+    if docker_caddy_available; then
+        docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" up -d --force-recreate mtproto-mask-caddy >/dev/null 2>&1
+    else
+        systemctl restart "$MASK_CADDY_SERVICE"
+    fi
+}
+
 if ! command -v systemctl >/dev/null 2>&1; then
     exit 0
 fi
@@ -119,7 +157,7 @@ if ! command -v curl >/dev/null 2>&1; then
     exit 1
 fi
 
-if ! systemctl list-unit-files --type=service --no-legend 2>/dev/null | grep -q '^nginx\.service[[:space:]]'; then
+if ! docker_caddy_available && ! systemctl list-unit-files --type=service --no-legend 2>/dev/null | grep -q "^${MASK_CADDY_SERVICE}[[:space:]]"; then
     exit 0
 fi
 
@@ -162,9 +200,9 @@ probe_endpoint() {
     fi
 }
 
-if ! systemctl is-active --quiet nginx; then
-    logger -t mtproto-mask-health "nginx inactive, restarting"
-    systemctl restart nginx || true
+if ! caddy_active; then
+    logger -t mtproto-mask-health "Caddy masking service inactive, restarting"
+    restart_caddy || true
     sleep 1
 fi
 
@@ -172,12 +210,12 @@ if probe_endpoint; then
     exit 0
 fi
 
-logger -t mtproto-mask-health "mask endpoint ${tls_domain} via ${target_host}:${mask_port} unreachable; restarting nginx"
-systemctl restart nginx || true
+logger -t mtproto-mask-health "mask endpoint ${tls_domain} via ${target_host}:${mask_port} unreachable; restarting Caddy"
+restart_caddy || true
 sleep 1
 
 if probe_endpoint; then
-    logger -t mtproto-mask-health "mask endpoint ${tls_domain} via ${target_host}:${mask_port} recovered after nginx restart"
+    logger -t mtproto-mask-health "mask endpoint ${tls_domain} via ${target_host}:${mask_port} recovered after Caddy restart"
     exit 0
 fi
 
@@ -221,11 +259,17 @@ WantedBy=timers.target
 EOF
 
 systemctl daemon-reload
-systemctl enable nginx >/dev/null 2>&1 || true
+if $DOCKER_CADDY; then
+    docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" up -d mtproto-mask-caddy >/dev/null 2>&1 || true
+else
+    systemctl enable "$MASK_CADDY_SERVICE" >/dev/null 2>&1 || true
+fi
 systemctl enable --now mtproto-mask-health.timer >/dev/null 2>&1 || true
 
-if systemctl is-active --quiet nginx; then
-    systemctl try-reload-or-restart nginx >/dev/null 2>&1 || true
+if $DOCKER_CADDY; then
+    docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" up -d --force-recreate mtproto-mask-caddy >/dev/null 2>&1 || true
+elif systemctl is-active --quiet "$MASK_CADDY_SERVICE"; then
+    systemctl try-reload-or-restart "$MASK_CADDY_SERVICE" >/dev/null 2>&1 || true
 fi
 
 systemctl start mtproto-mask-health.service >/dev/null 2>&1 || true
@@ -242,8 +286,10 @@ else
     warn "Masking health timer is not enabled"
 fi
 
-if systemctl is-active --quiet nginx; then
-    ok "Nginx service is active"
+if $DOCKER_CADDY && docker inspect -f '{{.State.Running}}' mtproto-mask-caddy 2>/dev/null | grep -qx true; then
+    ok "Caddy masking container is active"
+elif ! $DOCKER_CADDY && systemctl is-active --quiet "$MASK_CADDY_SERVICE"; then
+    ok "Caddy masking service is active"
 else
-    warn "Nginx service is not active"
+    warn "Caddy masking backend is not active"
 fi

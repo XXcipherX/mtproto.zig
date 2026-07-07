@@ -432,6 +432,36 @@ def _unit_enabled(unit: str) -> bool:
     )
 
 
+def _docker_container_running(name: str) -> bool:
+    if not shutil.which("docker"):
+        return False
+    try:
+        out = subprocess.check_output(
+            ["docker", "inspect", "-f", "{{.State.Running}}", name],
+            text=True,
+            timeout=2,
+            stderr=subprocess.DEVNULL,
+        )
+        return out.strip() == "true"
+    except Exception:
+        return False
+
+
+def _docker_container_exists(name: str) -> bool:
+    if not shutil.which("docker"):
+        return False
+    try:
+        subprocess.check_call(
+            ["docker", "inspect", name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        )
+        return True
+    except Exception:
+        return False
+
+
 def _probe_mask_endpoint(target: str, port: int, use_netns: bool) -> bool:
     if not shutil.which("curl"):
         return False
@@ -515,14 +545,19 @@ def _masking_status() -> dict:
     if mode == "local":
         endpoint_ok = _probe_mask_endpoint(target_host, mask_port, using_netns_target)
 
-    nginx_active = _unit_active("nginx.service")
-    nginx_enabled = _unit_enabled("nginx.service")
+    caddy_container = _docker_container_exists("mtproto-mask-caddy")
+    caddy_active = (
+        _docker_container_running("mtproto-mask-caddy")
+        if caddy_container
+        else _unit_active("mtproto-mask-caddy.service")
+    )
+    caddy_enabled = caddy_container or _unit_enabled("mtproto-mask-caddy.service")
     timer_active = _unit_active("mtproto-mask-health.timer")
     timer_enabled = _unit_enabled("mtproto-mask-health.timer")
 
     healthy = True
     if mode == "local":
-        healthy = nginx_active and timer_active and bool(endpoint_ok)
+        healthy = caddy_active and timer_active and bool(endpoint_ok)
 
     result = {
         "enabled": mask_enabled,
@@ -532,8 +567,8 @@ def _masking_status() -> dict:
         "target": f"{target_host}:{mask_port}" if mode != "disabled" else "-",
         "using_netns": using_netns_target,
         "endpoint_ok": endpoint_ok,
-        "nginx_active": nginx_active,
-        "nginx_enabled": nginx_enabled,
+        "caddy_active": caddy_active,
+        "caddy_enabled": caddy_enabled,
         "health_timer_active": timer_active,
         "health_timer_enabled": timer_enabled,
         "healthy": healthy,

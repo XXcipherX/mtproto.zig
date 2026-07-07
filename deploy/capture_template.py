@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-capture_template.py — Capture a real Nginx/OpenSSL TLS 1.3 ServerHello template.
+capture_template.py - Capture a real TLS 1.3 ServerHello template.
 
 Connects to a live HTTPS server (e.g. your tls_domain), captures the ServerHello +
 CCS + first AppData, zeroes the mutable fields (random, session_id, x25519 key),
 and saves the result as a binary template.
 
-This template can be used to update the comptime Nginx template in tls.zig
-when OpenSSL/Nginx updates change the ServerHello structure.
+This template can be used to update the comptime FakeTLS template in tls.zig
+when common TLS server behavior changes.
 
 Usage:
     python3 capture_template.py [host] [port]
@@ -15,8 +15,8 @@ Usage:
     python3 capture_template.py                  # defaults to wb.ru:443
 
 Output:
-    nginx_template.bin  — raw binary template (zeroed mutable fields)
-    nginx_template.txt  — hex dump + field annotations
+    server_hello_template.bin - raw binary template (zeroed mutable fields)
+    server_hello_template.txt - hex dump + field annotations
 
 Requirements:
     Python 3.6+ (stdlib only, no pip packages)
@@ -169,8 +169,8 @@ def capture_server_hello(host: str, port: int) -> bytes:
     print(f"  Sending ClientHello ({len(client_hello)} bytes)...")
     sock.sendall(client_hello)
 
-    # Read response — we need ServerHello + CCS + first AppData
-    # Real Nginx sends these as separate TLS records
+    # Read response: ServerHello + CCS + first AppData.
+    # Common TLS 1.3 servers send these as separate TLS records.
     response = b""
     records_captured = 0
     target_records = 3  # ServerHello, CCS, AppData (encrypted extensions + cert + etc)
@@ -318,7 +318,7 @@ def create_template(data: bytes, offsets: dict) -> bytes:
 def write_hex_dump(data: bytes, path: str, offsets: dict):
     """Write an annotated hex dump."""
     with open(path, "w") as f:
-        f.write(f"# Nginx/OpenSSL TLS 1.3 ServerHello Template\n")
+        f.write(f"# TLS 1.3 ServerHello Template\n")
         f.write(f"# Total size: {len(data)} bytes\n")
         f.write(f"# Mutable fields (zeroed):\n")
         for name in ("random", "session_id", "x25519_key"):
@@ -326,7 +326,7 @@ def write_hex_dump(data: bytes, path: str, offsets: dict):
                 o = offsets[name]
                 f.write(f"#   {name}: offset={o['offset']}, length={o['length']}\n")
         f.write(f"#\n")
-        f.write(f"# To use in tls.zig, update buildNginxTemplate() with these bytes.\n")
+        f.write(f"# To use in tls.zig, update buildStaticServerTemplate() with these bytes.\n")
         f.write(f"#\n\n")
 
         # Hex dump with offset annotations
@@ -336,7 +336,7 @@ def write_hex_dump(data: bytes, path: str, offsets: dict):
             ascii_str = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
             f.write(f"{i:04x}:  {hex_str:<48s}  |{ascii_str}|\n")
 
-        f.write(f"\n# Zig comptime array (paste into tls.zig buildNginxTemplate):\n")
+        f.write(f"\n# Zig comptime array (paste into tls.zig buildStaticServerTemplate):\n")
         f.write(f"# const template = [_]u8{{\n")
         for i in range(0, len(data), 12):
             chunk = data[i : i + 12]
@@ -368,8 +368,8 @@ def main():
     template = create_template(response, offsets)
 
     # Step 4: Write outputs
-    bin_path = "nginx_template.bin"
-    txt_path = "nginx_template.txt"
+    bin_path = "server_hello_template.bin"
+    txt_path = "server_hello_template.txt"
 
     with open(bin_path, "wb") as f:
         f.write(template)

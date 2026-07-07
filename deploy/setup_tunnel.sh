@@ -400,21 +400,21 @@ fi
 MASK_PORT="$(get_mask_port "$INSTALL_DIR/config.toml")"
 MASK_PORT="${MASK_PORT:-443}"
 if [[ "$MASK_PORT" != "443" ]]; then
-    MASKING_SITE="/etc/nginx/sites-available/mtproto-masking"
-    if [[ -f "$MASKING_SITE" ]]; then
-        if ! grep -Eq "^[[:space:]]*listen[[:space:]]+10\\.200\\.200\\.1:${MASK_PORT}[[:space:]]+ssl;" "$MASKING_SITE"; then
-            if grep -Eq "^[[:space:]]*listen[[:space:]]+127\\.0\\.0\\.1:${MASK_PORT}[[:space:]]+ssl;" "$MASKING_SITE"; then
-                sed -i "/^[[:space:]]*listen[[:space:]]*127\\.0\\.0\\.1:${MASK_PORT}[[:space:]]*ssl;/a\    listen 10.200.200.1:${MASK_PORT} ssl;" "$MASKING_SITE"
-                if nginx -t >/dev/null 2>&1; then
-                    systemctl reload nginx || true
-                    ok "Patched Nginx masking listener on 10.200.200.1:${MASK_PORT}"
-                else
-                    warn "Nginx config test failed after masking listener patch"
-                fi
-            else
-                warn "Could not find 127.0.0.1:${MASK_PORT} listener in ${MASKING_SITE}"
-            fi
+    MASK_DOMAIN="$(get_config_value "$INSTALL_DIR/config.toml" "censorship" "tls_domain" "")"
+    MASKING_SETUP="${INSTALL_DIR}/setup_masking.sh"
+    if [[ ! -x "$MASKING_SETUP" ]]; then
+        MASKING_SETUP="$(dirname "$0")/setup_masking.sh"
+    fi
+
+    if [[ -x "$MASKING_SETUP" && -n "$MASK_DOMAIN" ]]; then
+        info "Refreshing Caddy masking listener for tunnel netns..."
+        if MASK_DOMAIN="$MASK_DOMAIN" MASK_PORT="$MASK_PORT" MASK_SET_PUBLIC_IP=0 bash "$MASKING_SETUP" "$MASK_DOMAIN" < /dev/null; then
+            ok "Caddy masking listener refreshed on 10.200.200.1:${MASK_PORT}"
+        else
+            warn "Caddy masking refresh failed; local masking may not be reachable from the proxy netns"
         fi
+    else
+        warn "setup_masking.sh not found or tls_domain missing; could not refresh Caddy tunnel listener"
     fi
 fi
 

@@ -22,7 +22,7 @@
 #   6. Applies TCPMSS clamping (DPI bypass: splits ClientHello into tiny packets)
 #   7. Optionally installs inbound SYN pacing for Android/Desktop handshake stability
 #   8. Installs IPv6 address hopping script + cron job (optional, requires CF_TOKEN + CF_ZONE + IPV6_PREFIX)
-#   9. Installs masking self-healing monitor (nginx + timer watchdog)
+#   9. Installs masking self-healing monitor (Caddy + timer watchdog)
 #   10. Prints the ready-to-use tg:// link
 
 set -euo pipefail
@@ -340,7 +340,7 @@ MASKING_OK=false
 SYNFIX_OK=false
 NFQWS_OK=false
 
-info "Setting up Self-domain Nginx Masking (zero-RTT)..."
+info "Setting up Self-domain Caddy Masking (zero-RTT)..."
 if MASK_DOMAIN="$TLS_DOMAIN" bash "$TMPBUILD/deploy/setup_masking.sh" "$TLS_DOMAIN" < /dev/null; then
     MASKING_OK=true
 else
@@ -489,9 +489,9 @@ else
 echo -e "  ${DIM}○ Inbound SYN pacing (optional; set ENABLE_SYNFIX=true)${RESET}"
 fi
 if $MASKING_OK; then
-echo -e "  ${GREEN}✓${RESET} Self-domain Nginx Masking (Zero-RTT Active Probe defense)"
+echo -e "  ${GREEN}✓${RESET} Self-domain Caddy Masking (PQ 404 backend)"
 else
-echo -e "  ${RED}✗${RESET} Self-domain Nginx Masking (setup failed)"
+echo -e "  ${RED}✗${RESET} Self-domain Caddy Masking (setup failed)"
 fi
 echo -e "  ${GREEN}✓${RESET} Split-TLS (1-byte TLS Record chunking)"
 if $NFQWS_OK; then

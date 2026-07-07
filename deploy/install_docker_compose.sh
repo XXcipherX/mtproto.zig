@@ -18,6 +18,7 @@
 #   ENABLE_SYNFIX=true|false
 #   SYNFIX_ACTION=reject|drop
 #   MASK_PORT=8443
+#   CADDY_IMAGE=caddy:2.10-alpine
 #   GHCR_USER=<user> GHCR_TOKEN=<token>   # for private GHCR packages
 
 set -euo pipefail
@@ -34,6 +35,8 @@ ENABLE_MASKING="${ENABLE_MASKING:-true}"
 ENABLE_SYNFIX="${ENABLE_SYNFIX:-false}"
 SYNFIX_ACTION="${SYNFIX_ACTION:-reject}"
 MASK_PORT="${MASK_PORT:-8443}"
+MASK_ACME_ROOT="${MASK_ACME_ROOT:-${MASK_SITE_ROOT:-/var/www/certbot}}"
+CADDY_IMAGE="${CADDY_IMAGE:-caddy:2.10-alpine}"
 COMPOSE_FILE="${INSTALL_DIR}/compose.yml"
 ENV_FILE="${INSTALL_DIR}/.env"
 CONFIG_FILE="${INSTALL_DIR}/config.toml"
@@ -234,8 +237,34 @@ services:
         max-file: "3"
 EOF
 
+    if is_true "$ENABLE_MASKING"; then
+        cat >> "$COMPOSE_FILE" <<'EOF'
+
+  mtproto-mask-caddy:
+    image: ${CADDY_IMAGE:-caddy:2.10-alpine}
+    container_name: mtproto-mask-caddy
+    restart: unless-stopped
+    network_mode: host
+    user: "0:0"
+    volumes:
+      - ./Caddyfile.mask:/etc/caddy/Caddyfile:ro
+      - ${MASK_ACME_ROOT:-/var/www/certbot}:${MASK_ACME_ROOT:-/var/www/certbot}:ro
+      - ${INSTALL_DIR:-/opt/mtproto-proxy}/caddy/ssl:${INSTALL_DIR:-/opt/mtproto-proxy}/caddy/ssl:ro
+      - ./caddy/data:/data
+      - ./caddy/config:/config
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+EOF
+    fi
+
     cat > "$ENV_FILE" <<EOF
+INSTALL_DIR=${INSTALL_DIR}
 MTPROTO_IMAGE=${IMAGE}
+CADDY_IMAGE=${CADDY_IMAGE}
+MASK_ACME_ROOT=${MASK_ACME_ROOT}
 EOF
 }
 
@@ -247,8 +276,8 @@ write_compose_service() {
     cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=MTProto Proxy (Docker Compose)
-After=network-online.target docker.service nginx.service
-Wants=network-online.target docker.service nginx.service
+After=network-online.target docker.service
+Wants=network-online.target docker.service
 
 [Service]
 Type=oneshot
@@ -412,15 +441,15 @@ setup_masking_and_desync() {
 
     if is_true "$ENABLE_MASKING"; then
         [[ -n "$TLS_DOMAIN" ]] || fail "Masking requires TLS_DOMAIN or [censorship].tls_domain"
-        info "Setting up Self-domain Nginx Masking..."
-        if MASK_DOMAIN="$TLS_DOMAIN" MASK_PORT="$MASK_PORT" bash "${INSTALL_DIR}/setup_masking.sh" "$TLS_DOMAIN" < /dev/null; then
+        info "Setting up Self-domain Caddy Masking..."
+        if MTPROTO_DOCKER_INSTALL=1 COMPOSE_FILE="$COMPOSE_FILE" ENV_FILE="$ENV_FILE" MASK_DOMAIN="$TLS_DOMAIN" MASK_PORT="$MASK_PORT" bash "${INSTALL_DIR}/setup_masking.sh" "$TLS_DOMAIN" < /dev/null; then
             MASKING_OK=true
             refresh_config_vars
         else
             warn "Masking setup failed. Check DNS A record and TCP/80 reachability."
         fi
     else
-        warn "Self-domain Nginx Masking disabled by ENABLE_MASKING=false"
+        warn "Self-domain Caddy Masking disabled by ENABLE_MASKING=false"
     fi
 
     if is_true "$ENABLE_SYNFIX"; then
@@ -446,10 +475,10 @@ setup_masking_and_desync() {
 validate_masking() {
     refresh_config_vars
     if ! is_true "$ENABLE_MASKING"; then
-        return
+        return 0
     fi
-    [[ -n "$TLS_DOMAIN" ]] || return
-    [[ -n "$MASK_PORT" ]] || return
+    [[ -n "$TLS_DOMAIN" ]] || return 0
+    [[ -n "$MASK_PORT" ]] || return 0
 
     if curl -sk --max-time 5 --resolve "${TLS_DOMAIN}:${MASK_PORT}:127.0.0.1" "https://${TLS_DOMAIN}:${MASK_PORT}/" >/dev/null 2>&1; then
         ok "Masking validation passed (${TLS_DOMAIN} via 127.0.0.1:${MASK_PORT})"
@@ -505,9 +534,9 @@ print_summary() {
         echo -e "  ${DIM}o Inbound SYN pacing (optional; set ENABLE_SYNFIX=true)${RESET}"
     fi
     if $MASKING_OK; then
-        echo -e "  ${GREEN}+${RESET} Self-domain Nginx Masking"
+        echo -e "  ${GREEN}+${RESET} Self-domain Caddy Masking"
     else
-        echo -e "  ${RED}!${RESET} Self-domain Nginx Masking"
+        echo -e "  ${RED}!${RESET} Self-domain Caddy Masking"
     fi
     echo -e "  ${GREEN}+${RESET} Split-TLS"
     if $NFQWS_OK; then
