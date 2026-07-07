@@ -16,7 +16,9 @@
 #   USE_MIDDLE_PROXY=true|false
 #   ENABLE_MASKING=true|false
 #   ENABLE_SYNFIX=true|false
-#   SYNFIX_ACTION=reject|drop
+#   SYNFIX_RATE=30/minute
+#   SYNFIX_BURST=1
+#   SYNFIX_ACTION=drop|reject
 #   MASK_PORT=8443
 #   CADDY_IMAGE=caddy:2.10-alpine
 #   GHCR_USER=<user> GHCR_TOKEN=<token>   # for private GHCR packages
@@ -33,7 +35,9 @@ PORT="${PORT:-443}"
 USE_MIDDLE_PROXY="${USE_MIDDLE_PROXY:-true}"
 ENABLE_MASKING="${ENABLE_MASKING:-true}"
 ENABLE_SYNFIX="${ENABLE_SYNFIX:-false}"
-SYNFIX_ACTION="${SYNFIX_ACTION:-reject}"
+SYNFIX_RATE="${SYNFIX_RATE:-30/minute}"
+SYNFIX_BURST="${SYNFIX_BURST:-1}"
+SYNFIX_ACTION="${SYNFIX_ACTION:-drop}"
 MASK_PORT="${MASK_PORT:-8443}"
 MASK_ACME_ROOT="${MASK_ACME_ROOT:-${MASK_SITE_ROOT:-/var/www/certbot}}"
 CADDY_IMAGE="${CADDY_IMAGE:-caddy:2.10-alpine}"
@@ -454,7 +458,7 @@ setup_masking_and_desync() {
 
     if is_true "$ENABLE_SYNFIX"; then
         info "Setting up inbound SYN pacing..."
-        if PORT="$PORT" SYNFIX_ACTION="$SYNFIX_ACTION" bash "${INSTALL_DIR}/setup_synfix.sh" < /dev/null; then
+        if PORT="$PORT" SYNFIX_RATE="$SYNFIX_RATE" SYNFIX_BURST="$SYNFIX_BURST" SYNFIX_ACTION="$SYNFIX_ACTION" bash "${INSTALL_DIR}/setup_synfix.sh" < /dev/null; then
             SYNFIX_OK=true
             ok "Inbound SYN pacing configured"
         else
@@ -527,7 +531,7 @@ print_summary() {
     echo -e "  ${GREEN}+${RESET} Anti-Replay Cache"
     echo -e "  ${GREEN}+${RESET} TCPMSS=88"
     if $SYNFIX_OK; then
-        echo -e "  ${GREEN}+${RESET} Inbound SYN pacing (${SYNFIX_ACTION})"
+        echo -e "  ${GREEN}+${RESET} Inbound SYN pacing (${SYNFIX_RATE}, burst ${SYNFIX_BURST}, ${SYNFIX_ACTION})"
     elif is_true "$ENABLE_SYNFIX"; then
         echo -e "  ${RED}!${RESET} Inbound SYN pacing"
     else

@@ -7,7 +7,9 @@
 #
 # Optional environment:
 #   ENABLE_SYNFIX=true   # install inbound SYN pacing rules for filtered routes
-#   SYNFIX_ACTION=reject # reject (tcp-reset, default) or drop for over-limit SYNs
+#   SYNFIX_RATE=30/minute
+#   SYNFIX_BURST=1
+#   SYNFIX_ACTION=drop   # drop (default) or reject (tcp-reset) for over-limit SYNs
 #
 # The script is idempotent:
 #   - On first run: installs Zig, builds proxy, generates config, sets up systemd + DPI bypass.
@@ -34,7 +36,9 @@ SERVICE_NAME="mtproto-proxy"
 SERVICE_FILE="/etc/systemd/system/mtproto-proxy.service"
 FORCE_SERVICE_UPDATE="${FORCE_SERVICE_UPDATE:-0}"
 ENABLE_SYNFIX="${ENABLE_SYNFIX:-false}"
-SYNFIX_ACTION="${SYNFIX_ACTION:-reject}"
+SYNFIX_RATE="${SYNFIX_RATE:-30/minute}"
+SYNFIX_BURST="${SYNFIX_BURST:-1}"
+SYNFIX_ACTION="${SYNFIX_ACTION:-drop}"
 IS_UPDATE=false
 [[ -f "$INSTALL_DIR/mtproto-proxy" ]] && IS_UPDATE=true
 
@@ -349,7 +353,7 @@ fi
 
 if is_true "$ENABLE_SYNFIX"; then
     info "Setting up inbound SYN pacing..."
-    if PORT="$PORT" SYNFIX_ACTION="$SYNFIX_ACTION" bash "$TMPBUILD/deploy/setup_synfix.sh" < /dev/null 2>&1; then
+    if PORT="$PORT" SYNFIX_RATE="$SYNFIX_RATE" SYNFIX_BURST="$SYNFIX_BURST" SYNFIX_ACTION="$SYNFIX_ACTION" bash "$TMPBUILD/deploy/setup_synfix.sh" < /dev/null 2>&1; then
         SYNFIX_OK=true
     else
         warn "SYN pacing setup failed (non-critical, proxy still works)"
@@ -482,7 +486,7 @@ echo -e "  ${BOLD}DPI Bypass:${RESET}"
 echo -e "  ${GREEN}✓${RESET} Anti-Replay Cache (ТСПУ Revisor protection)"
 echo -e "  ${GREEN}✓${RESET} TCPMSS=88 (ClientHello fragmentation)"
 if $SYNFIX_OK; then
-echo -e "  ${GREEN}✓${RESET} Inbound SYN pacing (${SYNFIX_ACTION})"
+echo -e "  ${GREEN}✓${RESET} Inbound SYN pacing (${SYNFIX_RATE}, burst ${SYNFIX_BURST}, ${SYNFIX_ACTION})"
 elif is_true "$ENABLE_SYNFIX"; then
 echo -e "  ${RED}✗${RESET} Inbound SYN pacing (setup failed)"
 else

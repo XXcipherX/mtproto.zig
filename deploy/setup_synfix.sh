@@ -6,8 +6,9 @@
 # connection. Android/Desktop clients can open multiple parallel TLS attempts;
 # on filtered routes that pattern is enough for DPI to stall the following
 # ClientHello/FakeTLS flow. The rule set lets iOS-like SYN fingerprints bypass
-# the slow lane and paces all other clients per source IP with TCP reset on
-# excess attempts so Telegram retries quickly instead of waiting on drops.
+# the slow lane and paces all other clients per source IP. Excess attempts are
+# dropped silently by default so Telegram does not amplify noisy retry bursts
+# with immediate tcp-reset feedback.
 #
 # Usage:
 #   sudo bash deploy/setup_synfix.sh
@@ -15,9 +16,9 @@
 #
 # Optional environment:
 #   PORT=443
-#   SYNFIX_RATE=54/minute
+#   SYNFIX_RATE=30/minute
 #   SYNFIX_BURST=1
-#   SYNFIX_ACTION=reject|drop
+#   SYNFIX_ACTION=drop|reject
 
 set -euo pipefail
 
@@ -25,9 +26,9 @@ INSTALL_DIR="${INSTALL_DIR:-/opt/mtproto-proxy}"
 CONFIG_FILE="${CONFIG_FILE:-${INSTALL_DIR}/config.toml}"
 CHAIN="MTPR_SYNFIX"
 IOS_MARK="0x400"
-SYNFIX_RATE="${SYNFIX_RATE:-54/minute}"
+SYNFIX_RATE="${SYNFIX_RATE:-30/minute}"
 SYNFIX_BURST="${SYNFIX_BURST:-1}"
-SYNFIX_ACTION="${SYNFIX_ACTION:-reject}"
+SYNFIX_ACTION="${SYNFIX_ACTION:-drop}"
 SYNFIX_HTABLE_EXPIRE="${SYNFIX_HTABLE_EXPIRE:-60000}"
 SYNFIX_HTABLE_SIZE="${SYNFIX_HTABLE_SIZE:-32768}"
 IOS_U32='32 & 0x00FFFFFF = 0x0002FFFF && 40 & 0xFF000000 = 0x02000000 && 44 & 0xFFFF0000 = 0x01030000 && 48 & 0xFFFFFF00 = 0x01010800 && 60 & 0xFFFFFFFF = 0x04020000'

@@ -287,7 +287,9 @@ Useful environment variables:
 | `USE_MIDDLE_PROXY` | `true` | Initial `use_middle_proxy` value |
 | `ENABLE_MASKING` | `true` | Install Caddy/certbot masking and set `mask = true`; Docker installs run Caddy in Compose |
 | `ENABLE_SYNFIX` | `false` | Install inbound SYN pacing rules for Android/Desktop routes that need it |
-| `SYNFIX_ACTION` | `reject` | Over-limit SYN action: `reject` sends TCP reset for faster retries, `drop` is quieter |
+| `SYNFIX_RATE` | `30/minute` | Per-source SYN rate for non-iOS-like fingerprints |
+| `SYNFIX_BURST` | `1` | Per-source SYN burst for non-iOS-like fingerprints |
+| `SYNFIX_ACTION` | `drop` | Over-limit SYN action: `drop` is quiet, `reject` sends TCP reset |
 | `MASK_PORT` | `8443` | Local Caddy HTTPS masking backend port |
 | `CADDY_IMAGE` | `caddy:2.10-alpine` | Caddy image used by the Docker Compose installer |
 | `GHCR_USER` / `GHCR_TOKEN` | _(empty)_ | Optional login for private GHCR packages |
@@ -330,7 +332,7 @@ curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/in
   | sudo env ENABLE_SYNFIX=true bash
 ```
 
-`SYNFIX_ACTION=reject` is the default and sends `tcp-reset` for over-limit SYNs so Telegram retries quickly. Use `SYNFIX_ACTION=drop` only when you intentionally want silent drops.
+The SYN pacing default is `SYNFIX_RATE=30/minute SYNFIX_BURST=1 SYNFIX_ACTION=drop`. This keeps excess Android/Desktop retry bursts quiet instead of feeding immediate tcp-reset retries. Use `SYNFIX_ACTION=reject` only when you intentionally want fast reset feedback.
 
 ### Self-Domain 404 Masking
 
