@@ -61,6 +61,23 @@ is_true() {
     esac
 }
 
+enable_netfilter_persistent() {
+    command -v systemctl >/dev/null 2>&1 || return 0
+    systemctl enable netfilter-persistent.service >/dev/null 2>&1 || true
+}
+
+save_ipv4_iptables() {
+    mkdir -p /etc/iptables
+    iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+    enable_netfilter_persistent
+}
+
+save_ipv6_iptables() {
+    mkdir -p /etc/iptables
+    ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
+    enable_netfilter_persistent
+}
+
 is_tunnel_service_unit() {
     local unit_path="$1"
     [[ -f "$unit_path" ]] || return 1
@@ -153,7 +170,7 @@ get_first_user_secret() {
 # NOTE: All apt-get calls use < /dev/null to prevent dpkg hooks from
 # consuming stdin when this script is run via 'curl | bash'.
 apt-get update -qq < /dev/null || true
-apt-get install -y iptables xxd git curl jq openssl tar xz-utils < /dev/null >/dev/null 2>&1 || true
+DEBIAN_FRONTEND=noninteractive apt-get install -y iptables iptables-persistent netfilter-persistent xxd git curl jq openssl tar xz-utils < /dev/null >/dev/null 2>&1 || true
 
 # ── Install Zig ─────────────────────────────────────────────
 if command -v zig &>/dev/null && zig version 2>/dev/null | grep -q "$ZIG_VERSION"; then
@@ -285,8 +302,7 @@ fi
 if command -v iptables &>/dev/null; then
     iptables -t mangle -D OUTPUT -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88 2>/dev/null || true
     iptables -t mangle -A OUTPUT -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88
-    mkdir -p /etc/iptables
-    iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+    save_ipv4_iptables
     ok "TCPMSS=88 clamping applied to IPv4 (passive DPI bypass)"
 else
     echo -e "${RED}⚠${RESET} iptables not found — IPv4 TCPMSS bypass NOT applied"
@@ -295,8 +311,7 @@ fi
 if command -v ip6tables &>/dev/null; then
     ip6tables -t mangle -D OUTPUT -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88 2>/dev/null || true
     if ip6tables -t mangle -A OUTPUT -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88 2>/dev/null; then
-        mkdir -p /etc/iptables
-        ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
+        save_ipv6_iptables
         ok "TCPMSS=88 clamping applied to IPv6 (passive DPI bypass)"
     else
         info "IPv6 TCPMSS skipped (IPv6 may be disabled)"

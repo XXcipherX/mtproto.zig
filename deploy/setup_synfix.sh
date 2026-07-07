@@ -115,6 +115,9 @@ remove_rules() {
 persist_rules() {
     mkdir -p /etc/iptables
     iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl enable netfilter-persistent.service >/dev/null 2>&1 || true
+    fi
 }
 
 if $REMOVE; then

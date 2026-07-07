@@ -70,6 +70,23 @@ is_true() {
     esac
 }
 
+enable_netfilter_persistent() {
+    command -v systemctl >/dev/null 2>&1 || return 0
+    systemctl enable netfilter-persistent.service >/dev/null 2>&1 || true
+}
+
+save_ipv4_iptables() {
+    mkdir -p /etc/iptables
+    iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+    enable_netfilter_persistent
+}
+
+save_ipv6_iptables() {
+    mkdir -p /etc/iptables
+    ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
+    enable_netfilter_persistent
+}
+
 bool_literal() {
     if is_true "$1"; then
         printf 'true'
@@ -196,7 +213,7 @@ docker_install() {
 install_packages() {
     info "Installing Docker and required tools..."
     apt-get update -qq < /dev/null || true
-    apt-get install -y ca-certificates curl openssl iptables xxd jq git < /dev/null
+    DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl openssl iptables iptables-persistent netfilter-persistent xxd jq git < /dev/null
 
     if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>&1; then
         info "Installing Docker Engine and Compose plugin from get.docker.com..."
@@ -393,8 +410,7 @@ apply_firewall_and_tcpmss() {
     if command -v iptables >/dev/null 2>&1; then
         iptables -t mangle -D OUTPUT -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88 2>/dev/null || true
         iptables -t mangle -A OUTPUT -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88
-        mkdir -p /etc/iptables
-        iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+        save_ipv4_iptables
         ok "TCPMSS=88 clamping applied to IPv4"
     else
         warn "iptables not found; TCPMSS bypass was not applied"
@@ -403,8 +419,7 @@ apply_firewall_and_tcpmss() {
     if command -v ip6tables >/dev/null 2>&1; then
         ip6tables -t mangle -D OUTPUT -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88 2>/dev/null || true
         if ip6tables -t mangle -A OUTPUT -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88 2>/dev/null; then
-            mkdir -p /etc/iptables
-            ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
+            save_ipv6_iptables
             ok "TCPMSS=88 clamping applied to IPv6"
         else
             info "IPv6 TCPMSS skipped"
