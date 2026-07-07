@@ -37,6 +37,11 @@ pub const Config = struct {
     /// Handshake read timeout after first byte arrives
     handshake_timeout_sec: u32 = 15,
     tag: ?[16]u8 = null,
+    /// FakeTLS SNI / fronting domain. Since the June-2026 TSPU rollout, the
+    /// real masking endpoint for this domain should negotiate X25519MLKEM768
+    /// (0x11ec) in one round. Classical-x25519-only domains can become a passive
+    /// marker for iOS and for other clients sharing the same NAT egress IP.
+    /// Changing this value changes every ee-secret link, so choose it carefully.
     tls_domain: []const u8 = "google.com",
     /// True when tls_domain was duplicated by the parser and must be freed.
     tls_domain_owned: bool = false,

@@ -2255,13 +2255,37 @@ const EventLoop = struct {
         slot.validation_user_len = @intCast(ulen);
         @memcpy(slot.validation_user[0..ulen], v.user[0..ulen]);
 
-        slot.server_hello = tls.buildServerHelloWithTemplate(
-            self.state.allocator,
-            self.state.tls_server_hello_template[0..],
-            &slot.validation_secret,
-            &slot.validation_digest,
-            slot.validation_session_id[0..slot.validation_session_id_len],
-        ) catch {
+        const offers_pq = tls.clientOffersPqKeyShare(client_hello);
+        const echoed_cipher = tls.extractFirstTls13Cipher(client_hello);
+        const cipher_label = if (echoed_cipher) |cs| switch (cs) {
+            0x1301 => "0x1301",
+            0x1302 => "0x1302",
+            0x1303 => "0x1303",
+            else => "unknown",
+        } else "none";
+        log.debug("[{d}] valid FakeTLS ClientHello: key_share={s} cipher={s}", .{
+            slot.conn_id,
+            if (offers_pq) "X25519MLKEM768(0x11ec)" else "x25519(0x001d)",
+            cipher_label,
+        });
+
+        slot.server_hello = (if (offers_pq)
+            tls.buildServerHelloPq(
+                self.state.allocator,
+                &slot.validation_secret,
+                &slot.validation_digest,
+                slot.validation_session_id[0..slot.validation_session_id_len],
+                echoed_cipher,
+            )
+        else
+            tls.buildServerHelloWithTemplateCipher(
+                self.state.allocator,
+                self.state.tls_server_hello_template[0..],
+                &slot.validation_secret,
+                &slot.validation_digest,
+                slot.validation_session_id[0..slot.validation_session_id_len],
+                echoed_cipher,
+            )) catch {
             self.closeSlot(slot, "build server hello failed");
             return;
         };

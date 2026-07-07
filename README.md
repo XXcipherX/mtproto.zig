@@ -39,6 +39,7 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 | **Multi-user** | Access Control | Independent secret-based authentication per user |
 | **Anti-replay** | Timestamp + Digest Cache | Rejects replayed handshakes outside ±2 min window AND detects ТСПУ Revisor active probes |
 | **Masking** | Connection Cloaking | Forwards unauthenticated clients either to `tls_domain:443` or, for self-domain installs, to a local Nginx 404 backend |
+| **PQ FakeTLS** | DPI Evasion | Echoes `X25519MLKEM768` (`0x11ec`) ServerHello key_share for modern Desktop/Android ClientHellos |
 | **Fast Mode** | Direct-Path S2C Offload | Reduces CPU usage by delegating S2C AES work to Telegram DCs on direct paths (non-MiddleProxy) |
 | **MiddleProxy** | Telemt-Compatible ME | Optional ME transport for DC1..5 (`use_middle_proxy`); media-path traffic prefers ME endpoints with direct fallback when unavailable |
 | **Auto Refresh** | Telegram Metadata | Periodically updates regular/media MiddleProxy endpoints and secret from Telegram core endpoints when any ME route is enabled |
@@ -286,6 +287,7 @@ Useful environment variables:
 | `USE_MIDDLE_PROXY` | `true` | Initial `use_middle_proxy` value |
 | `ENABLE_MASKING` | `true` | Install Nginx/certbot masking and set `mask = true` |
 | `ENABLE_SYNFIX` | `false` | Install inbound SYN pacing rules for Android/Desktop routes that need it |
+| `SYNFIX_ACTION` | `reject` | Over-limit SYN action: `reject` sends TCP reset for faster retries, `drop` is quieter |
 | `MASK_PORT` | `8443` | Local Nginx HTTPS masking backend port |
 | `GHCR_USER` / `GHCR_TOKEN` | _(empty)_ | Optional login for private GHCR packages |
 
@@ -315,7 +317,7 @@ This will:
 6. Apply **TCPMSS=88** iptables/ip6tables rules when available (passive DPI bypass)
 7. Optionally install inbound SYN pacing for Android/Desktop handshake stability (`ENABLE_SYNFIX=true`)
 8. Install **IPv6 hop script** when `CF_TOKEN`+`CF_ZONE`+`IPV6_PREFIX` are provided
-9. Set up self-domain Nginx 404 masking on `127.0.0.1:8443`, including Let's Encrypt on TCP/80 and the masking health timer
+9. Set up self-domain Nginx 404 masking on `127.0.0.1:8443`, including Let's Encrypt on TCP/80, X25519MLKEM768 capability warning, and the masking health timer
 10. Attempt OS-level `zapret` / `nfqws` TCP desync setup
 11. Refresh optional monitor files if `proxy-monitor` already exists
 12. Print a ready-to-use `tg://` connection link when `[access.users]` contains a valid 32-hex secret
@@ -326,6 +328,8 @@ Inbound SYN pacing is disabled by default. Enable it only on filtered routes whe
 curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/install.sh \
   | sudo env ENABLE_SYNFIX=true bash
 ```
+
+`SYNFIX_ACTION=reject` is the default and sends `tcp-reset` for over-limit SYNs so Telegram retries quickly. Use `SYNFIX_ACTION=drop` only when you intentionally want silent drops.
 
 ### Self-Domain 404 Masking
 
@@ -343,7 +347,7 @@ curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/in
   sudo env MASK_DOMAIN=proxy.example.com LE_EMAIL=admin@example.com bash
 ```
 
-The installer writes `server.public_ip = "proxy.example.com"` and `censorship.tls_domain = "proxy.example.com"` on first install, configures Nginx on `127.0.0.1:8443` to return `404` for non-proxy requests, obtains a Let's Encrypt certificate via `:80`, installs a renewal hook that reloads Nginx, and generates links that use the domain. Existing installs can be converted with:
+The installer writes `server.public_ip = "proxy.example.com"` and `censorship.tls_domain = "proxy.example.com"` on first install, configures Nginx on `127.0.0.1:8443` to return `404` for non-proxy requests, obtains a Let's Encrypt certificate via `:80`, checks whether the masking TLS backend can negotiate X25519MLKEM768 (`0x11ec`), installs a renewal hook that reloads Nginx, and generates links that use the domain. Existing installs can be converted with:
 
 ```bash
 sudo env MASK_DOMAIN=proxy.example.com LE_EMAIL=admin@example.com \
@@ -746,7 +750,7 @@ alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eli
 | `[server]` | `unsafe_override_limits` | `false` | Disable auto-clamping of `max_connections` to the RAM-safe estimate. Use only if you're sure your host has enough memory |
 | `[monitor]` | `host` | `"127.0.0.1"` | Bind address for the optional monitoring dashboard HTTP server. This section is read by `proxy-monitor`, not by the proxy binary. Set to `"0.0.0.0"` to expose on all interfaces (warning: no built-in auth) |
 | `[monitor]` | `port` | `61208` | TCP port for the optional monitoring dashboard HTTP server |
-| `[censorship]` | `tls_domain` | `"google.com"` | FakeTLS SNI domain. With `mask_port=443`, unauthenticated clients are forwarded to this domain directly. For self-domain masking, set it to your own domain and point its DNS A record to the VPS |
+| `[censorship]` | `tls_domain` | `"google.com"` | FakeTLS SNI domain. With `mask_port=443`, unauthenticated clients are forwarded to this domain directly. For self-domain masking, set it to your own domain and point its DNS A record to the VPS. Since June 2026, the real masking endpoint should negotiate X25519MLKEM768 (`0x11ec`) in one round; classical-x25519-only domains can be a passive marker |
 | `[censorship]` | `mask` | `true` | Forward unauthenticated connections to the configured masking target to defeat active probing |
 | `[censorship]` | `mask_port` | `443` | Masking target port. `443` connects to `tls_domain:443`; non-443 values connect to a local address on that port (`127.0.0.1:<mask_port>`, or `10.200.200.1:<mask_port>` inside tunnel netns), so that port must be served by Nginx or another local backend. Use `8443` for self-domain Nginx so public `443` remains owned by `mtproto-proxy` |
 | `[censorship]` | `desync` | `true` | Split fake `ServerHello` into `1 byte + short pause + rest` to desynchronize passive DPI |
@@ -771,7 +775,7 @@ alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eli
 
 > **Operational note** &nbsp; The proxy limits new connections to 30/sec per /24 subnet by default (`rate_limit_per_subnet`). This blocks ТСПУ scanners and DPI replay probes without affecting legitimate Telegram clients.
 
-> **Operational note** &nbsp; Self-domain masking expects DNS `A proxy.example.com -> <VPS_IP>`, Cloudflare DNS-only mode if used, public TCP `80` for Let's Encrypt, public TCP `443` for `mtproto-proxy`, and local Nginx TLS on `127.0.0.1:8443` returning `404` for non-proxy requests. By default, `setup_masking.sh` disables `/etc/nginx/sites-enabled/default` and makes `mtproto-masking` the default public `:80` server so unmatched HTTP requests also return `404`. The `ee` link secret changes when `tls_domain` changes, so regenerate client links after changing the domain.
+> **Operational note** &nbsp; Self-domain masking expects DNS `A proxy.example.com -> <VPS_IP>`, Cloudflare DNS-only mode if used, public TCP `80` for Let's Encrypt, public TCP `443` for `mtproto-proxy`, and local Nginx TLS on `127.0.0.1:8443` returning `404` for non-proxy requests. By default, `setup_masking.sh` disables `/etc/nginx/sites-enabled/default` and makes `mtproto-masking` the default public `:80` server so unmatched HTTP requests also return `404`. It also probes the local TLS backend for X25519MLKEM768 support and warns if the backend is classical-x25519-only or the local OpenSSL is too old to verify PQ support. The `ee` link secret changes when `tls_domain` changes, so regenerate client links after changing the domain.
 
 > **Tip** &nbsp; Generate a random secret: `openssl rand -hex 16`
 

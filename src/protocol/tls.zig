@@ -146,6 +146,17 @@ pub fn buildServerHelloWithTemplate(
     client_digest: *const [constants.tls_digest_len]u8,
     session_id: []const u8,
 ) ![]u8 {
+    return buildServerHelloWithTemplateCipher(allocator, template, secret, client_digest, session_id, null);
+}
+
+pub fn buildServerHelloWithTemplateCipher(
+    allocator: std.mem.Allocator,
+    template: []const u8,
+    secret: []const u8,
+    client_digest: *const [constants.tls_digest_len]u8,
+    session_id: []const u8,
+    cipher: ?u16,
+) ![]u8 {
     if (template.len != nginx_template_len) return error.BadServerHelloTemplate;
     if (session_id.len != 32) return error.InvalidSessionIdLength;
 
@@ -154,6 +165,12 @@ pub fn buildServerHelloWithTemplate(
     errdefer allocator.free(response);
     @memcpy(response, template);
 
+    // 1b. Echo a client-offered TLS 1.3 cipher when known. Real servers negotiate
+    // one of the offered suites; a hard-coded suite is a passive ServerHello tell.
+    if (cipher) |cs| {
+        std.mem.writeInt(u16, response[tmpl_cipher_offset..][0..2], cs, .big);
+    }
+
     // 2. Patch Session ID (echo from client). Template assumes 32-byte session ID.
     @memcpy(response[tmpl_session_id_offset..][0..32], session_id);
 
@@ -161,6 +178,11 @@ pub fn buildServerHelloWithTemplate(
     var x25519_key: [32]u8 = undefined;
     crypto.randomBytes(&x25519_key);
     @memcpy(response[tmpl_x25519_key_offset..][0..32], &x25519_key);
+
+    // 3b. Randomize fake encrypted-certificate AppData per connection. TLS 1.3
+    // certificate bytes are encrypted under fresh ECDHE keys, so identical
+    // ciphertext across connections is a fingerprint.
+    crypto.randomBytes(response[tmpl_appdata_offset..][0..fake_cert_payload_size]);
 
     // 4. Compute HMAC over full response with random field zeroed.
     //    Template already has zeros at offset 11..43, so HMAC input is correct.
@@ -172,6 +194,152 @@ pub fn buildServerHelloWithTemplate(
     hmac.final(&response_digest);
 
     // 5. Insert HMAC digest into Server Random field
+    @memcpy(response[tmpl_random_offset..][0..32], &response_digest);
+
+    return response;
+}
+
+// ============= Post-quantum X25519MLKEM768 ServerHello =============
+//
+// Modern Telegram Desktop/Android ClientHellos can offer X25519MLKEM768
+// (named group 0x11ec). Answering such a flow with plain x25519 (0x001d)
+// is a passive group-downgrade tell, so when the client provided a 0x11ec
+// key_share we emit a 0x11ec ServerHello key_share of the correct wire size.
+//
+// The bytes are intentionally high-entropy placeholder bytes, not a real
+// ML-KEM encapsulation: MTProto FakeTLS clients validate record framing plus
+// the HMAC in server-random, and the proxy is not a TLS terminator.
+
+pub const pq_named_group: u16 = 0x11ec;
+/// X25519MLKEM768 server share: ML-KEM-768 ciphertext (1088) || X25519 (32).
+const pq_key_share_len: usize = 1120;
+/// PQ ServerHello record length: 5(rec hdr)+4(hs hdr)+2(ver)+32(rand)+1+32(sid)
+/// +2(cipher)+1(comp)+2(extlen)+6(supported_versions)+4(ks ext hdr)
+/// +2(group)+2(keylen)+1120(key) = 1215.
+const pq_server_hello_record_len: usize = 95 + pq_key_share_len;
+/// Full PQ response: ServerHello + CCS(6) + AppData(5 + cert payload).
+pub const pq_server_hello_len: usize = pq_server_hello_record_len + 6 + 5 + fake_cert_payload_size;
+/// Offset of the 1120-byte PQ key_share inside the response.
+const pq_key_offset: usize = 95;
+/// Offset of the fake AppData body inside the PQ response.
+const pq_appdata_offset: usize = pq_server_hello_record_len + 6 + 5;
+
+/// Return true when the ClientHello carries a key_share entry for X25519MLKEM768.
+pub fn clientOffersPqKeyShare(handshake: []const u8) bool {
+    if (handshake.len < 43 or handshake[0] != constants.tls_record_handshake) return false;
+    var pos: usize = 5;
+    if (pos >= handshake.len or handshake[pos] != 0x01) return false;
+    pos += 4; // handshake type + 3-byte length
+    pos += 2 + 32; // legacy_version + random
+    if (pos + 1 > handshake.len) return false;
+    const sid_len: usize = handshake[pos];
+    pos += 1 + sid_len;
+    if (pos + 2 > handshake.len) return false;
+    const cs_len = std.mem.readInt(u16, handshake[pos..][0..2], .big);
+    pos += 2;
+    if (cs_len % 2 != 0 or pos + cs_len > handshake.len) return false;
+    pos += cs_len;
+    if (pos + 1 > handshake.len) return false;
+    const comp_len: usize = handshake[pos];
+    pos += 1 + comp_len;
+    if (pos + 2 > handshake.len) return false;
+    const ext_total = std.mem.readInt(u16, handshake[pos..][0..2], .big);
+    pos += 2;
+    const ext_end = @min(pos + ext_total, handshake.len);
+
+    while (pos + 4 <= ext_end) {
+        const etype = std.mem.readInt(u16, handshake[pos..][0..2], .big);
+        const elen = std.mem.readInt(u16, handshake[pos + 2 ..][0..2], .big);
+        pos += 4;
+        if (pos + elen > ext_end) break;
+        if (etype == 0x0033 and elen >= 2) {
+            const list_len = std.mem.readInt(u16, handshake[pos..][0..2], .big);
+            var kp: usize = pos + 2;
+            const ks_end = @min(pos + 2 + list_len, pos + elen);
+            while (kp + 4 <= ks_end) {
+                const group = std.mem.readInt(u16, handshake[kp..][0..2], .big);
+                const key_len = std.mem.readInt(u16, handshake[kp + 2 ..][0..2], .big);
+                kp += 4;
+                if (kp + key_len > ks_end) break;
+                if (group == pq_named_group) return true;
+                kp += key_len;
+            }
+        }
+        pos += elen;
+    }
+
+    return false;
+}
+
+/// Build a ServerHello that answers an X25519MLKEM768-offering client with a
+/// 0x11ec key_share. Same HMAC-in-server-random construction as the x25519 path.
+pub fn buildServerHelloPq(
+    allocator: std.mem.Allocator,
+    secret: []const u8,
+    client_digest: *const [constants.tls_digest_len]u8,
+    session_id: []const u8,
+    cipher: ?u16,
+) ![]u8 {
+    if (session_id.len != 32) return error.InvalidSessionIdLength;
+
+    const response = try allocator.alloc(u8, pq_server_hello_len);
+    errdefer allocator.free(response);
+    @memset(response, 0);
+
+    // Record 1: ServerHello with a 0x11ec key_share.
+    response[0] = constants.tls_record_handshake;
+    response[1] = 0x03;
+    response[2] = 0x03;
+    std.mem.writeInt(u16, response[3..][0..2], @intCast(pq_server_hello_record_len - 5), .big);
+    response[5] = 0x02;
+    std.mem.writeInt(u24, response[6..][0..3], @intCast(pq_server_hello_record_len - 9), .big);
+    response[9] = 0x03;
+    response[10] = 0x03;
+    response[43] = 0x20;
+    @memcpy(response[tmpl_session_id_offset..][0..32], session_id);
+    std.mem.writeInt(u16, response[tmpl_cipher_offset..][0..2], cipher orelse 0x1301, .big);
+    response[78] = 0x00;
+    std.mem.writeInt(u16, response[79..][0..2], @intCast(6 + 4 + 4 + pq_key_share_len), .big);
+
+    // supported_versions (0x002b) first, matching OpenSSL TLS 1.3 ordering.
+    response[81] = 0x00;
+    response[82] = 0x2b;
+    response[83] = 0x00;
+    response[84] = 0x02;
+    response[85] = 0x03;
+    response[86] = 0x04;
+
+    // key_share (0x0033), group 0x11ec, key length 1120.
+    response[87] = 0x00;
+    response[88] = 0x33;
+    std.mem.writeInt(u16, response[89..][0..2], @intCast(4 + pq_key_share_len), .big);
+    std.mem.writeInt(u16, response[91..][0..2], pq_named_group, .big);
+    std.mem.writeInt(u16, response[93..][0..2], @intCast(pq_key_share_len), .big);
+    crypto.randomBytes(response[pq_key_offset..][0..pq_key_share_len]);
+
+    // Record 2: Change Cipher Spec.
+    const ccs = pq_server_hello_record_len;
+    response[ccs] = constants.tls_record_change_cipher;
+    response[ccs + 1] = 0x03;
+    response[ccs + 2] = 0x03;
+    response[ccs + 3] = 0x00;
+    response[ccs + 4] = 0x01;
+    response[ccs + 5] = 0x01;
+
+    // Record 3: fake encrypted certificate AppData.
+    const app = ccs + 6;
+    response[app] = constants.tls_record_application;
+    response[app + 1] = 0x03;
+    response[app + 2] = 0x03;
+    std.mem.writeInt(u16, response[app + 3 ..][0..2], fake_cert_payload_len, .big);
+    crypto.randomBytes(response[pq_appdata_offset..][0..fake_cert_payload_size]);
+
+    const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+    var hmac = HmacSha256.init(secret);
+    hmac.update(client_digest[0..]);
+    hmac.update(response);
+    var response_digest: [32]u8 = undefined;
+    hmac.final(&response_digest);
     @memcpy(response[tmpl_random_offset..][0..32], &response_digest);
 
     return response;
@@ -192,6 +360,8 @@ pub fn buildServerHelloWithTemplate(
 const tmpl_random_offset: usize = 11;
 /// Offset of Session ID (32 bytes) — echoed from client at runtime
 const tmpl_session_id_offset: usize = 44;
+/// Offset of the 2-byte cipher suite, immediately after the 32-byte session_id.
+const tmpl_cipher_offset: usize = tmpl_session_id_offset + 32;
 /// Offset of X25519 public key (32 bytes) — filled with random at runtime
 const tmpl_x25519_key_offset: usize = 95;
 
@@ -201,10 +371,14 @@ const tmpl_x25519_key_offset: usize = 95;
 ///   Finished (~36) + AEAD tags (~50) + record layer overhead.
 /// Fixed size eliminates the random-range fingerprint that ТСПУ detects.
 const fake_cert_payload_len: u16 = 2878;
+const fake_cert_payload_size: usize = @as(usize, fake_cert_payload_len);
 
 /// Total template size: ServerHello(127) + CCS(6) + AppData(5 + 2878)
-const nginx_template_len: usize = 127 + 6 + 5 + fake_cert_payload_len;
+const nginx_template_len: usize = 127 + 6 + 5 + fake_cert_payload_size;
 pub const server_hello_template_len: usize = nginx_template_len;
+/// Fixed ServerHello+CCS+AppData-header prefix length.
+const tmpl_appdata_offset: usize = nginx_template_len - fake_cert_payload_size;
+pub const server_hello_prefix_len: usize = tmpl_appdata_offset;
 
 const default_template_seed: u64 = 0x4E67_696E_785F_544C;
 
@@ -324,7 +498,7 @@ fn buildNginxTemplate(seed: u64) [nginx_template_len]u8 {
     // Fill with deterministic pseudo-random bytes (SplitMix64).
     // Looks like encrypted data to DPI, same every time like a real cert.
     var prng_state: u64 = seed;
-    for (0..fake_cert_payload_len) |i| {
+    for (0..fake_cert_payload_size) |i| {
         prng_state +%= 0x9E3779B97F4A7C15;
         var z = prng_state;
         z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9;
@@ -332,7 +506,7 @@ fn buildNginxTemplate(seed: u64) [nginx_template_len]u8 {
         z = z ^ (z >> 31);
         t[pos + i] = @intCast((z >> 24) & 0xFF);
     }
-    pos += fake_cert_payload_len;
+    pos += fake_cert_payload_size;
 
     if (pos != nginx_template_len) unreachable;
     return t;
@@ -400,6 +574,35 @@ pub fn extractSni(handshake: []const u8) ?[]const u8 {
             }
         }
         pos += elen;
+    }
+
+    return null;
+}
+
+/// Return the first non-GREASE TLS 1.3 cipher suite offered by the client.
+/// Used to make the synthetic ServerHello track the ClientHello like a real server.
+pub fn extractFirstTls13Cipher(handshake: []const u8) ?u16 {
+    if (handshake.len < 43 or handshake[0] != constants.tls_record_handshake) return null;
+
+    var pos: usize = 5;
+    if (pos >= handshake.len or handshake[pos] != 0x01) return null;
+    pos += 4; // handshake type + 3-byte length
+    pos += 2 + 32; // legacy_version + random
+
+    if (pos + 1 > handshake.len) return null;
+    const session_id_len: usize = handshake[pos];
+    pos += 1 + session_id_len;
+
+    if (pos + 2 > handshake.len) return null;
+    const cipher_suites_len = std.mem.readInt(u16, handshake[pos..][0..2], .big);
+    pos += 2;
+    if (cipher_suites_len % 2 != 0 or pos + cipher_suites_len > handshake.len) return null;
+
+    var i: usize = 0;
+    while (i + 2 <= cipher_suites_len) : (i += 2) {
+        const suite = std.mem.readInt(u16, handshake[pos + i ..][0..2], .big);
+        if ((suite & 0x0f0f) == 0x0a0a) continue;
+        if (suite == 0x1301 or suite == 0x1302 or suite == 0x1303) return suite;
     }
 
     return null;
@@ -500,12 +703,12 @@ test "buildServerHello produces valid three-record Nginx template structure" {
     ));
 }
 
-test "buildServerHello deterministic AppData (no random size fingerprint)" {
+test "buildServerHello AppData: fixed length, per-connection-random body" {
     const allocator = std.testing.allocator;
     var digest = [_]u8{0xAA} ** 32;
     const session_id = [_]u8{0xBB} ** 32;
 
-    // Build two responses — AppData body should be identical (deterministic template)
+    // Build two responses: size stays fixed, encrypted-cert bytes vary per connection.
     const r1 = try buildServerHello(allocator, &digest, &digest, &session_id);
     defer allocator.free(r1);
     const r2 = try buildServerHello(allocator, &digest, &digest, &session_id);
@@ -514,9 +717,8 @@ test "buildServerHello deterministic AppData (no random size fingerprint)" {
     // Same total size (fixed template)
     try std.testing.expectEqual(r1.len, r2.len);
 
-    // AppData bodies are identical (deterministic PRNG, same "certificate" every time)
     const app_offset = 127 + 6 + 5; // after ServerHello + CCS + AppData header
-    try std.testing.expectEqualSlices(u8, r1[app_offset..], r2[app_offset..]);
+    try std.testing.expect(!std.mem.eql(u8, r1[app_offset..], r2[app_offset..]));
 }
 
 test "buildServerHelloTemplate depends on seed" {
@@ -587,6 +789,129 @@ test "extractSni - malformed returns null" {
     try std.testing.expect(extractSni(&[_]u8{ 0x16, 0x03, 0x01, 0x00 }) == null);
     // Not a handshake type
     try std.testing.expect(extractSni(&[_]u8{ 0x17, 0x03, 0x01, 0x00, 0x00 }) == null);
+}
+
+test "extractFirstTls13Cipher returns first non-GREASE TLS1.3 suite" {
+    var ch: [52]u8 = undefined;
+    ch[0] = constants.tls_record_handshake;
+    ch[1] = 0x03;
+    ch[2] = 0x01;
+    ch[3] = 0x00;
+    ch[4] = 0x2f;
+    ch[5] = 0x01;
+    ch[6] = 0x00;
+    ch[7] = 0x00;
+    ch[8] = 0x2b;
+    ch[9] = 0x03;
+    ch[10] = 0x03;
+    @memset(ch[11..43], 0xAB);
+    ch[43] = 0x00;
+    ch[44] = 0x00;
+    ch[45] = 0x06;
+    ch[46] = 0x0a;
+    ch[47] = 0x0a;
+    ch[48] = 0x13;
+    ch[49] = 0x03;
+    ch[50] = 0x13;
+    ch[51] = 0x01;
+
+    try std.testing.expectEqual(@as(?u16, 0x1303), extractFirstTls13Cipher(&ch));
+    try std.testing.expect(extractFirstTls13Cipher(ch[0..40]) == null);
+}
+
+test "buildServerHelloWithTemplateCipher echoes chosen cipher" {
+    const allocator = std.testing.allocator;
+    var digest = [_]u8{0xAA} ** 32;
+    const session_id = [_]u8{0xBB} ** 32;
+
+    const resp = try buildServerHelloWithTemplateCipher(allocator, &nginx_template, &digest, &digest, &session_id, 0x1303);
+    defer allocator.free(resp);
+
+    try std.testing.expectEqual(@as(u16, 0x1303), std.mem.readInt(u16, resp[tmpl_cipher_offset..][0..2], .big));
+}
+
+test "clientOffersPqKeyShare detects a 0x11ec key_share entry" {
+    var ch: [96]u8 = undefined;
+    var n: usize = 0;
+    const W = struct {
+        fn b(buf: []u8, pos: *usize, v: u8) void {
+            buf[pos.*] = v;
+            pos.* += 1;
+        }
+        fn h(buf: []u8, pos: *usize, v: u16) void {
+            std.mem.writeInt(u16, buf[pos.*..][0..2], v, .big);
+            pos.* += 2;
+        }
+    };
+
+    W.b(&ch, &n, constants.tls_record_handshake);
+    W.h(&ch, &n, 0x0301);
+    W.h(&ch, &n, 0);
+    W.b(&ch, &n, 0x01);
+    W.b(&ch, &n, 0);
+    W.h(&ch, &n, 0);
+    W.h(&ch, &n, 0x0303);
+    @memset(ch[n..][0..32], 0xAA);
+    n += 32;
+    W.b(&ch, &n, 0);
+    W.h(&ch, &n, 2);
+    W.h(&ch, &n, 0x1301);
+    W.b(&ch, &n, 1);
+    W.b(&ch, &n, 0);
+    const ext_total_at = n;
+    W.h(&ch, &n, 0);
+    const ext_start = n;
+    W.h(&ch, &n, 0x0033);
+    const ext_len_at = n;
+    W.h(&ch, &n, 0);
+    const ext_payload_start = n;
+    const list_len_at = n;
+    W.h(&ch, &n, 0);
+    const shares_start = n;
+    W.h(&ch, &n, pq_named_group);
+    W.h(&ch, &n, 4);
+    @memset(ch[n..][0..4], 0xCC);
+    n += 4;
+    std.mem.writeInt(u16, ch[list_len_at..][0..2], @intCast(n - shares_start), .big);
+    std.mem.writeInt(u16, ch[ext_len_at..][0..2], @intCast(n - ext_payload_start), .big);
+    std.mem.writeInt(u16, ch[ext_total_at..][0..2], @intCast(n - ext_start), .big);
+
+    try std.testing.expect(clientOffersPqKeyShare(ch[0..n]));
+    ch[shares_start] = 0x00;
+    ch[shares_start + 1] = 0x1d;
+    try std.testing.expect(!clientOffersPqKeyShare(ch[0..n]));
+}
+
+test "buildServerHelloPq emits a 0x11ec key_share with correct framing + HMAC" {
+    const allocator = std.testing.allocator;
+    const digest = [_]u8{0} ** constants.tls_digest_len;
+    const sid = [_]u8{0x33} ** 32;
+    const secret = [_]u8{0x42} ** 16;
+
+    const resp = try buildServerHelloPq(allocator, &secret, &digest, &sid, 0x1303);
+    defer allocator.free(resp);
+
+    try std.testing.expectEqual(pq_server_hello_len, resp.len);
+    try std.testing.expectEqual(@as(u8, constants.tls_record_handshake), resp[0]);
+    try std.testing.expectEqual(@as(u16, @intCast(pq_server_hello_record_len - 5)), std.mem.readInt(u16, resp[3..][0..2], .big));
+    try std.testing.expectEqual(@as(u16, 0x1303), std.mem.readInt(u16, resp[tmpl_cipher_offset..][0..2], .big));
+    try std.testing.expectEqualSlices(u8, &sid, resp[tmpl_session_id_offset..][0..32]);
+    try std.testing.expectEqual(@as(u16, 0x0033), std.mem.readInt(u16, resp[87..][0..2], .big));
+    try std.testing.expectEqual(pq_named_group, std.mem.readInt(u16, resp[91..][0..2], .big));
+    try std.testing.expectEqual(@as(u16, @intCast(pq_key_share_len)), std.mem.readInt(u16, resp[93..][0..2], .big));
+    try std.testing.expectEqual(@as(u8, constants.tls_record_change_cipher), resp[pq_server_hello_record_len]);
+    try std.testing.expectEqual(@as(u8, constants.tls_record_application), resp[pq_server_hello_record_len + 6]);
+
+    const check = try allocator.dupe(u8, resp);
+    defer allocator.free(check);
+    @memset(check[tmpl_random_offset..][0..32], 0);
+    const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+    var hmac = HmacSha256.init(&secret);
+    hmac.update(&digest);
+    hmac.update(check);
+    var expected: [32]u8 = undefined;
+    hmac.final(&expected);
+    try std.testing.expect(std.crypto.timing_safe.eql([32]u8, expected, resp[tmpl_random_offset..][0..32].*));
 }
 
 test "validateTlsHandshake returns canonical_hmac" {

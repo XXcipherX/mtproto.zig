@@ -97,6 +97,11 @@ port = 443
 # Self-domain masking domain. Point this domain's DNS A record to this VPS.
 # Public :443 is handled by mtproto-proxy; ordinary HTTPS clients are forwarded
 # to local Nginx on mask_port and receive 404.
+# Since June 2026, the masking TLS backend for this domain should negotiate
+# X25519MLKEM768 (post-quantum group 0x11ec) in one round. A classical-x25519-only
+# backend can mark iOS clients and other users sharing their NAT IP for blocking.
+# setup_masking.sh probes the local backend and warns when OpenSSL/backend support
+# is missing. Changing tls_domain changes every ee-secret link.
 tls_domain = "proxy.example.com"
 
 # Forward unauthenticated / invalid connections to the self-domain Nginx 404 backend

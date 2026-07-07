@@ -17,6 +17,7 @@
 #   PORT=443
 #   SYNFIX_RATE=54/minute
 #   SYNFIX_BURST=1
+#   SYNFIX_ACTION=reject|drop
 
 set -euo pipefail
 
@@ -26,6 +27,7 @@ CHAIN="MTPR_SYNFIX"
 IOS_MARK="0x400"
 SYNFIX_RATE="${SYNFIX_RATE:-54/minute}"
 SYNFIX_BURST="${SYNFIX_BURST:-1}"
+SYNFIX_ACTION="${SYNFIX_ACTION:-reject}"
 SYNFIX_HTABLE_EXPIRE="${SYNFIX_HTABLE_EXPIRE:-60000}"
 SYNFIX_HTABLE_SIZE="${SYNFIX_HTABLE_SIZE:-32768}"
 IOS_U32='32 & 0x00FFFFFF = 0x0002FFFF && 40 & 0xFF000000 = 0x02000000 && 44 & 0xFFFF0000 = 0x01030000 && 48 & 0xFFFFFF00 = 0x01010800 && 60 & 0xFFFFFFFF = 0x04020000'
@@ -77,11 +79,25 @@ while [[ $# -gt 0 ]]; do
             REMOVE=true
             shift
             ;;
+        --reject)
+            SYNFIX_ACTION="reject"
+            shift
+            ;;
+        --drop)
+            SYNFIX_ACTION="drop"
+            shift
+            ;;
         *)
             fail "Unknown argument: $1"
             ;;
     esac
 done
+
+case "${SYNFIX_ACTION,,}" in
+    reject|rst|reset|tcp-reset) SYNFIX_ACTION="reject" ;;
+    drop) SYNFIX_ACTION="drop" ;;
+    *) fail "Invalid SYNFIX_ACTION: ${SYNFIX_ACTION} (expected reject or drop)" ;;
+esac
 
 remove_rules() {
     if command -v iptables >/dev/null 2>&1; then
@@ -136,9 +152,15 @@ iptables -A "$CHAIN" \
     --hashlimit-htable-size "$SYNFIX_HTABLE_SIZE" \
     -j ACCEPT
 
-iptables -A "$CHAIN" \
-    -p tcp --dport "$PORT" --syn \
-    -j REJECT --reject-with tcp-reset
+if [[ "$SYNFIX_ACTION" == "reject" ]]; then
+    iptables -A "$CHAIN" \
+        -p tcp --dport "$PORT" --syn \
+        -j REJECT --reject-with tcp-reset
+else
+    iptables -A "$CHAIN" \
+        -p tcp --dport "$PORT" --syn \
+        -j DROP
+fi
 
 iptables -A "$CHAIN" -j RETURN
 
@@ -151,5 +173,5 @@ echo -e "${BOLD}${CYAN}MTProto SYN fix${RESET}"
 echo -e "  ${DIM}Port:${RESET}       ${PORT}"
 echo -e "  ${DIM}iOS mark:${RESET}   ${IOS_MARK}"
 echo -e "  ${DIM}Other rate:${RESET} ${SYNFIX_RATE}, burst ${SYNFIX_BURST}"
-echo -e "  ${DIM}Reject:${RESET}     tcp-reset"
+echo -e "  ${DIM}Action:${RESET}     ${SYNFIX_ACTION}"
 echo ""

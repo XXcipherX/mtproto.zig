@@ -7,6 +7,7 @@
 #
 # Optional environment:
 #   ENABLE_SYNFIX=true   # install inbound SYN pacing rules for filtered routes
+#   SYNFIX_ACTION=reject # reject (tcp-reset, default) or drop for over-limit SYNs
 #
 # The script is idempotent:
 #   - On first run: installs Zig, builds proxy, generates config, sets up systemd + DPI bypass.
@@ -33,6 +34,7 @@ SERVICE_NAME="mtproto-proxy"
 SERVICE_FILE="/etc/systemd/system/mtproto-proxy.service"
 FORCE_SERVICE_UPDATE="${FORCE_SERVICE_UPDATE:-0}"
 ENABLE_SYNFIX="${ENABLE_SYNFIX:-false}"
+SYNFIX_ACTION="${SYNFIX_ACTION:-reject}"
 IS_UPDATE=false
 [[ -f "$INSTALL_DIR/mtproto-proxy" ]] && IS_UPDATE=true
 
@@ -339,7 +341,7 @@ SYNFIX_OK=false
 NFQWS_OK=false
 
 info "Setting up Self-domain Nginx Masking (zero-RTT)..."
-if MASK_DOMAIN="$TLS_DOMAIN" bash "$TMPBUILD/deploy/setup_masking.sh" "$TLS_DOMAIN" < /dev/null 2>&1; then
+if MASK_DOMAIN="$TLS_DOMAIN" bash "$TMPBUILD/deploy/setup_masking.sh" "$TLS_DOMAIN" < /dev/null; then
     MASKING_OK=true
 else
     warn "Masking setup failed (non-critical, proxy still works). Check DNS A record, TCP/80, and run: sudo env MASK_DOMAIN=${TLS_DOMAIN} bash ${INSTALL_DIR}/setup_masking.sh"
@@ -347,7 +349,7 @@ fi
 
 if is_true "$ENABLE_SYNFIX"; then
     info "Setting up inbound SYN pacing..."
-    if PORT="$PORT" bash "$TMPBUILD/deploy/setup_synfix.sh" < /dev/null 2>&1; then
+    if PORT="$PORT" SYNFIX_ACTION="$SYNFIX_ACTION" bash "$TMPBUILD/deploy/setup_synfix.sh" < /dev/null 2>&1; then
         SYNFIX_OK=true
     else
         warn "SYN pacing setup failed (non-critical, proxy still works)"
@@ -480,7 +482,7 @@ echo -e "  ${BOLD}DPI Bypass:${RESET}"
 echo -e "  ${GREEN}✓${RESET} Anti-Replay Cache (ТСПУ Revisor protection)"
 echo -e "  ${GREEN}✓${RESET} TCPMSS=88 (ClientHello fragmentation)"
 if $SYNFIX_OK; then
-echo -e "  ${GREEN}✓${RESET} Inbound SYN pacing (Android/Desktop handshake stability)"
+echo -e "  ${GREEN}✓${RESET} Inbound SYN pacing (${SYNFIX_ACTION})"
 elif is_true "$ENABLE_SYNFIX"; then
 echo -e "  ${RED}✗${RESET} Inbound SYN pacing (setup failed)"
 else

@@ -20,6 +20,7 @@
 #   MASK_ALLOW_SELF_SIGNED=1                  # dev/test fallback only
 #   MASK_SET_PUBLIC_IP=0                      # do not set [server].public_ip
 #   MASK_KEEP_NGINX_DEFAULT=1                 # keep existing sites-enabled/default
+#   CHECK_PQ_DOMAIN=false                     # skip X25519MLKEM768 masking probe
 #
 # What it does:
 #   1. Installs Nginx and certbot if needed.
@@ -39,6 +40,7 @@ SERVICE_FILE="/etc/systemd/system/mtproto-proxy.service"
 NGINX_PORT="${MASK_PORT:-8443}"
 MASK_SET_PUBLIC_IP="${MASK_SET_PUBLIC_IP:-1}"
 MASK_ALLOW_SELF_SIGNED="${MASK_ALLOW_SELF_SIGNED:-0}"
+CHECK_PQ_DOMAIN="${CHECK_PQ_DOMAIN:-true}"
 ACME_ROOT="${MASK_ACME_ROOT:-${MASK_SITE_ROOT:-/var/www/certbot}}"
 TUNNEL_HOST_IP=""
 
@@ -122,6 +124,62 @@ info()  { echo -e "${CYAN}>${RESET} $*"; }
 ok()    { echo -e "${GREEN}OK${RESET} $*"; }
 warn()  { echo -e "${RED}WARN${RESET} $*"; }
 fail()  { echo -e "${RED}FAIL${RESET} $*" >&2; exit 1; }
+
+is_true() {
+    case "${1,,}" in
+        1|true|yes|on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+check_pq_fronting_backend() {
+    local host="$1"
+    local port="$2"
+    local servername="$3"
+    local out legacy_out
+
+    is_true "$CHECK_PQ_DOMAIN" || return 0
+    command -v openssl >/dev/null 2>&1 || {
+        warn "openssl not found; skipping X25519MLKEM768 masking-domain check"
+        return 0
+    }
+
+    info "Checking masking backend X25519MLKEM768 support..."
+    out="$(echo | timeout 10 openssl s_client \
+        -connect "${host}:${port}" \
+        -servername "${servername}" \
+        -groups X25519MLKEM768:X25519 \
+        -tls1_3 2>&1 || true)"
+
+    if grep -q "Server Temp Key" <<<"$out"; then
+        if grep -Eqi "MLKEM|ML-KEM" <<<"$out"; then
+            ok "Masking backend negotiates X25519MLKEM768 for ${servername}"
+        else
+            warn "Masking backend negotiates a classical TLS group, not X25519MLKEM768"
+            warn "Since the June-2026 TSPU rollout this can mark iOS clients and everyone sharing their NAT egress IP"
+        fi
+        return 0
+    fi
+
+    if grep -q "CONNECTED" <<<"$out"; then
+        warn "Masking backend connected but did not expose a single-round X25519MLKEM768/X25519 Server Temp Key"
+        warn "Avoid HRR / non-x25519 masking targets; FakeTLS emits a single ServerHello"
+        return 0
+    fi
+
+    legacy_out="$(echo | timeout 10 openssl s_client \
+        -connect "${host}:${port}" \
+        -servername "${servername}" \
+        -groups X25519 \
+        -tls1_3 2>&1 || true)"
+
+    if grep -q "Server Temp Key" <<<"$legacy_out"; then
+        warn "Couldn't test X25519MLKEM768, but x25519 works. This host may have OpenSSL older than 3.5 or the backend rejects the hybrid group"
+        warn "Verify ${servername} with @Sni_checker_bot or an OpenSSL 3.5+ client before sharing links"
+    else
+        warn "Could not verify TLS group support for masking backend ${host}:${port}"
+    fi
+}
 
 [[ $EUID -eq 0 ]] || fail "Run as root: sudo bash setup_masking.sh"
 
@@ -351,6 +409,7 @@ fi
 
 if curl -sk --max-time 5 --resolve "${TLS_DOMAIN}:${NGINX_PORT}:127.0.0.1" "https://${TLS_DOMAIN}:${NGINX_PORT}/" >/dev/null 2>&1; then
     ok "Masking backend responds with SNI ${TLS_DOMAIN} on 127.0.0.1:${NGINX_PORT}"
+    check_pq_fronting_backend "127.0.0.1" "$NGINX_PORT" "$TLS_DOMAIN"
 else
     warn "Masking backend probe failed. Check: curl -vk --resolve ${TLS_DOMAIN}:${NGINX_PORT}:127.0.0.1 https://${TLS_DOMAIN}:${NGINX_PORT}/"
 fi
