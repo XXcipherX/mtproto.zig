@@ -841,6 +841,8 @@ const ConnectionSlot = struct {
 
     created_at_ms: i64 = 0,
     first_byte_at_ms: i64 = 0,
+    /// Timestamp for the current upstream connect attempt. Reset per candidate.
+    upstream_connect_started_ms: i64 = 0,
     last_activity_ms: i64 = 0,
     /// Last relayed payload time in each direction. If the server spoke more
     /// recently than the client, the server reply is unanswered.
@@ -1003,6 +1005,7 @@ const ConnectionSlot = struct {
         self.direct_fallback_addr = null;
         self.direct_fallback_used = false;
         self.current_upstream_addr = null;
+        self.upstream_connect_started_ms = 0;
         self.dc_abs = 0;
         self.is_media_path = false;
 
@@ -2518,10 +2521,12 @@ const EventLoop = struct {
         slot.upstream_kind = kind;
         slot.current_upstream_addr = addr;
         slot.phase = .connecting_upstream;
+        slot.upstream_connect_started_ms = compat.milliTimestamp();
         errdefer {
             slot.upstream_fd = invalid_fd;
             slot.upstream_kind = .none;
             slot.current_upstream_addr = null;
+            slot.upstream_connect_started_ms = 0;
         }
 
         connectFd(fd, &addr.any, addr.getOsSockLen()) catch |err| switch (err) {
@@ -2554,6 +2559,7 @@ const EventLoop = struct {
 
         configureRelaySocket(slot.client_fd);
         configureRelaySocket(slot.upstream_fd);
+        slot.upstream_connect_started_ms = 0;
 
         if (slot.upstream_kind == .mask) {
             if (slot.mask_prebuffer) |pre| {
@@ -2590,6 +2596,7 @@ const EventLoop = struct {
         }
         slot.upstream_kind = .none;
         slot.current_upstream_addr = null;
+        slot.upstream_connect_started_ms = 0;
         slot.upstream_queue.clear();
     }
 
@@ -3439,6 +3446,23 @@ const EventLoop = struct {
 
             if (slot.phase == .closing) {
                 self.closeSlot(slot, "closing phase");
+                continue;
+            }
+
+            if (slot.phase == .connecting_upstream and
+                self.state.config.dc_connect_timeout_sec > 0 and
+                slot.upstream_connect_started_ms > 0 and
+                now_ms - slot.upstream_connect_started_ms > secondsToMs(self.state.config.dc_connect_timeout_sec))
+            {
+                const failed_kind = slot.upstream_kind;
+                const failed_addr = slot.current_upstream_addr;
+                self.cleanupFailedUpstreamConnect(slot);
+
+                if (failed_kind == .dc and self.tryNextDcEndpoint(slot, error.ConnectionTimedOut, failed_addr)) {
+                    continue;
+                }
+
+                self.closeSlot(slot, "dc connect timeout");
                 continue;
             }
 

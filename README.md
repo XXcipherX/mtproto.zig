@@ -706,6 +706,7 @@ max_connections = 512                      # Safe default for small (1 vCPU / ~1
 idle_timeout_sec = 120
 # client_silence_close_sec = 0             # Close relays whose last server reply is unanswered by the client for N seconds
 handshake_timeout_sec = 15
+# dc_connect_timeout_sec = 10              # Per-DC TCP connect deadline; 0 disables per-endpoint failover timing
 tag = "1234567890abcdef1234567890abcdef"   # Optional: promotion tag from @MTProxybot
 log_level = "info"                         # Runtime log level: debug, info, warn, err
 rate_limit_per_subnet = 30                # Max new connections/sec per /24 subnet (0 = disabled)
@@ -749,6 +750,7 @@ alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eli
 | `[server]` | `idle_timeout_sec` | `120` | Connection idle timeout in seconds (also used before first client byte; parser lower bound 5) |
 | `[server]` | `client_silence_close_sec` | `0` | Close an established relay when the server's last reply has gone unanswered by the client for N seconds. This bounds an iOS MtProtoKit bad_salt wedge where "Updating" can hang until the DC closes the socket. Fires only when the last relayed payload was server→client and the client has sent relay payload before. `0` disables it; if enabled, start around `10`-`15` and tune to taste |
 | `[server]` | `handshake_timeout_sec` | `15` | Timeout for completing handshake after first byte (parser lower bound 5) |
+| `[server]` | `dc_connect_timeout_sec` | `10` | Per-endpoint TCP connect deadline for Telegram DC candidates. If one candidate is black-holed, the proxy abandons that endpoint and tries the next within the global handshake timeout. Set `0` to disable |
 | `[server]` | `middleproxy_buffer_kb` | `1024` | MiddleProxy per-direction buffer cap in KiB. Active ME connections start with 16 KiB C2S/S2C buffers and grow on demand up to `min(middleproxy_buffer_kb, 16384)` KiB; each event loop also keeps lazy shared scratch buffers. Values below 1024 may still cause `MiddleProxyBufferOverflow` on media-heavy traffic (Stories, video messages). Parser lower bound is 64 KiB |
 | `[server]` | `tag` | _(none)_ | Optional 32 hex-char promotion tag from [@MTProxybot](https://t.me/MTProxybot) |
 | `[server]` | `log_level` | `"info"` | Runtime log verbosity: `debug` (all DC routing, relay, close details), `info` (default — connection stats, warnings), `warn`, `err`. Change without recompilation; takes effect on restart |

@@ -36,6 +36,9 @@ pub const Config = struct {
     client_silence_close_sec: u32 = 0,
     /// Handshake read timeout after first byte arrives
     handshake_timeout_sec: u32 = 15,
+    /// Per-endpoint TCP connect deadline for Telegram DC candidates.
+    /// 0 disables it and relies only on the global handshake timeout.
+    dc_connect_timeout_sec: u32 = 10,
     tag: ?[16]u8 = null,
     /// FakeTLS SNI / fronting domain. Since the June-2026 TSPU rollout, the
     /// real masking endpoint for this domain should negotiate X25519MLKEM768
@@ -366,6 +369,10 @@ pub const Config = struct {
                         if (parseIntSetting(u32, key, value)) |parsed| {
                             cfg.handshake_timeout_sec = @max(@as(u32, 5), parsed);
                         }
+                    } else if (std.mem.eql(u8, key, "dc_connect_timeout_sec")) {
+                        if (parseIntSetting(u32, key, value)) |parsed| {
+                            cfg.dc_connect_timeout_sec = parsed;
+                        }
                     } else if (std.mem.eql(u8, key, "tag")) {
                         if (parseHex16Setting(key, value)) |tag| {
                             cfg.tag = tag;
@@ -476,6 +483,7 @@ test "parse config - valid complete" {
         \\max_connections = 6000
         \\idle_timeout_sec = 180
         \\handshake_timeout_sec = 30
+        \\dc_connect_timeout_sec = 7
         \\fast_mode = true
         \\
         \\[censorship]
@@ -496,6 +504,7 @@ test "parse config - valid complete" {
     try std.testing.expectEqual(@as(u32, 6000), cfg.max_connections);
     try std.testing.expectEqual(@as(u32, 180), cfg.idle_timeout_sec);
     try std.testing.expectEqual(@as(u32, 30), cfg.handshake_timeout_sec);
+    try std.testing.expectEqual(@as(u32, 7), cfg.dc_connect_timeout_sec);
     try std.testing.expectEqualStrings("example.com", cfg.tls_domain);
     try std.testing.expect(cfg.use_middle_proxy);
     try std.testing.expect(cfg.mask);
@@ -521,6 +530,7 @@ test "parse config - missing fields defaults" {
     try std.testing.expectEqual(@as(u32, 512), cfg.max_connections);
     try std.testing.expectEqual(@as(u32, 120), cfg.idle_timeout_sec);
     try std.testing.expectEqual(@as(u32, 15), cfg.handshake_timeout_sec);
+    try std.testing.expectEqual(@as(u32, 10), cfg.dc_connect_timeout_sec);
     try std.testing.expectEqualStrings("google.com", cfg.tls_domain);
     try std.testing.expect(!cfg.use_middle_proxy); // Default is false
     try std.testing.expect(cfg.mask); // Default is true
@@ -924,6 +934,7 @@ test "parse config - full production-like config" {
         \\max_connections = 512
         \\idle_timeout_sec = 120
         \\handshake_timeout_sec = 15
+        \\dc_connect_timeout_sec = 10
         \\backlog = 8192
         \\log_level = "info"
         \\rate_limit_per_subnet = 30
@@ -950,6 +961,7 @@ test "parse config - full production-like config" {
     try std.testing.expectEqual(@as(u32, 512), cfg.max_connections);
     try std.testing.expectEqual(@as(u32, 120), cfg.idle_timeout_sec);
     try std.testing.expectEqual(@as(u32, 15), cfg.handshake_timeout_sec);
+    try std.testing.expectEqual(@as(u32, 10), cfg.dc_connect_timeout_sec);
     try std.testing.expectEqual(@as(u32, 8192), cfg.backlog);
     try std.testing.expectEqual(std.log.Level.info, cfg.log_level);
     try std.testing.expectEqual(@as(u8, 30), cfg.rate_limit_per_subnet);
