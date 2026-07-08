@@ -370,6 +370,11 @@ fn hasFatalEpollHangup(events: u32) bool {
     return (events & (linux.EPOLL.ERR | linux.EPOLL.HUP | linux.EPOLL.RDHUP)) != 0;
 }
 
+fn hasGracefulEpollRdhup(events: u32) bool {
+    return (events & linux.EPOLL.RDHUP) != 0 and
+        (events & (linux.EPOLL.ERR | linux.EPOLL.HUP)) == 0;
+}
+
 fn classCapacity(class: MsgBlockClass) usize {
     return switch (class) {
         .tiny => tiny_block_size,
@@ -948,6 +953,9 @@ const ConnectionSlot = struct {
     client_interest_out: bool = false,
     upstream_interest_in: bool = false,
     upstream_interest_out: bool = false,
+    relay_half_closed: bool = false,
+    client_detached: bool = false,
+    upstream_detached: bool = false,
 
     fn hasClientPending(self: *const ConnectionSlot) bool {
         return !self.client_queue.isEmpty();
@@ -1675,6 +1683,7 @@ const EventLoop = struct {
     prev_mp_fallback: u64,
     mp_c2s_scratch: ?[]u8,
     mp_s2c_scratch: ?[]u8,
+    pending_close_fds: std.ArrayList(posix.fd_t),
 
     fn init(state: *ProxyState, listen_fd: posix.fd_t) !EventLoop {
         const epoll_fd = try epollCreate();
@@ -1701,6 +1710,7 @@ const EventLoop = struct {
             .prev_mp_fallback = 0,
             .mp_c2s_scratch = null,
             .mp_s2c_scratch = null,
+            .pending_close_fds = .empty,
         };
         errdefer loop.pool.deinit();
 
@@ -1720,8 +1730,22 @@ const EventLoop = struct {
         if (self.mp_c2s_scratch) |buf| self.state.allocator.free(buf);
         if (self.mp_s2c_scratch) |buf| self.state.allocator.free(buf);
 
+        self.drainPendingCloses();
+        self.pending_close_fds.deinit(self.state.allocator);
+
         self.pool.deinit();
         closeFd(self.epoll_fd);
+    }
+
+    fn deferClose(self: *EventLoop, fd: posix.fd_t) void {
+        self.pending_close_fds.append(self.state.allocator, fd) catch {
+            closeFd(fd);
+        };
+    }
+
+    fn drainPendingCloses(self: *EventLoop) void {
+        for (self.pending_close_fds.items) |fd| closeFd(fd);
+        self.pending_close_fds.clearRetainingCapacity();
     }
 
     fn run(self: *EventLoop) !void {
@@ -1730,6 +1754,8 @@ const EventLoop = struct {
         var next_timer_tick_ns: i128 = compat.nanoTimestamp();
 
         while (true) {
+            self.drainPendingCloses();
+
             const rc = linux.epoll_wait(self.epoll_fd, events[0..].ptr, @intCast(events.len), event_loop_wait_ms);
             switch (posix.errno(rc)) {
                 .SUCCESS => {},
@@ -1776,6 +1802,12 @@ const EventLoop = struct {
 
     fn processSlotEvent(self: *EventLoop, slot: *ConnectionSlot, fd: posix.fd_t, events: u32) void {
         if (slot.phase == .idle) return;
+        if (fd != slot.client_fd and fd != slot.upstream_fd) return;
+        if ((fd == slot.client_fd and slot.client_detached) or
+            (fd == slot.upstream_fd and slot.upstream_detached))
+        {
+            return;
+        }
 
         const fatal_hangup = hasFatalEpollHangup(events);
 
@@ -1797,7 +1829,15 @@ const EventLoop = struct {
             }
         }
 
+        if (fd != slot.client_fd and fd != slot.upstream_fd) return;
+        if ((fd == slot.client_fd and slot.client_detached) or
+            (fd == slot.upstream_fd and slot.upstream_detached))
+        {
+            return;
+        }
+
         if (fatal_hangup and shouldCloseOnFatalHangup(slot.phase, fd, slot.upstream_fd)) {
+            if (self.tryBeginRelayHalfClose(slot, fd, events)) return;
             if (shouldFallbackMiddleProxyOnFatalHangup(slot.phase, fd, slot.upstream_fd) and
                 self.fallbackFromMiddleProxyToDirect(slot))
             {
@@ -2065,6 +2105,10 @@ const EventLoop = struct {
         if (had_pending and !slot.hasClientPending()) {
             slot.last_activity_ms = compat.milliTimestamp();
         }
+        if (slot.relay_half_closed and slot.upstream_detached and !slot.hasClientPending()) {
+            self.closeSlot(slot, "relay drained after upstream half-close");
+            return;
+        }
 
         switch (slot.phase) {
             .writing_server_hello_first => {
@@ -2113,6 +2157,10 @@ const EventLoop = struct {
                 }
                 if (had_pending and !slot.hasUpstreamPending()) {
                     slot.last_activity_ms = compat.milliTimestamp();
+                }
+                if (slot.relay_half_closed and slot.client_detached and !slot.hasUpstreamPending()) {
+                    self.closeSlot(slot, "relay drained after client half-close");
+                    return;
                 }
 
                 if (slot.phase == .writing_dc_nonce and !slot.hasUpstreamPending()) {
@@ -2609,12 +2657,15 @@ const EventLoop = struct {
             const fd = slot.upstream_fd;
             _ = self.delFd(fd) catch {};
             self.pool.unmapFd(fd);
-            closeFd(fd);
+            self.deferClose(fd);
             slot.upstream_fd = invalid_fd;
         }
         slot.upstream_kind = .none;
         slot.current_upstream_addr = null;
         slot.upstream_connect_started_ms = 0;
+        slot.upstream_detached = false;
+        slot.upstream_interest_in = false;
+        slot.upstream_interest_out = false;
         slot.upstream_queue.clear();
     }
 
@@ -3576,20 +3627,20 @@ const EventLoop = struct {
                     slot.mp_step == .waiting_rpc_handshake_response;
             },
 
-            .relaying => {
-                want_client_in = !slot.hasUpstreamPending();
-                want_upstream_in = !slot.hasClientPending();
-            },
-
-            .mask_relaying => {
-                want_client_in = !slot.hasUpstreamPending();
-                want_upstream_in = !slot.hasClientPending();
+            .relaying, .mask_relaying => {
+                if (slot.relay_half_closed) {
+                    want_client_in = false;
+                    want_upstream_in = false;
+                } else {
+                    want_client_in = !slot.hasUpstreamPending();
+                    want_upstream_in = !slot.hasClientPending();
+                }
             },
 
             else => {},
         }
 
-        if (!isInvalidFd(slot.client_fd)) {
+        if (!isInvalidFd(slot.client_fd) and !slot.client_detached) {
             if (slot.client_interest_in != want_client_in or slot.client_interest_out != want_client_out) {
                 try self.modFd(slot.client_fd, want_client_in, want_client_out);
                 slot.client_interest_in = want_client_in;
@@ -3597,7 +3648,7 @@ const EventLoop = struct {
             }
         }
 
-        if (!isInvalidFd(slot.upstream_fd)) {
+        if (!isInvalidFd(slot.upstream_fd) and !slot.upstream_detached) {
             if (slot.upstream_interest_in != want_upstream_in or slot.upstream_interest_out != want_upstream_out) {
                 try self.modFd(slot.upstream_fd, want_upstream_in, want_upstream_out);
                 slot.upstream_interest_in = want_upstream_in;
@@ -3630,6 +3681,36 @@ const EventLoop = struct {
         return next;
     }
 
+    fn tryBeginRelayHalfClose(self: *EventLoop, slot: *ConnectionSlot, hung_fd: posix.fd_t, events: u32) bool {
+        if (slot.relay_half_closed) return false;
+        if (!hasGracefulEpollRdhup(events)) return false;
+        if (slot.phase != .relaying and slot.phase != .mask_relaying) return false;
+
+        const drain_to_upstream = hung_fd == slot.client_fd and slot.hasUpstreamPending();
+        const drain_to_client = hung_fd == slot.upstream_fd and slot.hasClientPending();
+        if (!drain_to_upstream and !drain_to_client) return false;
+
+        _ = self.delFd(hung_fd) catch {};
+        self.pool.unmapFd(hung_fd);
+        if (hung_fd == slot.client_fd) {
+            slot.client_detached = true;
+            slot.client_interest_in = false;
+            slot.client_interest_out = false;
+        } else {
+            slot.upstream_detached = true;
+            slot.upstream_interest_in = false;
+            slot.upstream_interest_out = false;
+        }
+        slot.relay_half_closed = true;
+        slot.last_activity_ms = compat.milliTimestamp();
+
+        self.syncInterests(slot) catch {
+            self.closeSlot(slot, "half-close interest sync failed");
+            return true;
+        };
+        return true;
+    }
+
     fn closeSlot(self: *EventLoop, slot: *ConnectionSlot, reason: []const u8) void {
         if (slot.phase == .idle) return;
         log.debug("[{d}] closing: dc_idx={d} media={} phase={s} reason={s} c2s={d} s2c={d}", .{
@@ -3645,14 +3726,14 @@ const EventLoop = struct {
         if (!isInvalidFd(slot.client_fd)) {
             _ = self.delFd(slot.client_fd) catch {};
             self.pool.unmapFd(slot.client_fd);
-            closeFd(slot.client_fd);
+            self.deferClose(slot.client_fd);
             slot.client_fd = invalid_fd;
         }
 
         if (!isInvalidFd(slot.upstream_fd)) {
             _ = self.delFd(slot.upstream_fd) catch {};
             self.pool.unmapFd(slot.upstream_fd);
-            closeFd(slot.upstream_fd);
+            self.deferClose(slot.upstream_fd);
             slot.upstream_fd = invalid_fd;
         }
 
@@ -3668,6 +3749,9 @@ const EventLoop = struct {
             self.closed_since_log += 1;
         }
 
+        slot.relay_half_closed = false;
+        slot.client_detached = false;
+        slot.upstream_detached = false;
         slot.phase = .idle;
         self.pool.release(slot);
     }
@@ -4620,8 +4704,13 @@ test "middle proxy nonce response failures fall back to direct path" {
         .prev_mp_fallback = 0,
         .mp_c2s_scratch = null,
         .mp_s2c_scratch = null,
+        .pending_close_fds = .empty,
     };
-    defer loop.pool.deinit();
+    defer {
+        loop.drainPendingCloses();
+        loop.pending_close_fds.deinit(std.testing.allocator);
+        loop.pool.deinit();
+    }
 
     const slot = loop.pool.acquire() orelse return error.TestExpectedEqual;
     defer {
@@ -4897,6 +4986,10 @@ test "epoll hangup helper" {
     try std.testing.expect(hasFatalEpollHangup(linux.EPOLL.HUP));
     try std.testing.expect(hasFatalEpollHangup(linux.EPOLL.ERR));
     try std.testing.expect(!hasFatalEpollHangup(linux.EPOLL.IN));
+    try std.testing.expect(hasGracefulEpollRdhup(linux.EPOLL.RDHUP));
+    try std.testing.expect(hasGracefulEpollRdhup(linux.EPOLL.RDHUP | linux.EPOLL.IN));
+    try std.testing.expect(!hasGracefulEpollRdhup(linux.EPOLL.RDHUP | linux.EPOLL.HUP));
+    try std.testing.expect(!hasGracefulEpollRdhup(linux.EPOLL.RDHUP | linux.EPOLL.ERR));
 }
 
 test "fatal hangup close policy distinguishes client/upstream while connecting" {
