@@ -119,6 +119,10 @@ mask = true
 # netns mode, the runtime automatically targets 10.200.200.1:8443.
 mask_port = 8443
 
+# Maximum lifetime for a masking relay connection. This limits active probes
+# that keep the Caddy 404 backend connection open. 0 disables the cap.
+# mask_relay_max_secs = 0
+
 # Split ServerHello into 1-byte + short delay + rest (defeats passive DPI signatures).
 # Enabled by default.
 # desync = true

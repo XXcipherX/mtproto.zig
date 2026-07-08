@@ -56,6 +56,8 @@ pub const Config = struct {
     mask: bool = true,
     /// Test-only hook to override the mask port
     mask_port: u16 = 443,
+    /// Maximum masking relay lifetime in seconds; 0 disables.
+    mask_relay_max_secs: u32 = 0,
     /// TCP desync: split ServerHello into 1-byte + rest to evade DPI
     desync: bool = true,
     /// Base delay between first ServerHello byte and the rest.
@@ -424,6 +426,8 @@ pub const Config = struct {
                         if (parseBoolSetting(key, value)) |parsed| cfg.mask = parsed;
                     } else if (std.mem.eql(u8, key, "mask_port")) {
                         if (parseIntSetting(u16, key, value)) |parsed| cfg.mask_port = parsed;
+                    } else if (std.mem.eql(u8, key, "mask_relay_max_secs")) {
+                        if (parseIntSetting(u32, key, value)) |parsed| cfg.mask_relay_max_secs = parsed;
                     } else if (std.mem.eql(u8, key, "desync")) {
                         if (parseBoolSetting(key, value)) |parsed| cfg.desync = parsed;
                     } else if (std.mem.eql(u8, key, "desync_split_delay_ms")) {
@@ -507,6 +511,7 @@ test "parse config - valid complete" {
         \\[censorship]
         \\tls_domain = "example.com"
         \\mask = true
+        \\mask_relay_max_secs = 30
         \\desync = true
         \\desync_split_delay_ms = 4
         \\desync_split_jitter_ms = 6
@@ -529,6 +534,7 @@ test "parse config - valid complete" {
     try std.testing.expectEqualStrings("example.com", cfg.tls_domain);
     try std.testing.expect(cfg.use_middle_proxy);
     try std.testing.expect(cfg.mask);
+    try std.testing.expectEqual(@as(u32, 30), cfg.mask_relay_max_secs);
     try std.testing.expect(cfg.desync);
     try std.testing.expectEqual(@as(u32, 4), cfg.desync_split_delay_ms);
     try std.testing.expectEqual(@as(u32, 6), cfg.desync_split_jitter_ms);
@@ -558,6 +564,7 @@ test "parse config - missing fields defaults" {
     try std.testing.expectEqualStrings("google.com", cfg.tls_domain);
     try std.testing.expect(!cfg.use_middle_proxy); // Default is false
     try std.testing.expect(cfg.mask); // Default is true
+    try std.testing.expectEqual(@as(u32, 0), cfg.mask_relay_max_secs);
     try std.testing.expect(cfg.desync); // Default is true
     try std.testing.expectEqual(@as(u32, 3), cfg.desync_split_delay_ms);
     try std.testing.expectEqual(@as(u32, 2), cfg.desync_split_jitter_ms);
@@ -971,6 +978,7 @@ test "parse config - full production-like config" {
         \\mask = true
         \\fast_mode = true
         \\mask_port = 8443
+        \\mask_relay_max_secs = 45
         \\desync_split_delay_ms = 3
         \\desync_split_jitter_ms = 2
         \\fake_cert_size = 0
@@ -1000,6 +1008,7 @@ test "parse config - full production-like config" {
     try std.testing.expect(cfg.mask);
     try std.testing.expect(cfg.fast_mode);
     try std.testing.expectEqual(@as(u16, 8443), cfg.mask_port);
+    try std.testing.expectEqual(@as(u32, 45), cfg.mask_relay_max_secs);
     try std.testing.expectEqual(@as(u32, 3), cfg.desync_split_delay_ms);
     try std.testing.expectEqual(@as(u32, 2), cfg.desync_split_jitter_ms);
     try std.testing.expectEqual(@as(u32, 0), cfg.fake_cert_size);
@@ -1069,6 +1078,20 @@ test "parse config - censorship section booleans" {
     try std.testing.expect(!cfg.desync);
     try std.testing.expect(cfg.drs);
     try std.testing.expect(cfg.fast_mode);
+}
+
+test "parse config - mask relay max lifetime" {
+    const content =
+        \\[censorship]
+        \\mask_relay_max_secs = 60
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 60), cfg.mask_relay_max_secs);
 }
 
 test "parse config - fake_cert_size bounds" {

@@ -721,6 +721,7 @@ rate_limit_per_subnet = 30                # Max new connections/sec per /24 subn
 tls_domain = "proxy.example.com"
 mask = true
 mask_port = 8443
+# mask_relay_max_secs = 0                  # Max lifetime for masked Caddy relays; 0 disables
 desync = true
 # desync_split_delay_ms = 3                # Base delay between first ServerHello byte and the rest
 # desync_split_jitter_ms = 2               # Random extra delay, 0..N ms, added to the base
@@ -764,6 +765,7 @@ alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eli
 | `[censorship]` | `tls_domain` | `"google.com"` | FakeTLS SNI domain. With `mask_port=443`, unauthenticated clients are forwarded to this domain directly. For self-domain masking, set it to your own domain and point its DNS A record to the VPS. Since June 2026, the real masking endpoint should negotiate X25519MLKEM768 (`0x11ec`) in one round; classical-x25519-only domains can be a passive marker |
 | `[censorship]` | `mask` | `true` | Forward unauthenticated connections to the configured masking target to defeat active probing |
 | `[censorship]` | `mask_port` | `443` | Masking target port. `443` connects to `tls_domain:443`; non-443 values connect to a local address on that port (`127.0.0.1:<mask_port>`, or `10.200.200.1:<mask_port>` inside tunnel netns), so that port must be served by Caddy or another local backend. Use `8443` for self-domain Caddy so public `443` remains owned by `mtproto-proxy` |
+| `[censorship]` | `mask_relay_max_secs` | `0` | Maximum lifetime for masking relay connections to the configured backend. Limits active probes that keep the Caddy 404 connection open; `0` disables the cap |
 | `[censorship]` | `desync` | `true` | Split fake `ServerHello` into `1 byte + short pause + rest` to desynchronize passive DPI |
 | `[censorship]` | `desync_split_delay_ms` | `3` | Base delay between the first fake `ServerHello` byte and the remaining bytes |
 | `[censorship]` | `desync_split_jitter_ms` | `2` | Random extra delay in milliseconds added to `desync_split_delay_ms` (`0..N` per connection) |

@@ -3499,6 +3499,13 @@ const EventLoop = struct {
                     continue;
                 }
             } else if (slot.phase == .relaying or slot.phase == .mask_relaying) {
+                if (slot.phase == .mask_relaying and self.state.config.mask_relay_max_secs > 0 and
+                    now_ms - slot.created_at_ms > secondsToMs(self.state.config.mask_relay_max_secs))
+                {
+                    self.closeSlot(slot, "mask relay max lifetime");
+                    continue;
+                }
+
                 // Break an iOS MtProtoKit bad_salt wedge: after a server reply,
                 // the client may stop sending until the DC closes the socket.
                 if (slot.phase == .relaying and self.state.config.client_silence_close_sec > 0 and
