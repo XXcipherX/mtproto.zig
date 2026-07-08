@@ -378,12 +378,24 @@ EOF
     ok "Generated ${CONFIG_FILE}"
 }
 
+is_compose_service() {
+    command -v systemctl >/dev/null 2>&1 || return 1
+    systemctl cat "$SERVICE_NAME" 2>/dev/null \
+        | grep -Eq 'Description=MTProto Proxy \(Docker Compose\)|ExecStart=.*[[:space:]]compose[[:space:]].*-f[[:space:]].*compose\.yml[[:space:]]up[[:space:]]-d'
+}
+
 stop_legacy_service() {
-    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet mtproto-proxy; then
-        warn "Stopping legacy systemd mtproto-proxy service to free port ${PORT}"
-        systemctl stop mtproto-proxy || true
-        systemctl disable mtproto-proxy >/dev/null 2>&1 || true
+    command -v systemctl >/dev/null 2>&1 || return 0
+    systemctl is-active --quiet "$SERVICE_NAME" || return 0
+
+    if is_compose_service; then
+        info "Existing ${SERVICE_NAME}.service is already Docker Compose-managed; keeping it until restart"
+        return
     fi
+
+    warn "Stopping legacy host ${SERVICE_NAME}.service to free port ${PORT}"
+    systemctl stop "$SERVICE_NAME" || true
+    systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
 }
 
 docker_login_if_needed() {
