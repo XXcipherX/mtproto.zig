@@ -76,9 +76,10 @@ pub const Config = struct {
     /// this limit, while EventLoop keeps shared C2S/S2C scratch space for
     /// framing and decrypt/encrypt staging. The C2S scratch starts near 1x
     /// buffer size and grows on demand for pathological tiny-packet bursts.
-    /// Minimum 1024 recommended — lower caps still risk MiddleProxyBufferOverflow
-    /// on media downloads (Stories, video messages) through middle proxy.
-    middleproxy_buffer_kb: u32 = 1024,
+    /// Minimum 1024 recommended; default 2048 leaves headroom for 1 MiB media parts.
+    /// Lower caps still risk MiddleProxyBufferOverflow on media downloads
+    /// (Stories, video messages) through middle proxy.
+    middleproxy_buffer_kb: u32 = 2048,
     /// Runtime log level: "debug", "info" (default), "warn", "err"
     log_level: std.log.Level = .info,
     /// Max new connections per second per /24 subnet (0 = disabled).
@@ -570,8 +571,8 @@ test "parse config - missing fields defaults" {
     try std.testing.expectEqual(@as(u32, 2), cfg.desync_split_jitter_ms);
     try std.testing.expectEqual(@as(u32, 0), cfg.fake_cert_size);
     try std.testing.expect(!cfg.fast_mode); // Default is false
-    try std.testing.expectEqual(@as(u32, 1024), cfg.middleproxy_buffer_kb);
-    try std.testing.expectEqual(@as(usize, 1024 * 1024), cfg.middleProxyBufferBytes());
+    try std.testing.expectEqual(@as(u32, 2048), cfg.middleproxy_buffer_kb);
+    try std.testing.expectEqual(@as(usize, 2048 * 1024), cfg.middleProxyBufferBytes());
     try std.testing.expectEqual(@as(u8, 30), cfg.rate_limit_per_subnet);
     try std.testing.expect(!cfg.unsafe_override_limits);
     try std.testing.expectEqual(@as(usize, 1), cfg.users.count());
@@ -964,7 +965,7 @@ test "parse config - full production-like config" {
         \\[server]
         \\port = 443
         \\tag = 9649114fbafd6fe2ae98ca635c4e4007
-        \\middleproxy_buffer_kb = 1024
+        \\middleproxy_buffer_kb = 2048
         \\max_connections = 512
         \\idle_timeout_sec = 120
         \\handshake_timeout_sec = 15
@@ -995,7 +996,7 @@ test "parse config - full production-like config" {
     try std.testing.expect(cfg.use_middle_proxy);
     try std.testing.expectEqual(@as(u16, 443), cfg.port);
     try std.testing.expect(cfg.tag != null);
-    try std.testing.expectEqual(@as(u32, 1024), cfg.middleproxy_buffer_kb);
+    try std.testing.expectEqual(@as(u32, 2048), cfg.middleproxy_buffer_kb);
     try std.testing.expectEqual(@as(u32, 512), cfg.max_connections);
     try std.testing.expectEqual(@as(u32, 120), cfg.idle_timeout_sec);
     try std.testing.expectEqual(@as(u32, 15), cfg.handshake_timeout_sec);
