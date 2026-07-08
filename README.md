@@ -722,6 +722,8 @@ tls_domain = "proxy.example.com"
 mask = true
 mask_port = 8443
 desync = true
+# desync_split_delay_ms = 3                # Base delay between first ServerHello byte and the rest
+# desync_split_jitter_ms = 2               # Random extra delay, 0..N ms, added to the base
 # fake_cert_size = 0                       # Fake encrypted-cert AppData size; 0 keeps built-in default
 drs = false
 fast_mode = true
@@ -763,6 +765,8 @@ alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eli
 | `[censorship]` | `mask` | `true` | Forward unauthenticated connections to the configured masking target to defeat active probing |
 | `[censorship]` | `mask_port` | `443` | Masking target port. `443` connects to `tls_domain:443`; non-443 values connect to a local address on that port (`127.0.0.1:<mask_port>`, or `10.200.200.1:<mask_port>` inside tunnel netns), so that port must be served by Caddy or another local backend. Use `8443` for self-domain Caddy so public `443` remains owned by `mtproto-proxy` |
 | `[censorship]` | `desync` | `true` | Split fake `ServerHello` into `1 byte + short pause + rest` to desynchronize passive DPI |
+| `[censorship]` | `desync_split_delay_ms` | `3` | Base delay between the first fake `ServerHello` byte and the remaining bytes |
+| `[censorship]` | `desync_split_jitter_ms` | `2` | Random extra delay in milliseconds added to `desync_split_delay_ms` (`0..N` per connection) |
 | `[censorship]` | `fake_cert_size` | `0` | Fake TLS encrypted-certificate AppData size in bytes. `0` keeps the built-in 2878-byte default; explicit values are clamped to `256..16384` |
 | `[censorship]` | `drs` | `false` | Dynamic Record Sizing: ramp TLS records from 1369→16384 bytes after warmup (mimics Chrome/Firefox) |
 | `[censorship]` | `fast_mode` | `false` | **Recommended** for direct-path traffic. Delegates S2C AES encryption to Telegram DC and reduces proxy CPU/RAM pressure |

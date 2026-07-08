@@ -2070,7 +2070,7 @@ const EventLoop = struct {
             .writing_server_hello_first => {
                 if (!slot.hasClientPending()) {
                     slot.phase = .desync_wait;
-                    slot.desync_deadline_ns = compat.nanoTimestamp() + (3 * std.time.ns_per_ms);
+                    slot.desync_deadline_ns = self.desyncSplitDeadlineNs();
                 }
             },
             .writing_server_hello_rest => {
@@ -2593,6 +2593,15 @@ const EventLoop = struct {
         }
 
         self.sendDcNonce(slot);
+    }
+
+    fn desyncSplitDeadlineNs(self: *EventLoop) i128 {
+        var delay_ms: u64 = self.state.config.desync_split_delay_ms;
+        const jitter_ms = self.state.config.desync_split_jitter_ms;
+        if (jitter_ms > 0) {
+            delay_ms += crypto.randomRange(u64, @as(u64, jitter_ms) + 1);
+        }
+        return compat.nanoTimestamp() + (@as(i128, @intCast(delay_ms)) * std.time.ns_per_ms);
     }
 
     fn cleanupFailedUpstreamConnect(self: *EventLoop, slot: *ConnectionSlot) void {

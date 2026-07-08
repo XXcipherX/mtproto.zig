@@ -58,6 +58,10 @@ pub const Config = struct {
     mask_port: u16 = 443,
     /// TCP desync: split ServerHello into 1-byte + rest to evade DPI
     desync: bool = true,
+    /// Base delay between first ServerHello byte and the rest.
+    desync_split_delay_ms: u32 = 3,
+    /// Random extra delay added to desync_split_delay_ms.
+    desync_split_jitter_ms: u32 = 2,
     /// FakeTLS encrypted certificate AppData size.
     /// 0 keeps the built-in default that matches the static template.
     fake_cert_size: u32 = 0,
@@ -422,6 +426,10 @@ pub const Config = struct {
                         if (parseIntSetting(u16, key, value)) |parsed| cfg.mask_port = parsed;
                     } else if (std.mem.eql(u8, key, "desync")) {
                         if (parseBoolSetting(key, value)) |parsed| cfg.desync = parsed;
+                    } else if (std.mem.eql(u8, key, "desync_split_delay_ms")) {
+                        if (parseIntSetting(u32, key, value)) |parsed| cfg.desync_split_delay_ms = parsed;
+                    } else if (std.mem.eql(u8, key, "desync_split_jitter_ms")) {
+                        if (parseIntSetting(u32, key, value)) |parsed| cfg.desync_split_jitter_ms = parsed;
                     } else if (std.mem.eql(u8, key, "fake_cert_size")) {
                         if (parseIntSetting(u32, key, value)) |parsed| {
                             cfg.fake_cert_size = if (parsed == 0)
@@ -500,6 +508,8 @@ test "parse config - valid complete" {
         \\tls_domain = "example.com"
         \\mask = true
         \\desync = true
+        \\desync_split_delay_ms = 4
+        \\desync_split_jitter_ms = 6
         \\fake_cert_size = 4096
         \\
         \\[access.users]
@@ -520,6 +530,8 @@ test "parse config - valid complete" {
     try std.testing.expect(cfg.use_middle_proxy);
     try std.testing.expect(cfg.mask);
     try std.testing.expect(cfg.desync);
+    try std.testing.expectEqual(@as(u32, 4), cfg.desync_split_delay_ms);
+    try std.testing.expectEqual(@as(u32, 6), cfg.desync_split_jitter_ms);
     try std.testing.expectEqual(@as(u32, 4096), cfg.fake_cert_size);
     try std.testing.expect(cfg.fast_mode);
     try std.testing.expectEqual(@as(usize, 2), cfg.users.count());
@@ -547,6 +559,8 @@ test "parse config - missing fields defaults" {
     try std.testing.expect(!cfg.use_middle_proxy); // Default is false
     try std.testing.expect(cfg.mask); // Default is true
     try std.testing.expect(cfg.desync); // Default is true
+    try std.testing.expectEqual(@as(u32, 3), cfg.desync_split_delay_ms);
+    try std.testing.expectEqual(@as(u32, 2), cfg.desync_split_jitter_ms);
     try std.testing.expectEqual(@as(u32, 0), cfg.fake_cert_size);
     try std.testing.expect(!cfg.fast_mode); // Default is false
     try std.testing.expectEqual(@as(u32, 1024), cfg.middleproxy_buffer_kb);
@@ -957,6 +971,8 @@ test "parse config - full production-like config" {
         \\mask = true
         \\fast_mode = true
         \\mask_port = 8443
+        \\desync_split_delay_ms = 3
+        \\desync_split_jitter_ms = 2
         \\fake_cert_size = 0
         \\drs = true
         \\
@@ -984,6 +1000,8 @@ test "parse config - full production-like config" {
     try std.testing.expect(cfg.mask);
     try std.testing.expect(cfg.fast_mode);
     try std.testing.expectEqual(@as(u16, 8443), cfg.mask_port);
+    try std.testing.expectEqual(@as(u32, 3), cfg.desync_split_delay_ms);
+    try std.testing.expectEqual(@as(u32, 2), cfg.desync_split_jitter_ms);
     try std.testing.expectEqual(@as(u32, 0), cfg.fake_cert_size);
     try std.testing.expect(cfg.drs);
     try std.testing.expectEqual(@as(usize, 2), cfg.users.count());
@@ -1083,6 +1101,22 @@ test "parse config - fake_cert_size bounds" {
     var default_cfg = try Config.parse(std.testing.allocator, default_content);
     defer default_cfg.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u32, 0), default_cfg.fake_cert_size);
+}
+
+test "parse config - desync split timing" {
+    const content =
+        \\[censorship]
+        \\desync_split_delay_ms = 5
+        \\desync_split_jitter_ms = 9
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 5), cfg.desync_split_delay_ms);
+    try std.testing.expectEqual(@as(u32, 9), cfg.desync_split_jitter_ms);
 }
 
 test "parse config - deinit frees explicitly configured default tls_domain" {
