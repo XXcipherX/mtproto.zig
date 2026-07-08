@@ -3950,9 +3950,9 @@ fn secondsToMs(sec: u32) i64 {
     return @as(i64, @intCast(sec)) * std.time.ms_per_s;
 }
 
-fn setSendTimeout(fd: posix.fd_t, timeout_sec: u32) void {
-    const tv = posix.timeval{ .sec = @intCast(timeout_sec), .usec = 0 };
-    setSockOptBytes(fd, linux.SOL.SOCKET, linux.SO.SNDTIMEO, std.mem.asBytes(&tv));
+fn setTcpUserTimeout(fd: posix.fd_t, timeout_ms: u32) void {
+    const value: c_int = @intCast(timeout_ms);
+    setSockOptBytes(fd, linux.IPPROTO.TCP, linux.TCP.USER_TIMEOUT, std.mem.asBytes(&value));
 }
 
 fn setTcpKeepalive(fd: posix.fd_t) void {
@@ -3979,7 +3979,7 @@ fn setTcpNoDelay(fd: posix.fd_t) void {
 fn configureRelaySocket(fd: posix.fd_t) void {
     setTcpNoDelay(fd);
     setTcpKeepalive(fd);
-    setSendTimeout(fd, 30);
+    setTcpUserTimeout(fd, 30 * std.time.ms_per_s);
 }
 
 fn formatAddress(addr: net.Address, buf: *[64]u8) []const u8 {
