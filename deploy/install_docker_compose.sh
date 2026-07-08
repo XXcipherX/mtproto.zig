@@ -308,6 +308,7 @@ Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=${INSTALL_DIR}
 ExecStart=${docker_bin} compose --env-file ${ENV_FILE} -f ${COMPOSE_FILE} up -d
+ExecReload=${docker_bin} compose --env-file ${ENV_FILE} -f ${COMPOSE_FILE} up -d --force-recreate --no-deps mtproto-proxy
 ExecStop=${docker_bin} compose --env-file ${ENV_FILE} -f ${COMPOSE_FILE} down
 TimeoutStartSec=0
 
@@ -389,7 +390,7 @@ stop_legacy_service() {
     systemctl is-active --quiet "$SERVICE_NAME" || return 0
 
     if is_compose_service; then
-        info "Existing ${SERVICE_NAME}.service is already Docker Compose-managed; keeping it until restart"
+        info "Existing ${SERVICE_NAME}.service is already Docker Compose-managed; keeping it running until proxy reload"
         return
     fi
 
@@ -402,6 +403,14 @@ docker_login_if_needed() {
     if [[ -n "${GHCR_USER:-}" && -n "${GHCR_TOKEN:-}" ]]; then
         info "Logging in to ghcr.io as ${GHCR_USER}"
         printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin >/dev/null
+    fi
+}
+
+start_or_reload_compose_service() {
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
+        systemctl reload "$SERVICE_NAME"
+    else
+        systemctl start "$SERVICE_NAME"
     fi
 }
 
@@ -529,6 +538,8 @@ setup_masking_and_desync() {
 }
 
 validate_masking() {
+    local attempt
+    local masking_valid=false
     refresh_config_vars
     if ! is_true "$ENABLE_MASKING"; then
         return 0
@@ -536,9 +547,16 @@ validate_masking() {
     [[ -n "$TLS_DOMAIN" ]] || return 0
     [[ -n "$MASK_PORT" ]] || return 0
 
-    if curl -sk --max-time 5 --resolve "${TLS_DOMAIN}:${MASK_PORT}:127.0.0.1" "https://${TLS_DOMAIN}:${MASK_PORT}/" >/dev/null 2>&1; then
-        ok "Masking validation passed (${TLS_DOMAIN} via 127.0.0.1:${MASK_PORT})"
-    else
+    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+        if curl -sk --max-time 3 --resolve "${TLS_DOMAIN}:${MASK_PORT}:127.0.0.1" "https://${TLS_DOMAIN}:${MASK_PORT}/" >/dev/null 2>&1; then
+            ok "Masking validation passed (${TLS_DOMAIN} via 127.0.0.1:${MASK_PORT})"
+            masking_valid=true
+            break
+        fi
+        sleep 1
+    done
+
+    if ! $masking_valid; then
         warn "Masking validation failed: ${TLS_DOMAIN} via 127.0.0.1:${MASK_PORT} is not responding"
     fi
 
@@ -638,15 +656,15 @@ apply_firewall_and_tcpmss
 setup_ipv6_hopping
 setup_masking_and_desync
 
-info "Starting mtproto-proxy Docker Compose service"
-if systemctl restart "$SERVICE_NAME"; then
+info "Starting/reloading mtproto-proxy Docker Compose service"
+if start_or_reload_compose_service; then
     if systemctl is-active --quiet "$SERVICE_NAME"; then
-        ok "Proxy service started"
+        ok "Proxy service started/reloaded"
     else
-        fail "Proxy restart finished but service is not active. Check: journalctl -u ${SERVICE_NAME} --no-pager -n 50"
+        fail "Proxy start/reload finished but service is not active. Check: journalctl -u ${SERVICE_NAME} --no-pager -n 50"
     fi
 else
-    fail "Proxy failed to restart. Check: journalctl -u ${SERVICE_NAME} --no-pager -n 50"
+    fail "Proxy failed to start/reload. Check: journalctl -u ${SERVICE_NAME} --no-pager -n 50"
 fi
 
 validate_masking
