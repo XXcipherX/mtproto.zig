@@ -3537,7 +3537,7 @@ const EventLoop = struct {
 
             if (slot.handshakeInProgress()) {
                 if (slot.first_byte_at_ms == 0) {
-                    if (now_ms - slot.created_at_ms > secondsToMs(self.state.config.idle_timeout_sec)) {
+                    if (now_ms - slot.created_at_ms > self.idleTimeoutMs(slot)) {
                         self.closeSlot(slot, "idle pre-first-byte timeout");
                         continue;
                     }
@@ -3568,7 +3568,7 @@ const EventLoop = struct {
                     self.closeSlot(slot, "client silence wedge breaker");
                     continue;
                 }
-                if (now_ms - slot.last_activity_ms > secondsToMs(self.state.config.idle_timeout_sec)) {
+                if (now_ms - slot.last_activity_ms > self.idleTimeoutMs(slot)) {
                     self.closeSlot(slot, "relay idle timeout");
                     continue;
                 }
@@ -3581,6 +3581,14 @@ const EventLoop = struct {
         }
 
         self.timer_scan_cursor = @intCast(idx);
+    }
+
+    fn idleTimeoutMs(self: *const EventLoop, slot: *const ConnectionSlot) i64 {
+        return jitteredIdleTimeoutMs(
+            self.state.config.idle_timeout_sec,
+            self.state.config.idle_timeout_jitter_pct,
+            idleTimeoutSeed(slot),
+        );
     }
 
     fn syncInterests(self: *EventLoop, slot: *ConnectionSlot) !void {
@@ -4032,6 +4040,30 @@ fn setNonBlocking(fd: posix.fd_t) void {
 
 fn secondsToMs(sec: u32) i64 {
     return @as(i64, @intCast(sec)) * std.time.ms_per_s;
+}
+
+fn idleTimeoutSeed(slot: *const ConnectionSlot) u64 {
+    const created: u64 = if (slot.created_at_ms > 0) @intCast(slot.created_at_ms) else 0;
+    var x = slot.conn_id ^ (created *% 0x9E37_79B9_7F4A_7C15);
+    x +%= 0x9E37_79B9_7F4A_7C15;
+    var z = x;
+    z = (z ^ (z >> 30)) *% 0xBF58_476D_1CE4_E5B9;
+    z = (z ^ (z >> 27)) *% 0x94D0_49BB_1331_11EB;
+    return z ^ (z >> 31);
+}
+
+fn jitteredIdleTimeoutMs(base_sec: u32, jitter_pct: u8, seed: u64) i64 {
+    const base_ms = secondsToMs(base_sec);
+    if (jitter_pct == 0) return base_ms;
+
+    const pct: i64 = @intCast(@min(@as(u8, 100), jitter_pct));
+    const range = @divTrunc(base_ms * pct, 100);
+    if (range <= 0) return base_ms;
+
+    const span: u64 = @intCast(2 * range + 1);
+    const offset = @as(i64, @intCast(seed % span)) - range;
+    const floor_ms = @max(secondsToMs(5), @divTrunc(base_ms, 2));
+    return @max(floor_ms, base_ms + offset);
 }
 
 fn setTcpUserTimeout(fd: posix.fd_t, timeout_ms: u32) void {
@@ -5010,6 +5042,24 @@ test "fatal middle-proxy upstream hangup is fallback eligible" {
     try std.testing.expect(!shouldFallbackMiddleProxyOnFatalHangup(.middle_proxy_handshake, client_fd, upstream_fd));
     try std.testing.expect(!shouldFallbackMiddleProxyOnFatalHangup(.connecting_upstream, upstream_fd, upstream_fd));
     try std.testing.expect(shouldCloseOnFatalHangup(.middle_proxy_handshake, upstream_fd, upstream_fd));
+}
+
+test "jittered idle timeout keeps zero jitter exact" {
+    try std.testing.expectEqual(secondsToMs(120), jitteredIdleTimeoutMs(120, 0, 12345));
+}
+
+test "jittered idle timeout stays bounded" {
+    const base_ms = secondsToMs(120);
+    const range_ms = @divTrunc(base_ms * 15, 100);
+
+    var seed: u64 = 0;
+    while (seed < 128) : (seed += 1) {
+        const value = jitteredIdleTimeoutMs(120, 15, seed *% 0x9E37_79B9_7F4A_7C15);
+        try std.testing.expect(value >= base_ms - range_ms);
+        try std.testing.expect(value <= base_ms + range_ms);
+    }
+
+    try std.testing.expectEqual(secondsToMs(5), jitteredIdleTimeoutMs(5, 100, 0));
 }
 
 test "fd requirement helpers" {

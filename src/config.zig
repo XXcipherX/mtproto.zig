@@ -30,6 +30,8 @@ pub const Config = struct {
     max_connections: u32 = 512,
     /// Pre-handshake idle timeout: wait for first client byte
     idle_timeout_sec: u32 = 120,
+    /// Per-connection idle timeout jitter in percent; 0 disables.
+    idle_timeout_jitter_pct: u8 = 15,
     /// Close a relay when the server has replied but the client stays silent for
     /// this many seconds; 0 = disabled. This bounds an iOS MtProtoKit bad_salt
     /// wedge where the client stops sending until the DC closes the socket.
@@ -371,6 +373,10 @@ pub const Config = struct {
                         if (parseIntSetting(u32, key, value)) |parsed| {
                             cfg.idle_timeout_sec = @max(@as(u32, 5), parsed);
                         }
+                    } else if (std.mem.eql(u8, key, "idle_timeout_jitter_pct")) {
+                        if (parseIntSetting(u8, key, value)) |parsed| {
+                            cfg.idle_timeout_jitter_pct = @min(@as(u8, 100), parsed);
+                        }
                     } else if (std.mem.eql(u8, key, "client_silence_close_sec")) {
                         if (parseIntSetting(u32, key, value)) |parsed| {
                             cfg.client_silence_close_sec = parsed;
@@ -505,6 +511,7 @@ test "parse config - valid complete" {
         \\backlog = 8192
         \\max_connections = 6000
         \\idle_timeout_sec = 180
+        \\idle_timeout_jitter_pct = 25
         \\handshake_timeout_sec = 30
         \\dc_connect_timeout_sec = 7
         \\fast_mode = true
@@ -530,6 +537,7 @@ test "parse config - valid complete" {
     try std.testing.expectEqual(@as(u32, 8192), cfg.backlog);
     try std.testing.expectEqual(@as(u32, 6000), cfg.max_connections);
     try std.testing.expectEqual(@as(u32, 180), cfg.idle_timeout_sec);
+    try std.testing.expectEqual(@as(u8, 25), cfg.idle_timeout_jitter_pct);
     try std.testing.expectEqual(@as(u32, 30), cfg.handshake_timeout_sec);
     try std.testing.expectEqual(@as(u32, 7), cfg.dc_connect_timeout_sec);
     try std.testing.expectEqualStrings("example.com", cfg.tls_domain);
@@ -560,6 +568,7 @@ test "parse config - missing fields defaults" {
     try std.testing.expectEqual(@as(u32, 4096), cfg.backlog); // Default is 4096
     try std.testing.expectEqual(@as(u32, 512), cfg.max_connections);
     try std.testing.expectEqual(@as(u32, 120), cfg.idle_timeout_sec);
+    try std.testing.expectEqual(@as(u8, 15), cfg.idle_timeout_jitter_pct);
     try std.testing.expectEqual(@as(u32, 15), cfg.handshake_timeout_sec);
     try std.testing.expectEqual(@as(u32, 10), cfg.dc_connect_timeout_sec);
     try std.testing.expectEqualStrings("google.com", cfg.tls_domain);
@@ -744,6 +753,20 @@ test "parse config - server runtime tunables lower bounds" {
     try std.testing.expectEqual(@as(u32, 32), cfg.max_connections);
     try std.testing.expectEqual(@as(u32, 5), cfg.idle_timeout_sec);
     try std.testing.expectEqual(@as(u32, 5), cfg.handshake_timeout_sec);
+}
+
+test "parse config - idle timeout jitter clamps to 100 percent" {
+    const content =
+        \\[server]
+        \\idle_timeout_jitter_pct = 150
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u8, 100), cfg.idle_timeout_jitter_pct);
 }
 
 test "parse config - spaces and tabs" {
@@ -968,6 +991,7 @@ test "parse config - full production-like config" {
         \\middleproxy_buffer_kb = 2048
         \\max_connections = 512
         \\idle_timeout_sec = 120
+        \\idle_timeout_jitter_pct = 15
         \\handshake_timeout_sec = 15
         \\dc_connect_timeout_sec = 10
         \\backlog = 8192
@@ -999,6 +1023,7 @@ test "parse config - full production-like config" {
     try std.testing.expectEqual(@as(u32, 2048), cfg.middleproxy_buffer_kb);
     try std.testing.expectEqual(@as(u32, 512), cfg.max_connections);
     try std.testing.expectEqual(@as(u32, 120), cfg.idle_timeout_sec);
+    try std.testing.expectEqual(@as(u8, 15), cfg.idle_timeout_jitter_pct);
     try std.testing.expectEqual(@as(u32, 15), cfg.handshake_timeout_sec);
     try std.testing.expectEqual(@as(u32, 10), cfg.dc_connect_timeout_sec);
     try std.testing.expectEqual(@as(u32, 8192), cfg.backlog);

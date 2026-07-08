@@ -704,6 +704,7 @@ backlog = 4096                             # TCP listen queue size
 middleproxy_buffer_kb = 2048               # ME C2S/S2C buffers grow on demand up to this cap; runtime caps effective value at 16384 KiB
 max_connections = 512                      # Safe default for small (1 vCPU / ~1 GB) VPS
 idle_timeout_sec = 120
+# idle_timeout_jitter_pct = 15             # Per-connection idle timeout jitter in percent; 0 disables
 # client_silence_close_sec = 0             # Close relays whose last server reply is unanswered by the client for N seconds
 handshake_timeout_sec = 15
 # dc_connect_timeout_sec = 10              # Per-DC TCP connect deadline; 0 disables per-endpoint failover timing
@@ -752,6 +753,7 @@ alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eli
 | `[server]` | `backlog` | `4096` | TCP listen queue size (for high-traffic loads) |
 | `[server]` | `max_connections` | `512` | Concurrent connection cap (small-VPS tuned default, parser lower bound 32). On Linux, startup first auto-clamps this to the RAM-safe estimate unless `unsafe_override_limits=true`; the proxy then clamps again if `RLIMIT_NOFILE` cannot cover the fd budget |
 | `[server]` | `idle_timeout_sec` | `120` | Connection idle timeout in seconds (also used before first client byte; parser lower bound 5) |
+| `[server]` | `idle_timeout_jitter_pct` | `15` | Per-connection random jitter applied to `idle_timeout_sec` (`±N%`, clamped to `0..100`). The effective timeout is floored to at least 5 seconds and at least half the base timeout. Set `0` to disable |
 | `[server]` | `client_silence_close_sec` | `0` | Close an established relay when the server's last reply has gone unanswered by the client for N seconds. This bounds an iOS MtProtoKit bad_salt wedge where "Updating" can hang until the DC closes the socket. Fires only when the last relayed payload was server→client and the client has sent relay payload before. `0` disables it; if enabled, start around `10`-`15` and tune to taste |
 | `[server]` | `handshake_timeout_sec` | `15` | Timeout for completing handshake after first byte (parser lower bound 5) |
 | `[server]` | `dc_connect_timeout_sec` | `10` | Per-endpoint TCP connect deadline for Telegram DC candidates. If one candidate is black-holed, the proxy abandons that endpoint and tries the next within the global handshake timeout. Set `0` to disable |

@@ -42,6 +42,11 @@ port = 443
 # Default is 120; raise if your client mix keeps many pre-warmed idle sockets.
 # idle_timeout_sec = 120
 
+# Per-connection random jitter for idle_timeout_sec, in percent.
+# Effective idle timeout is base ± this percentage, floored to at least 5s
+# and at least half the base timeout. Set 0 to disable.
+# idle_timeout_jitter_pct = 15
+
 # Close an established relay where the server's last reply has gone unanswered
 # by the client for this many seconds. This bounds an iOS MtProtoKit bad_salt
 # wedge where "Updating" hangs until the DC closes the socket. Fires only after
