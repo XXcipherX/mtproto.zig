@@ -6,6 +6,7 @@
 #   curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/install.sh | sudo bash
 #
 # Optional environment:
+#   ENABLE_TCPMSS=true  # optional legacy fallback: force tiny MSS ClientHello fragmentation
 #   ENABLE_SYNFIX=true   # install inbound SYN pacing rules for filtered routes
 #   SYNFIX_RATE=30/minute
 #   SYNFIX_BURST=1
@@ -21,7 +22,7 @@
 #   3. Generates a random user secret (only on first install)
 #   4. Creates a systemd service
 #   5. Opens configured proxy port in ufw (if active)
-#   6. Applies TCPMSS clamping (DPI bypass: splits ClientHello into tiny packets)
+#   6. Optionally applies TCPMSS clamping (legacy DPI bypass fallback)
 #   7. Optionally installs inbound SYN pacing for Android/Desktop handshake stability
 #   8. Installs IPv6 address hopping script + cron job (optional, requires CF_TOKEN + CF_ZONE + IPV6_PREFIX)
 #   9. Installs masking self-healing monitor (Caddy + timer watchdog)
@@ -35,10 +36,12 @@ REPO_URL="https://github.com/XXcipherX/mtproto.zig.git"
 SERVICE_NAME="mtproto-proxy"
 SERVICE_FILE="/etc/systemd/system/mtproto-proxy.service"
 FORCE_SERVICE_UPDATE="${FORCE_SERVICE_UPDATE:-0}"
+ENABLE_TCPMSS="${ENABLE_TCPMSS:-false}"
 ENABLE_SYNFIX="${ENABLE_SYNFIX:-false}"
 SYNFIX_RATE="${SYNFIX_RATE:-30/minute}"
 SYNFIX_BURST="${SYNFIX_BURST:-1}"
 SYNFIX_ACTION="${SYNFIX_ACTION:-drop}"
+TCPMSS_OK=false
 IS_UPDATE=false
 [[ -f "$INSTALL_DIR/mtproto-proxy" ]] && IS_UPDATE=true
 
@@ -298,24 +301,45 @@ if command -v ufw &>/dev/null && ufw status | grep -q "active"; then
     ok "Opened port $PORT in ufw"
 fi
 
-# TCPMSS clamping: force ClientHello fragmentation to bypass passive DPI
+# TCPMSS clamping is a legacy fallback. With PQ-capable Caddy masking it is
+# disabled by default because tiny MSS can hurt media throughput.
 if command -v iptables &>/dev/null; then
-    iptables -t mangle -D OUTPUT -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88 2>/dev/null || true
-    iptables -t mangle -A OUTPUT -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88
+    TCPMSS_V4_REMOVED=false
+    while iptables -t mangle -D OUTPUT -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88 2>/dev/null; do
+        TCPMSS_V4_REMOVED=true
+    done
+    if is_true "$ENABLE_TCPMSS"; then
+        iptables -t mangle -A OUTPUT -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88
+        TCPMSS_OK=true
+        ok "TCPMSS=88 clamping applied to IPv4 (legacy passive DPI fallback)"
+    elif $TCPMSS_V4_REMOVED; then
+        ok "Removed legacy IPv4 TCPMSS=88 clamping"
+    else
+        info "Skipping TCPMSS=88 clamping (set ENABLE_TCPMSS=true for legacy fallback)"
+    fi
     save_ipv4_iptables
-    ok "TCPMSS=88 clamping applied to IPv4 (passive DPI bypass)"
 else
-    echo -e "${RED}⚠${RESET} iptables not found — IPv4 TCPMSS bypass NOT applied"
+    echo -e "${RED}⚠${RESET} iptables not found — IPv4 TCPMSS cleanup skipped"
 fi
 
 if command -v ip6tables &>/dev/null; then
-    ip6tables -t mangle -D OUTPUT -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88 2>/dev/null || true
-    if ip6tables -t mangle -A OUTPUT -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88 2>/dev/null; then
-        save_ipv6_iptables
-        ok "TCPMSS=88 clamping applied to IPv6 (passive DPI bypass)"
+    TCPMSS_V6_REMOVED=false
+    while ip6tables -t mangle -D OUTPUT -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88 2>/dev/null; do
+        TCPMSS_V6_REMOVED=true
+    done
+    if is_true "$ENABLE_TCPMSS"; then
+        if ip6tables -t mangle -A OUTPUT -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88 2>/dev/null; then
+            TCPMSS_OK=true
+            ok "TCPMSS=88 clamping applied to IPv6 (legacy passive DPI fallback)"
+        else
+            info "IPv6 TCPMSS skipped (IPv6 may be disabled)"
+        fi
+    elif $TCPMSS_V6_REMOVED; then
+        ok "Removed legacy IPv6 TCPMSS=88 clamping"
     else
-        info "IPv6 TCPMSS skipped (IPv6 may be disabled)"
+        info "Skipping IPv6 TCPMSS=88 clamping"
     fi
+    save_ipv6_iptables
 fi
 
 # ── IPv6 Hopping (Cloudflare API) ───────────────────────────
@@ -499,7 +523,11 @@ fi
 echo ""
 echo -e "  ${BOLD}DPI Bypass:${RESET}"
 echo -e "  ${GREEN}✓${RESET} Anti-Replay Cache (ТСПУ Revisor protection)"
-echo -e "  ${GREEN}✓${RESET} TCPMSS=88 (ClientHello fragmentation)"
+if $TCPMSS_OK; then
+echo -e "  ${GREEN}✓${RESET} TCPMSS=88 (legacy ClientHello fragmentation fallback)"
+else
+echo -e "  ${DIM}○ TCPMSS=88 (disabled by default; set ENABLE_TCPMSS=true for legacy fallback)${RESET}"
+fi
 if $SYNFIX_OK; then
 echo -e "  ${GREEN}✓${RESET} Inbound SYN pacing (${SYNFIX_RATE}, burst ${SYNFIX_BURST}, ${SYNFIX_ACTION})"
 elif is_true "$ENABLE_SYNFIX"; then

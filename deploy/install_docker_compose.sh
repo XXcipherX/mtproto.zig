@@ -15,6 +15,7 @@
 #   SECRET=<32 hex chars>
 #   USE_MIDDLE_PROXY=true|false
 #   ENABLE_MASKING=true|false
+#   ENABLE_TCPMSS=true|false
 #   ENABLE_SYNFIX=true|false
 #   SYNFIX_RATE=30/minute
 #   SYNFIX_BURST=1
@@ -34,6 +35,7 @@ AUTO_IMAGE_CPU_VARIANT="${AUTO_IMAGE_CPU_VARIANT:-true}"
 PORT="${PORT:-443}"
 USE_MIDDLE_PROXY="${USE_MIDDLE_PROXY:-true}"
 ENABLE_MASKING="${ENABLE_MASKING:-true}"
+ENABLE_TCPMSS="${ENABLE_TCPMSS:-false}"
 ENABLE_SYNFIX="${ENABLE_SYNFIX:-false}"
 SYNFIX_RATE="${SYNFIX_RATE:-30/minute}"
 SYNFIX_BURST="${SYNFIX_BURST:-1}"
@@ -47,6 +49,7 @@ CONFIG_FILE="${INSTALL_DIR}/config.toml"
 SERVICE_NAME="mtproto-proxy"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 MASKING_OK=false
+TCPMSS_OK=false
 SYNFIX_OK=false
 NFQWS_OK=false
 AUTO_SELECTED_CPU_IMAGE=false
@@ -407,23 +410,45 @@ apply_firewall_and_tcpmss() {
         ok "Opened port ${PORT} in ufw"
     fi
 
+    # TCPMSS clamping is a legacy fallback. With PQ-capable Caddy masking it is
+    # disabled by default because tiny MSS can hurt media throughput.
     if command -v iptables >/dev/null 2>&1; then
-        iptables -t mangle -D OUTPUT -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88 2>/dev/null || true
-        iptables -t mangle -A OUTPUT -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88
+        local tcpmss_v4_removed=false
+        while iptables -t mangle -D OUTPUT -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88 2>/dev/null; do
+            tcpmss_v4_removed=true
+        done
+        if is_true "$ENABLE_TCPMSS"; then
+            iptables -t mangle -A OUTPUT -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88
+            TCPMSS_OK=true
+            ok "TCPMSS=88 clamping applied to IPv4"
+        elif $tcpmss_v4_removed; then
+            ok "Removed legacy IPv4 TCPMSS=88 clamping"
+        else
+            info "Skipping TCPMSS=88 clamping (set ENABLE_TCPMSS=true for legacy fallback)"
+        fi
         save_ipv4_iptables
-        ok "TCPMSS=88 clamping applied to IPv4"
     else
-        warn "iptables not found; TCPMSS bypass was not applied"
+        warn "iptables not found; TCPMSS cleanup skipped"
     fi
 
     if command -v ip6tables >/dev/null 2>&1; then
-        ip6tables -t mangle -D OUTPUT -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88 2>/dev/null || true
-        if ip6tables -t mangle -A OUTPUT -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88 2>/dev/null; then
-            save_ipv6_iptables
-            ok "TCPMSS=88 clamping applied to IPv6"
+        local tcpmss_v6_removed=false
+        while ip6tables -t mangle -D OUTPUT -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88 2>/dev/null; do
+            tcpmss_v6_removed=true
+        done
+        if is_true "$ENABLE_TCPMSS"; then
+            if ip6tables -t mangle -A OUTPUT -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88 2>/dev/null; then
+                TCPMSS_OK=true
+                ok "TCPMSS=88 clamping applied to IPv6"
+            else
+                info "IPv6 TCPMSS skipped"
+            fi
+        elif $tcpmss_v6_removed; then
+            ok "Removed legacy IPv6 TCPMSS=88 clamping"
         else
-            info "IPv6 TCPMSS skipped"
+            info "Skipping IPv6 TCPMSS=88 clamping"
         fi
+        save_ipv6_iptables
     fi
 }
 
@@ -544,7 +569,11 @@ print_summary() {
     echo ""
     echo -e "  ${BOLD}DPI Bypass:${RESET}"
     echo -e "  ${GREEN}+${RESET} Anti-Replay Cache"
-    echo -e "  ${GREEN}+${RESET} TCPMSS=88"
+    if $TCPMSS_OK; then
+        echo -e "  ${GREEN}+${RESET} TCPMSS=88"
+    else
+        echo -e "  ${DIM}o TCPMSS=88 (disabled by default; set ENABLE_TCPMSS=true for legacy fallback)${RESET}"
+    fi
     if $SYNFIX_OK; then
         echo -e "  ${GREEN}+${RESET} Inbound SYN pacing (${SYNFIX_RATE}, burst ${SYNFIX_BURST}, ${SYNFIX_ACTION})"
     elif is_true "$ENABLE_SYNFIX"; then

@@ -45,7 +45,7 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 | **Auto Refresh** | Telegram Metadata | Periodically updates regular/media MiddleProxy endpoints and secret from Telegram core endpoints when any ME route is enabled |
 | **Promotion** | Tag Support | Optional promotion tag for sponsored proxy channel registration |
 | **IPv6 Hopping** | DPI Evasion | Auto-rotates IPv6 from /64 subnet on ban detection via Cloudflare API |
-| **TCPMSS=88** | DPI Evasion | Forces ClientHello fragmentation across 6 TCP packets, breaking ISP DPI reassembly |
+| **Optional TCPMSS=88** | Legacy DPI fallback | Disabled by default; can force tiny ClientHello fragmentation when explicitly enabled |
 | **TCP Desync** | DPI Evasion | Integrated `zapret` (`nfqws`) OS-level desynchronization (fake packets + TTL spoofing) |
 | **Split-TLS** | DPI Evasion | Splits fake `ServerHello` write into `1 byte + short pause + rest` to desynchronize passive DPI |
 | **Zero-RTT** | DPI Evasion | Local self-domain Caddy 404 masking (`127.0.0.1:8443`, with tunnel netns auto-routing and PQ TLS groups) to defeat active probing timing analysis |
@@ -263,11 +263,11 @@ docker run --rm \
 
 If your config sets `server.port = 8443`, publish `-p 8443:8443` instead.
 
-OS-level mitigations from `deploy/` (iptables `TCPMSS`, `nfqws`, etc.) are **not** applied inside the container; only the proxy binary runs there.
+OS-level mitigations from `deploy/` (iptables `nfqws`, optional `TCPMSS`, etc.) are **not** applied inside the container; only the proxy binary runs there.
 
 ### Docker Compose install
 
-For VPS installs from a prebuilt image, use the Docker Compose installer. It mirrors the one-line source installer for host-level setup: creates `/opt/mtproto-proxy/config.toml`, writes `/opt/mtproto-proxy/compose.yml`, installs a `mtproto-proxy.service` Docker Compose wrapper, configures self-domain Caddy masking as a Compose service, applies TCPMSS, optionally installs inbound SYN pacing, installs nfqws, pulls the images, starts the proxy and Caddy containers, and prints the `tg://` link:
+For VPS installs from a prebuilt image, use the Docker Compose installer. It mirrors the one-line source installer for host-level setup: creates `/opt/mtproto-proxy/config.toml`, writes `/opt/mtproto-proxy/compose.yml`, installs a `mtproto-proxy.service` Docker Compose wrapper, configures self-domain Caddy masking as a Compose service, removes legacy TCPMSS unless explicitly enabled, optionally installs inbound SYN pacing, installs nfqws, pulls the images, starts the proxy and Caddy containers, and prints the `tg://` link:
 
 ```bash
 curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/install_docker_compose.sh \
@@ -286,6 +286,7 @@ Useful environment variables:
 | `SECRET` | random | 32-hex user secret; generated once when config is absent |
 | `USE_MIDDLE_PROXY` | `true` | Initial `use_middle_proxy` value |
 | `ENABLE_MASKING` | `true` | Install Caddy/certbot masking and set `mask = true`; Docker installs run Caddy in Compose |
+| `ENABLE_TCPMSS` | `false` | Enable legacy `TCPMSS=88` ClientHello fragmentation fallback; disabled by default with PQ-capable Caddy masking |
 | `ENABLE_SYNFIX` | `false` | Install inbound SYN pacing rules for Android/Desktop routes that need it |
 | `SYNFIX_RATE` | `30/minute` | Per-source SYN rate for non-iOS-like fingerprints |
 | `SYNFIX_BURST` | `1` | Per-source SYN burst for non-iOS-like fingerprints |
@@ -317,7 +318,7 @@ This will:
 3. Generate a random 16-byte secret on first install
 4. Create a `systemd` service (`mtproto-proxy`)
 5. Open the configured proxy port in `ufw` (if active)
-6. Apply **TCPMSS=88** iptables/ip6tables rules when available (passive DPI bypass)
+6. Remove legacy **TCPMSS=88** iptables/ip6tables rules unless `ENABLE_TCPMSS=true` is set
 7. Optionally install inbound SYN pacing for Android/Desktop handshake stability (`ENABLE_SYNFIX=true`)
 8. Install **IPv6 hop script** when `CF_TOKEN`+`CF_ZONE`+`IPV6_PREFIX` are provided
 9. Set up self-domain Caddy 404 masking on `127.0.0.1:8443`, including Let's Encrypt on TCP/80, X25519MLKEM768 TLS groups, and the masking health timer
@@ -332,7 +333,9 @@ curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/in
   | sudo env ENABLE_SYNFIX=true bash
 ```
 
-The SYN pacing default is `SYNFIX_RATE=30/minute SYNFIX_BURST=1 SYNFIX_ACTION=drop`. This keeps excess Android/Desktop retry bursts quiet instead of feeding immediate tcp-reset retries. Use `SYNFIX_ACTION=reject` only when you intentionally want fast reset feedback. Installers persist TCPMSS/SYNFIX iptables rules with `netfilter-persistent` so they are restored after reboot.
+The SYN pacing default is `SYNFIX_RATE=30/minute SYNFIX_BURST=1 SYNFIX_ACTION=drop`. This keeps excess Android/Desktop retry bursts quiet instead of feeding immediate tcp-reset retries. Use `SYNFIX_ACTION=reject` only when you intentionally want fast reset feedback. Installers persist SYNFIX and optional TCPMSS iptables state with `netfilter-persistent` so it is restored after reboot.
+
+Legacy `TCPMSS=88` ClientHello fragmentation is disabled by default for PQ-capable Caddy masking setups. Re-enable it only as an explicit fallback with `ENABLE_TCPMSS=true`.
 
 ### Self-Domain 404 Masking
 
