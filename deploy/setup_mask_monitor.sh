@@ -33,11 +33,26 @@ fail()  { echo -e "${RED}x${RESET} $*" >&2; exit 1; }
 
 [[ $EUID -eq 0 ]] || fail "Run as root: sudo bash setup_mask_monitor.sh"
 
-docker_caddy_configured() {
-    command -v docker >/dev/null 2>&1 || return 1
+docker_compose_has_caddy_service() {
     [[ -f "$COMPOSE_FILE" ]] || return 1
-    docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" config --services 2>/dev/null \
-        | grep -qx 'mtproto-mask-caddy'
+    if command -v docker >/dev/null 2>&1 \
+        && docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" config --services 2>/dev/null \
+        | grep -qx 'mtproto-mask-caddy'; then
+        return 0
+    fi
+
+    # If compose config is temporarily unavailable, still remember that this
+    # install is Docker-managed and avoid falling back to the host Caddy unit.
+    grep -Eq '^[[:space:]]+mtproto-mask-caddy:[[:space:]]*$' "$COMPOSE_FILE" 2>/dev/null
+}
+
+docker_caddy_container_exists() {
+    command -v docker >/dev/null 2>&1 || return 1
+    docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx 'mtproto-mask-caddy'
+}
+
+docker_caddy_configured() {
+    docker_compose_has_caddy_service || docker_caddy_container_exists
 }
 
 docker_caddy_running() {
@@ -138,11 +153,32 @@ probe_netns_endpoint() {
     ip netns exec "$NS_NAME" curl -sk --max-time 3 --resolve "${domain}:${port}:${host}" "https://${domain}:${port}/" >/dev/null 2>&1
 }
 
-docker_caddy_available() {
-    command -v docker >/dev/null 2>&1 || return 1
+docker_compose_has_caddy_service() {
     [[ -f "$COMPOSE_FILE" ]] || return 1
-    docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" config --services 2>/dev/null \
-        | grep -qx 'mtproto-mask-caddy'
+    if command -v docker >/dev/null 2>&1 \
+        && docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" config --services 2>/dev/null \
+        | grep -qx 'mtproto-mask-caddy'; then
+        return 0
+    fi
+
+    # Keep Docker installs on the Docker path even when compose config cannot
+    # be rendered for a moment, for example while Docker is being updated.
+    grep -Eq '^[[:space:]]+mtproto-mask-caddy:[[:space:]]*$' "$COMPOSE_FILE" 2>/dev/null
+}
+
+docker_caddy_container_exists() {
+    command -v docker >/dev/null 2>&1 || return 1
+    docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$CADDY_CONTAINER"
+}
+
+docker_caddy_available() {
+    docker_compose_has_caddy_service || docker_caddy_container_exists
+}
+
+docker_compose_up_caddy() {
+    command -v docker >/dev/null 2>&1 || return 1
+    docker_compose_has_caddy_service || return 1
+    docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" up -d --force-recreate mtproto-mask-caddy >/dev/null 2>&1
 }
 
 caddy_active() {
@@ -155,7 +191,12 @@ caddy_active() {
 
 restart_caddy() {
     if docker_caddy_available; then
-        docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" up -d --force-recreate mtproto-mask-caddy >/dev/null 2>&1
+        docker_compose_up_caddy && return 0
+        if docker_caddy_container_exists; then
+            docker restart "$CADDY_CONTAINER" >/dev/null 2>&1 || docker start "$CADDY_CONTAINER" >/dev/null 2>&1
+            return
+        fi
+        return 1
     else
         systemctl restart "$MASK_CADDY_SERVICE"
     fi
@@ -251,6 +292,8 @@ chmod 0755 "$MASK_HEALTH_SCRIPT"
 cat > "$MASK_HEALTH_SERVICE" << 'EOF'
 [Unit]
 Description=MTProto masking endpoint health check
+After=network-online.target docker.service mtproto-mask-caddy.service
+Wants=network-online.target
 
 [Service]
 Type=oneshot
