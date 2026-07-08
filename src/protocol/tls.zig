@@ -156,7 +156,7 @@ pub fn buildServerHelloWithTemplateCipher(
     session_id: []const u8,
     cipher: ?u16,
 ) ![]u8 {
-    if (template.len != server_template_len) return error.BadServerHelloTemplate;
+    const cert_payload_size = templateFakeCertPayloadSize(template) orelse return error.BadServerHelloTemplate;
     if (session_id.len != 32) return error.InvalidSessionIdLength;
 
     // 1. Copy the pre-built template (random and session_id are zeroed in template)
@@ -181,7 +181,7 @@ pub fn buildServerHelloWithTemplateCipher(
     // 3b. Randomize fake encrypted-certificate AppData per connection. TLS 1.3
     // certificate bytes are encrypted under fresh ECDHE keys, so identical
     // ciphertext across connections is a fingerprint.
-    crypto.randomBytes(response[tmpl_appdata_offset..][0..fake_cert_payload_size]);
+    crypto.randomBytes(response[server_hello_prefix_len..][0..cert_payload_size]);
 
     // 4. Compute HMAC over full response with random field zeroed.
     //    Template already has zeros at offset 11..43, so HMAC input is correct.
@@ -278,10 +278,13 @@ pub fn buildServerHelloPq(
     client_digest: *const [constants.tls_digest_len]u8,
     session_id: []const u8,
     cipher: ?u16,
+    cert_payload_size: usize,
 ) ![]u8 {
     if (session_id.len != 32) return error.InvalidSessionIdLength;
+    if (!validFakeCertPayloadSize(cert_payload_size)) return error.InvalidFakeCertSize;
 
-    const response = try allocator.alloc(u8, pq_server_hello_len);
+    const response_len = pqResponseLen(cert_payload_size);
+    const response = try allocator.alloc(u8, response_len);
     errdefer allocator.free(response);
     @memset(response, 0);
 
@@ -330,8 +333,8 @@ pub fn buildServerHelloPq(
     response[app] = constants.tls_record_application;
     response[app + 1] = 0x03;
     response[app + 2] = 0x03;
-    std.mem.writeInt(u16, response[app + 3 ..][0..2], fake_cert_payload_len, .big);
-    crypto.randomBytes(response[pq_appdata_offset..][0..fake_cert_payload_size]);
+    std.mem.writeInt(u16, response[app + 3 ..][0..2], @intCast(cert_payload_size), .big);
+    crypto.randomBytes(response[pq_appdata_offset..][0..cert_payload_size]);
 
     const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
     var hmac = HmacSha256.init(secret);
@@ -371,6 +374,9 @@ const tmpl_x25519_key_offset: usize = 95;
 /// Fixed size eliminates the random-range fingerprint that ТСПУ detects.
 const fake_cert_payload_len: u16 = 2878;
 const fake_cert_payload_size: usize = @as(usize, fake_cert_payload_len);
+pub const default_fake_cert_size: usize = fake_cert_payload_size;
+pub const min_fake_cert_size: usize = 256;
+pub const max_fake_cert_size: usize = 16 * 1024;
 
 /// Total template size: ServerHello(127) + CCS(6) + AppData(5 + 2878)
 const server_template_len: usize = 127 + 6 + 5 + fake_cert_payload_size;
@@ -392,8 +398,69 @@ pub fn buildServerHelloTemplate(seed: ?u64) [server_template_len]u8 {
     return buildStaticServerTemplate(actual_seed);
 }
 
+pub fn effectiveFakeCertSize(configured: u32) usize {
+    if (configured == 0) return default_fake_cert_size;
+    return @min(max_fake_cert_size, @max(min_fake_cert_size, @as(usize, configured)));
+}
+
+pub fn buildServerHelloTemplateAlloc(
+    allocator: std.mem.Allocator,
+    seed: ?u64,
+    cert_payload_size: usize,
+) ![]u8 {
+    if (!validFakeCertPayloadSize(cert_payload_size)) return error.InvalidFakeCertSize;
+
+    const actual_seed = seed orelse crypto.randomInt(u64);
+    const template = try allocator.alloc(u8, server_hello_prefix_len + cert_payload_size);
+    errdefer allocator.free(template);
+    try fillServerHelloTemplate(template, actual_seed, cert_payload_size);
+    return template;
+}
+
+pub fn firstAppDataRecordLen(records: []const u8) ?usize {
+    var pos: usize = 0;
+    while (pos + 5 <= records.len) {
+        const typ = records[pos];
+        const len = std.mem.readInt(u16, records[pos + 3 ..][0..2], .big);
+        const body_start = pos + 5;
+        const next = body_start + @as(usize, len);
+        if (next > records.len) return null;
+        if (typ == constants.tls_record_application) return @as(usize, len);
+        pos = next;
+    }
+    return null;
+}
+
+pub fn pqResponseLen(cert_payload_size: usize) usize {
+    return pq_server_hello_record_len + 6 + 5 + cert_payload_size;
+}
+
+fn validFakeCertPayloadSize(cert_payload_size: usize) bool {
+    return cert_payload_size >= min_fake_cert_size and
+        cert_payload_size <= max_fake_cert_size and
+        cert_payload_size <= std.math.maxInt(u16);
+}
+
+fn templateFakeCertPayloadSize(template: []const u8) ?usize {
+    if (template.len < server_hello_prefix_len) return null;
+    const cert_payload_size = template.len - server_hello_prefix_len;
+    if (!validFakeCertPayloadSize(cert_payload_size)) return null;
+    if (firstAppDataRecordLen(template)) |record_len| {
+        if (record_len == cert_payload_size) return cert_payload_size;
+    }
+    return null;
+}
+
 fn buildStaticServerTemplate(seed: u64) [server_template_len]u8 {
     var t: [server_template_len]u8 = undefined;
+    fillServerHelloTemplate(t[0..], seed, fake_cert_payload_size) catch unreachable;
+    return t;
+}
+
+fn fillServerHelloTemplate(t: []u8, seed: u64, cert_payload_size: usize) !void {
+    if (t.len != server_hello_prefix_len + cert_payload_size) return error.BadServerHelloTemplate;
+    if (!validFakeCertPayloadSize(cert_payload_size)) return error.InvalidFakeCertSize;
+
     var pos: usize = 0;
 
     // ── Record 1: ServerHello ──────────────────────────────────
@@ -489,15 +556,13 @@ fn buildStaticServerTemplate(seed: u64) [server_template_len]u8 {
     t[pos] = 0x17; // Application Data type
     t[pos + 1] = 0x03;
     t[pos + 2] = 0x03; // TLS 1.2
-    // Payload length in big-endian
-    t[pos + 3] = @intCast((fake_cert_payload_len >> 8) & 0xFF);
-    t[pos + 4] = @intCast(fake_cert_payload_len & 0xFF);
+    std.mem.writeInt(u16, t[pos + 3 ..][0..2], @intCast(cert_payload_size), .big);
     pos += 5;
 
     // Fill with deterministic pseudo-random bytes (SplitMix64).
     // Looks like encrypted data to DPI, same every time like a real cert.
     var prng_state: u64 = seed;
-    for (0..fake_cert_payload_size) |i| {
+    for (0..cert_payload_size) |i| {
         prng_state +%= 0x9E3779B97F4A7C15;
         var z = prng_state;
         z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9;
@@ -505,10 +570,9 @@ fn buildStaticServerTemplate(seed: u64) [server_template_len]u8 {
         z = z ^ (z >> 31);
         t[pos + i] = @intCast((z >> 24) & 0xFF);
     }
-    pos += fake_cert_payload_size;
+    pos += cert_payload_size;
 
-    if (pos != server_template_len) unreachable;
-    return t;
+    if (pos != t.len) return error.BadServerHelloTemplate;
 }
 
 /// Check if bytes look like a TLS ClientHello.
@@ -666,7 +730,7 @@ test "buildServerHello produces valid three-record server template structure" {
     try std.testing.expectEqual(@as(u8, 0x03), response[app_start + 2]);
 
     const len2 = std.mem.readInt(u16, response[app_start + 3 ..][0..2], .big);
-    // AppData is now fixed-size, not random-length.
+    // AppData is fixed-size by default, not random-length.
     try std.testing.expectEqual(fake_cert_payload_len, len2);
 
     // Total response length should match all three records
@@ -716,7 +780,7 @@ test "buildServerHello AppData: fixed length, per-connection-random body" {
     // Same total size (fixed template)
     try std.testing.expectEqual(r1.len, r2.len);
 
-    const app_offset = 127 + 6 + 5; // after ServerHello + CCS + AppData header
+    const app_offset = server_hello_prefix_len; // after ServerHello + CCS + AppData header
     try std.testing.expect(!std.mem.eql(u8, r1[app_offset..], r2[app_offset..]));
 }
 
@@ -724,8 +788,39 @@ test "buildServerHelloTemplate depends on seed" {
     const t1 = buildServerHelloTemplate(0x1111_2222_3333_4444);
     const t2 = buildServerHelloTemplate(0x5555_6666_7777_8888);
 
-    const app_offset = 127 + 6 + 5;
+    const app_offset = server_hello_prefix_len;
     try std.testing.expect(!std.mem.eql(u8, t1[app_offset..], t2[app_offset..]));
+}
+
+test "buildServerHelloTemplateAlloc supports custom fake cert size" {
+    const allocator = std.testing.allocator;
+    var digest = [_]u8{0xAA} ** 32;
+    const session_id = [_]u8{0xBB} ** 32;
+    const cert_size: usize = 4096;
+
+    const template = try buildServerHelloTemplateAlloc(allocator, 0x1111_2222_3333_4444, cert_size);
+    defer allocator.free(template);
+    try std.testing.expectEqual(server_hello_prefix_len + cert_size, template.len);
+    try std.testing.expectEqual(@as(?usize, cert_size), firstAppDataRecordLen(template));
+
+    const resp = try buildServerHelloWithTemplateCipher(allocator, template, &digest, &digest, &session_id, 0x1302);
+    defer allocator.free(resp);
+    try std.testing.expectEqual(server_hello_prefix_len + cert_size, resp.len);
+    try std.testing.expectEqual(@as(?usize, cert_size), firstAppDataRecordLen(resp));
+    try std.testing.expectEqual(@as(u16, 0x1302), std.mem.readInt(u16, resp[tmpl_cipher_offset..][0..2], .big));
+}
+
+test "effectiveFakeCertSize clamps explicit values and keeps zero default" {
+    try std.testing.expectEqual(default_fake_cert_size, effectiveFakeCertSize(0));
+    try std.testing.expectEqual(min_fake_cert_size, effectiveFakeCertSize(1));
+    try std.testing.expectEqual(@as(usize, 4096), effectiveFakeCertSize(4096));
+    try std.testing.expectEqual(max_fake_cert_size, effectiveFakeCertSize(99999));
+}
+
+test "firstAppDataRecordLen rejects truncated records" {
+    const template = buildServerHelloTemplate(0x1111_2222_3333_4444);
+    try std.testing.expectEqual(@as(?usize, default_fake_cert_size), firstAppDataRecordLen(template[0..]));
+    try std.testing.expect(firstAppDataRecordLen(template[0 .. template.len - 1]) == null);
 }
 
 test "validateTlsHandshake - valid handshake" {
@@ -887,7 +982,7 @@ test "buildServerHelloPq emits a 0x11ec key_share with correct framing + HMAC" {
     const sid = [_]u8{0x33} ** 32;
     const secret = [_]u8{0x42} ** 16;
 
-    const resp = try buildServerHelloPq(allocator, &secret, &digest, &sid, 0x1303);
+    const resp = try buildServerHelloPq(allocator, &secret, &digest, &sid, 0x1303, default_fake_cert_size);
     defer allocator.free(resp);
 
     try std.testing.expectEqual(pq_server_hello_len, resp.len);
@@ -900,6 +995,7 @@ test "buildServerHelloPq emits a 0x11ec key_share with correct framing + HMAC" {
     try std.testing.expectEqual(@as(u16, @intCast(pq_key_share_len)), std.mem.readInt(u16, resp[93..][0..2], .big));
     try std.testing.expectEqual(@as(u8, constants.tls_record_change_cipher), resp[pq_server_hello_record_len]);
     try std.testing.expectEqual(@as(u8, constants.tls_record_application), resp[pq_server_hello_record_len + 6]);
+    try std.testing.expectEqual(@as(?usize, default_fake_cert_size), firstAppDataRecordLen(resp));
 
     const check = try allocator.dupe(u8, resp);
     defer allocator.free(check);
@@ -911,6 +1007,21 @@ test "buildServerHelloPq emits a 0x11ec key_share with correct framing + HMAC" {
     var expected: [32]u8 = undefined;
     hmac.final(&expected);
     try std.testing.expect(std.crypto.timing_safe.eql([32]u8, expected, resp[tmpl_random_offset..][0..32].*));
+}
+
+test "buildServerHelloPq supports custom fake cert size" {
+    const allocator = std.testing.allocator;
+    const digest = [_]u8{0} ** constants.tls_digest_len;
+    const sid = [_]u8{0x33} ** 32;
+    const secret = [_]u8{0x42} ** 16;
+    const cert_size: usize = 4096;
+
+    const resp = try buildServerHelloPq(allocator, &secret, &digest, &sid, 0x1301, cert_size);
+    defer allocator.free(resp);
+
+    try std.testing.expectEqual(pqResponseLen(cert_size), resp.len);
+    try std.testing.expectEqual(@as(?usize, cert_size), firstAppDataRecordLen(resp));
+    try std.testing.expectEqual(@as(u16, 0x1301), std.mem.readInt(u16, resp[tmpl_cipher_offset..][0..2], .big));
 }
 
 test "validateTlsHandshake returns canonical_hmac" {

@@ -58,6 +58,9 @@ pub const Config = struct {
     mask_port: u16 = 443,
     /// TCP desync: split ServerHello into 1-byte + rest to evade DPI
     desync: bool = true,
+    /// FakeTLS encrypted certificate AppData size.
+    /// 0 keeps the built-in default that matches the static template.
+    fake_cert_size: u32 = 0,
     /// Dynamic Record Sizing: ramp TLS records from 1369→16384 bytes
     drs: bool = false,
     /// Fast mode: skip S2C encryption by passing client keys to DC directly
@@ -419,6 +422,13 @@ pub const Config = struct {
                         if (parseIntSetting(u16, key, value)) |parsed| cfg.mask_port = parsed;
                     } else if (std.mem.eql(u8, key, "desync")) {
                         if (parseBoolSetting(key, value)) |parsed| cfg.desync = parsed;
+                    } else if (std.mem.eql(u8, key, "fake_cert_size")) {
+                        if (parseIntSetting(u32, key, value)) |parsed| {
+                            cfg.fake_cert_size = if (parsed == 0)
+                                0
+                            else
+                                @min(@as(u32, 16 * 1024), @max(@as(u32, 256), parsed));
+                        }
                     } else if (std.mem.eql(u8, key, "drs")) {
                         if (parseBoolSetting(key, value)) |parsed| cfg.drs = parsed;
                     } else if (std.mem.eql(u8, key, "fast_mode")) {
@@ -490,6 +500,7 @@ test "parse config - valid complete" {
         \\tls_domain = "example.com"
         \\mask = true
         \\desync = true
+        \\fake_cert_size = 4096
         \\
         \\[access.users]
         \\alice = "00112233445566778899aabbccddeeff"
@@ -509,6 +520,7 @@ test "parse config - valid complete" {
     try std.testing.expect(cfg.use_middle_proxy);
     try std.testing.expect(cfg.mask);
     try std.testing.expect(cfg.desync);
+    try std.testing.expectEqual(@as(u32, 4096), cfg.fake_cert_size);
     try std.testing.expect(cfg.fast_mode);
     try std.testing.expectEqual(@as(usize, 2), cfg.users.count());
 
@@ -535,6 +547,7 @@ test "parse config - missing fields defaults" {
     try std.testing.expect(!cfg.use_middle_proxy); // Default is false
     try std.testing.expect(cfg.mask); // Default is true
     try std.testing.expect(cfg.desync); // Default is true
+    try std.testing.expectEqual(@as(u32, 0), cfg.fake_cert_size);
     try std.testing.expect(!cfg.fast_mode); // Default is false
     try std.testing.expectEqual(@as(u32, 1024), cfg.middleproxy_buffer_kb);
     try std.testing.expectEqual(@as(usize, 1024 * 1024), cfg.middleProxyBufferBytes());
@@ -944,6 +957,7 @@ test "parse config - full production-like config" {
         \\mask = true
         \\fast_mode = true
         \\mask_port = 8443
+        \\fake_cert_size = 0
         \\drs = true
         \\
         \\[access.users]
@@ -970,6 +984,7 @@ test "parse config - full production-like config" {
     try std.testing.expect(cfg.mask);
     try std.testing.expect(cfg.fast_mode);
     try std.testing.expectEqual(@as(u16, 8443), cfg.mask_port);
+    try std.testing.expectEqual(@as(u32, 0), cfg.fake_cert_size);
     try std.testing.expect(cfg.drs);
     try std.testing.expectEqual(@as(usize, 2), cfg.users.count());
     try std.testing.expect(cfg.users.contains("alexander"));
@@ -1036,6 +1051,38 @@ test "parse config - censorship section booleans" {
     try std.testing.expect(!cfg.desync);
     try std.testing.expect(cfg.drs);
     try std.testing.expect(cfg.fast_mode);
+}
+
+test "parse config - fake_cert_size bounds" {
+    const low_content =
+        \\[censorship]
+        \\fake_cert_size = 12
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+    var low = try Config.parse(std.testing.allocator, low_content);
+    defer low.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 256), low.fake_cert_size);
+
+    const high_content =
+        \\[censorship]
+        \\fake_cert_size = 99999
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+    var high = try Config.parse(std.testing.allocator, high_content);
+    defer high.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 16 * 1024), high.fake_cert_size);
+
+    const default_content =
+        \\[censorship]
+        \\fake_cert_size = 0
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+    var default_cfg = try Config.parse(std.testing.allocator, default_content);
+    defer default_cfg.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 0), default_cfg.fake_cert_size);
 }
 
 test "parse config - deinit frees explicitly configured default tls_domain" {

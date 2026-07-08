@@ -123,6 +123,10 @@ mask_port = 8443
 # Enabled by default.
 # desync = true
 
+# Fake TLS encrypted-certificate AppData size in bytes.
+# 0 keeps the built-in default (2878). Explicit values are clamped to 256..16384.
+# fake_cert_size = 0
+
 # Dynamic Record Sizing: ramp TLS records from 1369 → 16384 bytes to mimic browser behavior.
 # Improves throughput after initial handshake, may help evade statistical traffic analysis.
 # drs = false

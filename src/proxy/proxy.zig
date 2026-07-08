@@ -1153,7 +1153,7 @@ pub const ProxyState = struct {
     handshakes_inflight: std.atomic.Value(u32),
     mask_addr: ?net.Address,
     replay_cache: ReplayCache,
-    tls_server_hello_template: [tls.server_hello_template_len]u8,
+    tls_server_hello_template: []u8,
 
     // Degradation counters (monotonic totals, delta'd in stats log)
     stats_dropped_cap: std.atomic.Value(u64),
@@ -1199,6 +1199,13 @@ pub const ProxyState = struct {
         const user_secrets = try secrets.toOwnedSlice(allocator);
         secrets = .empty;
         errdefer freeUserSecrets(allocator, user_secrets);
+
+        const tls_template = try tls.buildServerHelloTemplateAlloc(
+            allocator,
+            null,
+            tls.effectiveFakeCertSize(cfg.fake_cert_size),
+        );
+        errdefer allocator.free(tls_template);
 
         var resolved_addr: ?net.Address = null;
         if (cfg.mask) {
@@ -1281,7 +1288,7 @@ pub const ProxyState = struct {
             .handshakes_inflight = std.atomic.Value(u32).init(0),
             .mask_addr = resolved_addr,
             .replay_cache = ReplayCache.init(),
-            .tls_server_hello_template = tls.buildServerHelloTemplate(null),
+            .tls_server_hello_template = tls_template,
             .stats_dropped_cap = std.atomic.Value(u64).init(0),
             .stats_dropped_saturation = std.atomic.Value(u64).init(0),
             .stats_dropped_rate_limit = std.atomic.Value(u64).init(0),
@@ -1312,6 +1319,7 @@ pub const ProxyState = struct {
         @memset(self.middle_proxy_secret[0..], 0);
         self.middle_proxy_secret_len = 0;
         self.middle_proxy_lock.unlock();
+        self.allocator.free(self.tls_server_hello_template);
         freeUserSecrets(self.allocator, self.user_secrets);
     }
 
@@ -2279,11 +2287,12 @@ const EventLoop = struct {
                 &slot.validation_digest,
                 slot.validation_session_id[0..slot.validation_session_id_len],
                 echoed_cipher,
+                self.state.tls_server_hello_template.len - tls.server_hello_prefix_len,
             )
         else
             tls.buildServerHelloWithTemplateCipher(
                 self.state.allocator,
-                self.state.tls_server_hello_template[0..],
+                self.state.tls_server_hello_template,
                 &slot.validation_secret,
                 &slot.validation_digest,
                 slot.validation_session_id[0..slot.validation_session_id_len],
