@@ -59,7 +59,7 @@ Connection-capacity methodology and command profiles: `test/README.md`.
 ## Runtime Model
 
 - Client relay is handled by a single-threaded Linux `epoll` event loop.
-- When any MiddleProxy path is enabled (`use_middle_proxy` or `force_media_middle_proxy`), a joinable background updater thread refreshes MiddleProxy metadata from Telegram core endpoints hourly and can wake early after stalled MiddleProxy handshakes.
+- When any MiddleProxy path is enabled (`use_middle_proxy` or `force_media_middle_proxy`), a background updater immediately refreshes metadata from Telegram core endpoints, then refreshes hourly and can wake early after stalled MiddleProxy handshakes. The listener starts on bundled fallback endpoints without waiting for that first fetch.
 - FakeTLS validation expects Telegram-style 32-byte ClientHello Session IDs and copies the Session ID into the synthetic ServerHello.
 - Handshake and relay lifetimes are controlled by event-loop timers (`idle_timeout_sec`, `handshake_timeout_sec`), not by `SO_RCVTIMEO`.
 - The handshake-inflight budget is charged only after the first client byte, so silent pre-warmed TCP sessions cannot consume the 30%-of-capacity handshake allowance.
@@ -804,7 +804,7 @@ alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eli
 
 > **Note** &nbsp; The parser supports inline `#` / `;` comments after values and treats duplicate owned string/user/direct-user entries as last-write-wins without leaking previous allocations.
 
-> **Note** &nbsp; MiddleProxy settings (regular DC1..5 endpoints + media-path endpoints + shared secret) are refreshed automatically from Telegram (`getProxyConfig`, `getProxySecret`) every hour, with reactive early refresh after stalled MiddleProxy handshakes and bundled defaults as fallback.
+> **Note** &nbsp; MiddleProxy settings (regular DC1..5 endpoints + media-path endpoints + shared secret) are refreshed immediately in the background after startup, then hourly, with reactive early refresh after stalled MiddleProxy handshakes and bundled defaults as fallback.
 
 ## &nbsp; Troubleshooting ("Updating...")
 

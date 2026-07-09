@@ -1375,10 +1375,6 @@ pub const ProxyState = struct {
         }
 
         if (self.config.datacenter_override == null and self.config.usesAnyMiddleProxy()) {
-            self.refreshMiddleProxyInfo() catch |err| {
-                log.warn("Initial middle-proxy refresh failed, using bundled defaults: {any}", .{err});
-            };
-
             self.startMiddleProxyUpdater();
             middle_proxy_updater_started = self.middle_proxy_updater_thread != null;
         }
@@ -1490,6 +1486,15 @@ pub const ProxyState = struct {
     }
 
     fn middleProxyUpdaterMain(self: *ProxyState) void {
+        if (self.config.usesAnyMiddleProxy()) {
+            // Serve immediately with bundled fallback endpoints. Fetching metadata
+            // in this worker keeps a censored or slow core.telegram.org from
+            // delaying accepts after a proxy restart.
+            self.refreshMiddleProxyInfo() catch |err| {
+                log.warn("Initial middle-proxy refresh failed, using bundled defaults: {any}", .{err});
+            };
+        }
+
         while (self.waitMiddleProxyUpdatePeriod()) {
             self.refreshMiddleProxyInfo() catch |err| {
                 log.warn("Middle-proxy refresh failed: {any}", .{err});
