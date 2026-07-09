@@ -157,20 +157,22 @@ info "Setting up NFQUEUE rules..."
 remove_nfqws_rules iptables
 remove_nfqws_rules ip6tables
 
-# Add NFQUEUE rules — intercept outbound TCP from port
-iptables -t mangle -A OUTPUT -p tcp --sport "$PORT" -j NFQUEUE --queue-num "$NFQUEUE_NUM"
+# Add NFQUEUE rules — intercept outbound TCP from port. If nfqws is stopped or
+# restarting, queue-bypass keeps the proxy reachable without TCP desync instead
+# of black-holing every packet sourced from the proxy port.
+iptables -t mangle -A OUTPUT -p tcp --sport "$PORT" -j NFQUEUE --queue-num "$NFQUEUE_NUM" --queue-bypass
 
 # Safely handle IPv6 (may be disabled on some kernels)
 if command -v ip6tables &>/dev/null; then
     ip6tables -t mangle -D OUTPUT -p tcp --sport "$PORT" -j NFQUEUE --queue-num "$NFQUEUE_NUM" 2>/dev/null || true
-    ip6tables -t mangle -A OUTPUT -p tcp --sport "$PORT" -j NFQUEUE --queue-num "$NFQUEUE_NUM" 2>/dev/null || true
+    ip6tables -t mangle -A OUTPUT -p tcp --sport "$PORT" -j NFQUEUE --queue-num "$NFQUEUE_NUM" --queue-bypass 2>/dev/null || true
 fi
 
 # Persist rules
 mkdir -p /etc/iptables
 iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
 ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
-ok "NFQUEUE rules applied (queue ${NFQUEUE_NUM})"
+ok "NFQUEUE rules applied (queue ${NFQUEUE_NUM}, queue-bypass enabled)"
 
 # ── Create systemd service ──────────────────────────────────
 info "Creating systemd service..."
