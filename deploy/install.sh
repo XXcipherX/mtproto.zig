@@ -64,6 +64,20 @@ is_true() {
     esac
 }
 
+secure_runtime_files() {
+    if [[ -f "$INSTALL_DIR/config.toml" ]]; then
+        chown mtproto:mtproto "$INSTALL_DIR/config.toml"
+        chmod 0640 "$INSTALL_DIR/config.toml"
+    fi
+
+    # env.sh is sourced only by the root-owned IPv6-hop cron job and can contain
+    # Cloudflare credentials. Never hand it to the unprivileged proxy process.
+    if [[ -f "$INSTALL_DIR/env.sh" ]]; then
+        chown root:root "$INSTALL_DIR/env.sh"
+        chmod 0600 "$INSTALL_DIR/env.sh"
+    fi
+}
+
 enable_netfilter_persistent() {
     command -v systemctl >/dev/null 2>&1 || return 0
     systemctl enable netfilter-persistent.service >/dev/null 2>&1 || true
@@ -274,7 +288,7 @@ if ! id -u mtproto &>/dev/null; then
     useradd --system --no-create-home --shell /usr/sbin/nologin mtproto
     ok "Created system user 'mtproto'"
 fi
-chown -R mtproto:mtproto "$INSTALL_DIR"
+secure_runtime_files
 
 # ── Install systemd service ─────────────────────────────────
 if [[ "$FORCE_SERVICE_UPDATE" == "1" ]]; then
@@ -408,8 +422,9 @@ else
     warn "nfqws setup failed (non-critical, proxy still works)"
 fi
 
-# Fix ownership: setup_masking.sh rewrites config.toml via awk+mv as root
-chown -R mtproto:mtproto "$INSTALL_DIR"
+# setup_masking.sh rewrites config.toml via awk+mv as root. Restore only the
+# service config's intended ownership without exposing optional credentials.
+secure_runtime_files
 
 # Restart proxy to apply Mask Port and NFQUEUE capabilities
 if systemctl restart "$SERVICE_NAME"; then

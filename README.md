@@ -171,7 +171,7 @@ To update an already installed proxy, simply re-run the same install command:
 curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/install.sh | sudo bash
 ```
 
-The script is **idempotent**: it rebuilds from latest source, replaces the binary, and preserves your existing `config.toml`. Existing `env.sh` stays untouched unless you rerun install with new `CF_TOKEN` / `CF_ZONE` / `IPV6_PREFIX` settings. User secrets and connection links remain unchanged.
+The script is **idempotent**: it rebuilds from latest source, replaces the binary, and preserves your existing `config.toml`. Host installs keep `config.toml` as `mtproto:mtproto` with mode `0640`; `env.sh` stays root-only (`0600`) and is untouched unless you rerun install with new `CF_TOKEN` / `CF_ZONE` / `IPV6_PREFIX` settings. User secrets and connection links remain unchanged.
 
 For a fresh self-domain install, pass `MASK_DOMAIN` as shown below or enter the domain at the installer prompt. Non-interactive bootstrap paths must pass `MASK_DOMAIN` explicitly.
 
@@ -364,7 +364,7 @@ sudo systemctl restart mtproto-proxy
 
 The Caddy backend intentionally does not publish a site body. Only `/.well-known/acme-challenge/` on port `80` is served for Let's Encrypt; all other HTTP/HTTPS requests receive `404`. If another service already owns public `:80`, stop it before running `setup_masking.sh` so Caddy can serve the ACME challenge.
 
-To enable IPv6 auto-hopping (Cloudflare DNS rotation on ban detection), provide Cloudflare API credentials plus your routed `/64` prefix. The installer stores these values in `/opt/mtproto-proxy/env.sh`, and the cron-launched hop script sources that file before updating your domain's AAAA record. `DNS_NAME` defaults to the masking TLS domain when omitted.
+To enable IPv6 auto-hopping (Cloudflare DNS rotation on ban detection), provide Cloudflare API credentials plus your routed `/64` prefix. The installer stores these values in root-owned `/opt/mtproto-proxy/env.sh` (`0600`), and the root cron-launched hop script sources that file before updating your domain's AAAA record. `DNS_NAME` defaults to the masking TLS domain when omitted.
 
 #### Obtaining Cloudflare Credentials
 
@@ -470,7 +470,8 @@ On startup, the proxy automatically detects host RAM and prints a **CAPACITY** b
 ```bash
 sudo cp deploy/mtproto-proxy.service /etc/systemd/system/
 sudo useradd --system --no-create-home --shell /usr/sbin/nologin mtproto
-sudo chown -R mtproto:mtproto /opt/mtproto-proxy
+sudo chown mtproto:mtproto /opt/mtproto-proxy/config.toml
+sudo chmod 0640 /opt/mtproto-proxy/config.toml
 
 sudo systemctl daemon-reload
 sudo systemctl enable mtproto-proxy

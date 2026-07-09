@@ -266,7 +266,13 @@ set_config_value() {
         }
     ' "$CONFIG_FILE" > "$tmp"; then
         mv "$tmp" "$CONFIG_FILE"
-        chown mtproto:mtproto "$CONFIG_FILE" 2>/dev/null || true
+        if [[ "$CADDY_RUNTIME" == "host" ]]; then
+            chown mtproto:mtproto "$CONFIG_FILE" 2>/dev/null || true
+            chmod 0640 "$CONFIG_FILE"
+        else
+            chown root:root "$CONFIG_FILE"
+            chmod 0600 "$CONFIG_FILE"
+        fi
     else
         rm -f "$tmp"
         fail "Failed to update ${CONFIG_FILE}"
