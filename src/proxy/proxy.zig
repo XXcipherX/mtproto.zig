@@ -843,6 +843,9 @@ const ConnectionSlot = struct {
 
     phase: ConnectionPhase = .idle,
     active_reserved: bool = false,
+    /// Set after the first client byte reserves a handshake-budget slot.
+    /// Silent pre-warmed TCP sessions deliberately do not consume this budget.
+    hs_counted: bool = false,
 
     created_at_ms: i64 = 0,
     first_byte_at_ms: i64 = 0,
@@ -1903,26 +1906,14 @@ const EventLoop = struct {
                 continue;
             }
 
-            // Handshake inflight budget: cap at 30% of max_connections.
-            // Prevents churn (scanners/probes) from starving established relay sessions.
-            const hs_inflight = self.state.handshakes_inflight.fetchAdd(1, .monotonic);
-            const hs_max = (self.state.config.max_connections * 3) / 10;
-            if (hs_max > 0 and hs_inflight >= hs_max) {
-                _ = self.state.handshakes_inflight.fetchSub(1, .monotonic);
-                _ = self.state.active_connections.fetchSub(1, .monotonic);
-                _ = self.state.stats_dropped_hs_budget.fetchAdd(1, .monotonic);
-                closeFd(cfd);
-                continue;
-            }
-
             const slot = self.pool.acquire() orelse {
-                _ = self.state.handshakes_inflight.fetchSub(1, .monotonic);
                 _ = self.state.active_connections.fetchSub(1, .monotonic);
                 closeFd(cfd);
                 continue;
             };
 
             slot.active_reserved = true;
+            slot.hs_counted = false;
             slot.conn_id = self.state.connection_count.fetchAdd(1, .monotonic);
             slot.client_fd = cfd;
             slot.peer_addr = client_addr;
@@ -2199,6 +2190,32 @@ const EventLoop = struct {
         }
     }
 
+    /// Charge the bounded handshake budget only after a client actually starts
+    /// sending data. This prevents silent TCP sessions from starving real
+    /// handshakes while preserving the existing 30%-of-capacity churn limit.
+    fn reserveHandshakeBudget(self: *EventLoop, slot: *ConnectionSlot) bool {
+        if (slot.hs_counted) return true;
+
+        const hs_inflight = self.state.handshakes_inflight.fetchAdd(1, .monotonic);
+        const hs_max = (self.state.config.max_connections * 3) / 10;
+        if (hs_max > 0 and hs_inflight >= hs_max) {
+            _ = self.state.handshakes_inflight.fetchSub(1, .monotonic);
+            _ = self.state.stats_dropped_hs_budget.fetchAdd(1, .monotonic);
+            return false;
+        }
+
+        slot.hs_counted = true;
+        return true;
+    }
+
+    /// Release a reserved handshake-budget slot exactly once. Relay and mask
+    /// completion can release it early; all error paths funnel through closeSlot.
+    fn releaseHandshakeBudget(self: *EventLoop, slot: *ConnectionSlot) void {
+        if (!slot.hs_counted) return;
+        _ = self.state.handshakes_inflight.fetchSub(1, .monotonic);
+        slot.hs_counted = false;
+    }
+
     fn readTlsHeader(self: *EventLoop, slot: *ConnectionSlot) void {
         while (slot.tls_hdr_pos < tls_header_len) {
             const n = posix.read(slot.client_fd, slot.tls_hdr_buf[slot.tls_hdr_pos..]) catch |err| {
@@ -2212,6 +2229,10 @@ const EventLoop = struct {
             }
             if (slot.first_byte_at_ms == 0) {
                 slot.first_byte_at_ms = compat.milliTimestamp();
+                if (!self.reserveHandshakeBudget(slot)) {
+                    self.closeSlot(slot, "handshake budget exhausted");
+                    return;
+                }
             }
             slot.tls_hdr_pos += @intCast(n);
             slot.last_activity_ms = compat.milliTimestamp();
@@ -2629,8 +2650,8 @@ const EventLoop = struct {
                     return;
                 }
             }
-            // Handshake complete (mask path) — release from handshake budget
-            _ = self.state.handshakes_inflight.fetchSub(1, .monotonic);
+            // Handshake complete (mask path) — release from handshake budget.
+            self.releaseHandshakeBudget(slot);
             slot.phase = .mask_relaying;
             return;
         }
@@ -2826,8 +2847,8 @@ const EventLoop = struct {
     }
 
     fn startRelay(self: *EventLoop, slot: *ConnectionSlot) void {
-        // Handshake complete — release from handshake budget
-        _ = self.state.handshakes_inflight.fetchSub(1, .monotonic);
+        // Handshake complete — release from handshake budget.
+        self.releaseHandshakeBudget(slot);
         slot.phase = .relaying;
 
         if (slot.pipelined_data) |buf| {
@@ -3745,14 +3766,11 @@ const EventLoop = struct {
             slot.upstream_fd = invalid_fd;
         }
 
+        self.releaseHandshakeBudget(slot);
         slot.resetOwnedBuffers(self.state.allocator);
 
         if (slot.active_reserved) {
             _ = self.state.active_connections.fetchSub(1, .monotonic);
-            // If connection was still in handshake phase, release from handshake budget
-            if (slot.handshakeInProgress()) {
-                _ = self.state.handshakes_inflight.fetchSub(1, .monotonic);
-            }
             slot.active_reserved = false;
             self.closed_since_log += 1;
         }
@@ -5280,4 +5298,62 @@ test "handshakeInProgress - phases" {
     try std.testing.expect(!slot.handshakeInProgress());
     slot.phase = .closing;
     try std.testing.expect(!slot.handshakeInProgress());
+}
+
+test "handshake budget is charged once after the first client byte" {
+    var cfg = Config{
+        .users = std.StringHashMap([16]u8).init(std.testing.allocator),
+        .direct_users = std.StringHashMap(void).init(std.testing.allocator),
+        .max_connections = 10,
+        .mask = false,
+        .datacenter_override = net.Address.initIp4(.{ 127, 0, 0, 1 }, 443),
+    };
+    defer cfg.deinit(std.testing.allocator);
+
+    var state = try ProxyState.init(std.testing.allocator, cfg);
+    defer state.deinit();
+
+    var loop = EventLoop{
+        .state = &state,
+        .epoll_fd = invalid_fd,
+        .listen_fd = invalid_fd,
+        .pool = try ConnectionPool.init(std.testing.allocator, 1),
+        .accept_paused = false,
+        .accept_resume_ns = 0,
+        .saturation_paused = false,
+        .timer_scan_cursor = 0,
+        .stats_next_log_ns = 0,
+        .accepted_since_log = 0,
+        .closed_since_log = 0,
+        .subnet_limiter = SubnetRateLimit.init(),
+        .prev_dropped_cap = 0,
+        .prev_dropped_saturation = 0,
+        .prev_dropped_rate_limit = 0,
+        .prev_dropped_hs_budget = 0,
+        .prev_hs_timeout = 0,
+        .prev_mp_fallback = 0,
+        .mp_c2s_scratch = null,
+        .mp_s2c_scratch = null,
+        .pending_close_fds = .empty,
+    };
+    defer {
+        loop.pending_close_fds.deinit(std.testing.allocator);
+        loop.pool.deinit();
+    }
+
+    const slot = loop.pool.acquire() orelse return error.TestExpectedEqual;
+    defer loop.pool.release(slot);
+
+    try std.testing.expectEqual(@as(u32, 0), state.handshakes_inflight.load(.monotonic));
+    try std.testing.expect(loop.reserveHandshakeBudget(slot));
+    try std.testing.expect(slot.hs_counted);
+    try std.testing.expectEqual(@as(u32, 1), state.handshakes_inflight.load(.monotonic));
+
+    try std.testing.expect(loop.reserveHandshakeBudget(slot));
+    try std.testing.expectEqual(@as(u32, 1), state.handshakes_inflight.load(.monotonic));
+
+    loop.releaseHandshakeBudget(slot);
+    loop.releaseHandshakeBudget(slot);
+    try std.testing.expect(!slot.hs_counted);
+    try std.testing.expectEqual(@as(u32, 0), state.handshakes_inflight.load(.monotonic));
 }

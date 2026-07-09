@@ -62,6 +62,7 @@ Connection-capacity methodology and command profiles: `test/README.md`.
 - When any MiddleProxy path is enabled (`use_middle_proxy` or `force_media_middle_proxy`), a joinable background updater thread refreshes MiddleProxy metadata from Telegram core endpoints hourly and can wake early after stalled MiddleProxy handshakes.
 - FakeTLS validation expects Telegram-style 32-byte ClientHello Session IDs and copies the Session ID into the synthetic ServerHello.
 - Handshake and relay lifetimes are controlled by event-loop timers (`idle_timeout_sec`, `handshake_timeout_sec`), not by `SO_RCVTIMEO`.
+- The handshake-inflight budget is charged only after the first client byte, so silent pre-warmed TCP sessions cannot consume the 30%-of-capacity handshake allowance.
 - Failed non-blocking upstream connects are reclaimed immediately on fatal hangup events; the relay loop should not spin on dead upstream sockets.
 - Timer maintenance runs on a fixed cadence and scans only the allocated connection-slot prefix; production builds also emit aggregated `conn stats` every 10 seconds.
 - Client payload bytes pipelined after the 64-byte MTProto obfuscation nonce are buffered and forwarded once the upstream path is ready.
@@ -828,7 +829,7 @@ Interpretation:
 - `fd quota reached ... pausing accepts for 500ms` means the listener hit `EMFILE`/`ENFILE` and intentionally backed off instead of busy-looping.
 - `conn stats ... paused=<fd_pause>/<saturation_pause>` exposes two pause reasons: fd-quota backoff first, saturation hysteresis second.
 - `drops: ... rate+=...` means the per-subnet rate limiter rejected excess new connections.
-- `drops: ... hs_budget+=...` means the handshake-inflight budget rejected excess new handshakes after the 30%-of-capacity threshold.
+- `drops: ... hs_budget+=...` means the handshake-inflight budget rejected excess handshakes after their first client byte and the 30%-of-capacity threshold.
 - `drops: ... mp_fallback+=...` means the MiddleProxy path degraded and the proxy recovered by reconnecting directly to the same DC.
 - `connection saturation ...` and `saturation eased ...` are the 90%/80% admission-control logs; if the second `paused=` flag is `true`, raise capacity only after checking RAM and probe results.
 
