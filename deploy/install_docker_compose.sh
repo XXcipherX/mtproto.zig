@@ -252,6 +252,10 @@ services:
     container_name: mtproto-proxy
     restart: unless-stopped
     network_mode: host
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
     volumes:
       - ./config.toml:/etc/mtproto-proxy/config.toml:ro
     logging:
