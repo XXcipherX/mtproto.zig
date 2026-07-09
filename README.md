@@ -177,7 +177,7 @@ For a fresh self-domain install, pass `MASK_DOMAIN` as shown below or enter the 
 
 ## Docker image
 
-The repository includes a **multi-stage Dockerfile**: Zig is bootstrapped from the official tarball inside the build stage; the runtime image is Debian **bookworm-slim** with `curl` and CA certs. The proxy binary performs HTTPS public-IP detection and MiddleProxy metadata refresh itself, so CA certs are required; `curl` is kept for container-side diagnostics and as a fallback when the Zig resolver rejects a malformed `/etc/resolv.conf`. The process runs as **root** inside the container (simple bind to port 443). The image ships `config.toml.example` as `/etc/mtproto-proxy/config.toml` for a quick start; mount your own file for real secrets and settings.
+The repository includes a **multi-stage Dockerfile**: Zig is bootstrapped from the official tarball inside the build stage; the runtime image is Debian **bookworm-slim** with `curl` and CA certs. The proxy binary performs HTTPS public-IP detection and MiddleProxy metadata refresh itself, so CA certs are required; `curl` is kept for container-side diagnostics and as a fallback when the Zig resolver rejects a malformed `/etc/resolv.conf`. That fallback follows only a bounded number of HTTPS-to-HTTPS redirects. The process runs as **root** inside the container (simple bind to port 443). The image ships `config.toml.example` as `/etc/mtproto-proxy/config.toml` for a quick start; mount your own file for real secrets and settings.
 
 ### Build
 
