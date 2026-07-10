@@ -1178,12 +1178,12 @@ pub const ProxyState = struct {
     middle_proxy_addrs_primary: [5]net.Address,
     middle_proxy_addrs_media_primary: [5]net.Address,
     middle_proxy_addr_203: net.Address,
-    middle_proxy_addrs_dc4: [16]net.Address,
-    middle_proxy_addrs_dc4_len: usize,
-    middle_proxy_addrs_media_dc4: [16]net.Address,
-    middle_proxy_addrs_media_dc4_len: usize,
-    middle_proxy_addrs_203: [8]net.Address,
-    middle_proxy_addrs_203_len: usize,
+    middle_proxy_candidates: [5][16]net.Address,
+    middle_proxy_candidate_lens: [5]usize,
+    middle_proxy_media_candidates: [5][16]net.Address,
+    middle_proxy_media_candidate_lens: [5]usize,
+    middle_proxy_candidates_203: [16]net.Address,
+    middle_proxy_candidates_203_len: usize,
     middle_proxy_secret: [256]u8,
     middle_proxy_secret_len: usize,
     middle_proxy_nat_ip4: ?[4]u8,
@@ -1309,12 +1309,12 @@ pub const ProxyState = struct {
             .middle_proxy_addrs_primary = constants.tg_middle_proxies_v4,
             .middle_proxy_addrs_media_primary = constants.tg_media_middle_proxies_v4,
             .middle_proxy_addr_203 = constants.getDcAddressV4(203),
-            .middle_proxy_addrs_dc4 = [_]net.Address{constants.tg_middle_proxies_v4[3]} ++ ([_]net.Address{constants.tg_middle_proxies_v4[3]} ** 15),
-            .middle_proxy_addrs_dc4_len = 1,
-            .middle_proxy_addrs_media_dc4 = [_]net.Address{constants.tg_media_middle_proxies_v4[3]} ++ ([_]net.Address{constants.tg_media_middle_proxies_v4[3]} ** 15),
-            .middle_proxy_addrs_media_dc4_len = 1,
-            .middle_proxy_addrs_203 = [_]net.Address{constants.getDcAddressV4(203)} ++ ([_]net.Address{constants.getDcAddressV4(203)} ** 7),
-            .middle_proxy_addrs_203_len = 1,
+            .middle_proxy_candidates = defaultMiddleProxyCandidateLists(constants.tg_middle_proxies_v4),
+            .middle_proxy_candidate_lens = [_]usize{1} ** 5,
+            .middle_proxy_media_candidates = defaultMiddleProxyCandidateLists(constants.tg_media_middle_proxies_v4),
+            .middle_proxy_media_candidate_lens = [_]usize{1} ** 5,
+            .middle_proxy_candidates_203 = [_]net.Address{constants.getDcAddressV4(203)} ** 16,
+            .middle_proxy_candidates_203_len = 1,
             .middle_proxy_secret = default_middle_proxy_secret,
             .middle_proxy_secret_len = middleproxy.proxy_secret.len,
             .middle_proxy_nat_ip4 = detected_nat_ip4,
@@ -1404,25 +1404,23 @@ pub const ProxyState = struct {
     }
 
     const MiddleProxySnapshot = struct {
-        addrs_primary: [5]net.Address,
-        addrs_media_primary: [5]net.Address,
-        addr_203: net.Address,
-        addrs_dc4: [16]net.Address,
-        addrs_dc4_len: usize,
-        addrs_media_dc4: [16]net.Address,
-        addrs_media_dc4_len: usize,
-        addrs_203: [8]net.Address,
-        addrs_203_len: usize,
+        candidates: [5][16]net.Address,
+        candidate_lens: [5]usize,
+        media_candidates: [5][16]net.Address,
+        media_candidate_lens: [5]usize,
+        candidates_203: [16]net.Address,
+        candidates_203_len: usize,
         secret: [256]u8,
         secret_len: usize,
 
-        fn getForDc(self: *const MiddleProxySnapshot, dc_abs: usize, media: bool) ?net.Address {
-            if (dc_abs == 203) return self.addr_203;
-            if (dc_abs >= 1 and dc_abs <= self.addrs_primary.len) {
-                if (media) return self.addrs_media_primary[dc_abs - 1];
-                return self.addrs_primary[dc_abs - 1];
+        fn candidatesForDc(self: *const MiddleProxySnapshot, dc_abs: usize, media: bool) []const net.Address {
+            if (dc_abs == 203) return self.candidates_203[0..self.candidates_203_len];
+            if (dc_abs >= 1 and dc_abs <= self.candidates.len) {
+                const index = dc_abs - 1;
+                if (media) return self.media_candidates[index][0..self.media_candidate_lens[index]];
+                return self.candidates[index][0..self.candidate_lens[index]];
             }
-            return null;
+            return &.{};
         }
     };
 
@@ -1431,15 +1429,12 @@ pub const ProxyState = struct {
         defer self.middle_proxy_lock.unlockShared();
 
         return .{
-            .addrs_primary = self.middle_proxy_addrs_primary,
-            .addrs_media_primary = self.middle_proxy_addrs_media_primary,
-            .addr_203 = self.middle_proxy_addr_203,
-            .addrs_dc4 = self.middle_proxy_addrs_dc4,
-            .addrs_dc4_len = self.middle_proxy_addrs_dc4_len,
-            .addrs_media_dc4 = self.middle_proxy_addrs_media_dc4,
-            .addrs_media_dc4_len = self.middle_proxy_addrs_media_dc4_len,
-            .addrs_203 = self.middle_proxy_addrs_203,
-            .addrs_203_len = self.middle_proxy_addrs_203_len,
+            .candidates = self.middle_proxy_candidates,
+            .candidate_lens = self.middle_proxy_candidate_lens,
+            .media_candidates = self.middle_proxy_media_candidates,
+            .media_candidate_lens = self.middle_proxy_media_candidate_lens,
+            .candidates_203 = self.middle_proxy_candidates_203,
+            .candidates_203_len = self.middle_proxy_candidates_203_len,
             .secret = self.middle_proxy_secret,
             .secret_len = self.middle_proxy_secret_len,
         };
@@ -1535,23 +1530,16 @@ pub const ProxyState = struct {
 
         var next_primary: [5]?net.Address = [_]?net.Address{null} ** 5;
         var next_media_primary: [5]?net.Address = [_]?net.Address{null} ** 5;
-        var next_dc4_candidates: [16]net.Address = undefined;
-        var next_dc4_candidates_len: usize = 0;
-        var next_media_dc4_candidates: [16]net.Address = undefined;
-        var next_media_dc4_candidates_len: usize = 0;
+        var next_candidates: [5][16]net.Address = undefined;
+        var next_candidate_lens: [5]usize = [_]usize{0} ** 5;
+        var next_media_candidates: [5][16]net.Address = undefined;
+        var next_media_candidate_lens: [5]usize = [_]usize{0} ** 5;
         for (0..next_primary.len) |i| {
             const dc_num: i16 = @intCast(i + 1);
 
             var candidates: [16]net.Address = undefined;
             const count = parseMiddleProxyAddressesForDc(cfg_bytes, dc_num, .positive_only, &candidates);
-
-            if (i == 3 and count > 0) {
-                const dc4_n = @min(count, next_dc4_candidates.len);
-                @memcpy(next_dc4_candidates[0..dc4_n], candidates[0..dc4_n]);
-                next_dc4_candidates_len = dc4_n;
-            }
-
-            next_primary[i] = if (count == 0)
+            const preferred = if (count == 0)
                 null
             else if (i == 3)
                 candidates[0]
@@ -1559,17 +1547,14 @@ pub const ProxyState = struct {
                 reachable
             else
                 candidates[0];
+            next_primary[i] = preferred;
+            if (preferred) |addr| {
+                next_candidate_lens[i] = copyMiddleProxyCandidates(&next_candidates[i], candidates[0..count], addr);
+            }
 
             var media_candidates: [16]net.Address = undefined;
             const media_count = parseMiddleProxyAddressesForDc(cfg_bytes, dc_num, .negative_only, &media_candidates);
-
-            if (i == 3 and media_count > 0) {
-                const dc4_n = @min(media_count, next_media_dc4_candidates.len);
-                @memcpy(next_media_dc4_candidates[0..dc4_n], media_candidates[0..dc4_n]);
-                next_media_dc4_candidates_len = dc4_n;
-            }
-
-            next_media_primary[i] = if (media_count == 0)
+            const media_preferred = if (media_count == 0)
                 null
             else if (i == 3)
                 media_candidates[0]
@@ -1577,16 +1562,18 @@ pub const ProxyState = struct {
                 reachable
             else
                 media_candidates[0];
+            next_media_primary[i] = media_preferred;
+            if (media_preferred) |addr| {
+                next_media_candidate_lens[i] = copyMiddleProxyCandidates(&next_media_candidates[i], media_candidates[0..media_count], addr);
+            }
         }
 
-        var candidates_203: [8]net.Address = undefined;
+        var candidates_203: [16]net.Address = undefined;
         const count_203 = parseMiddleProxyAddressesForDc(cfg_bytes, 203, .any, &candidates_203);
-        var next_203_candidates: [8]net.Address = undefined;
+        var next_203_candidates: [16]net.Address = undefined;
         var next_203_candidates_len: usize = 0;
         if (count_203 > 0) {
-            const c203_n = @min(count_203, next_203_candidates.len);
-            @memcpy(next_203_candidates[0..c203_n], candidates_203[0..c203_n]);
-            next_203_candidates_len = c203_n;
+            next_203_candidates_len = copyMiddleProxyCandidates(&next_203_candidates, candidates_203[0..count_203], candidates_203[0]);
         }
         const next_addr_203 = if (count_203 == 0) null else candidates_203[0];
 
@@ -1628,32 +1615,32 @@ pub const ProxyState = struct {
                 }
             }
 
-            if (next_dc4_candidates_len > 0) {
-                if (self.middle_proxy_addrs_dc4_len != next_dc4_candidates_len or
-                    !addressesEqual(self.middle_proxy_addrs_dc4[0..next_dc4_candidates_len], next_dc4_candidates[0..next_dc4_candidates_len]))
+            for (0..next_candidate_lens.len) |i| {
+                if (next_candidate_lens[i] > 0 and
+                    (self.middle_proxy_candidate_lens[i] != next_candidate_lens[i] or
+                        !addressesEqual(self.middle_proxy_candidates[i][0..next_candidate_lens[i]], next_candidates[i][0..next_candidate_lens[i]])))
                 {
-                    @memcpy(self.middle_proxy_addrs_dc4[0..next_dc4_candidates_len], next_dc4_candidates[0..next_dc4_candidates_len]);
-                    self.middle_proxy_addrs_dc4_len = next_dc4_candidates_len;
+                    @memcpy(self.middle_proxy_candidates[i][0..next_candidate_lens[i]], next_candidates[i][0..next_candidate_lens[i]]);
+                    self.middle_proxy_candidate_lens[i] = next_candidate_lens[i];
                     changed = true;
                 }
-            }
 
-            if (next_media_dc4_candidates_len > 0) {
-                if (self.middle_proxy_addrs_media_dc4_len != next_media_dc4_candidates_len or
-                    !addressesEqual(self.middle_proxy_addrs_media_dc4[0..next_media_dc4_candidates_len], next_media_dc4_candidates[0..next_media_dc4_candidates_len]))
+                if (next_media_candidate_lens[i] > 0 and
+                    (self.middle_proxy_media_candidate_lens[i] != next_media_candidate_lens[i] or
+                        !addressesEqual(self.middle_proxy_media_candidates[i][0..next_media_candidate_lens[i]], next_media_candidates[i][0..next_media_candidate_lens[i]])))
                 {
-                    @memcpy(self.middle_proxy_addrs_media_dc4[0..next_media_dc4_candidates_len], next_media_dc4_candidates[0..next_media_dc4_candidates_len]);
-                    self.middle_proxy_addrs_media_dc4_len = next_media_dc4_candidates_len;
+                    @memcpy(self.middle_proxy_media_candidates[i][0..next_media_candidate_lens[i]], next_media_candidates[i][0..next_media_candidate_lens[i]]);
+                    self.middle_proxy_media_candidate_lens[i] = next_media_candidate_lens[i];
                     changed = true;
                 }
             }
 
             if (next_203_candidates_len > 0) {
-                if (self.middle_proxy_addrs_203_len != next_203_candidates_len or
-                    !addressesEqual(self.middle_proxy_addrs_203[0..next_203_candidates_len], next_203_candidates[0..next_203_candidates_len]))
+                if (self.middle_proxy_candidates_203_len != next_203_candidates_len or
+                    !addressesEqual(self.middle_proxy_candidates_203[0..next_203_candidates_len], next_203_candidates[0..next_203_candidates_len]))
                 {
-                    @memcpy(self.middle_proxy_addrs_203[0..next_203_candidates_len], next_203_candidates[0..next_203_candidates_len]);
-                    self.middle_proxy_addrs_203_len = next_203_candidates_len;
+                    @memcpy(self.middle_proxy_candidates_203[0..next_203_candidates_len], next_203_candidates[0..next_203_candidates_len]);
+                    self.middle_proxy_candidates_203_len = next_203_candidates_len;
                     changed = true;
                 }
             }
@@ -2769,8 +2756,9 @@ const EventLoop = struct {
 
             var fb_buf: [64]u8 = undefined;
             const fb_str = formatAddress(fallback, &fb_buf);
-            log.warn("[{d}] middle-proxy exhausted after {d} candidate(s) ({any}), fallback to direct {s}", .{
+            log.warn("[{d}] middle-proxy dc={d} exhausted after {d} candidate(s) ({any}), fallback to direct {s}", .{
                 slot.conn_id,
+                slot.dc_idx,
                 candidate_count,
                 err,
                 fb_str,
@@ -4356,6 +4344,21 @@ fn isSameIpEndpoint(a: net.Address, b: net.Address) bool {
     return false;
 }
 
+fn defaultMiddleProxyCandidateLists(primary: [5]net.Address) [5][16]net.Address {
+    var lists: [5][16]net.Address = undefined;
+    for (primary, 0..) |addr, i| {
+        lists[i] = [_]net.Address{addr} ** 16;
+    }
+    return lists;
+}
+
+fn copyMiddleProxyCandidates(out: *[16]net.Address, candidates: []const net.Address, preferred: net.Address) usize {
+    var count: usize = 0;
+    appendUniqueAddress(out, &count, preferred);
+    for (candidates) |addr| appendUniqueAddress(out, &count, addr);
+    return count;
+}
+
 fn appendUniqueAddress(addrs: *[16]net.Address, count: *usize, addr: net.Address) void {
     if (count.* >= addrs.len) return;
     for (addrs[0..count.*]) |existing| {
@@ -4406,13 +4409,14 @@ fn buildDcConnectPlan(
         return plan;
     }
 
-    var middle_addr: ?net.Address = null;
+    var middle_candidates: []const net.Address = &.{};
     if (snapshot) |snap| {
-        middle_addr = snap.getForDc(dc_abs, plan.is_media_path);
-        if (middle_addr == null and plan.is_media_path) {
-            middle_addr = snap.getForDc(dc_abs, false);
+        middle_candidates = snap.candidatesForDc(dc_abs, plan.is_media_path);
+        if (middle_candidates.len == 0 and plan.is_media_path) {
+            middle_candidates = snap.candidatesForDc(dc_abs, false);
         }
     }
+    const middle_addr = if (middle_candidates.len > 0) middle_candidates[0] else null;
 
     const force_media_middle_proxy = cfg.force_media_middle_proxy and plan.is_media_path and middle_addr != null;
     plan.use_middle_proxy = if (force_media_middle_proxy)
@@ -4427,25 +4431,8 @@ fn buildDcConnectPlan(
         return plan;
     }
 
-    if (snapshot) |snap| {
-        if (dc_abs == 4) {
-            if (plan.is_media_path and snap.addrs_media_dc4_len > 0) {
-                var n: usize = 0;
-                while (n < snap.addrs_media_dc4_len and plan.count < plan.candidates.len) : (n += 1) {
-                    appendUniqueAddress(&plan.candidates, &plan.count, snap.addrs_media_dc4[n]);
-                }
-            } else if (snap.addrs_dc4_len > 0) {
-                var n: usize = 0;
-                while (n < snap.addrs_dc4_len and plan.count < plan.candidates.len) : (n += 1) {
-                    appendUniqueAddress(&plan.candidates, &plan.count, snap.addrs_dc4[n]);
-                }
-            }
-        } else if (dc_abs == 203 and snap.addrs_203_len > 0) {
-            var n: usize = 0;
-            while (n < snap.addrs_203_len and plan.count < plan.candidates.len) : (n += 1) {
-                appendUniqueAddress(&plan.candidates, &plan.count, snap.addrs_203[n]);
-            }
-        }
+    for (middle_candidates) |addr| {
+        appendUniqueAddress(&plan.candidates, &plan.count, addr);
     }
 
     if (plan.count == 0 and middle_addr != null) {
@@ -4936,22 +4923,22 @@ test "direct users bypass middle-proxy routing" {
 
     const mp_dc4 = net.Address.initIp4(.{ 11, 11, 11, 11 }, 443);
     const mp_dc203 = net.Address.initIp4(.{ 12, 12, 12, 12 }, 443);
+    const mp_media_dc5_secondary = net.Address.initIp4(.{ 13, 13, 13, 13 }, 443);
+    var media_candidates = defaultMiddleProxyCandidateLists(constants.tg_media_middle_proxies_v4);
+    media_candidates[4][1] = mp_media_dc5_secondary;
     const snapshot = ProxyState.MiddleProxySnapshot{
-        .addrs_primary = .{
+        .candidates = defaultMiddleProxyCandidateLists(.{
             constants.tg_middle_proxies_v4[0],
             constants.tg_middle_proxies_v4[1],
             constants.tg_middle_proxies_v4[2],
             mp_dc4,
             constants.tg_middle_proxies_v4[4],
-        },
-        .addrs_media_primary = constants.tg_media_middle_proxies_v4,
-        .addr_203 = mp_dc203,
-        .addrs_dc4 = [_]net.Address{mp_dc4} ++ ([_]net.Address{mp_dc4} ** 15),
-        .addrs_dc4_len = 1,
-        .addrs_media_dc4 = [_]net.Address{constants.tg_media_middle_proxies_v4[3]} ++ ([_]net.Address{constants.tg_media_middle_proxies_v4[3]} ** 15),
-        .addrs_media_dc4_len = 1,
-        .addrs_203 = [_]net.Address{mp_dc203} ++ ([_]net.Address{mp_dc203} ** 7),
-        .addrs_203_len = 1,
+        }),
+        .candidate_lens = [_]usize{1} ** 5,
+        .media_candidates = media_candidates,
+        .media_candidate_lens = .{ 1, 1, 1, 1, 2 },
+        .candidates_203 = [_]net.Address{mp_dc203} ** 16,
+        .candidates_203_len = 1,
         .secret = [_]u8{0} ** 256,
         .secret_len = 16,
     };
@@ -4969,6 +4956,10 @@ test "direct users bypass middle-proxy routing" {
     const regular_media = buildDcConnectPlan(&cfg, 203, -203, &snapshot, "regular");
     try std.testing.expect(regular_media.use_middle_proxy);
     try std.testing.expect(regular_media.candidates[0].eql(mp_dc203));
+
+    const regular_media_dc5 = buildDcConnectPlan(&cfg, 5, -5, &snapshot, "regular");
+    try std.testing.expectEqual(@as(usize, 2), regular_media_dc5.count);
+    try std.testing.expect(regular_media_dc5.candidates[1].eql(mp_media_dc5_secondary));
 
     const admin_media = buildDcConnectPlan(&cfg, 203, -203, &snapshot, "admin");
     try std.testing.expect(!admin_media.use_middle_proxy);
