@@ -1502,12 +1502,35 @@ pub const ProxyState = struct {
         }
     }
 
+    fn fetchMiddleProxyMetadata(self: *ProxyState, label: []const u8, url: []const u8) ![]u8 {
+        var attempt: u8 = 0;
+        while (attempt < 2) : (attempt += 1) {
+            const bytes = http_fetch.fetchUrlBytes(
+                self.allocator,
+                url,
+                .{ .max_response_bytes = 1 * 1024 * 1024 },
+            ) catch |err| {
+                if (err == error.HttpRequestTimedOut and attempt == 0) {
+                    log.info("Middle-proxy {s} request timed out; retrying once in 1s", .{label});
+                    compat.sleep(std.time.ns_per_s);
+                    continue;
+                }
+                if (err == error.HttpRequestTimedOut) {
+                    log.info("Middle-proxy {s} request timed out after retry", .{label});
+                }
+                return err;
+            };
+
+            if (attempt > 0) {
+                log.info("Middle-proxy {s} request succeeded on retry", .{label});
+            }
+            return bytes;
+        }
+        unreachable;
+    }
+
     fn refreshMiddleProxyInfo(self: *ProxyState) !void {
-        const cfg_bytes = try http_fetch.fetchUrlBytes(
-            self.allocator,
-            middle_proxy_config_url,
-            .{ .max_response_bytes = 1 * 1024 * 1024 },
-        );
+        const cfg_bytes = try self.fetchMiddleProxyMetadata("getProxyConfig", middle_proxy_config_url);
         defer self.allocator.free(cfg_bytes);
 
         var next_primary: [5]?net.Address = [_]?net.Address{null} ** 5;
@@ -1567,11 +1590,7 @@ pub const ProxyState = struct {
         }
         const next_addr_203 = if (count_203 == 0) null else candidates_203[0];
 
-        const next_secret = try http_fetch.fetchUrlBytes(
-            self.allocator,
-            middle_proxy_secret_url,
-            .{ .max_response_bytes = 1 * 1024 * 1024 },
-        );
+        const next_secret = try self.fetchMiddleProxyMetadata("getProxySecret", middle_proxy_secret_url);
         defer self.allocator.free(next_secret);
 
         if (next_secret.len < 16 or next_secret.len > self.middle_proxy_secret.len) {
