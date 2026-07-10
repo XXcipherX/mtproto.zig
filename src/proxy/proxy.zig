@@ -2769,7 +2769,12 @@ const EventLoop = struct {
 
             var fb_buf: [64]u8 = undefined;
             const fb_str = formatAddress(fallback, &fb_buf);
-            log.warn("[{d}] middle-proxy exhausted, fallback to direct {s}", .{ slot.conn_id, fb_str });
+            log.warn("[{d}] middle-proxy exhausted after {d} candidate(s) ({any}), fallback to direct {s}", .{
+                slot.conn_id,
+                candidate_count,
+                err,
+                fb_str,
+            });
             return true;
         }
 
