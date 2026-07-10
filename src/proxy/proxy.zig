@@ -2580,7 +2580,9 @@ const EventLoop = struct {
         slot.upstream_candidate_next = 1;
         slot.current_upstream_addr = candidates[0];
 
-        self.startConnectUpstream(slot, candidates[0], .dc) catch {
+        const first_addr = candidates[0];
+        self.startConnectUpstream(slot, first_addr, .dc) catch |err| {
+            if (self.tryNextDcEndpoint(slot, err, first_addr)) return;
             self.closeSlot(slot, "upstream connect start failed");
         };
     }
