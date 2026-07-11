@@ -1443,6 +1443,33 @@ pub const ProxyState = struct {
         };
     }
 
+    fn promoteMiddleProxyCandidate(self: *ProxyState, dc_abs: usize, media: bool, addr: net.Address) bool {
+        self.middle_proxy_lock.lock();
+        defer self.middle_proxy_lock.unlock();
+
+        if (dc_abs == 203) {
+            return promoteMiddleProxyCandidateInList(
+                &self.middle_proxy_candidates_203,
+                self.middle_proxy_candidates_203_len,
+                addr,
+            );
+        }
+        if (dc_abs < 1 or dc_abs > self.middle_proxy_candidates.len) return false;
+
+        const index = dc_abs - 1;
+        if (media and promoteMiddleProxyCandidateInList(
+            &self.middle_proxy_media_candidates[index],
+            self.middle_proxy_media_candidate_lens[index],
+            addr,
+        )) return true;
+
+        return promoteMiddleProxyCandidateInList(
+            &self.middle_proxy_candidates[index],
+            self.middle_proxy_candidate_lens[index],
+            addr,
+        );
+    }
+
     fn startMiddleProxyUpdater(self: *ProxyState) void {
         if (self.middle_proxy_updater_thread != null) return;
         self.middle_proxy_updater_stop.store(false, .release);
@@ -3319,9 +3346,22 @@ const EventLoop = struct {
                 };
 
                 slot.mp_step = .done;
+                self.promoteSuccessfulMiddleProxyCandidate(slot);
                 self.startRelay(slot);
             },
             else => {},
+        }
+    }
+
+    fn promoteSuccessfulMiddleProxyCandidate(self: *EventLoop, slot: *const ConnectionSlot) void {
+        if (!slot.use_middle_proxy or slot.upstream_candidate_next <= 1) return;
+        const addr = slot.current_upstream_addr orelse return;
+
+        if (self.state.promoteMiddleProxyCandidate(@intCast(slot.dc_abs), slot.is_media_path, addr)) {
+            log.info("[{d}] promoted successful middle-proxy fallback candidate: dc_idx={d}", .{
+                slot.conn_id,
+                slot.dc_idx,
+            });
         }
     }
 
@@ -4405,6 +4445,23 @@ fn copyMiddleProxyCandidates(out: *[16]net.Address, candidates: []const net.Addr
     return count;
 }
 
+fn promoteMiddleProxyCandidateInList(candidates: *[16]net.Address, candidate_len: usize, addr: net.Address) bool {
+    const len = @min(candidate_len, candidates.len);
+    var index: usize = 0;
+    while (index < len) : (index += 1) {
+        if (!isSameIpEndpoint(candidates[index], addr)) continue;
+        if (index == 0) return false;
+
+        const promoted = candidates[index];
+        while (index > 0) : (index -= 1) {
+            candidates[index] = candidates[index - 1];
+        }
+        candidates[0] = promoted;
+        return true;
+    }
+    return false;
+}
+
 fn appendUniqueAddress(addrs: *[16]net.Address, count: *usize, addr: net.Address) void {
     if (count.* >= addrs.len) return;
     for (addrs[0..count.*]) |existing| {
@@ -5145,6 +5202,19 @@ test "connect timeout shares handshake budget across candidates" {
         @as(i64, 0),
         budgetedConnectTimeoutMs(0, 1_000, 15_000, 2_000, 2),
     );
+}
+
+test "successful middle-proxy fallback candidate is promoted" {
+    const first = net.Address.initIp4(.{ 11, 11, 11, 11 }, 443);
+    const second = net.Address.initIp4(.{ 12, 12, 12, 12 }, 443);
+    const third = net.Address.initIp4(.{ 13, 13, 13, 13 }, 443);
+    var candidates = [_]net.Address{ first, second, third } ++ ([_]net.Address{first} ** 13);
+
+    try std.testing.expect(promoteMiddleProxyCandidateInList(&candidates, 3, second));
+    try std.testing.expect(candidates[0].eql(second));
+    try std.testing.expect(candidates[1].eql(first));
+    try std.testing.expect(candidates[2].eql(third));
+    try std.testing.expect(!promoteMiddleProxyCandidateInList(&candidates, 3, second));
 }
 
 test "jittered idle timeout stays bounded" {
