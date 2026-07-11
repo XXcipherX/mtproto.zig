@@ -832,6 +832,15 @@ const ReplayCache = struct {
     }
 };
 
+const middle_proxy_connect_cooldown_ms: i64 = 60 * std.time.ms_per_s;
+const middle_proxy_cooldown_slots = 32;
+
+const MiddleProxyCooldown = struct {
+    active: bool = false,
+    addr: net.Address = undefined,
+    until_ms: i64 = 0,
+};
+
 const ConnectionSlot = struct {
     index: u32 = 0,
     conn_id: u64 = 0,
@@ -1187,6 +1196,7 @@ pub const ProxyState = struct {
     middle_proxy_media_candidate_lens: [5]usize,
     middle_proxy_candidates_203: [16]net.Address,
     middle_proxy_candidates_203_len: usize,
+    middle_proxy_cooldowns: [middle_proxy_cooldown_slots]MiddleProxyCooldown,
     middle_proxy_secret: [256]u8,
     middle_proxy_secret_len: usize,
     middle_proxy_nat_ip4: ?[4]u8,
@@ -1318,6 +1328,7 @@ pub const ProxyState = struct {
             .middle_proxy_media_candidate_lens = [_]usize{1} ** 5,
             .middle_proxy_candidates_203 = [_]net.Address{constants.getDcAddressV4(203)} ** 16,
             .middle_proxy_candidates_203_len = 1,
+            .middle_proxy_cooldowns = [_]MiddleProxyCooldown{.{}} ** middle_proxy_cooldown_slots,
             .middle_proxy_secret = default_middle_proxy_secret,
             .middle_proxy_secret_len = middleproxy.proxy_secret.len,
             .middle_proxy_nat_ip4 = detected_nat_ip4,
@@ -1431,7 +1442,7 @@ pub const ProxyState = struct {
         self.middle_proxy_lock.lockShared();
         defer self.middle_proxy_lock.unlockShared();
 
-        return .{
+        var snapshot = MiddleProxySnapshot{
             .candidates = self.middle_proxy_candidates,
             .candidate_lens = self.middle_proxy_candidate_lens,
             .media_candidates = self.middle_proxy_media_candidates,
@@ -1441,11 +1452,20 @@ pub const ProxyState = struct {
             .secret = self.middle_proxy_secret,
             .secret_len = self.middle_proxy_secret_len,
         };
+        const now_ms = compat.milliTimestamp();
+        for (0..snapshot.candidates.len) |i| {
+            prioritizeMiddleProxyCandidates(&snapshot.candidates[i], snapshot.candidate_lens[i], &self.middle_proxy_cooldowns, now_ms);
+            prioritizeMiddleProxyCandidates(&snapshot.media_candidates[i], snapshot.media_candidate_lens[i], &self.middle_proxy_cooldowns, now_ms);
+        }
+        prioritizeMiddleProxyCandidates(&snapshot.candidates_203, snapshot.candidates_203_len, &self.middle_proxy_cooldowns, now_ms);
+        return snapshot;
     }
 
     fn promoteMiddleProxyCandidate(self: *ProxyState, dc_abs: usize, media: bool, addr: net.Address) bool {
         self.middle_proxy_lock.lock();
         defer self.middle_proxy_lock.unlock();
+
+        self.clearMiddleProxyCooldownLocked(addr);
 
         if (dc_abs == 203) {
             return promoteMiddleProxyCandidateInList(
@@ -1468,6 +1488,46 @@ pub const ProxyState = struct {
             self.middle_proxy_candidate_lens[index],
             addr,
         );
+    }
+
+    fn cooldownMiddleProxyCandidate(self: *ProxyState, addr: net.Address) bool {
+        self.middle_proxy_lock.lock();
+        defer self.middle_proxy_lock.unlock();
+
+        const now_ms = compat.milliTimestamp();
+        var replacement_index: usize = 0;
+        var replacement_until_ms: i64 = std.math.maxInt(i64);
+        for (&self.middle_proxy_cooldowns, 0..) |*entry, i| {
+            if (entry.active and isSameIpEndpoint(entry.addr, addr)) {
+                entry.until_ms = now_ms + middle_proxy_connect_cooldown_ms;
+                return false;
+            }
+            if (!entry.active or entry.until_ms <= now_ms) {
+                replacement_index = i;
+                break;
+            }
+            if (entry.until_ms < replacement_until_ms) {
+                replacement_index = i;
+                replacement_until_ms = entry.until_ms;
+            }
+        }
+
+        self.middle_proxy_cooldowns[replacement_index] = .{
+            .active = true,
+            .addr = addr,
+            .until_ms = now_ms + middle_proxy_connect_cooldown_ms,
+        };
+        return true;
+    }
+
+    fn clearMiddleProxyCooldownLocked(self: *ProxyState, addr: net.Address) void {
+        for (&self.middle_proxy_cooldowns) |*entry| {
+            if (entry.active and isSameIpEndpoint(entry.addr, addr)) {
+                entry.active = false;
+                entry.until_ms = 0;
+                return;
+            }
+        }
     }
 
     fn startMiddleProxyUpdater(self: *ProxyState) void {
@@ -2758,6 +2818,18 @@ const EventLoop = struct {
     fn tryNextDcEndpoint(self: *EventLoop, slot: *ConnectionSlot, err: anyerror, attempt_addr: ?net.Address) bool {
         const candidates = slot.upstream_candidates orelse return false;
         const candidate_count = slotCandidateCount(slot);
+
+        if (slot.use_middle_proxy) {
+            if (attempt_addr) |addr| {
+                if (self.state.cooldownMiddleProxyCandidate(addr)) {
+                    log.info("[{d}] cooling failed middle-proxy endpoint for {d}s: dc_idx={d}", .{
+                        slot.conn_id,
+                        60,
+                        slot.dc_idx,
+                    });
+                }
+            }
+        }
 
         if (slot.upstream_candidate_next < candidates.len) {
             const next_idx = slot.upstream_candidate_next;
@@ -4462,6 +4534,39 @@ fn promoteMiddleProxyCandidateInList(candidates: *[16]net.Address, candidate_len
     return false;
 }
 
+fn prioritizeMiddleProxyCandidates(
+    candidates: *[16]net.Address,
+    candidate_len: usize,
+    cooldowns: []const MiddleProxyCooldown,
+    now_ms: i64,
+) void {
+    const len = @min(candidate_len, candidates.len);
+    if (len < 2) return;
+
+    var reordered: [16]net.Address = undefined;
+    var count: usize = 0;
+    for (candidates[0..len]) |addr| {
+        if (!isMiddleProxyCandidateCooling(cooldowns, addr, now_ms)) {
+            reordered[count] = addr;
+            count += 1;
+        }
+    }
+    for (candidates[0..len]) |addr| {
+        if (isMiddleProxyCandidateCooling(cooldowns, addr, now_ms)) {
+            reordered[count] = addr;
+            count += 1;
+        }
+    }
+    @memcpy(candidates[0..len], reordered[0..len]);
+}
+
+fn isMiddleProxyCandidateCooling(cooldowns: []const MiddleProxyCooldown, addr: net.Address, now_ms: i64) bool {
+    for (cooldowns) |entry| {
+        if (entry.active and entry.until_ms > now_ms and isSameIpEndpoint(entry.addr, addr)) return true;
+    }
+    return false;
+}
+
 fn appendUniqueAddress(addrs: *[16]net.Address, count: *usize, addr: net.Address) void {
     if (count.* >= addrs.len) return;
     for (addrs[0..count.*]) |existing| {
@@ -5215,6 +5320,18 @@ test "successful middle-proxy fallback candidate is promoted" {
     try std.testing.expect(candidates[1].eql(first));
     try std.testing.expect(candidates[2].eql(third));
     try std.testing.expect(!promoteMiddleProxyCandidateInList(&candidates, 3, second));
+}
+
+test "middle-proxy cooldown prioritizes healthy candidates" {
+    const first = net.Address.initIp4(.{ 11, 11, 11, 11 }, 443);
+    const second = net.Address.initIp4(.{ 12, 12, 12, 12 }, 443);
+    var candidates = [_]net.Address{ first, second } ++ ([_]net.Address{first} ** 14);
+    var cooldowns = [_]MiddleProxyCooldown{.{}} ** middle_proxy_cooldown_slots;
+    cooldowns[0] = .{ .active = true, .addr = first, .until_ms = 200 };
+
+    prioritizeMiddleProxyCandidates(&candidates, 2, &cooldowns, 100);
+    try std.testing.expect(candidates[0].eql(second));
+    try std.testing.expect(candidates[1].eql(first));
 }
 
 test "jittered idle timeout stays bounded" {
