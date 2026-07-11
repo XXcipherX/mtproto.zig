@@ -851,6 +851,8 @@ const ConnectionSlot = struct {
     first_byte_at_ms: i64 = 0,
     /// Timestamp for the current upstream connect attempt. Reset per candidate.
     upstream_connect_started_ms: i64 = 0,
+    /// Fixed deadline for the current upstream connect attempt.
+    upstream_connect_deadline_ms: i64 = 0,
     last_activity_ms: i64 = 0,
     /// Last relayed payload time in each direction. If the server spoke more
     /// recently than the client, the server reply is unanswered.
@@ -1017,6 +1019,7 @@ const ConnectionSlot = struct {
         self.direct_fallback_used = false;
         self.current_upstream_addr = null;
         self.upstream_connect_started_ms = 0;
+        self.upstream_connect_deadline_ms = 0;
         self.dc_abs = 0;
         self.is_media_path = false;
 
@@ -2598,6 +2601,24 @@ const EventLoop = struct {
         try self.startConnectUpstream(slot, addr, .mask);
     }
 
+    fn upstreamConnectDeadlineMs(self: *EventLoop, slot: *const ConnectionSlot, started_at_ms: i64) i64 {
+        const configured_timeout_ms = secondsToMs(self.state.config.dc_connect_timeout_sec);
+        if (configured_timeout_ms <= 0) return 0;
+
+        const candidate_count = if (slot.upstream_candidates) |candidates| blk: {
+            const next_index = @min(@as(usize, @intCast(slot.upstream_candidate_next)), candidates.len);
+            break :blk candidates.len - next_index + 1;
+        } else 1;
+        const attempt_timeout_ms = budgetedConnectTimeoutMs(
+            configured_timeout_ms,
+            slot.first_byte_at_ms,
+            secondsToMs(self.state.config.handshake_timeout_sec),
+            started_at_ms,
+            candidate_count,
+        );
+        return started_at_ms + attempt_timeout_ms;
+    }
+
     fn startConnectUpstream(self: *EventLoop, slot: *ConnectionSlot, addr: net.Address, kind: UpstreamKind) !void {
         const fd = try socketTcpNonblocking(addr.any.family);
         errdefer closeFd(fd);
@@ -2613,11 +2634,13 @@ const EventLoop = struct {
         slot.current_upstream_addr = addr;
         slot.phase = .connecting_upstream;
         slot.upstream_connect_started_ms = compat.milliTimestamp();
+        slot.upstream_connect_deadline_ms = self.upstreamConnectDeadlineMs(slot, slot.upstream_connect_started_ms);
         errdefer {
             slot.upstream_fd = invalid_fd;
             slot.upstream_kind = .none;
             slot.current_upstream_addr = null;
             slot.upstream_connect_started_ms = 0;
+            slot.upstream_connect_deadline_ms = 0;
         }
 
         connectFd(fd, &addr.any, addr.getOsSockLen()) catch |err| switch (err) {
@@ -2651,6 +2674,7 @@ const EventLoop = struct {
         configureRelaySocket(slot.client_fd);
         configureRelaySocket(slot.upstream_fd);
         slot.upstream_connect_started_ms = 0;
+        slot.upstream_connect_deadline_ms = 0;
 
         if (slot.upstream_kind == .mask) {
             if (slot.mask_prebuffer) |pre| {
@@ -2697,6 +2721,7 @@ const EventLoop = struct {
         slot.upstream_kind = .none;
         slot.current_upstream_addr = null;
         slot.upstream_connect_started_ms = 0;
+        slot.upstream_connect_deadline_ms = 0;
         slot.upstream_detached = false;
         slot.upstream_interest_in = false;
         slot.upstream_interest_out = false;
@@ -3559,9 +3584,8 @@ const EventLoop = struct {
             }
 
             if (slot.phase == .connecting_upstream and
-                self.state.config.dc_connect_timeout_sec > 0 and
-                slot.upstream_connect_started_ms > 0 and
-                now_ms - slot.upstream_connect_started_ms > secondsToMs(self.state.config.dc_connect_timeout_sec))
+                slot.upstream_connect_deadline_ms > 0 and
+                now_ms > slot.upstream_connect_deadline_ms)
             {
                 const failed_kind = slot.upstream_kind;
                 const failed_addr = slot.current_upstream_addr;
@@ -4077,6 +4101,26 @@ fn setNonBlocking(fd: posix.fd_t) void {
 
 fn secondsToMs(sec: u32) i64 {
     return @as(i64, @intCast(sec)) * std.time.ms_per_s;
+}
+
+fn budgetedConnectTimeoutMs(
+    configured_timeout_ms: i64,
+    first_byte_at_ms: i64,
+    handshake_timeout_ms: i64,
+    started_at_ms: i64,
+    candidate_count: usize,
+) i64 {
+    if (configured_timeout_ms <= 0 or first_byte_at_ms <= 0 or candidate_count <= 1) {
+        return configured_timeout_ms;
+    }
+
+    const handshake_deadline_ms = first_byte_at_ms + handshake_timeout_ms;
+    const remaining_handshake_ms = @max(@as(i64, 1), handshake_deadline_ms - started_at_ms);
+    const fair_share_ms = @max(
+        @as(i64, 1),
+        @divTrunc(remaining_handshake_ms, @as(i64, @intCast(candidate_count))),
+    );
+    return @min(configured_timeout_ms, fair_share_ms);
 }
 
 fn idleTimeoutSeed(slot: *const ConnectionSlot) u64 {
@@ -5086,6 +5130,21 @@ test "fatal middle-proxy upstream hangup is fallback eligible" {
 
 test "jittered idle timeout keeps zero jitter exact" {
     try std.testing.expectEqual(secondsToMs(120), jitteredIdleTimeoutMs(120, 0, 12345));
+}
+
+test "connect timeout shares handshake budget across candidates" {
+    try std.testing.expectEqual(
+        @as(i64, 7000),
+        budgetedConnectTimeoutMs(10_000, 1_000, 15_000, 2_000, 2),
+    );
+    try std.testing.expectEqual(
+        @as(i64, 10_000),
+        budgetedConnectTimeoutMs(10_000, 1_000, 15_000, 2_000, 1),
+    );
+    try std.testing.expectEqual(
+        @as(i64, 0),
+        budgetedConnectTimeoutMs(0, 1_000, 15_000, 2_000, 2),
+    );
 }
 
 test "jittered idle timeout stays bounded" {
