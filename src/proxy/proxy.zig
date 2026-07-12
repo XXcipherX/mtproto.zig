@@ -4543,28 +4543,38 @@ fn prioritizeMiddleProxyCandidates(
     const len = @min(candidate_len, candidates.len);
     if (len < 2) return;
 
+    const CooledCandidate = struct {
+        addr: net.Address,
+        until_ms: i64,
+    };
     var reordered: [16]net.Address = undefined;
-    var count: usize = 0;
+    var healthy_count: usize = 0;
+    var cooled: [16]CooledCandidate = undefined;
+    var cooled_count: usize = 0;
     for (candidates[0..len]) |addr| {
-        if (!isMiddleProxyCandidateCooling(cooldowns, addr, now_ms)) {
-            reordered[count] = addr;
-            count += 1;
+        if (middleProxyCooldownUntilMs(cooldowns, addr, now_ms)) |until_ms| {
+            var insert_at = cooled_count;
+            while (insert_at > 0 and cooled[insert_at - 1].until_ms > until_ms) : (insert_at -= 1) {
+                cooled[insert_at] = cooled[insert_at - 1];
+            }
+            cooled[insert_at] = .{ .addr = addr, .until_ms = until_ms };
+            cooled_count += 1;
+        } else {
+            reordered[healthy_count] = addr;
+            healthy_count += 1;
         }
     }
-    for (candidates[0..len]) |addr| {
-        if (isMiddleProxyCandidateCooling(cooldowns, addr, now_ms)) {
-            reordered[count] = addr;
-            count += 1;
-        }
+    for (cooled[0..cooled_count], 0..) |entry, i| {
+        reordered[healthy_count + i] = entry.addr;
     }
     @memcpy(candidates[0..len], reordered[0..len]);
 }
 
-fn isMiddleProxyCandidateCooling(cooldowns: []const MiddleProxyCooldown, addr: net.Address, now_ms: i64) bool {
+fn middleProxyCooldownUntilMs(cooldowns: []const MiddleProxyCooldown, addr: net.Address, now_ms: i64) ?i64 {
     for (cooldowns) |entry| {
-        if (entry.active and entry.until_ms > now_ms and isSameIpEndpoint(entry.addr, addr)) return true;
+        if (entry.active and entry.until_ms > now_ms and isSameIpEndpoint(entry.addr, addr)) return entry.until_ms;
     }
-    return false;
+    return null;
 }
 
 fn appendUniqueAddress(addrs: *[16]net.Address, count: *usize, addr: net.Address) void {
@@ -5332,6 +5342,22 @@ test "middle-proxy cooldown prioritizes healthy candidates" {
     prioritizeMiddleProxyCandidates(&candidates, 2, &cooldowns, 100);
     try std.testing.expect(candidates[0].eql(second));
     try std.testing.expect(candidates[1].eql(first));
+}
+
+test "middle-proxy cooldown tries earliest recovery first when all cooled" {
+    const first = net.Address.initIp4(.{ 11, 11, 11, 11 }, 443);
+    const second = net.Address.initIp4(.{ 12, 12, 12, 12 }, 443);
+    const third = net.Address.initIp4(.{ 13, 13, 13, 13 }, 443);
+    var candidates = [_]net.Address{ first, second, third } ++ ([_]net.Address{first} ** 13);
+    var cooldowns = [_]MiddleProxyCooldown{.{}} ** middle_proxy_cooldown_slots;
+    cooldowns[0] = .{ .active = true, .addr = first, .until_ms = 300 };
+    cooldowns[1] = .{ .active = true, .addr = second, .until_ms = 200 };
+    cooldowns[2] = .{ .active = true, .addr = third, .until_ms = 250 };
+
+    prioritizeMiddleProxyCandidates(&candidates, 3, &cooldowns, 100);
+    try std.testing.expect(candidates[0].eql(second));
+    try std.testing.expect(candidates[1].eql(third));
+    try std.testing.expect(candidates[2].eql(first));
 }
 
 test "jittered idle timeout stays bounded" {
