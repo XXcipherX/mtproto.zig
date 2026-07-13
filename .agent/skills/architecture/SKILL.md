@@ -111,10 +111,10 @@ If `max_connections` exceeds the RAM-safe estimate, startup auto-clamps it befor
 - FakeTLS accepts only 32-byte Session IDs, stores the Session ID by value, and builds response HMAC without heap-copying the ClientHello.
 - Anti-replay cache keyed by the full canonical HMAC digest, not just the first hash key bytes.
 - MTProto obfuscation rejects reserved nonces before decrypting protocol tags.
-- Masking target selection for unauthenticated clients: `mask_port=443` resolves/connects to `tls_domain:443`; non-443 `mask_port` connects to a local address on that port (`127.0.0.1` in the init namespace, `10.200.200.1` inside the tunnel netns), so that port must be served by Nginx or another local masking backend.
+- Masking target selection for unauthenticated clients: `mask_port=443` resolves/connects to `tls_domain:443`; non-443 `mask_port` connects to a local address on that port (`127.0.0.1` in the init namespace, `10.200.200.1` inside the tunnel netns), so that port must be served by Caddy or another local masking backend.
 - TCPMSS clamping and optional zapret/nfqws integration via deploy scripts.
 - Split-TLS desync (`desync=true`) as split write of fake ServerHello.
-- Self-domain masking setup (`setup_masking.sh`) configures Nginx on `127.0.0.1:8443` and, in tunnel netns mode, `10.200.200.1:8443`; non-proxy requests receive 404.
+- Self-domain masking setup (`setup_masking.sh`) configures Caddy 2.10+ on `127.0.0.1:8443` and, in tunnel netns mode, `10.200.200.1:8443`; non-proxy requests receive 404. Source installs use `mtproto-mask-caddy.service`; Docker Compose installs use the `mtproto-mask-caddy` service/container.
 
 ## What To Verify During Changes
 

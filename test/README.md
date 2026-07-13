@@ -6,6 +6,7 @@ This folder contains practical tools to validate **capacity**, **stability**, an
 
 - `capacity_connections_probe.py` — concurrent connection sweeps with RSS tracking.
 - `connection_stability_check.py` — churn + idle-pool stability harness (leak/regression detector).
+- `daemon_smoke.py` — Linux-only real-daemon FakeTLS smoke used by CI; validates a good secret and rejects the same SNI with a bad secret.
 
 ## What We Measure
 
@@ -38,11 +39,16 @@ This is a capacity/memory harness, not an end-user Telegram UX benchmark.
 
 - Linux host with `/proc` and `ss` (`iproute2`).
 - Python 3.10+.
-- Benchmark workspace ready under `/root/benchmarks` (default layout).
+- For `capacity_connections_probe.py`, a benchmark workspace under `/root/benchmarks` by default, including the expected `bin/`, `configs/`, and `work/` assets. These binaries/configs are not shipped in this repository.
+- `daemon_smoke.py` only needs a locally built `zig-out/bin/mtproto-proxy`; it creates a temporary config itself and does not use the benchmark workspace.
 
 ## Quick Start
 
 ```bash
+# CI-style daemon handshake smoke
+zig build
+python3 test/daemon_smoke.py --binary zig-out/bin/mtproto-proxy
+
 # Show available profiles
 python3 test/capacity_connections_probe.py --list-profiles
 
@@ -52,6 +58,8 @@ sudo -E python3 test/capacity_connections_probe.py --profile mtproto.zig
 # Full matrix run
 sudo -E python3 test/capacity_connections_probe.py --profile all --sysctl-tune
 ```
+
+The `make capacity-probe-idle` and `make capacity-probe-active` targets select the `mtproto.zig` profile but do not build or populate `/root/benchmarks`; prepare that workspace before using them.
 
 ## Recommended Runs
 

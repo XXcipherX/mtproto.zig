@@ -48,6 +48,8 @@ If the target region blocks Telegram, add the tunnel layer before cutover:
 make deploy-tunnel SERVER=<NEW_VPS_IP> AWG_CONF=<path> [PASSWORD=<pass>] [TUNNEL_MODE=direct|preserve|middleproxy]
 ```
 
+For a brand-new self-domain node, bootstrap `deploy/install.sh` with `MASK_DOMAIN` first and then use `make deploy-tunnel-only`. The `make deploy-tunnel` target calls the non-interactive `make migrate` path, which does not forward `MASK_DOMAIN` into the installer.
+
 Tunnel deploy preserves a configured `public_ip` domain in `/opt/mtproto-proxy/config.toml`; it only injects a detected IP when `public_ip` is absent or still a placeholder. This keeps self-domain masking links on the operator-owned domain instead of the tunnel exit IP.
 
 ## Step 4: Validate Before Decommission

@@ -34,6 +34,8 @@ This workflow documents current build and deploy paths as implemented in `Makefi
 - `make deploy-monitor SERVER=<ip>` : deploy optional monitoring dashboard
 - `make monitor SERVER=<ip>` : open SSH tunnel to optional monitoring dashboard
 
+The capacity-probe targets expect the external `/root/benchmarks` layout used by `test/capacity_connections_probe.py`; the repository does not ship the required comparison binaries/configs. Always pass `SERVER=<ip>` explicitly to remote Make targets because the current `Makefile` contains a repository-specific default address.
+
 ## CI-Parity Validation
 
 Before merging behavior changes, match the GitHub workflow as closely as practical:
@@ -48,7 +50,7 @@ zig build
 python3 test/daemon_smoke.py --binary zig-out/bin/mtproto-proxy
 zig build -Doptimize=ReleaseFast
 zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux
-zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux -Dcpu=x86_64_v3
+zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux -Dcpu=x86_64_v3+aes
 zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux
 docker build --build-arg ZIG_VERSION=0.16.0 -t mtproto-zig-smoke .
 zig build -Doptimize=ReleaseFast bench
@@ -65,6 +67,8 @@ The daemon smoke launches a real localhost proxy, verifies a valid FakeTLS hands
 4. Uploads config when local config file exists.
 5. Uploads `.env` as `/opt/mtproto-proxy/env.sh` when present locally.
 6. Starts service and prints status.
+
+This Make target is x86_64-only and uses `x86_64_v3` without an explicit `+aes`. The CI deploy-target check and optimized amd64 Docker image use `x86_64_v3+aes`; use those/manual commands when hardware AES must be guaranteed. Use the manual or Docker build paths for aarch64.
 
 Why service stop is required:
 
@@ -120,21 +124,27 @@ curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/in
 
 Current installer behavior also:
 
-- refreshes self-domain Nginx 404 masking (`setup_masking.sh`) and the masking health timer when available;
+- refreshes self-domain Caddy 404 masking (`setup_masking.sh`) and the masking health timer when available;
 - attempts optional `zapret` / `nfqws` setup;
 - refreshes optional `proxy-monitor` files on disk and restarts that service if it is already active.
 - prints a connection link only when it can find a valid 32-hex secret in `[access.users]`.
 
+Fresh source installs omit `[general].use_middle_proxy`, so regular DC traffic uses the parser default `false`; `force_media_middle_proxy=true` still keeps media paths on MiddleProxy when possible. `config.toml.example` and the Docker Compose installer explicitly enable regular MiddleProxy routing instead.
+
 Self-domain masking notes:
 
 - Preferred setup is `MASK_DOMAIN=proxy.example.com`, with DNS `A` pointing to the VPS.
-- Public `:443` stays owned by `mtproto-proxy`; Nginx listens on `127.0.0.1:8443` and returns 404 for non-proxy requests.
+- Public `:443` stays owned by `mtproto-proxy`; Caddy listens on `127.0.0.1:8443` and returns 404 for non-proxy requests.
 - Public `:80` must be reachable for Let's Encrypt HTTP-01 unless the operator provisions certificates manually.
-- `setup_masking.sh` disables `/etc/nginx/sites-enabled/default` by default and makes `mtproto-masking` the default public `:80` server, so unmatched HTTP `Host`/IP requests return 404. Set `MASK_KEEP_NGINX_DEFAULT=1` only when intentionally keeping an existing default site.
-- `setup_masking.sh` installs a Let's Encrypt renewal hook that reloads Nginx after certificate renewal.
+- `setup_masking.sh` requires Caddy 2.10+ for `x25519mlkem768`, uses public `:80` for ACME HTTP-01, and configures all non-ACME HTTP/HTTPS requests to return 404.
+- `setup_masking.sh` installs a Let's Encrypt renewal hook that reloads the host Caddy service or recreates the Compose Caddy service after certificate renewal.
 - `MASK_ALLOW_SELF_SIGNED=1` is available only as a dev/test fallback; the default flow fails closed when Let's Encrypt cannot issue a certificate.
 - `MASK_SET_PUBLIC_IP=0` skips rewriting `[server].public_ip`; otherwise `setup_masking.sh` sets it to the masking domain.
 - Cloudflare records for the proxy domain must be DNS-only, not proxied.
+
+IPv6 hopping installed by both source and Docker Compose installers is a root cron job that calls `ipv6-hop.sh` without arguments every five minutes, causing an unconditional rotation. `ipv6-hop.sh --auto` is instead a long-running foreground ban-detection loop and is not enabled by the installers.
+
+The tracked `deploy/compose.yml` is a minimal proxy-only example. `deploy/install_docker_compose.sh` generates the operational `/opt/mtproto-proxy/compose.yml` with Caddy and install-specific settings.
 
 ## Systemd Unit Notes (`deploy/mtproto-proxy.service`)
 

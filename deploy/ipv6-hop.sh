@@ -13,7 +13,9 @@
 # Setup:
 #   1. Set CLOUDFLARE_TOKEN and CF_ZONE_ID below (or export them as env vars)
 #   2. Set DNS_NAME to your proxy domain
-#   3. crontab -e → add: */5 * * * * /opt/mtproto-proxy/ipv6-hop.sh --auto
+#   3. Installer cron calls the script without arguments every 5 minutes,
+#      performing an unconditional rotation. Run exactly one `--auto` process
+#      under a service manager if ban-triggered foreground mode is preferred.
 #
 # Requirements: curl, ip, jq
 

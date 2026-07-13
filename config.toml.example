@@ -3,6 +3,10 @@
 # Required when using a promotion tag from @MTProxybot.
 use_middle_proxy = true
 
+# This example enables regular MiddleProxy routing explicitly. The parser and
+# fresh source-installer default is false; the Docker Compose installer default
+# is true. Media paths still prefer MiddleProxy by default in either case.
+
 # Keep media-path traffic on MiddleProxy by default, even when regular DC1..5
 # traffic stays direct. Set to false if you want media to follow use_middle_proxy
 # without special preference.
@@ -36,7 +40,7 @@ port = 443
 # fd maps for this cap at startup; ConnectionSlot objects themselves are
 # created on demand. Startup auto-clamps this to a RAM-safe estimate unless
 # unsafe_override_limits=true.
-# max_connections = 65535
+# max_connections = 512
 
 # Seconds to wait for the first byte from a new client before dropping.
 # Default is 120; raise if your client mix keeps many pre-warmed idle sockets.

@@ -44,7 +44,7 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 | **MiddleProxy** | Telemt-Compatible ME | Optional ME transport for DC1..5 (`use_middle_proxy`); retries TCP candidates, cools failed endpoints for 60 seconds, promotes successful fallbacks, and prefers the earliest-recovering endpoint when all are cooled |
 | **Auto Refresh** | Telegram Metadata | Periodically updates regular/media MiddleProxy endpoints and secret from Telegram core endpoints when any ME route is enabled |
 | **Promotion** | Tag Support | Optional promotion tag for sponsored proxy channel registration |
-| **IPv6 Hopping** | DPI Evasion | Auto-rotates IPv6 from /64 subnet on ban detection via Cloudflare API |
+| **IPv6 Hopping** | DPI Evasion | Rotates IPv6 from a routed /64 and updates Cloudflare AAAA records; installers schedule a hop every 5 minutes, while `--auto` provides foreground ban-detection mode |
 | **Optional TCPMSS=88** | Legacy DPI fallback | Disabled by default; can force tiny ClientHello fragmentation when explicitly enabled |
 | **TCP Desync** | DPI Evasion | Integrated `zapret` (`nfqws`) OS-level desynchronization (fake packets + TTL spoofing); NFQUEUE queue-bypass preserves traffic while `nfqws` restarts |
 | **Split-TLS** | DPI Evasion | Splits fake `ServerHello` write into `1 byte + short pause + rest` to desynchronize passive DPI |
@@ -74,7 +74,7 @@ Connection-capacity methodology and command profiles: `test/README.md`.
 ### Prerequisites
 
 - **Linux** (x86_64 or aarch64) — the proxy uses `epoll` and does not support macOS, FreeBSD, or OpenBSD at runtime
-- [Zig](https://ziglang.org/download/) **0.16.0** or later (macOS is fine for cross-compilation)
+- [Zig](https://ziglang.org/download/) **0.16.0** (the version pinned by CI, Docker, and installers; macOS is fine for cross-compilation)
 
 ### Build & Run locally
 
@@ -97,6 +97,8 @@ make run
 ```
 
 The binary defaults to `config.toml`; the repository intentionally ships `config.toml.example` instead of a real local config.
+
+The example listens on privileged port `443`. Run locally with sufficient bind permissions (for example, as root) or change `[server].port` to a port above `1024`. The systemd unit uses `CAP_NET_BIND_SERVICE`, but `make run` does not grant that capability.
 
 ### Run Tests
 
@@ -133,6 +135,8 @@ zig build -Doptimize=ReleaseFast soak -- --seconds=120 --threads=8 --max-payload
 
 The GitHub workflow additionally verifies native `ReleaseFast`, Linux `x86_64`, deploy-target `x86_64_v3+aes`, Linux `aarch64`, Docker build smoke, and bench/soak paths.
 
+`zig build test` runs the tests reachable from `src/main.zig` plus `src/bench.zig`. The root-level `test_addr.zig` and `test_al.zig` files are ad-hoc Zig API probes: CI formatting covers them, but the build test graph does not compile or execute them.
+
 `bench` prints per-payload throughput (`in_mib_per_s`, `out_mib_per_s`) and `ns_per_op`.
 `soak` prints aggregate `ops/s`, throughput, and `errors`; non-zero errors fail the step.
 
@@ -147,13 +151,13 @@ The GitHub workflow additionally verifies native `ReleaseFast`, Linux `x86_64`, 
 | `make test` | Run unit tests |
 | `make bench` | Run ReleaseFast encapsulation microbenchmarks |
 | `make soak` | Run ReleaseFast multithreaded soak stress test (30s default) |
-| `make capacity-probe-idle` | Run idle-socket capacity probe for `mtproto.zig` |
-| `make capacity-probe-active` | Run TLS-auth (active) capacity probe for `mtproto.zig` |
+| `make capacity-probe-idle` | Run the idle-socket capacity profile; requires the external `/root/benchmarks` workspace described in `test/README.md` |
+| `make capacity-probe-active` | Run the TLS-auth capacity profile; requires the same external benchmark workspace |
 | `make stability-check PID=<pid> [HOST=127.0.0.1 PORT=443]` | Run churn + idle-pool stability harness against an existing proxy process |
 | `make stability-check-load [HOST=127.0.0.1 PORT=443]` | Run load-only stability smoke without `/proc` assertions |
 | `make clean` | Remove build artifacts |
 | `make fmt` | Format Zig files under `src/` |
-| `make deploy [SERVER=<ip>]` | Cross-compile, upload binary/scripts/config to VPS, restart service |
+| `make deploy SERVER=<ip>` | Build `x86_64-linux` with the `x86_64_v3` CPU baseline, upload binary/scripts/config to VPS, restart service |
 | `make migrate SERVER=<ip> [PASSWORD=<pass>]` | Bootstrap server, push local `config.toml`, then run `make deploy` |
 | `make update-dns SERVER=<ip>` | Run the Cloudflare DNS update helper on demand (`DNS_NAME`, `CF_TOKEN`, `CF_ZONE` come from `.env`) |
 | `make deploy-tunnel SERVER=<ip> AWG_CONF=<path> [PASSWORD=<pass>] [TUNNEL_MODE=direct\|preserve\|middleproxy]` | Full migration + AmneziaWG tunnel for blocked regions |
@@ -162,6 +166,8 @@ The GitHub workflow additionally verifies native `ReleaseFast`, Linux `x86_64`, 
 | `make monitor SERVER=<ip>` | Open SSH tunnel to monitoring dashboard |
 
 </details>
+
+Always pass `SERVER=<ip>` explicitly to remote Make targets. The current `Makefile` contains a repository-specific default address, so omitting `SERVER` does not fail safely. `make deploy` is x86_64-only and uses `-Dcpu=x86_64_v3`; use the manual build/Docker paths for aarch64 or when you specifically require `x86_64_v3+aes`.
 
 ## &nbsp; Update existing server
 
@@ -298,6 +304,8 @@ Useful environment variables:
 
 The installer requires Docker Compose v2 (`docker compose`) and installs Docker Engine + the Compose plugin via Docker's convenience script if either Docker or the plugin is missing. When `IMAGE` is not set, compatible x86_64 hosts automatically pull the `latest-amd64-v3` image; if that tag is unavailable, the installer falls back to generic `latest`. The proxy and Caddy Compose services use `network_mode: host`, so the proxy binds public `:443` and Caddy binds local masking/ACME ports directly on the VPS. Re-run the installer to pull and restart with newer images, or update manually:
 
+The tracked `deploy/compose.yml` is only a minimal proxy-service example. The installer generates a richer `/opt/mtproto-proxy/compose.yml` containing Caddy, resource limits, and install-specific settings; do not treat the tracked example as the installer's exact output.
+
 ```bash
 cd /opt/mtproto-proxy
 docker compose --env-file .env -f compose.yml pull
@@ -326,6 +334,8 @@ This will:
 10. Attempt OS-level `zapret` / `nfqws` TCP desync setup
 11. Refresh optional monitor files if `proxy-monitor` already exists
 12. Print a ready-to-use `tg://` connection link when `[access.users]` contains a valid 32-hex secret
+
+On a fresh source install the generated config omits `[general].use_middle_proxy`, so regular DC1..5 traffic uses the parser default `false`; media traffic still prefers MiddleProxy because `force_media_middle_proxy=true` by default. This differs from `config.toml.example` and the Docker Compose installer, both of which enable regular MiddleProxy routing explicitly.
 
 Inbound SYN pacing is disabled by default. Enable it only on filtered routes where Android/Desktop clients open too many parallel handshakes:
 
@@ -364,7 +374,7 @@ sudo systemctl restart mtproto-proxy
 
 The Caddy backend intentionally does not publish a site body. Only `/.well-known/acme-challenge/` on port `80` is served for Let's Encrypt; all other HTTP/HTTPS requests receive `404`. If another service already owns public `:80`, stop it before running `setup_masking.sh` so Caddy can serve the ACME challenge.
 
-To enable IPv6 auto-hopping (Cloudflare DNS rotation on ban detection), provide Cloudflare API credentials plus your routed `/64` prefix. The installer stores these values in root-owned `/opt/mtproto-proxy/env.sh` (`0600`), and the root cron-launched hop script sources that file before updating your domain's AAAA record. `DNS_NAME` defaults to the masking TLS domain when omitted.
+To enable IPv6 hopping, provide Cloudflare API credentials plus your routed `/64` prefix. The installer stores these values in root-owned `/opt/mtproto-proxy/env.sh` (`0600`) and installs a root cron job that invokes `ipv6-hop.sh` without arguments every five minutes. Each cron invocation performs an unconditional rotation and updates the domain's AAAA record. The separate `ipv6-hop.sh --auto` mode is a long-running foreground loop that rotates only after its handshake-timeout heuristic reaches the ban threshold; installers do not enable that mode. `DNS_NAME` defaults to the masking TLS domain when omitted.
 
 #### Obtaining Cloudflare Credentials
 
@@ -422,12 +432,14 @@ cd mtproto.zig
 zig build -Doptimize=ReleaseFast
 ```
 
-Or cross-compile on your Mac:
+Or cross-compile on your Mac for a baseline-compatible x86_64 target:
 
 ```bash
 zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux
 scp zig-out/bin/mtproto-proxy root@<SERVER_IP>:/opt/mtproto-proxy/
 ```
+
+For a modern x86_64 VPS where AES-NI support is known, use `-Dcpu=x86_64_v3+aes` to match the optimized CI/Docker variant and avoid the software-only AES backend warning.
 
 **3. Configure**
 
@@ -893,4 +905,4 @@ On startup the proxy now refreshes DC203 metadata from Telegram automatically. I
 
 ## &nbsp; License
 
-[MIT](LICENSE) &copy; 2026 XXcipherX
+[MIT](LICENSE) &copy; 2026 Aleksandr Kalashnikov

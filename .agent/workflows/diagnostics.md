@@ -56,6 +56,8 @@ Note:
 
 ## IPv6 Hopping and DNS
 
+Installer-managed cron invokes `ipv6-hop.sh` without arguments every five minutes, so each run rotates IPv6 unconditionally. The script's `--auto` mode is a separate foreground ban-detection loop and is not installed as a service/cron job.
+
 ```bash
 # Last hop log lines
 ssh root@<SERVER_IP> 'tail -20 /var/log/mtproto-ipv6-hop.log'
