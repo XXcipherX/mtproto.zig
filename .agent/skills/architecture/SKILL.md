@@ -18,7 +18,7 @@ Production MTProto proxy implemented in Zig with FakeTLS entry, obfuscated MTPro
 
 ## Runtime Model
 
-- Relay path is a single-threaded Linux `epoll` event loop.
+- Relay path is a single-threaded Linux `epoll` event loop. The large `EventLoop` container (including fixed admission tables) is allocated once on the heap and initialized in place so Debug builds do not reserve multi-megabyte stack frames.
 - Connections are represented by pooled `ConnectionSlot` state objects.
 - File descriptors are tracked via epoll + fd-to-slot mapping.
 - Recent runtime changes added safer failed-connect cleanup, monotonic full-active-prefix timer scanning, fd-budget clamping, 90%/80% saturation hysteresis, per-subnet unauthenticated admission limits, graceful RDHUP draining, low-noise periodic connection stats, classed message-queue blocks, and lazy MiddleProxy stream/scratch buffers.
@@ -106,14 +106,15 @@ Runtime allocation is lazier than this estimate: MiddleProxy per-connection stre
 
 If `max_connections` exceeds the memory-safe estimate, startup auto-clamps it before the proxy starts unless `[server].unsafe_override_limits = true`. If the estimate is below the supported minimum of 32 slots, safe mode fails startup instead of forcing 32. With the override enabled, startup keeps the configured value and logs a warning. If neither host nor cgroup memory can be read on Linux, startup logs that the clamp was skipped.
 
-`ProxyState.run` then applies a second, independent `RLIMIT_NOFILE` clamp before creating the event loop when the process soft fd limit cannot cover the effective connection cap.
+`ProxyState.run` then applies a second, independent `RLIMIT_NOFILE` clamp before creating the event loop when the process soft fd limit cannot cover the effective connection cap. If the fd budget cannot support the minimum 32 slots (576 descriptors including overhead), startup fails instead of advertising an impossible capacity.
 
 ## DPI Evasion Components
 
 - FakeTLS ServerHello template with runtime digest patching.
-- FakeTLS accepts only 32-byte Session IDs, stores the Session ID by value, and releases/zeroes the full ClientHello as soon as the synthetic ServerHello is built.
-- Anti-replay cache keyed by the full canonical HMAC digest, not just the first hash key bytes.
+- FakeTLS uses one strict ClientHello framing parser for authentication, SNI, cipher, and PQ key-share reads. It accepts only 32-byte Session IDs, stores the Session ID by value, and securely releases the full ClientHello as soon as the synthetic ServerHello is built.
+- Anti-replay cache compares the full canonical HMAC digest and never evicts a live entry inside the one-hour window. A saturated probe window fails closed.
 - MTProto obfuscation rejects reserved nonces before decrypting protocol tags.
+- Unknown MTProto DC indices are rejected before endpoint planning; modulo fallback is not part of the connection path.
 - Masking target selection for unauthenticated clients: `mask_port=443` resolves every address for `tls_domain:443` in the background, prefers IPv4, and fails over across candidates; non-443 `mask_port` connects to a local address on that port (`127.0.0.1` in the init namespace, `10.200.200.1` inside the tunnel netns). Hostname candidates are re-resolved hourly.
 - Config parsing is strict for proxy-owned sections/keys and malformed lines; `[monitor].host`/`port` remain accepted for the external dashboard. Config load errors propagate as a non-zero process exit.
 - TCPMSS clamping and optional zapret/nfqws integration via deploy scripts.

@@ -41,7 +41,7 @@ The capacity-probe targets expect the external `/root/benchmarks` layout used by
 Before merging behavior changes, match the GitHub workflow as closely as practical:
 
 ```bash
-zig fmt --check build.zig src test_addr.zig test_al.zig
+zig fmt --check build.zig src
 python3 -m py_compile test/*.py
 shellcheck --severity=error deploy/*.sh deploy/monitor/*.sh
 zig build test
@@ -56,6 +56,8 @@ docker build --build-arg ZIG_VERSION=0.16.0 -t mtproto-zig-smoke .
 zig build -Doptimize=ReleaseFast bench
 zig build -Doptimize=ReleaseFast soak -- --seconds=10
 ```
+
+The default install graph contains only `mtproto-proxy`. Use `zig build install-bench` only when the standalone `mtproto-bench` binary is required; `bench` and `soak` build it explicitly without coupling `run` to the global install step.
 
 The daemon smoke launches a real localhost proxy, verifies a valid FakeTLS handshake, and checks that the same SNI with a bad secret does not receive a valid FakeTLS response. CI uses a shorter soak for pull requests and a longer soak on pushes.
 
@@ -149,7 +151,7 @@ The tracked `deploy/compose.yml` is a minimal proxy-only example. `deploy/instal
 ## Systemd Unit Notes (`deploy/mtproto-proxy.service`)
 
 - Default and tunnel-patched units run as `mtproto:mtproto`, use `Restart=always` with `RestartSec=3`, and ship with `LimitNOFILE=131582` plus `TasksMax=65535`.
-- Startup first auto-clamps `max_connections` to an effective-memory estimate using the lower of host RAM and cgroup v2/v1 limits unless `unsafe_override_limits=true`; it fails safe if fewer than 32 slots fit. `ProxyState.run` then clamps again if `RLIMIT_NOFILE` cannot cover the resulting fd budget.
+- Startup first auto-clamps `max_connections` to an effective-memory estimate using the lower of host RAM and cgroup v2/v1 limits unless `unsafe_override_limits=true`; it fails safe if fewer than 32 slots fit. `ProxyState.run` then clamps again if `RLIMIT_NOFILE` can cover at least 32 slots, otherwise it also fails startup safely.
 - The daemon banner redacts user secrets and proxy links. Use `--show-secrets` only for an intentional foreground run in a private terminal.
 - Runtime relay model is still single-thread `epoll` in proxy core.
 - Default unit keeps `ReadOnlyPaths=/opt/mtproto-proxy` and only `CAP_NET_BIND_SERVICE`.

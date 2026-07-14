@@ -19,7 +19,7 @@ jobs:
           version: 0.16.0
 
       - name: Check Zig formatting
-        run: zig fmt --check build.zig src test_addr.zig test_al.zig
+        run: zig fmt --check build.zig src
 
       - name: Check Python harness syntax
         run: python3 -m py_compile test/*.py

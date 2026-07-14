@@ -30,10 +30,17 @@ pub const Address = extern union {
     };
 
     pub fn initIp4(ip: [4]u8, port: u16) Address {
-        return .{ .in = .{ .sa = .{
-            .port = std.mem.nativeToBig(u16, port),
-            .addr = std.mem.readInt(u32, &ip, .little),
-        } } };
+        return .{
+            .in = .{
+                .sa = .{
+                    .port = std.mem.nativeToBig(u16, port),
+                    // sockaddr stores the address in network byte order in memory.
+                    // Interpret the byte array as a native integer so its memory bytes
+                    // remain identical on both little- and big-endian targets.
+                    .addr = std.mem.bytesToValue(u32, &ip),
+                },
+            },
+        };
     }
 
     pub fn initIp6(ip: [16]u8, port: u16, flowinfo: u32, scope_id: u32) Address {
@@ -257,4 +264,10 @@ fn linuxSetSockOptIntAtLevel(fd: posix.fd_t, level: i32, optname: u32, value: i3
         .NOBUFS, .NOMEM => return error.SystemResources,
         else => return error.Unexpected,
     }
+}
+
+test "initIp4 preserves network-order address bytes" {
+    const ip = [4]u8{ 203, 0, 113, 42 };
+    const addr = Address.initIp4(ip, 443);
+    try std.testing.expectEqualSlices(u8, &ip, std.mem.asBytes(&addr.in.sa.addr));
 }

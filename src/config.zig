@@ -177,7 +177,10 @@ pub const Config = struct {
 
     pub fn loadFromFile(allocator: std.mem.Allocator, path: []const u8) !Config {
         const content = try compat.readFileAlloc(allocator, path, 1024 * 1024);
-        defer allocator.free(content);
+        defer {
+            std.crypto.secureZero(u8, content);
+            allocator.free(content);
+        }
         return parse(allocator, content);
     }
 
@@ -504,8 +507,11 @@ pub const Config = struct {
     }
 
     pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
+        if (self.tag) |*tag| std.crypto.secureZero(u8, tag);
+        self.tag = null;
         var it = self.users.iterator();
         while (it.next()) |entry| {
+            std.crypto.secureZero(u8, entry.value_ptr);
             allocator.free(entry.key_ptr.*);
         }
         self.users.deinit();
@@ -527,9 +533,11 @@ pub const Config = struct {
         }
     }
 
-    /// Get user secrets as a flat slice for handshake validation.
+    /// Get user secrets as a flat caller-owned slice for handshake validation.
+    /// Names are borrowed from this Config and remain valid only until deinit().
     pub fn getUserSecrets(self: *const Config, allocator: std.mem.Allocator) ![]const UserSecret {
         var list: std.ArrayList(UserSecret) = .empty;
+        errdefer list.deinit(allocator);
         var users = self.users;
         var it = users.iterator();
         while (it.next()) |entry| {

@@ -151,7 +151,7 @@ pub fn generateNonce() [constants.handshake_len]u8 {
 pub fn prepareTgNonce(
     nonce: *[constants.handshake_len]u8,
     proto_tag: constants.ProtoTag,
-    enc_key_iv: ?[]const u8,
+    enc_key_iv: ?*const [constants.key_len + constants.iv_len]u8,
 ) void {
     const tag_bytes = proto_tag.toBytes();
     @memcpy(nonce[constants.proto_tag_pos..][0..4], &tag_bytes);
