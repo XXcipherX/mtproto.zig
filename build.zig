@@ -18,7 +18,6 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
-    run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }
@@ -37,7 +36,9 @@ pub fn build(b: *std.Build) void {
         .root_module = bench_mod,
     });
 
-    b.installArtifact(bench_exe);
+    const install_bench = b.addInstallArtifact(bench_exe, .{});
+    const install_bench_step = b.step("install-bench", "Install the benchmark binary");
+    install_bench_step.dependOn(&install_bench.step);
 
     const run_bench_cmd = b.addRunArtifact(bench_exe);
     if (b.args) |args| {

@@ -110,7 +110,7 @@ make test
 CI also runs the stricter local checks below:
 
 ```bash
-zig fmt --check build.zig src test_addr.zig test_al.zig
+zig fmt --check build.zig src
 python3 -m py_compile test/*.py
 shellcheck --severity=error deploy/*.sh deploy/monitor/*.sh
 zig build -Doptimize=ReleaseSafe test
@@ -136,7 +136,7 @@ zig build -Doptimize=ReleaseFast soak -- --seconds=120 --threads=8 --max-payload
 
 The GitHub workflow additionally verifies native `ReleaseFast`, Linux `x86_64`, deploy-target `x86_64_v3+aes`, Linux `aarch64`, Docker build smoke, and bench/soak paths.
 
-`zig build test` runs the tests reachable from `src/main.zig` plus `src/bench.zig`. The root-level `test_addr.zig` and `test_al.zig` files are ad-hoc Zig API probes: CI formatting covers them, but the build test graph does not compile or execute them.
+`zig build test` runs the tests reachable from `src/main.zig` plus `src/bench.zig`. A normal `zig build` installs only `mtproto-proxy`; benchmark execution remains explicit through `bench`/`soak`, and `zig build install-bench` installs `mtproto-bench` when a standalone benchmark binary is needed.
 
 `bench` prints per-payload throughput (`in_mib_per_s`, `out_mib_per_s`) and `ns_per_op`.
 `soak` prints aggregate `ops/s`, throughput, and `errors`; non-zero errors fail the step.
@@ -768,7 +768,7 @@ alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eli
 | `[server]` | `public_ip` | _(none)_ | IP/domain shown in startup links. Set it explicitly when using `--show-secrets`; external discovery is intentionally not allowed to delay listener startup. For self-domain masking, use the same domain as `tls_domain`. Tunnel deploy scripts preserve an existing domain instead of replacing it with the tunnel exit IP |
 | `[server]` | `middle_proxy_nat_ip` | _(auto-detect)_ | Optional IPv4 override used in MiddleProxy NAT/AES derivation. Useful when `public_ip` is a hostname or when tunnel egress/detection would choose the wrong IPv4 |
 | `[server]` | `backlog` | `4096` | TCP listen queue size (for high-traffic loads) |
-| `[server]` | `max_connections` | `512` | Concurrent connection cap (small-VPS tuned default, parser lower bound 32). On Linux, startup first auto-clamps this to the effective-memory estimate (host/cgroup) unless `unsafe_override_limits=true`; the proxy then clamps again if `RLIMIT_NOFILE` cannot cover the fd budget |
+| `[server]` | `max_connections` | `512` | Concurrent connection cap (small-VPS tuned default, parser lower bound 32). On Linux, startup first auto-clamps this to the effective-memory estimate (host/cgroup) unless `unsafe_override_limits=true`; the proxy then clamps again if `RLIMIT_NOFILE` can support at least 32 slots, otherwise startup fails safely |
 | `[server]` | `idle_timeout_sec` | `120` | Established relay idle timeout in seconds (parser lower bound 5). Pre-first-byte admission uses a separate fixed 10-second deadline |
 | `[server]` | `idle_timeout_jitter_pct` | `15` | Per-connection random jitter applied to `idle_timeout_sec` (`±N%`, clamped to `0..100`). The effective timeout is floored to at least 5 seconds and at least half the base timeout. Set `0` to disable |
 | `[server]` | `client_silence_close_sec` | `0` | Close an established relay when the server's last reply has gone unanswered by the client for N seconds. This bounds an iOS MtProtoKit bad_salt wedge where "Updating" can hang until the DC closes the socket. Fires only when the last relayed payload was server→client and the client has sent relay payload before. `0` disables it; if enabled, start around `10`-`15` and tune to taste |
@@ -800,7 +800,7 @@ alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eli
 
 > **Operational note** &nbsp; `deploy/mtproto-proxy.service` ships with `LimitNOFILE=131582` to allow higher custom caps when needed. Default `max_connections=512` is tuned for small VPS profiles; increase it only after capacity testing.
 
-> **Operational note** &nbsp; The FakeTLS path rejects non-32-byte ClientHello Session IDs. Current Telegram MTProto-over-TLS clients use a 32-byte Session ID, which the proxy echoes in its TLS-like ServerHello template.
+> **Operational note** &nbsp; The FakeTLS path uses one strict ClientHello parser for validation, SNI, cipher selection, and PQ key-share detection. It rejects inconsistent nested lengths and non-32-byte Session IDs; current Telegram MTProto-over-TLS clients use a 32-byte Session ID, which the proxy echoes in its TLS-like ServerHello template.
 
 > **Operational note** &nbsp; The parser rejects unknown sections, unknown proxy keys, keys outside a section, and malformed non-comment lines. `[monitor].host` and `[monitor].port` remain accepted for the separate dashboard service. Socket ports must be in `1..65535`, and `backlog` must fit Linux's signed listen backlog range; invalid numeric values keep their safe defaults with a warning. Config load failures exit non-zero.
 
@@ -810,7 +810,7 @@ alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eli
 
 > **Operational note** &nbsp; The RAM-safety estimate intentionally budgets MiddleProxy at full configured per-direction cap even though active C2S/S2C buffers grow lazily from 16 KiB. Configured `middleproxy_buffer_kb` values above 16384 are accepted but the effective runtime cap is 16 MiB per direction and startup logs a warning.
 
-> **Operational note** &nbsp; The proxy limits new connections to 30/sec per /24 subnet by default (`rate_limit_per_subnet`). This blocks ТСПУ scanners and DPI replay probes without affecting legitimate Telegram clients.
+> **Operational note** &nbsp; The proxy limits new connections to 30/sec per /24 subnet by default (`rate_limit_per_subnet`). Native IPv6 keys retain all 48 prefix bits, while IPv4-mapped IPv6 shares the native IPv4 `/24` key. This blocks ТСПУ scanners and DPI replay probes without affecting legitimate Telegram clients.
 
 > **Operational note** &nbsp; Self-domain masking expects DNS `A proxy.example.com -> <VPS_IP>`, Cloudflare DNS-only mode if used, public TCP `80` for Let's Encrypt, public TCP `443` for `mtproto-proxy`, and local Caddy TLS on `127.0.0.1:8443` returning `404` for non-proxy requests. Docker Compose installs serve that local Caddy endpoint from the `mtproto-mask-caddy` container; source installs serve it from `mtproto-mask-caddy.service`. `setup_masking.sh` serves ACME HTTP-01 on `:80` and configures Caddy with `x25519mlkem768 x25519` curves. The `ee` link secret changes when `tls_domain` changes, so regenerate client links after changing the domain.
 

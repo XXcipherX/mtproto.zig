@@ -5,6 +5,11 @@ const config = @import("../config.zig");
 const crypto = @import("../crypto/crypto.zig");
 const constants = @import("constants.zig");
 
+fn secureFree(allocator: std.mem.Allocator, buf: []u8) void {
+    std.crypto.secureZero(u8, buf);
+    allocator.free(buf);
+}
+
 pub const proxy_secret = [128]u8{
     0xc4, 0xf9, 0xfa, 0xca, 0x96, 0x78, 0xe6, 0xbb, 0x48, 0xad, 0x6c, 0x7e, 0x2c, 0xe5, 0xc0, 0xd2,
     0x44, 0x30, 0x64, 0x5d, 0x55, 0x4a, 0xdd, 0xeb, 0x55, 0x41, 0x9e, 0x03, 0x4d, 0xa6, 0x27, 0x21,
@@ -49,9 +54,17 @@ pub fn getAesKeyAndIv(
     secret: []const u8,
     clt_ipv6: ?*const [16]u8,
     srv_ipv6: ?*const [16]u8,
-) struct { [32]u8, [16]u8 } {
+) !struct { [32]u8, [16]u8 } {
     var s_buf: [512]u8 = undefined;
+    defer std.crypto.secureZero(u8, &s_buf);
     var s_len: usize = 0;
+
+    if ((clt_ipv6 == null) != (srv_ipv6 == null)) return error.IncompleteIpv6Pair;
+    const ipv6_len: usize = if (clt_ipv6 != null) 32 else 0;
+    const fixed_len: usize = 16 + 16 + 4 + 4 + 2 + 4 + 2 + 16 + ipv6_len + 16;
+    if (purpose.len > s_buf.len - fixed_len or secret.len > s_buf.len - fixed_len - purpose.len) {
+        return error.KdfInputTooLong;
+    }
 
     const empty_ip4 = [_]u8{0} ** 4;
     const srv_ip_bytes = if (srv_ip) |ip| ip else &empty_ip4;
@@ -92,8 +105,10 @@ pub fn getAesKeyAndIv(
 
     const s = s_buf[0..s_len];
 
-    const md5_all = crypto.md5(s[1..]);
-    const sha1_all = crypto.sha1(s);
+    var md5_all = crypto.md5(s[1..]);
+    defer std.crypto.secureZero(u8, &md5_all);
+    var sha1_all = crypto.sha1(s);
+    defer std.crypto.secureZero(u8, &sha1_all);
 
     var key: [32]u8 = undefined;
     @memcpy(key[0..12], md5_all[0..12]);
@@ -227,8 +242,17 @@ pub const MiddleProxyContext = struct {
     }
 
     pub fn deinit(self: *MiddleProxyContext) void {
-        self.allocator.free(self.s2c_buf);
-        self.allocator.free(self.c2s_buf);
+        self.encryptor.wipe();
+        self.decryptor.wipe();
+        secureFree(self.allocator, self.s2c_buf);
+        secureFree(self.allocator, self.c2s_buf);
+        std.crypto.secureZero(u8, &self.conn_id);
+        std.crypto.secureZero(u8, &self.remote_ip_port);
+        std.crypto.secureZero(u8, &self.our_ip_port);
+        if (self.ad_tag) |*tag| std.crypto.secureZero(u8, tag);
+        self.s2c_len = 0;
+        self.s2c_decrypted_len = 0;
+        self.c2s_len = 0;
     }
 
     fn requiredBufferedCapacity(self: *const MiddleProxyContext, current_len: usize, extra_len: usize) !usize {
@@ -249,25 +273,35 @@ pub const MiddleProxyContext = struct {
     fn ensureC2sCapacity(self: *MiddleProxyContext, min_capacity: usize) !void {
         if (self.c2s_buf.len >= min_capacity) return;
         const next_capacity = nextBufferCapacity(self.c2s_buf.len, min_capacity, self.buffer_limit);
-        self.c2s_buf = try self.allocator.realloc(self.c2s_buf, next_capacity);
+        const next = try self.allocator.alloc(u8, next_capacity);
+        @memcpy(next[0..self.c2s_len], self.c2s_buf[0..self.c2s_len]);
+        secureFree(self.allocator, self.c2s_buf);
+        self.c2s_buf = next;
     }
 
     fn ensureS2cCapacity(self: *MiddleProxyContext, min_capacity: usize) !void {
         if (self.s2c_buf.len >= min_capacity) return;
         const next_capacity = nextBufferCapacity(self.s2c_buf.len, min_capacity, self.buffer_limit);
-        self.s2c_buf = try self.allocator.realloc(self.s2c_buf, next_capacity);
+        const next = try self.allocator.alloc(u8, next_capacity);
+        @memcpy(next[0..self.s2c_len], self.s2c_buf[0..self.s2c_len]);
+        secureFree(self.allocator, self.s2c_buf);
+        self.s2c_buf = next;
     }
 
     fn shrinkC2sIfIdle(self: *MiddleProxyContext) void {
         if (self.c2s_len != 0) return;
         if (self.c2s_buf.len <= shrink_stream_buffer_threshold) return;
-        self.c2s_buf = self.allocator.realloc(self.c2s_buf, initial_stream_buffer_size) catch return;
+        const next = self.allocator.alloc(u8, initial_stream_buffer_size) catch return;
+        secureFree(self.allocator, self.c2s_buf);
+        self.c2s_buf = next;
     }
 
     fn shrinkS2cIfIdle(self: *MiddleProxyContext) void {
         if (self.s2c_len != 0) return;
         if (self.s2c_buf.len <= shrink_stream_buffer_threshold) return;
-        self.s2c_buf = self.allocator.realloc(self.s2c_buf, initial_stream_buffer_size) catch return;
+        const next = self.allocator.alloc(u8, initial_stream_buffer_size) catch return;
+        secureFree(self.allocator, self.s2c_buf);
+        self.s2c_buf = next;
     }
 
     fn peekBufferedC2sByte(self: *const MiddleProxyContext, client_data: []const u8, idx: usize) u8 {
@@ -1530,4 +1564,25 @@ test "middle proxy context grows s2c buffer on demand within configured cap" {
     try std.testing.expectEqual(@as(usize, 0), ctx.s2c_len);
     try std.testing.expectEqual(@as(usize, 0), ctx.s2c_decrypted_len);
     try std.testing.expectEqual(MiddleProxyContext.initial_stream_buffer_size, ctx.s2c_buf.len);
+}
+
+test "middle proxy KDF rejects inputs beyond its fixed buffer" {
+    const nonce = [_]u8{0} ** 16;
+    const timestamp = [_]u8{0} ** 4;
+    const port = [_]u8{0} ** 2;
+    const oversized_secret = [_]u8{0} ** 512;
+
+    try std.testing.expectError(error.KdfInputTooLong, getAesKeyAndIv(
+        &nonce,
+        &nonce,
+        &timestamp,
+        null,
+        &port,
+        "CLIENT",
+        null,
+        &port,
+        &oversized_secret,
+        null,
+        null,
+    ));
 }

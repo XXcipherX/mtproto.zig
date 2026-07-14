@@ -29,6 +29,134 @@ pub const TlsValidation = struct {
     secret: [16]u8,
 };
 
+const ParsedClientHello = struct {
+    digest: []const u8,
+    session_id: []const u8,
+    sni: ?[]const u8,
+    first_tls13_cipher: ?u16,
+    offers_pq_key_share: bool,
+};
+
+/// Parse the ClientHello record once and enforce all nested outer lengths.
+/// Feature-specific readers below consume only slices produced by this parser.
+fn parseClientHello(handshake: []const u8) ?ParsedClientHello {
+    if (handshake.len < 5 + 4 + 2 + 32 + 1 + 2 + 2 + 1 + 1 + 2) return null;
+    if (handshake[0] != constants.tls_record_handshake) return null;
+    if (handshake[1] != 0x03 or (handshake[2] != 0x01 and handshake[2] != 0x03)) return null;
+
+    const record_len: usize = std.mem.readInt(u16, handshake[3..5], .big);
+    if (record_len != handshake.len - 5) return null;
+    if (handshake[5] != 0x01) return null;
+    const hello_len: usize = std.mem.readInt(u24, handshake[6..9], .big);
+    if (hello_len != record_len - 4) return null;
+
+    var pos: usize = 9;
+    if (2 + 32 > handshake.len - pos) return null;
+    pos += 2;
+    const digest = handshake[pos .. pos + 32];
+    pos += 32;
+
+    if (pos >= handshake.len) return null;
+    const session_id_len: usize = handshake[pos];
+    pos += 1;
+    if (session_id_len > 32 or session_id_len > handshake.len - pos) return null;
+    const session_id = handshake[pos .. pos + session_id_len];
+    pos += session_id_len;
+
+    if (2 > handshake.len - pos) return null;
+    const cipher_suites_len: usize = std.mem.readInt(u16, handshake[pos..][0..2], .big);
+    pos += 2;
+    if (cipher_suites_len < 2 or cipher_suites_len % 2 != 0 or cipher_suites_len > handshake.len - pos) return null;
+    const cipher_suites = handshake[pos .. pos + cipher_suites_len];
+    pos += cipher_suites_len;
+
+    var first_tls13_cipher: ?u16 = null;
+    var cipher_pos: usize = 0;
+    while (cipher_pos < cipher_suites.len) : (cipher_pos += 2) {
+        const suite = std.mem.readInt(u16, cipher_suites[cipher_pos..][0..2], .big);
+        if ((suite & 0x0f0f) == 0x0a0a) continue;
+        if (suite == 0x1301 or suite == 0x1302 or suite == 0x1303) {
+            first_tls13_cipher = suite;
+            break;
+        }
+    }
+
+    if (pos >= handshake.len) return null;
+    const compression_len: usize = handshake[pos];
+    pos += 1;
+    if (compression_len == 0 or compression_len > handshake.len - pos) return null;
+    pos += compression_len;
+
+    if (2 > handshake.len - pos) return null;
+    const extensions_len: usize = std.mem.readInt(u16, handshake[pos..][0..2], .big);
+    pos += 2;
+    if (extensions_len != handshake.len - pos) return null;
+    const extensions = handshake[pos..];
+
+    var ext_pos: usize = 0;
+    var sni: ?[]const u8 = null;
+    var seen_sni = false;
+    var seen_key_share = false;
+    var offers_pq_key_share = false;
+    while (ext_pos < extensions.len) {
+        if (extensions.len - ext_pos < 4) return null;
+        const ext_type = std.mem.readInt(u16, extensions[ext_pos..][0..2], .big);
+        const ext_len: usize = std.mem.readInt(u16, extensions[ext_pos + 2 ..][0..2], .big);
+        ext_pos += 4;
+        if (ext_len > extensions.len - ext_pos) return null;
+        const payload = extensions[ext_pos .. ext_pos + ext_len];
+
+        if (ext_type == 0x0000) {
+            if (seen_sni or payload.len < 2) return null;
+            seen_sni = true;
+            const names_len: usize = std.mem.readInt(u16, payload[0..2], .big);
+            if (names_len != payload.len - 2) return null;
+            var name_pos: usize = 2;
+            while (name_pos < payload.len) {
+                if (payload.len - name_pos < 3) return null;
+                const name_type = payload[name_pos];
+                const name_len: usize = std.mem.readInt(u16, payload[name_pos + 1 ..][0..2], .big);
+                name_pos += 3;
+                if (name_len > payload.len - name_pos) return null;
+                if (name_type == 0) {
+                    if (name_len == 0 or sni != null) return null;
+                    sni = payload[name_pos .. name_pos + name_len];
+                }
+                name_pos += name_len;
+            }
+        } else if (ext_type == 0x0033) {
+            if (seen_key_share or payload.len < 2) return null;
+            seen_key_share = true;
+            const shares_len: usize = std.mem.readInt(u16, payload[0..2], .big);
+            if (shares_len != payload.len - 2) return null;
+            var share_pos: usize = 2;
+            while (share_pos < payload.len) {
+                if (payload.len - share_pos < 4) return null;
+                const group = std.mem.readInt(u16, payload[share_pos..][0..2], .big);
+                const key_len: usize = std.mem.readInt(u16, payload[share_pos + 2 ..][0..2], .big);
+                share_pos += 4;
+                if (key_len == 0 or key_len > payload.len - share_pos) return null;
+                if (group == pq_named_group) {
+                    if (key_len != pq_client_key_share_len or offers_pq_key_share) return null;
+                    offers_pq_key_share = true;
+                } else if (group == 0x001d and key_len != 32) {
+                    return null;
+                }
+                share_pos += key_len;
+            }
+        }
+        ext_pos += ext_len;
+    }
+
+    return .{
+        .digest = digest,
+        .session_id = session_id,
+        .sni = sni,
+        .first_tls13_cipher = first_tls13_cipher,
+        .offers_pq_key_share = offers_pq_key_share,
+    };
+}
+
 // ============= Public Functions =============
 
 /// Validate a TLS ClientHello against user secrets.
@@ -41,20 +169,10 @@ pub fn validateTlsHandshake(
 ) !?TlsValidation {
     _ = allocator;
 
-    const min_len = constants.tls_digest_pos + constants.tls_digest_len + 1;
-    if (handshake.len < min_len) return null;
-
-    // Extract digest
-    const digest: [constants.tls_digest_len]u8 = handshake[constants.tls_digest_pos..][0..constants.tls_digest_len].*;
-
-    // Extract session ID
-    const session_id_len_pos = constants.tls_digest_pos + constants.tls_digest_len;
-    if (session_id_len_pos >= handshake.len) return null;
-    const session_id_len: usize = handshake[session_id_len_pos];
-    if (session_id_len != 32) return null;
-
-    const session_id_start = session_id_len_pos + 1;
-    if (handshake.len < session_id_start + session_id_len) return null;
+    const parsed = parseClientHello(handshake) orelse return null;
+    if (parsed.digest.ptr != handshake[constants.tls_digest_pos..].ptr) return null;
+    if (parsed.session_id.len != 32) return null;
+    const digest: [constants.tls_digest_len]u8 = parsed.digest[0..constants.tls_digest_len].*;
 
     const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
     const zero_digest = [_]u8{0} ** constants.tls_digest_len;
@@ -66,10 +184,12 @@ pub fn validateTlsHandshake(
 
     for (secrets) |entry| {
         var hmac = HmacSha256.init(&entry.secret);
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&hmac));
         hmac.update(handshake[0..constants.tls_digest_pos]);
         hmac.update(zero_digest[0..]);
         hmac.update(handshake[constants.tls_digest_pos + constants.tls_digest_len ..]);
         var computed: [constants.tls_digest_len]u8 = undefined;
+        defer std.crypto.secureZero(u8, &computed);
         hmac.final(&computed);
 
         // Constant-time comparison of first 28 bytes using stdlib
@@ -92,7 +212,7 @@ pub fn validateTlsHandshake(
 
         return .{
             .user = entry.name,
-            .session_id = handshake[session_id_start..][0..32].*,
+            .session_id = parsed.session_id[0..32].*,
             .digest = digest,
             .canonical_hmac = computed,
             .timestamp = timestamp,
@@ -163,6 +283,7 @@ pub fn buildServerHelloWithTemplateCipher(
     const response = try allocator.alloc(u8, template.len);
     errdefer allocator.free(response);
     @memcpy(response, template);
+    @memset(response[tmpl_random_offset..][0..32], 0);
 
     // 1b. Echo a client-offered TLS 1.3 cipher when known. Real servers negotiate
     // one of the offered suites; a hard-coded suite is a passive ServerHello tell.
@@ -183,13 +304,15 @@ pub fn buildServerHelloWithTemplateCipher(
     // ciphertext across connections is a fingerprint.
     crypto.randomBytes(response[server_hello_prefix_len..][0..cert_payload_size]);
 
-    // 4. Compute HMAC over full response with random field zeroed.
-    //    Template already has zeros at offset 11..43, so HMAC input is correct.
+    // 4. Compute HMAC over the full response with the random field explicitly
+    // zeroed. Correctness does not depend on caller-provided template contents.
     const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
     var hmac = HmacSha256.init(secret);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&hmac));
     hmac.update(client_digest[0..]);
     hmac.update(response);
     var response_digest: [32]u8 = undefined;
+    defer std.crypto.secureZero(u8, &response_digest);
     hmac.final(&response_digest);
 
     // 5. Insert HMAC digest into Server Random field
@@ -228,71 +351,7 @@ const pq_appdata_offset: usize = pq_server_hello_record_len + 6 + 5;
 
 /// Return true when the ClientHello carries a key_share entry for X25519MLKEM768.
 pub fn clientOffersPqKeyShare(handshake: []const u8) bool {
-    if (handshake.len < 9 or handshake[0] != constants.tls_record_handshake) return false;
-    const record_len: usize = std.mem.readInt(u16, handshake[3..5], .big);
-    if (record_len != handshake.len - 5) return false;
-    const hello_len: usize = std.mem.readInt(u24, handshake[6..9], .big);
-    if (hello_len != record_len - 4) return false;
-
-    const hello_end = handshake.len;
-    var pos: usize = 5;
-    if (handshake[pos] != 0x01) return false;
-    pos += 4; // handshake type + 3-byte length
-    if (pos + 2 + 32 > hello_end) return false;
-    pos += 2 + 32; // legacy_version + random
-    if (pos + 1 > hello_end) return false;
-    const sid_len: usize = handshake[pos];
-    pos += 1;
-    if (pos + sid_len > hello_end) return false;
-    pos += sid_len;
-    if (pos + 2 > hello_end) return false;
-    const cs_len: usize = std.mem.readInt(u16, handshake[pos..][0..2], .big);
-    pos += 2;
-    if (cs_len < 2 or cs_len % 2 != 0 or pos + cs_len > hello_end) return false;
-    pos += cs_len;
-    if (pos + 1 > hello_end) return false;
-    const comp_len: usize = handshake[pos];
-    pos += 1;
-    if (comp_len == 0 or pos + comp_len > hello_end) return false;
-    pos += comp_len;
-    if (pos + 2 > hello_end) return false;
-    const ext_total: usize = std.mem.readInt(u16, handshake[pos..][0..2], .big);
-    pos += 2;
-    if (pos + ext_total != hello_end) return false;
-    const ext_end = hello_end;
-    var found_pq = false;
-
-    while (pos < ext_end) {
-        if (pos + 4 > ext_end) return false;
-        const etype = std.mem.readInt(u16, handshake[pos..][0..2], .big);
-        const elen: usize = std.mem.readInt(u16, handshake[pos + 2 ..][0..2], .big);
-        pos += 4;
-        if (pos + elen > ext_end) return false;
-        if (etype == 0x0033) {
-            if (elen < 2) return false;
-            const list_len: usize = std.mem.readInt(u16, handshake[pos..][0..2], .big);
-            if (list_len != elen - 2) return false;
-            var kp: usize = pos + 2;
-            const ks_end = pos + elen;
-            while (kp < ks_end) {
-                if (kp + 4 > ks_end) return false;
-                const group = std.mem.readInt(u16, handshake[kp..][0..2], .big);
-                const key_len: usize = std.mem.readInt(u16, handshake[kp + 2 ..][0..2], .big);
-                kp += 4;
-                if (key_len == 0 or kp + key_len > ks_end) return false;
-                if (group == pq_named_group) {
-                    if (key_len != pq_client_key_share_len or found_pq) return false;
-                    found_pq = true;
-                } else if (group == 0x001d and key_len != 32) {
-                    return false;
-                }
-                kp += key_len;
-            }
-        }
-        pos += elen;
-    }
-
-    return found_pq;
+    return (parseClientHello(handshake) orelse return false).offers_pq_key_share;
 }
 
 /// Build a ServerHello that answers an X25519MLKEM768-offering client with a
@@ -365,9 +424,11 @@ pub fn buildServerHelloPq(
 
     const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
     var hmac = HmacSha256.init(secret);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&hmac));
     hmac.update(client_digest[0..]);
     hmac.update(response);
     var response_digest: [32]u8 = undefined;
+    defer std.crypto.secureZero(u8, &response_digest);
     hmac.final(&response_digest);
     @memcpy(response[tmpl_random_offset..][0..32], &response_digest);
 
@@ -397,7 +458,7 @@ const tmpl_x25519_key_offset: usize = 95;
 fn randomX25519PublicKey() ![32]u8 {
     var secret_key: [32]u8 = undefined;
     crypto.randomBytes(&secret_key);
-    defer @memset(secret_key[0..], 0);
+    defer std.crypto.secureZero(u8, &secret_key);
     return std.crypto.dh.X25519.recoverPublicKey(secret_key);
 }
 
@@ -619,93 +680,40 @@ pub fn isTlsHandshake(first_bytes: []const u8) bool {
 
 /// Extract SNI from a TLS ClientHello.
 pub fn extractSni(handshake: []const u8) ?[]const u8 {
-    if (handshake.len < 43 or handshake[0] != constants.tls_record_handshake) return null;
-
-    const record_len = std.mem.readInt(u16, handshake[3..5], .big);
-    if (handshake.len < @as(usize, 5) + record_len) return null;
-
-    var pos: usize = 5;
-    if (pos >= handshake.len or handshake[pos] != 0x01) return null; // not ClientHello
-
-    pos += 4; // type + 3-byte length
-    pos += 2 + 32; // version + random
-
-    if (pos + 1 > handshake.len) return null;
-    const session_id_len: usize = handshake[pos];
-    pos += 1 + session_id_len;
-
-    if (pos + 2 > handshake.len) return null;
-    const cipher_suites_len = std.mem.readInt(u16, handshake[pos..][0..2], .big);
-    pos += 2 + cipher_suites_len;
-
-    if (pos + 1 > handshake.len) return null;
-    const comp_len: usize = handshake[pos];
-    pos += 1 + comp_len;
-
-    if (pos + 2 > handshake.len) return null;
-    const ext_total_len = std.mem.readInt(u16, handshake[pos..][0..2], .big);
-    pos += 2;
-    const ext_end = pos + ext_total_len;
-    if (ext_end > handshake.len) return null;
-
-    // Walk extensions
-    while (pos + 4 <= ext_end) {
-        const etype = std.mem.readInt(u16, handshake[pos..][0..2], .big);
-        const elen = std.mem.readInt(u16, handshake[pos + 2 ..][0..2], .big);
-        pos += 4;
-        if (pos + elen > ext_end) break;
-
-        if (etype == 0x0000 and elen >= 5) {
-            // server_name extension
-            var sn_pos = pos + 2; // skip list_len
-            const sn_end = @min(pos + elen, ext_end);
-            while (sn_pos + 3 <= sn_end) {
-                const name_type = handshake[sn_pos];
-                const name_len = std.mem.readInt(u16, handshake[sn_pos + 1 ..][0..2], .big);
-                sn_pos += 3;
-                if (sn_pos + name_len > sn_end) break;
-                if (name_type == 0 and name_len > 0) {
-                    return handshake[sn_pos .. sn_pos + name_len];
-                }
-                sn_pos += name_len;
-            }
-        }
-        pos += elen;
-    }
-
-    return null;
+    return (parseClientHello(handshake) orelse return null).sni;
 }
 
 /// Return the first non-GREASE TLS 1.3 cipher suite offered by the client.
 /// Used to make the synthetic ServerHello track the ClientHello like a real server.
 pub fn extractFirstTls13Cipher(handshake: []const u8) ?u16 {
-    if (handshake.len < 43 or handshake[0] != constants.tls_record_handshake) return null;
-
-    var pos: usize = 5;
-    if (pos >= handshake.len or handshake[pos] != 0x01) return null;
-    pos += 4; // handshake type + 3-byte length
-    pos += 2 + 32; // legacy_version + random
-
-    if (pos + 1 > handshake.len) return null;
-    const session_id_len: usize = handshake[pos];
-    pos += 1 + session_id_len;
-
-    if (pos + 2 > handshake.len) return null;
-    const cipher_suites_len = std.mem.readInt(u16, handshake[pos..][0..2], .big);
-    pos += 2;
-    if (cipher_suites_len % 2 != 0 or pos + cipher_suites_len > handshake.len) return null;
-
-    var i: usize = 0;
-    while (i + 2 <= cipher_suites_len) : (i += 2) {
-        const suite = std.mem.readInt(u16, handshake[pos + i ..][0..2], .big);
-        if ((suite & 0x0f0f) == 0x0a0a) continue;
-        if (suite == 0x1301 or suite == 0x1302 or suite == 0x1303) return suite;
-    }
-
-    return null;
+    return (parseClientHello(handshake) orelse return null).first_tls13_cipher;
 }
 
 // ============= Tests =============
+
+fn buildTestClientHello(comptime session_id_len: usize, session_fill: u8) [52 + session_id_len]u8 {
+    var hello = [_]u8{0} ** (52 + session_id_len);
+    hello[0] = constants.tls_record_handshake;
+    hello[1] = 0x03;
+    hello[2] = 0x01;
+    std.mem.writeInt(u16, hello[3..5], @intCast(hello.len - 5), .big);
+    hello[5] = 0x01;
+    std.mem.writeInt(u24, hello[6..9], @intCast(hello.len - 9), .big);
+    hello[9] = 0x03;
+    hello[10] = 0x03;
+    hello[43] = @intCast(session_id_len);
+    @memset(hello[44..][0..session_id_len], session_fill);
+    var pos: usize = 44 + session_id_len;
+    std.mem.writeInt(u16, hello[pos..][0..2], 2, .big);
+    pos += 2;
+    std.mem.writeInt(u16, hello[pos..][0..2], 0x1301, .big);
+    pos += 2;
+    hello[pos] = 1;
+    hello[pos + 1] = 0;
+    pos += 2;
+    std.mem.writeInt(u16, hello[pos..][0..2], 0, .big);
+    return hello;
+}
 
 test "isTlsHandshake" {
     try std.testing.expect(isTlsHandshake(&[_]u8{ 0x16, 0x03, 0x01 }));
@@ -867,16 +875,13 @@ test "validateTlsHandshake - valid handshake" {
     };
 
     // Client hello mock with 32-byte session_id, matching the ServerHello template contract.
-    var handshake = [_]u8{0x00} ** 96;
+    var handshake = buildTestClientHello(32, 0xaa);
     // Set timestamp (say 123456789 = 0x075BCD15)
     // Wait, the client sends digest WITH timestamp XOR'd in the last 4 bytes.
     // If ignore_time_skew = true, the proxy doesn't care what timestamp is.
     // Proxy calculates HMAC on handshake with zeroed digest, then expects it to match (up to 28 bytes) the given digest.
 
-    var hmac_input = std.mem.zeroes([96]u8);
-    // Add session id len
-    hmac_input[43] = 32;
-    @memset(hmac_input[44..76], 0xaa);
+    const hmac_input = buildTestClientHello(32, 0xaa);
 
     // Compute HMAC
     const computed_mac = crypto.sha256Hmac(&secrets[1].secret, &hmac_input);
@@ -919,17 +924,43 @@ test "extractSni - malformed returns null" {
     try std.testing.expect(extractSni(&[_]u8{ 0x17, 0x03, 0x01, 0x00, 0x00 }) == null);
 }
 
+test "all ClientHello readers share strict record framing" {
+    const domain = "example.com";
+    var ch = [_]u8{0} ** 72;
+    const base = buildTestClientHello(0, 0);
+    @memcpy(ch[0..50], base[0..50]);
+    std.mem.writeInt(u16, ch[3..5], @intCast(ch.len - 5), .big);
+    std.mem.writeInt(u24, ch[6..9], @intCast(ch.len - 9), .big);
+    std.mem.writeInt(u16, ch[50..52], 20, .big);
+    std.mem.writeInt(u16, ch[52..54], 0x0000, .big);
+    std.mem.writeInt(u16, ch[54..56], 16, .big);
+    std.mem.writeInt(u16, ch[56..58], 14, .big);
+    ch[58] = 0;
+    std.mem.writeInt(u16, ch[59..61], @intCast(domain.len), .big);
+    @memcpy(ch[61..72], domain);
+
+    try std.testing.expectEqualStrings(domain, extractSni(&ch).?);
+    try std.testing.expectEqual(@as(?u16, 0x1301), extractFirstTls13Cipher(&ch));
+    try std.testing.expect(!clientOffersPqKeyShare(&ch));
+
+    // A truncated nested extension is rejected consistently by every reader.
+    std.mem.writeInt(u16, ch[54..56], 17, .big);
+    try std.testing.expect(extractSni(&ch) == null);
+    try std.testing.expect(extractFirstTls13Cipher(&ch) == null);
+    try std.testing.expect(!clientOffersPqKeyShare(&ch));
+}
+
 test "extractFirstTls13Cipher returns first non-GREASE TLS1.3 suite" {
-    var ch: [52]u8 = undefined;
+    var ch: [56]u8 = undefined;
     ch[0] = constants.tls_record_handshake;
     ch[1] = 0x03;
     ch[2] = 0x01;
     ch[3] = 0x00;
-    ch[4] = 0x2f;
+    ch[4] = 0x33;
     ch[5] = 0x01;
     ch[6] = 0x00;
     ch[7] = 0x00;
-    ch[8] = 0x2b;
+    ch[8] = 0x2f;
     ch[9] = 0x03;
     ch[10] = 0x03;
     @memset(ch[11..43], 0xAB);
@@ -942,6 +973,10 @@ test "extractFirstTls13Cipher returns first non-GREASE TLS1.3 suite" {
     ch[49] = 0x03;
     ch[50] = 0x13;
     ch[51] = 0x01;
+    ch[52] = 0x01;
+    ch[53] = 0x00;
+    ch[54] = 0x00;
+    ch[55] = 0x00;
 
     try std.testing.expectEqual(@as(?u16, 0x1303), extractFirstTls13Cipher(&ch));
     try std.testing.expect(extractFirstTls13Cipher(ch[0..40]) == null);
@@ -1065,11 +1100,9 @@ test "validateTlsHandshake returns canonical_hmac" {
     const allocator = std.testing.allocator;
 
     var secrets = [_]UserSecret{.{ .name = "alice", .secret = [_]u8{0x1A} ** 16 }};
-    var handshake = [_]u8{0x00} ** 96;
+    var handshake = buildTestClientHello(32, 0xaa);
 
-    var hmac_input = std.mem.zeroes([96]u8);
-    hmac_input[43] = 32;
-    @memset(hmac_input[44..76], 0xaa);
+    const hmac_input = buildTestClientHello(32, 0xaa);
 
     const computed_mac = crypto.sha256Hmac(&secrets[0].secret, &hmac_input);
     @memcpy(&handshake, &hmac_input);
@@ -1091,10 +1124,8 @@ test "validateTlsHandshake rejects non-32 session id" {
     const allocator = std.testing.allocator;
 
     var secrets = [_]UserSecret{.{ .name = "alice", .secret = [_]u8{0x1A} ** 16 }};
-    var handshake = [_]u8{0x00} ** 64;
-    var hmac_input = std.mem.zeroes([64]u8);
-    hmac_input[43] = 4;
-    hmac_input[44] = 0xaa;
+    var handshake = buildTestClientHello(4, 0xaa);
+    const hmac_input = buildTestClientHello(4, 0xaa);
 
     const computed_mac = crypto.sha256Hmac(&secrets[0].secret, &hmac_input);
     @memcpy(&handshake, &hmac_input);

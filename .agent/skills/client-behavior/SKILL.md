@@ -19,7 +19,7 @@ Current proxy runtime is a Linux single-thread `epoll` event loop with timer-dri
 
 Current FakeTLS and MTProto handshake assumptions:
 
-- ClientHello Session ID must be exactly 32 bytes; the proxy echoes it in the synthetic ServerHello.
+- ClientHello Session ID must be exactly 32 bytes; the proxy echoes it in the synthetic ServerHello. All ClientHello consumers share the same strict record/handshake/extension framing parser.
 - The 64-byte MTProto obfuscation nonce may be split across TLS appdata records.
 - Extra client appdata bytes after that 64-byte nonce may arrive in the same TLS record; the proxy buffers them and forwards them after upstream setup.
 
@@ -87,7 +87,7 @@ Proxy implications:
 
 - Expect parallel connection attempts and frequent connect churn.
 - Keep accept/close path cheap and non-blocking.
-- Subnet rate limiting groups IPv4-mapped IPv6 with native IPv4 `/24`; account for that when testing Android address-family races.
+- Subnet rate limiting groups IPv4-mapped IPv6 with native IPv4 `/24`; native IPv6 retains the complete `/48` prefix without a lossy 32-bit fold. Account for that when testing Android address-family races.
 
 ## Desktop (Telegram Desktop)
 

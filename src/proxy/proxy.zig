@@ -228,11 +228,13 @@ const SubnetRateLimit = struct {
     const MAX_PROBES = 8;
     const stale_after_s: i64 = 60;
 
+    // Keep naturally aligned fields first: EventLoop embeds this fixed table,
+    // so padding multiplied by BUCKETS directly increases its stack frame.
     const Entry = struct {
-        used: bool = false,
-        subnet_key: u32 = 0,
-        tokens: u8 = 0,
+        subnet_key: u64 = 0,
         last_refill_s: i64 = 0,
+        used: bool = false,
+        tokens: u8 = 0,
     };
 
     hash_seed: u64 = 0,
@@ -244,8 +246,8 @@ const SubnetRateLimit = struct {
         };
     }
 
-    fn indexFor(self: *const SubnetRateLimit, key: u32) usize {
-        var x = self.hash_seed ^ @as(u64, key);
+    fn indexFor(self: *const SubnetRateLimit, key: u64) usize {
+        var x = self.hash_seed ^ key;
         x +%= 0x9E3779B97F4A7C15;
         x ^= x >> 30;
         x *%= 0xBF58476D1CE4E5B9;
@@ -255,7 +257,7 @@ const SubnetRateLimit = struct {
         return @as(usize, @intCast(x & (BUCKETS - 1)));
     }
 
-    fn findEntry(self: *SubnetRateLimit, key: u32) ?*Entry {
+    fn findEntry(self: *SubnetRateLimit, key: u64) ?*Entry {
         const start = self.indexFor(key);
         var probe: usize = 0;
         while (probe < MAX_PROBES) : (probe += 1) {
@@ -317,22 +319,29 @@ const SubnetRateLimit = struct {
         return false;
     }
 
-    fn subnetKey(addr: net.Address) u32 {
+    fn subnetKey(addr: net.Address) u64 {
         if (addr.any.family == posix.AF.INET) {
             // /24 subnet: mask off last octet
             const ip_bytes = std.mem.asBytes(&addr.in.sa.addr);
-            return @as(u32, ip_bytes[0]) << 16 | @as(u32, ip_bytes[1]) << 8 | @as(u32, ip_bytes[2]);
+            return @as(u64, ip_bytes[0]) << 16 | @as(u64, ip_bytes[1]) << 8 | @as(u64, ip_bytes[2]);
         } else if (addr.any.family == posix.AF.INET6) {
             const ip6 = &addr.in6.sa.addr;
 
             const is_ipv4_mapped = std.mem.eql(u8, ip6[0..10], &[_]u8{0} ** 10) and
                 ip6[10] == 0xff and ip6[11] == 0xff;
             if (is_ipv4_mapped) {
-                return @as(u32, ip6[12]) << 16 | @as(u32, ip6[13]) << 8 | @as(u32, ip6[14]);
+                return @as(u64, ip6[12]) << 16 | @as(u64, ip6[13]) << 8 | @as(u64, ip6[14]);
             }
 
-            // /48 subnet: first 6 bytes hashed to u32
-            return @as(u32, ip6[0]) << 24 | @as(u32, ip6[1]) << 16 | @as(u32, ip6[2]) << 8 | @as(u32, ip6[3]) ^ (@as(u32, ip6[4]) << 8 | @as(u32, ip6[5]));
+            // Preserve all /48 bits and reserve the high bit as an IPv6 namespace
+            // marker so unrelated prefixes cannot collide before table hashing.
+            return @as(u64, 1) << 63 |
+                @as(u64, ip6[0]) << 40 |
+                @as(u64, ip6[1]) << 32 |
+                @as(u64, ip6[2]) << 24 |
+                @as(u64, ip6[3]) << 16 |
+                @as(u64, ip6[4]) << 8 |
+                @as(u64, ip6[5]);
         }
         return 0;
     }
@@ -485,7 +494,10 @@ const MessageQueue = struct {
             var blk = try self.acquireBlock(class);
             blk.len = take;
             @memcpy(blockStorage(blk)[0..take], data[off .. off + take]);
-            try self.blocks.append(self.allocator, blk);
+            self.blocks.append(self.allocator, blk) catch |err| {
+                self.recycleBlock(blk) catch self.destroyBlock(blk);
+                return err;
+            };
             self.total_len += take;
             off += take;
         }
@@ -588,6 +600,7 @@ const MessageQueue = struct {
     }
 
     fn recycleBlock(self: *MessageQueue, blk: *MsgBlock) !void {
+        std.crypto.secureZero(u8, blockStorage(blk));
         blk.len = 0;
         const list = switch (blk.class) {
             .tiny => &self.tiny_free,
@@ -610,6 +623,7 @@ const MessageQueue = struct {
     }
 
     fn destroyBlock(self: *MessageQueue, blk: *MsgBlock) void {
+        std.crypto.secureZero(u8, blockStorage(blk));
         switch (blk.class) {
             .tiny => {
                 const tiny: *TinyMsgBlock = @fieldParentPtr("header", blk);
@@ -750,9 +764,9 @@ const DynamicRecordSizer = struct {
     }
 
     fn recordSent(self: *DynamicRecordSizer, payload_len: usize) void {
-        if (!self.enabled) return;
-        self.records_sent += 1;
-        self.bytes_sent += @as(u64, @intCast(payload_len));
+        if (!self.enabled or self.current_size == full_size) return;
+        self.records_sent +|= 1;
+        self.bytes_sent +|= @as(u64, @intCast(payload_len));
         if (self.current_size == initial_size and
             (self.records_sent >= ramp_record_threshold or self.bytes_sent >= ramp_byte_threshold))
         {
@@ -803,9 +817,6 @@ const ReplayCache = struct {
         const start = self.indexFor(key);
 
         var first_stale_idx: ?usize = null;
-        var oldest_idx: usize = start;
-        var oldest_ts: i64 = std.math.maxInt(i64);
-
         var probe: usize = 0;
         while (probe < MAX_PROBES) : (probe += 1) {
             const idx = (start + probe) & (BUCKETS - 1);
@@ -824,13 +835,9 @@ const ReplayCache = struct {
             if (now_s - e.last_seen_s > stale_after_s and first_stale_idx == null) {
                 first_stale_idx = idx;
             }
-            if (e.last_seen_s < oldest_ts) {
-                oldest_ts = e.last_seen_s;
-                oldest_idx = idx;
-            }
         }
 
-        const victim_idx = first_stale_idx orelse oldest_idx;
+        const victim_idx = first_stale_idx orelse return true;
         self.entries[victim_idx] = .{ .used = true, .key = key, .digest = digest.*, .last_seen_s = now_s };
         return false;
     }
@@ -844,10 +851,11 @@ const SubnetHandshakeLimit = struct {
     const BUCKETS = 16384;
     const MAX_PROBES = 8;
 
+    // Field order is intentional for the same fixed-table layout reason above.
     const Entry = struct {
-        used: bool = false,
-        subnet_key: u32 = 0,
+        subnet_key: u64 = 0,
         inflight: u16 = 0,
+        used: bool = false,
     };
 
     hash_seed: u64 = 0,
@@ -857,8 +865,8 @@ const SubnetHandshakeLimit = struct {
         return .{ .hash_seed = crypto.randomInt(u64) };
     }
 
-    fn indexFor(self: *const SubnetHandshakeLimit, key: u32) usize {
-        var x = self.hash_seed ^ @as(u64, key);
+    fn indexFor(self: *const SubnetHandshakeLimit, key: u64) usize {
+        var x = self.hash_seed ^ key;
         x +%= 0x9E3779B97F4A7C15;
         x ^= x >> 30;
         x *%= 0xBF58476D1CE4E5B9;
@@ -868,7 +876,7 @@ const SubnetHandshakeLimit = struct {
         return @as(usize, @intCast(x & (BUCKETS - 1)));
     }
 
-    fn reserve(self: *SubnetHandshakeLimit, key: u32, limit: u16) bool {
+    fn reserve(self: *SubnetHandshakeLimit, key: u64, limit: u16) bool {
         const start = self.indexFor(key);
         var free_idx: ?usize = null;
         var probe: usize = 0;
@@ -888,7 +896,7 @@ const SubnetHandshakeLimit = struct {
         return true;
     }
 
-    fn release(self: *SubnetHandshakeLimit, key: u32) void {
+    fn release(self: *SubnetHandshakeLimit, key: u64) void {
         const start = self.indexFor(key);
         var probe: usize = 0;
         while (probe < MAX_PROBES) : (probe += 1) {
@@ -928,7 +936,7 @@ const ConnectionSlot = struct {
     /// Set after the first client byte reserves a handshake-budget slot.
     /// Silent pre-warmed TCP sessions deliberately do not consume this budget.
     hs_counted: bool = false,
-    subnet_key: u32 = 0,
+    subnet_key: u64 = 0,
     subnet_hs_counted: bool = false,
 
     created_at_ms: i64 = 0,
@@ -1084,17 +1092,17 @@ const ConnectionSlot = struct {
 
         self.releaseClientHello(allocator);
 
-        if (self.server_hello) |buf| allocator.free(buf);
+        if (self.server_hello) |buf| secureFree(allocator, buf);
         self.server_hello = null;
 
-        if (self.pipelined_data) |buf| allocator.free(buf);
+        if (self.pipelined_data) |buf| secureFree(allocator, buf);
         self.pipelined_data = null;
         self.pipelined_len = 0;
 
-        if (self.mask_prebuffer) |buf| allocator.free(buf);
+        if (self.mask_prebuffer) |buf| secureFree(allocator, buf);
         self.mask_prebuffer = null;
 
-        if (self.dc_initial_tail) |buf| allocator.free(buf);
+        if (self.dc_initial_tail) |buf| secureFree(allocator, buf);
         self.dc_initial_tail = null;
 
         if (self.middle_ctx) |*mp| mp.deinit();
@@ -1111,10 +1119,10 @@ const ConnectionSlot = struct {
         self.dc_abs = 0;
         self.is_media_path = false;
 
-        if (self.read_buf) |buf| allocator.free(buf);
+        if (self.read_buf) |buf| secureFree(allocator, buf);
         self.read_buf = null;
 
-        if (self.mp_frame_buf) |buf| allocator.free(buf);
+        if (self.mp_frame_buf) |buf| secureFree(allocator, buf);
         self.mp_frame_buf = null;
 
         if (self.obf_params) |*params| params.wipe();
@@ -1133,18 +1141,29 @@ const ConnectionSlot = struct {
         self.tg_decryptor = null;
         self.mp_enc = null;
         self.mp_dec = null;
-        @memset(self.mp_secret[0..], 0);
+        std.crypto.secureZero(u8, &self.validation_secret);
+        std.crypto.secureZero(u8, &self.validation_digest);
+        std.crypto.secureZero(u8, &self.validation_session_id);
+        std.crypto.secureZero(u8, &self.validation_user);
+        std.crypto.secureZero(u8, &self.handshake_buf);
+        std.crypto.secureZero(u8, &self.mp_nonce);
+        std.crypto.secureZero(u8, &self.mp_rpc_nonce_ans);
+        std.crypto.secureZero(u8, &self.mp_secret);
+        self.validation_session_id_len = 0;
+        self.validation_user_len = 0;
+        self.validation_force_direct = false;
+        self.handshake_pos = 0;
+        self.mp_timestamp = 0;
         self.mp_secret_len = 0;
         self.mp_nat_ip4 = null;
     }
 
     fn releaseClientHello(self: *ConnectionSlot, allocator: std.mem.Allocator) void {
         if (self.client_hello_heap) |buf| {
-            @memset(buf, 0);
-            allocator.free(buf);
+            secureFree(allocator, buf);
             self.client_hello_heap = null;
         } else if (self.client_hello_len > 0) {
-            @memset(self.client_hello_inline[0..self.client_hello_len], 0);
+            std.crypto.secureZero(u8, self.client_hello_inline[0..self.client_hello_len]);
         }
         self.client_hello_len = 0;
     }
@@ -1257,9 +1276,14 @@ const ConnectionPool = struct {
     }
 };
 
+fn secureFree(allocator: std.mem.Allocator, buf: []u8) void {
+    std.crypto.secureZero(u8, buf);
+    allocator.free(buf);
+}
+
 fn freeUserSecrets(allocator: std.mem.Allocator, secrets: []obfuscation.UserSecret) void {
     for (secrets) |*secret| {
-        @memset(secret.secret[0..], 0);
+        std.crypto.secureZero(u8, &secret.secret);
         allocator.free(secret.name);
     }
     allocator.free(secrets);
@@ -1311,7 +1335,10 @@ pub const ProxyState = struct {
     pub fn init(allocator: std.mem.Allocator, cfg: Config) !ProxyState {
         var secrets: std.ArrayList(obfuscation.UserSecret) = .empty;
         errdefer {
-            for (secrets.items) |secret| allocator.free(secret.name);
+            for (secrets.items) |*secret| {
+                std.crypto.secureZero(u8, &secret.secret);
+                allocator.free(secret.name);
+            }
             secrets.deinit(allocator);
         }
         var users = cfg.users;
@@ -1432,7 +1459,7 @@ pub const ProxyState = struct {
     pub fn deinit(self: *ProxyState) void {
         self.stopMiddleProxyUpdater();
         self.middle_proxy_lock.lock();
-        @memset(self.middle_proxy_secret[0..], 0);
+        std.crypto.secureZero(u8, &self.middle_proxy_secret);
         self.middle_proxy_secret_len = 0;
         self.middle_proxy_lock.unlock();
         self.allocator.free(self.tls_server_hello_template);
@@ -1490,6 +1517,13 @@ pub const ProxyState = struct {
             const needed_fds = requiredFdsForConnections(configured_max);
             if (soft < needed_fds) {
                 const clamped = maxConnectionsForNofile(soft);
+                if (clamped == 0) {
+                    log.err("RLIMIT_NOFILE soft={d} cannot support the minimum 32 connections (need at least {d})", .{
+                        soft,
+                        requiredFdsForConnections(32),
+                    });
+                    return error.InsufficientFileDescriptorLimit;
+                }
                 if (clamped < configured_max) {
                     self.config.max_connections = clamped;
                     log.warn("max_connections clamped from {d} to {d} due to RLIMIT_NOFILE soft={d}", .{
@@ -1504,8 +1538,11 @@ pub const ProxyState = struct {
         const effective_needed_fds = requiredFdsForConnections(self.config.max_connections);
         checkNofileLimit(@max(effective_needed_fds, min_nofile_soft), self.config.max_connections);
 
-        var loop = try EventLoop.init(self, server.stream.handle);
-        defer loop.deinit();
+        const loop = try EventLoop.init(self, server.stream.handle);
+        defer {
+            loop.deinit();
+            self.allocator.destroy(loop);
+        }
         try loop.run();
     }
 
@@ -1769,7 +1806,7 @@ pub const ProxyState = struct {
     fn refreshMiddleProxyInfo(self: *ProxyState) !void {
         if (self.middle_proxy_updater_stop.load(.acquire)) return error.UpdateCancelled;
         const cfg_bytes = try self.fetchMiddleProxyMetadata("getProxyConfig", middle_proxy_config_url);
-        defer self.allocator.free(cfg_bytes);
+        defer secureFree(self.allocator, cfg_bytes);
 
         var next_primary: [5]?net.Address = [_]?net.Address{null} ** 5;
         var next_media_primary: [5]?net.Address = [_]?net.Address{null} ** 5;
@@ -1823,7 +1860,7 @@ pub const ProxyState = struct {
 
         if (self.middle_proxy_updater_stop.load(.acquire)) return error.UpdateCancelled;
         const next_secret = try self.fetchMiddleProxyMetadata("getProxySecret", middle_proxy_secret_url);
-        defer self.allocator.free(next_secret);
+        defer secureFree(self.allocator, next_secret);
 
         if (next_secret.len < 16 or next_secret.len > self.middle_proxy_secret.len) {
             return error.BadMiddleProxySecret;
@@ -1893,7 +1930,7 @@ pub const ProxyState = struct {
             if (self.middle_proxy_secret_len != next_secret.len or
                 !std.mem.eql(u8, self.middle_proxy_secret[0..self.middle_proxy_secret_len], next_secret))
             {
-                @memset(self.middle_proxy_secret[0..], 0);
+                std.crypto.secureZero(u8, &self.middle_proxy_secret);
                 @memcpy(self.middle_proxy_secret[0..next_secret.len], next_secret);
                 self.middle_proxy_secret_len = next_secret.len;
                 changed = true;
@@ -1945,35 +1982,38 @@ const EventLoop = struct {
     mp_s2c_scratch: ?[]u8,
     pending_close_fds: std.ArrayList(posix.fd_t),
 
-    fn init(state: *ProxyState, listen_fd: posix.fd_t) !EventLoop {
+    fn init(state: *ProxyState, listen_fd: posix.fd_t) !*EventLoop {
         const epoll_fd = try epollCreate();
         errdefer closeFd(epoll_fd);
 
-        var loop = EventLoop{
-            .state = state,
-            .epoll_fd = epoll_fd,
-            .listen_fd = listen_fd,
-            .pool = try ConnectionPool.init(state.allocator, state.config.max_connections),
-            .accept_paused = false,
-            .accept_resume_ns = 0,
-            .saturation_paused = false,
-            .timer_scan_cursor = 0,
-            .stats_next_log_ns = compat.monotonicNanoTimestamp() + stats_log_interval_ns,
-            .accepted_since_log = 0,
-            .closed_since_log = 0,
-            .subnet_limiter = SubnetRateLimit.init(),
-            .subnet_handshakes = SubnetHandshakeLimit.init(),
-            .prev_dropped_cap = 0,
-            .prev_dropped_saturation = 0,
-            .prev_dropped_rate_limit = 0,
-            .prev_dropped_hs_budget = 0,
-            .prev_hs_timeout = 0,
-            .prev_mp_fallback = 0,
-            .mp_c2s_scratch = null,
-            .mp_s2c_scratch = null,
-            .pending_close_fds = .empty,
-        };
+        const loop = try state.allocator.create(EventLoop);
+        errdefer state.allocator.destroy(loop);
+
+        loop.state = state;
+        loop.epoll_fd = epoll_fd;
+        loop.listen_fd = listen_fd;
+        loop.pool = try ConnectionPool.init(state.allocator, state.config.max_connections);
         errdefer loop.pool.deinit();
+        loop.accept_paused = false;
+        loop.accept_resume_ns = 0;
+        loop.saturation_paused = false;
+        loop.timer_scan_cursor = 0;
+        loop.stats_next_log_ns = compat.monotonicNanoTimestamp() + stats_log_interval_ns;
+        loop.accepted_since_log = 0;
+        loop.closed_since_log = 0;
+        loop.subnet_limiter.hash_seed = crypto.randomInt(u64);
+        for (&loop.subnet_limiter.entries) |*entry| entry.* = .{};
+        loop.subnet_handshakes.hash_seed = crypto.randomInt(u64);
+        for (&loop.subnet_handshakes.entries) |*entry| entry.* = .{};
+        loop.prev_dropped_cap = 0;
+        loop.prev_dropped_saturation = 0;
+        loop.prev_dropped_rate_limit = 0;
+        loop.prev_dropped_hs_budget = 0;
+        loop.prev_hs_timeout = 0;
+        loop.prev_mp_fallback = 0;
+        loop.mp_c2s_scratch = null;
+        loop.mp_s2c_scratch = null;
+        loop.pending_close_fds = .empty;
 
         try loop.addFd(listen_fd, true, false);
         return loop;
@@ -1988,8 +2028,8 @@ const EventLoop = struct {
             }
         }
 
-        if (self.mp_c2s_scratch) |buf| self.state.allocator.free(buf);
-        if (self.mp_s2c_scratch) |buf| self.state.allocator.free(buf);
+        if (self.mp_c2s_scratch) |buf| secureFree(self.state.allocator, buf);
+        if (self.mp_s2c_scratch) |buf| secureFree(self.state.allocator, buf);
 
         self.drainPendingCloses();
         self.pending_close_fds.deinit(self.state.allocator);
@@ -2385,7 +2425,7 @@ const EventLoop = struct {
             .writing_server_hello_rest => {
                 if (!slot.hasClientPending()) {
                     if (slot.server_hello) |buf| {
-                        self.state.allocator.free(buf);
+                        secureFree(self.state.allocator, buf);
                         slot.server_hello = null;
                     }
                     slot.phase = .reading_mtproto_tls_header;
@@ -2448,7 +2488,7 @@ const EventLoop = struct {
     fn onDcNonceWritable(self: *EventLoop, slot: *ConnectionSlot) void {
         if (slot.dc_initial_tail) |tail| {
             if (queueUpstream(slot, tail)) |_| {
-                self.state.allocator.free(tail);
+                secureFree(self.state.allocator, tail);
                 slot.dc_initial_tail = null;
             } else |err| {
                 log.debug("[{d}] dc tail write error: {any}", .{ slot.conn_id, err });
@@ -2807,12 +2847,16 @@ const EventLoop = struct {
             return;
         }
         const dc_abs: usize = @intCast(dc_abs_wide);
+        if (!constants.isKnownDcV4(dc_abs)) {
+            self.closeSlot(slot, "unsupported datacenter index");
+            return;
+        }
 
         var snapshot = if (shouldUseMiddleProxySnapshot(&self.state.config, dc_abs, slot.dc_idx))
             self.state.getMiddleProxySnapshot()
         else
             null;
-        defer if (snapshot) |*snap| @memset(snap.secret[0..], 0);
+        defer if (snapshot) |*snap| std.crypto.secureZero(u8, &snap.secret);
 
         const plan = buildDcConnectPlan(&self.state.config, dc_abs, slot.dc_idx, if (snapshot) |*s| s else null, slot.validation_force_direct);
         if (plan.count == 0) {
@@ -2991,7 +3035,7 @@ const EventLoop = struct {
         if (slot.upstream_kind == .mask) {
             if (slot.mask_prebuffer) |pre| {
                 if (queueUpstream(slot, pre)) |_| {
-                    self.state.allocator.free(pre);
+                    secureFree(self.state.allocator, pre);
                     slot.mask_prebuffer = null;
                 } else |err| {
                     log.debug("[{d}] queue mask prebuffer failed: {any}", .{ slot.conn_id, err });
@@ -3154,9 +3198,11 @@ const EventLoop = struct {
         };
 
         var tg_nonce = obfuscation.generateNonce();
+        defer std.crypto.secureZero(u8, &tg_nonce);
 
         if (slot.use_fast_mode) {
             var client_s2c_key_iv: [constants.key_len + constants.iv_len]u8 = undefined;
+            defer std.crypto.secureZero(u8, &client_s2c_key_iv);
             @memcpy(client_s2c_key_iv[0..constants.key_len], &params.encrypt_key);
             std.mem.writeInt(u128, client_s2c_key_iv[constants.key_len..][0..constants.iv_len], params.encrypt_iv, .big);
             obfuscation.prepareTgNonce(&tg_nonce, params.proto_tag, &client_s2c_key_iv);
@@ -3168,22 +3214,29 @@ const EventLoop = struct {
 
         const tg_enc_key_iv = tg_nonce[constants.skip_len..][0 .. constants.key_len + constants.iv_len];
         var tg_enc_key: [constants.key_len]u8 = tg_enc_key_iv[0..constants.key_len].*;
+        defer std.crypto.secureZero(u8, &tg_enc_key);
         var tg_enc_iv_bytes: [constants.iv_len]u8 = tg_enc_key_iv[constants.key_len..][0..constants.iv_len].*;
+        defer std.crypto.secureZero(u8, &tg_enc_iv_bytes);
         const tg_enc_iv = std.mem.readInt(u128, &tg_enc_iv_bytes, .big);
 
         var tg_dec_key_iv: [constants.key_len + constants.iv_len]u8 = undefined;
+        defer std.crypto.secureZero(u8, &tg_dec_key_iv);
         for (0..tg_enc_key_iv.len) |i| {
             tg_dec_key_iv[i] = tg_enc_key_iv[tg_enc_key_iv.len - 1 - i];
         }
         var tg_dec_key: [constants.key_len]u8 = tg_dec_key_iv[0..constants.key_len].*;
+        defer std.crypto.secureZero(u8, &tg_dec_key);
         const tg_dec_iv = std.mem.readInt(u128, tg_dec_key_iv[constants.key_len..][0..constants.iv_len], .big);
 
         var tg_encryptor = crypto.AesCtr.init(&tg_enc_key, tg_enc_iv);
+        defer tg_encryptor.wipe();
         var encrypted_nonce: [constants.handshake_len]u8 = undefined;
+        defer std.crypto.secureZero(u8, &encrypted_nonce);
         @memcpy(&encrypted_nonce, &tg_nonce);
         tg_encryptor.apply(&encrypted_nonce);
 
         var nonce_to_send: [constants.handshake_len]u8 = undefined;
+        defer std.crypto.secureZero(u8, &nonce_to_send);
         @memcpy(nonce_to_send[0..constants.proto_tag_pos], tg_nonce[0..constants.proto_tag_pos]);
         @memcpy(nonce_to_send[constants.proto_tag_pos..], encrypted_nonce[constants.proto_tag_pos..]);
 
@@ -3198,10 +3251,12 @@ const EventLoop = struct {
             const dc_abs: usize = slot.dc_abs;
             if (dc_abs >= 1 and dc_abs <= constants.tg_datacenters_v4.len and dc_abs != 203) {
                 var promote_buf: [32]u8 = undefined;
+                defer std.crypto.secureZero(u8, &promote_buf);
                 var packet_len: usize = 0;
 
                 const rpc_id: u32 = 0xaeaf0c42;
                 var rpc_payload: [20]u8 = undefined;
+                defer std.crypto.secureZero(u8, &rpc_payload);
                 std.mem.writeInt(u32, rpc_payload[0..4], rpc_id, .little);
                 @memcpy(rpc_payload[4..20], &tag);
 
@@ -3231,11 +3286,6 @@ const EventLoop = struct {
         slot.tg_encryptor = tg_encryptor;
         slot.tg_decryptor = crypto.AesCtr.init(&tg_dec_key, tg_dec_iv);
         slot.phase = .writing_dc_nonce;
-
-        @memset(&tg_enc_key, 0);
-        @memset(&tg_enc_iv_bytes, 0);
-        @memset(&tg_dec_key, 0);
-        @memset(&tg_dec_key_iv, 0);
     }
 
     fn startRelay(self: *EventLoop, slot: *ConnectionSlot) void {
@@ -3285,7 +3335,7 @@ const EventLoop = struct {
             slot.c2s_bytes += data.len;
             slot.last_activity_ms = compat.monotonicMilliTimestamp();
             slot.last_client_byte_ms = slot.last_activity_ms;
-            self.state.allocator.free(buf);
+            secureFree(self.state.allocator, buf);
             slot.pipelined_data = null;
             slot.pipelined_len = 0;
         }
@@ -3459,6 +3509,8 @@ const EventLoop = struct {
 
                 var enc_keys: struct { [32]u8, [16]u8 } = undefined;
                 var dec_keys: struct { [32]u8, [16]u8 } = undefined;
+                defer std.crypto.secureZero(u8, std.mem.asBytes(&enc_keys));
+                defer std.crypto.secureZero(u8, std.mem.asBytes(&dec_keys));
                 var middle_local_addr: net.Address = undefined;
                 const mp_handshake_error: ?[]const u8 = handshake: {
                     const key_sel = slot.mp_secret[0..4];
@@ -3540,7 +3592,7 @@ const EventLoop = struct {
                         secret_slice,
                         my_ip_v6_ptr,
                         tg_ip_v6_ptr,
-                    );
+                    ) catch break :handshake "mp kdf input invalid";
 
                     dec_keys = middleproxy.getAesKeyAndIv(
                         &slot.mp_rpc_nonce_ans,
@@ -3554,7 +3606,7 @@ const EventLoop = struct {
                         secret_slice,
                         my_ip_v6_ptr,
                         tg_ip_v6_ptr,
-                    );
+                    ) catch break :handshake "mp kdf input invalid";
 
                     break :handshake null;
                 };
@@ -3690,7 +3742,7 @@ const EventLoop = struct {
         slot.direct_fallback_used = true;
         _ = self.state.stats_mp_fallback.fetchAdd(1, .monotonic);
         slot.use_middle_proxy = false;
-        @memset(slot.mp_secret[0..], 0);
+        std.crypto.secureZero(u8, &slot.mp_secret);
         slot.mp_secret_len = 0;
         slot.mp_nat_ip4 = null;
         self.setMiddleProxyStep(slot, .none);
@@ -3706,7 +3758,7 @@ const EventLoop = struct {
 
         // Reset nonce path state to cleanly re-send direct nonce.
         if (slot.dc_initial_tail) |tail| {
-            self.state.allocator.free(tail);
+            secureFree(self.state.allocator, tail);
             slot.dc_initial_tail = null;
         }
         if (slot.tg_encryptor) |*enc| enc.wipe();
@@ -4121,7 +4173,7 @@ const EventLoop = struct {
         }
 
         const next = try self.state.allocator.alloc(u8, target_capacity);
-        if (self.mp_c2s_scratch) |prev| self.state.allocator.free(prev);
+        if (self.mp_c2s_scratch) |prev| secureFree(self.state.allocator, prev);
         self.mp_c2s_scratch = next;
         return next;
     }
@@ -4133,7 +4185,7 @@ const EventLoop = struct {
         }
 
         const next = try self.state.allocator.alloc(u8, target_capacity);
-        if (self.mp_s2c_scratch) |prev| self.state.allocator.free(prev);
+        if (self.mp_s2c_scratch) |prev| secureFree(self.state.allocator, prev);
         self.mp_s2c_scratch = next;
         return next;
     }
@@ -4334,7 +4386,10 @@ const EventLoop = struct {
 
         if (buf.len < next_len) {
             const next_capacity = pipelinedCapacity(buf.len, next_len);
-            buf = try self.state.allocator.realloc(buf, next_capacity);
+            const next = try self.state.allocator.alloc(u8, next_capacity);
+            @memcpy(next[0..slot.pipelined_len], buf[0..slot.pipelined_len]);
+            secureFree(self.state.allocator, buf);
+            buf = next;
             slot.pipelined_data = buf;
         }
 
@@ -4510,11 +4565,11 @@ fn shouldAcceptListen(accept_paused: bool, saturation_paused: bool) bool {
 }
 
 fn maxConnectionsForNofile(soft_nofile: usize) u32 {
-    if (soft_nofile <= nofile_fd_overhead + 2) return 32;
+    if (soft_nofile < requiredFdsForConnections(32)) return 0;
 
     const cap = (soft_nofile - nofile_fd_overhead) / 2;
     const capped_u32: u32 = @intCast(@min(cap, @as(usize, std.math.maxInt(u32))));
-    return @max(@as(u32, 32), capped_u32);
+    return capped_u32;
 }
 
 fn getNofileSoftLimit() ?usize {
@@ -4941,9 +4996,6 @@ fn shouldUseMiddleProxySnapshot(cfg: *const Config, dc_abs: usize, dc_idx: i16) 
 }
 
 fn directDcAddressV4(dc_abs: usize) net.Address {
-    if (!constants.isKnownDcV4(dc_abs)) {
-        log.warn("unknown dc_abs={d}; using modulo DC fallback address", .{dc_abs});
-    }
     return constants.getDcAddressV4(dc_abs);
 }
 
@@ -4955,6 +5007,7 @@ fn buildDcConnectPlan(
     bypass_middle_proxy: bool,
 ) DcConnectPlan {
     var plan = DcConnectPlan{};
+    if (!constants.isKnownDcV4(dc_abs)) return plan;
     plan.is_media_path = (dc_idx < 0) or (dc_abs == 203);
 
     if (cfg.datacenter_override) |override| {
@@ -5551,6 +5604,19 @@ test "direct users bypass middle-proxy routing" {
     try std.testing.expect(admin_media.candidates[0].eql(constants.getDcAddressV4(203)));
 }
 
+test "unknown datacenter indices produce no connect plan" {
+    var cfg = Config{
+        .users = std.StringHashMap([16]u8).init(std.testing.allocator),
+        .direct_users = std.StringHashMap(void).init(std.testing.allocator),
+    };
+    defer cfg.deinit(std.testing.allocator);
+
+    const plan = buildDcConnectPlan(&cfg, 6, 6, null, false);
+    try std.testing.expectEqual(@as(usize, 0), plan.count);
+    try std.testing.expect(!plan.use_middle_proxy);
+    try std.testing.expect(plan.direct_fallback == null);
+}
+
 test "DRS disabled skips ramp and uses full TLS record size" {
     var drs = DynamicRecordSizer.init(false);
     try std.testing.expectEqual(DynamicRecordSizer.full_size, drs.nextRecordSize());
@@ -5562,6 +5628,11 @@ test "DRS enabled ramps" {
     var drs = DynamicRecordSizer.init(true);
     for (0..8) |_| drs.recordSent(1369);
     try std.testing.expectEqual(DynamicRecordSizer.full_size, drs.nextRecordSize());
+    const records_at_ramp = drs.records_sent;
+    const bytes_at_ramp = drs.bytes_sent;
+    drs.recordSent(std.math.maxInt(usize));
+    try std.testing.expectEqual(records_at_ramp, drs.records_sent);
+    try std.testing.expectEqual(bytes_at_ramp, drs.bytes_sent);
 }
 
 test "message queue consume is stable" {
@@ -5745,6 +5816,8 @@ test "fd requirement helpers" {
     try std.testing.expectEqual(@as(usize, 131582), requiredFdsForConnections(65535));
     try std.testing.expectEqual(@as(u32, 65535), maxConnectionsForNofile(131582));
     try std.testing.expectEqual(@as(u32, 32511), maxConnectionsForNofile(65535));
+    try std.testing.expectEqual(@as(u32, 32), maxConnectionsForNofile(requiredFdsForConnections(32)));
+    try std.testing.expectEqual(@as(u32, 0), maxConnectionsForNofile(requiredFdsForConnections(32) - 1));
 }
 
 test "accept listen interest stays disabled while any pause reason is active" {
@@ -5818,6 +5891,15 @@ test "subnet rate limit - IPv4-mapped IPv6 keys match native IPv4 /24" {
     try std.testing.expect(SubnetRateLimit.subnetKey(native6) != mapped_key);
 }
 
+test "subnet rate limit - preserves every IPv6 /48 prefix bit" {
+    const prefix_a = [_]u8{ 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00 } ++ [_]u8{0} ** 10;
+    const prefix_b = [_]u8{ 0x20, 0x01, 0x0d, 0xb9, 0x00, 0x01 } ++ [_]u8{0} ** 10;
+    const addr_a = net.Address.initIp6(prefix_a, 443, 0, 0);
+    const addr_b = net.Address.initIp6(prefix_b, 443, 0, 0);
+
+    try std.testing.expect(SubnetRateLimit.subnetKey(addr_a) != SubnetRateLimit.subnetKey(addr_b));
+}
+
 test "subnet rate limit - allows up to max then blocks" {
     var limiter = SubnetRateLimit{};
     const addr = net.Address.initIp4(.{ 192, 168, 1, 100 }, 443);
@@ -5872,7 +5954,7 @@ test "subnet rate limit - live probe window is not evicted" {
         const idx = (start + probe) & (SubnetRateLimit.BUCKETS - 1);
         limiter.entries[idx] = .{
             .used = true,
-            .subnet_key = 0x80000000 + @as(u32, @intCast(probe)),
+            .subnet_key = 0x80000000 + @as(u64, @intCast(probe)),
             .tokens = 1,
             .last_refill_s = now_s,
         };
@@ -5883,7 +5965,7 @@ test "subnet rate limit - live probe window is not evicted" {
     probe = 0;
     while (probe < SubnetRateLimit.MAX_PROBES) : (probe += 1) {
         const idx = (start + probe) & (SubnetRateLimit.BUCKETS - 1);
-        try std.testing.expectEqual(0x80000000 + @as(u32, @intCast(probe)), limiter.entries[idx].subnet_key);
+        try std.testing.expectEqual(0x80000000 + @as(u64, @intCast(probe)), limiter.entries[idx].subnet_key);
     }
 }
 
@@ -5928,6 +6010,34 @@ test "replay cache compares full digest on key collision" {
     try std.testing.expect(!cache.checkAndInsert(&digest_b));
     try std.testing.expect(cache.checkAndInsert(&digest_a));
     try std.testing.expect(cache.checkAndInsert(&digest_b));
+}
+
+test "replay cache never evicts a live probe window" {
+    var cache = ReplayCache.init();
+    const digest = [_]u8{0x5a} ** 32;
+    const start = cache.indexFor(ReplayCache.digestKey(&digest));
+    const now_s = @divTrunc(compat.monotonicMilliTimestamp(), 1000);
+
+    var probe: usize = 0;
+    while (probe < ReplayCache.MAX_PROBES) : (probe += 1) {
+        const idx = (start + probe) & (ReplayCache.BUCKETS - 1);
+        var occupied_digest = [_]u8{0} ** 32;
+        @memset(&occupied_digest, @intCast(probe + 1));
+        cache.entries[idx] = .{
+            .used = true,
+            .key = @as(u64, @intCast(probe + 1)),
+            .digest = occupied_digest,
+            .last_seen_s = now_s,
+        };
+    }
+
+    // A saturated live window fails closed instead of weakening replay protection.
+    try std.testing.expect(cache.checkAndInsert(&digest));
+    probe = 0;
+    while (probe < ReplayCache.MAX_PROBES) : (probe += 1) {
+        const idx = (start + probe) & (ReplayCache.BUCKETS - 1);
+        try std.testing.expectEqual(@as(u64, @intCast(probe + 1)), cache.entries[idx].key);
+    }
 }
 
 test "handshakeInProgress - phases" {
@@ -6023,7 +6133,7 @@ test "handshake budget is charged once after the first client byte" {
 test "subnet handshake limit bounds and releases unauthenticated slots" {
     var limiter = SubnetHandshakeLimit.init();
     limiter.hash_seed = 0;
-    const key: u32 = 0x010203;
+    const key: u64 = 0x010203;
 
     try std.testing.expect(limiter.reserve(key, 2));
     try std.testing.expect(limiter.reserve(key, 2));

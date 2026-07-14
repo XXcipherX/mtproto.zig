@@ -10,7 +10,7 @@ This file tracks practical pitfalls and current runtime constraints for `mtproto
 ## Current Architecture Baseline
 
 - Relay core is Linux `epoll` event loop, single-threaded on hot path.
-- Connection pools allocate slot indexes/fd maps for the configured cap, while `ConnectionSlot` objects are heap-created on demand.
+- The large `EventLoop` container and its fixed subnet tables are heap-allocated and initialized in place; returning it by value can overflow the Debug daemon stack. Connection pools allocate slot indexes/fd maps for the configured cap, while `ConnectionSlot` objects are heap-created on demand.
 - Non-blocking writes are queue-based (`MessageQueue`) and flushed with `writev`.
 - `MessageQueue` has classed storage blocks and a 4 MiB pending-byte cap; queue overflow is a close-worthy backpressure signal.
 - Runtime discovery runs in a joinable updater thread after the listener is ready when MiddleProxy or masking resolution is active; shutdown is cooperative and endpoint probes poll cancellation in short intervals.
@@ -37,14 +37,16 @@ Do not reintroduce thread-per-connection or blocking relay loops.
 - `SO_SNDTIMEO` and TCP keepalive are configured for relay sockets.
 - Handshake/idle behavior is timer-driven (`idle_timeout_sec`, `handshake_timeout_sec`) in `runTimers`.
 - Pre-first-byte admission has a separate fixed 10-second deadline, and unauthenticated sockets are capped concurrently per IPv4 `/24` or IPv6 `/48`.
+- IPv6 subnet keys preserve all 48 prefix bits; IPv4-mapped IPv6 intentionally shares the corresponding native IPv4 `/24` key.
 - `SIGPIPE` is ignored process-wide before socket relay starts; write paths must continue handling `EPIPE` as a normal connection failure.
 - There is no active `SO_RCVTIMEO`-based relay timeout path in current code.
-- FakeTLS validation requires a 32-byte ClientHello Session ID. The Session ID is stored by value and echoed into the fixed Nginx-like ServerHello template; the complete ClientHello is zeroed/freed immediately after response construction.
+- FakeTLS validation requires a 32-byte ClientHello Session ID. Authentication, SNI, TLS 1.3 cipher, and PQ key-share detection share one strict outer parser, so do not introduce a second path with different nested-length rules. The Session ID is stored by value and echoed into the fixed Nginx-like ServerHello template; the complete ClientHello is securely zeroed/freed immediately after response construction.
 - Extra TLS appdata bytes after the 64-byte MTProto obfuscation nonce are buffered as `pipelined_data` and flushed after the DC/MiddleProxy path is ready.
 
 ## Queueing and Partial Write Model
 
 - Outbound data is queued in block classes (tiny/small/standard).
+- Recycled/destroyed queue blocks are securely wiped. If appending an acquired block pointer fails, return that block to its free list (or destroy it) before propagating OOM.
 - Flush path uses scatter-gather `writev` with explicit queue consumption.
 - Backpressure is represented by pending queue state and epoll `OUT` interest toggles.
 - Legacy `writeAll` assumptions are outdated for this codebase.
@@ -65,7 +67,8 @@ Do not reintroduce thread-per-connection or blocking relay loops.
 
 ## Protocol Validation Notes
 
-- Replay detection compares the full canonical HMAC digest, even when the hash-table key collides.
+- Replay detection compares the full canonical HMAC digest, even when the hash-table key collides; live entries must not be evicted before the one-hour replay window expires.
+- `prepareTgNonce` accepts exactly a 48-byte key+IV pointer, MiddleProxy KDF rejects inputs that exceed its fixed transcript buffer, and unknown DC indices are rejected before routing.
 - Reserved MTProto obfuscation nonces are rejected before protocol-tag decryption.
 - Direct-user bypass only applies when the name exists in `[access.users]`; unknown names in `[access.direct_users]` warn and are ignored.
 - Duplicate user/direct-user/config string entries are last-write-wins. Direct users accept `false`/`0`/`no` to remove a previous duplicate entry.
@@ -86,6 +89,7 @@ Do not reintroduce thread-per-connection or blocking relay loops.
 ## Development Conventions
 
 - Pass allocators explicitly and free deterministically.
+- Securely wipe secret-bearing and plaintext buffers before allocator release, including Config user-secret values, queue blocks, MiddleProxy stream/scratch buffers, nonce/KDF state, and cipher contexts.
 - Use error unions and avoid swallowing critical errors on control-path boundaries.
 - Keep tests close to protocol primitives and relay helpers.
 - For substantial behavior changes, update `README.md` and relevant `.agent` docs in the same change.
