@@ -63,6 +63,20 @@ pub fn milliTimestamp() i64 {
     return @intCast(@divTrunc(nanoTimestamp(), std.time.ns_per_ms));
 }
 
+/// Monotonic process-local clock for elapsed-time measurements and deadlines.
+/// Unlike `nanoTimestamp`, this clock is not affected by wall-clock updates.
+pub fn monotonicNanoTimestamp() i128 {
+    if (builtin.os.tag == .linux) return monotonicNanoTimestampLinux();
+
+    var threaded_io = initThreadedIo();
+    defer threaded_io.deinit();
+    return @intCast(std.Io.Timestamp.now(threaded_io.io(), .awake).nanoseconds);
+}
+
+pub fn monotonicMilliTimestamp() i64 {
+    return @intCast(@divTrunc(monotonicNanoTimestamp(), std.time.ns_per_ms));
+}
+
 pub fn timestamp() i64 {
     return @intCast(@divTrunc(nanoTimestamp(), std.time.ns_per_s));
 }
@@ -182,6 +196,15 @@ fn nanoTimestampLinux() i128 {
     switch (posix.errno(linux.clock_gettime(.REALTIME, &ts))) {
         .SUCCESS => return @as(i128, ts.sec) * std.time.ns_per_s + @as(i128, ts.nsec),
         else => return 0,
+    }
+}
+
+fn monotonicNanoTimestampLinux() i128 {
+    const linux = std.os.linux;
+    var ts: linux.timespec = undefined;
+    switch (posix.errno(linux.clock_gettime(.MONOTONIC, &ts))) {
+        .SUCCESS => return @as(i128, ts.sec) * std.time.ns_per_s + @as(i128, ts.nsec),
+        else => return nanoTimestampLinux(),
     }
 }
 

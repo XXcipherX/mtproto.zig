@@ -13,7 +13,7 @@ This file tracks practical pitfalls and current runtime constraints for `mtproto
 - Connection pools allocate slot indexes/fd maps for the configured cap, while `ConnectionSlot` objects are heap-created on demand.
 - Non-blocking writes are queue-based (`MessageQueue`) and flushed with `writev`.
 - `MessageQueue` has classed storage blocks and a 4 MiB pending-byte cap; queue overflow is a close-worthy backpressure signal.
-- MiddleProxy metadata refresh runs in a joinable updater thread only when any MiddleProxy route is active.
+- Runtime discovery runs in a joinable updater thread after the listener is ready when MiddleProxy or masking resolution is active; shutdown is cooperative and endpoint probes poll cancellation in short intervals.
 
 Do not reintroduce thread-per-connection or blocking relay loops.
 
@@ -39,7 +39,7 @@ Do not reintroduce thread-per-connection or blocking relay loops.
 - Pre-first-byte admission has a separate fixed 10-second deadline, and unauthenticated sockets are capped concurrently per IPv4 `/24` or IPv6 `/48`.
 - `SIGPIPE` is ignored process-wide before socket relay starts; write paths must continue handling `EPIPE` as a normal connection failure.
 - There is no active `SO_RCVTIMEO`-based relay timeout path in current code.
-- FakeTLS validation requires a 32-byte ClientHello Session ID. The Session ID is stored by value and echoed into the fixed Nginx-like ServerHello template.
+- FakeTLS validation requires a 32-byte ClientHello Session ID. The Session ID is stored by value and echoed into the fixed Nginx-like ServerHello template; the complete ClientHello is zeroed/freed immediately after response construction.
 - Extra TLS appdata bytes after the 64-byte MTProto obfuscation nonce are buffered as `pipelined_data` and flushed after the DC/MiddleProxy path is ready.
 
 ## Queueing and Partial Write Model
@@ -61,6 +61,7 @@ Do not reintroduce thread-per-connection or blocking relay loops.
 - The startup capacity clamp intentionally budgets the full effective MiddleProxy cap per direction, so it is more conservative than the idle memory footprint.
 - `force_media_middle_proxy` defaults to true, so media traffic keeps preferring ME unless explicitly disabled.
 - `middle_proxy_nat_ip` can override the IPv4 embedded into MiddleProxy NAT/AES derivation when AWG/public-IP detection is not the address you want.
+- A connection snapshots the MiddleProxy secret and NAT IPv4 together with its endpoint plan; secret rotation cannot split key-selector and KDF inputs mid-handshake.
 
 ## Protocol Validation Notes
 
@@ -68,6 +69,7 @@ Do not reintroduce thread-per-connection or blocking relay loops.
 - Reserved MTProto obfuscation nonces are rejected before protocol-tag decryption.
 - Direct-user bypass only applies when the name exists in `[access.users]`; unknown names in `[access.direct_users]` warn and are ignored.
 - Duplicate user/direct-user/config string entries are last-write-wins. Direct users accept `false`/`0`/`no` to remove a previous duplicate entry.
+- Unknown proxy sections/keys and malformed config lines are fatal parse errors. `[monitor].host` and `[monitor].port` are the intentional externally consumed exception.
 
 ## Timeout and Lifetime Notes
 

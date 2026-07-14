@@ -81,7 +81,7 @@ fn runBench(allocator: std.mem.Allocator) !void {
             _ = try ctx.encapsulateSingleMessageC2S(payload, (w & 1) == 1, out_buf);
         }
 
-        const start_ns = compat.nanoTimestamp();
+        const start_ns = compat.monotonicNanoTimestamp();
 
         var produced_out_bytes: u64 = 0;
         var i: usize = 0;
@@ -106,13 +106,13 @@ fn runBench(allocator: std.mem.Allocator) !void {
 }
 
 fn positiveElapsedNs(start_ns: i128) u64 {
-    const elapsed_ns = compat.nanoTimestamp() - start_ns;
+    const elapsed_ns = compat.monotonicNanoTimestamp() - start_ns;
     if (elapsed_ns <= 0) return 1;
     return @intCast(elapsed_ns);
 }
 
 fn runSoak(allocator: std.mem.Allocator, opts: Options) !void {
-    const start_ms = compat.milliTimestamp();
+    const start_ms = compat.monotonicMilliTimestamp();
     const duration_ms = @as(i64, @intCast(opts.seconds)) * 1000;
 
     var shared = SoakShared{
@@ -151,7 +151,7 @@ fn runSoak(allocator: std.mem.Allocator, opts: Options) !void {
     }
     joined = true;
 
-    const end_ms = compat.milliTimestamp();
+    const end_ms = compat.monotonicMilliTimestamp();
     const elapsed_ms_i64 = @max(@as(i64, 1), end_ms - start_ms);
     const elapsed_ms: u64 = @intCast(elapsed_ms_i64);
 
@@ -197,7 +197,7 @@ fn soakWorker(args: WorkerArgs) void {
 
     var rng_state = makeSeed(args.worker_id);
 
-    while (!args.shared.stop.load(.acquire) and compat.milliTimestamp() < args.shared.deadline_ms) {
+    while (!args.shared.stop.load(.acquire) and compat.monotonicMilliTimestamp() < args.shared.deadline_ms) {
         const payload_len = nextPayloadLen(&rng_state, args.max_payload);
         payload_buf[0] +%= 1;
         const quickack = (nextRand(&rng_state) & 1) == 1;
@@ -333,7 +333,7 @@ fn bytesPerSecToMiBMs(bytes: u64, elapsed_ms: u64) u64 {
 }
 
 fn makeSeed(worker_id: usize) u64 {
-    const now_ms = compat.milliTimestamp();
+    const now_ms = compat.monotonicMilliTimestamp();
     const base: u64 = if (now_ms >= 0)
         @intCast(now_ms)
     else
