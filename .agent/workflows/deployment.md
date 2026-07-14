@@ -149,7 +149,8 @@ The tracked `deploy/compose.yml` is a minimal proxy-only example. `deploy/instal
 ## Systemd Unit Notes (`deploy/mtproto-proxy.service`)
 
 - Default and tunnel-patched units run as `mtproto:mtproto`, use `Restart=always` with `RestartSec=3`, and ship with `LimitNOFILE=131582` plus `TasksMax=65535`.
-- Startup first auto-clamps `max_connections` to the RAM-safe estimate from `/proc/meminfo` unless `unsafe_override_limits=true`; `ProxyState.run` then clamps again if `RLIMIT_NOFILE` cannot cover the resulting fd budget.
+- Startup first auto-clamps `max_connections` to an effective-memory estimate using the lower of host RAM and cgroup v2/v1 limits unless `unsafe_override_limits=true`; it fails safe if fewer than 32 slots fit. `ProxyState.run` then clamps again if `RLIMIT_NOFILE` cannot cover the resulting fd budget.
+- The daemon banner redacts user secrets and proxy links. Use `--show-secrets` only for an intentional foreground run in a private terminal.
 - Runtime relay model is still single-thread `epoll` in proxy core.
 - Default unit keeps `ReadOnlyPaths=/opt/mtproto-proxy` and only `CAP_NET_BIND_SERVICE`.
 - Tunnel-patched unit keeps the hardening settings, adds `CAP_NET_ADMIN` + `CAP_SYS_ADMIN`, and uses `ExecStartPre=/usr/local/bin/setup_netns.sh` to recreate the namespace on every restart.

@@ -496,7 +496,10 @@ pub const MiddleProxyContext = struct {
     }
 
     fn encapsulateSingleMessageC2SWithPlainFlag(self: *MiddleProxyContext, client_data: []const u8, is_quickack: bool, allow_plain_detection: bool, out_buf: []u8) !usize {
-        if (self.proto_tag != .secure and (client_data.len & 3) != 0) return error.InvalidPayloadLength;
+        // MiddleProxy CBC padding is encoded as complete 4-byte NOOP markers.
+        // An unaligned inner payload cannot be padded to a 16-byte AES block
+        // without writing a partial marker outside the advertised frame.
+        if ((client_data.len & 3) != 0) return error.InvalidPayloadLength;
 
         var flags = Flag.magic | Flag.extmode2;
         if (self.ad_tag != null) {
@@ -991,7 +994,7 @@ test "secure c2s strips plain padded-intermediate padding" {
     try std.testing.expectEqualSlices(u8, &mtproto_payload, rpc_payload[56..]);
 }
 
-test "secure c2s accepts unaligned plain mtproto payload data" {
+test "secure c2s rejects unaligned plain mtproto payload data" {
     const allocator = std.testing.allocator;
 
     const key = [_]u8{0} ** 32;
@@ -1025,19 +1028,7 @@ test "secure c2s accepts unaligned plain mtproto payload data" {
     try std.testing.expectEqual(ctx.c2sFrameEncryptedLen(mtproto_payload.len), required);
 
     var encrypted_out: [512]u8 = undefined;
-    const out = try ctx.encapsulateC2S(packet[0..], encrypted_out[0..]);
-    try std.testing.expectEqual(@as(usize, 0), ctx.c2s_len);
-
-    var decryptor = crypto.AesCbc.init(&key, &iv);
-    try decryptor.decryptInPlace(encrypted_out[0..out.len]);
-
-    const total_len = std.mem.readInt(u32, encrypted_out[0..4], .little);
-    const rpc_payload = encrypted_out[8 .. total_len - 4];
-    const flags = std.mem.readInt(u32, rpc_payload[4..8], .little);
-    try std.testing.expect((flags & Flag.pad) != 0);
-    try std.testing.expect((flags & Flag.not_encrypted) != 0);
-    try std.testing.expectEqual(@as(usize, 56 + mtproto_payload.len), rpc_payload.len);
-    try std.testing.expectEqualSlices(u8, &mtproto_payload, rpc_payload[56..]);
+    try std.testing.expectError(error.InvalidPayloadLength, ctx.encapsulateC2S(packet[0..], encrypted_out[0..]));
 }
 
 test "secure c2s treats invalid plain-looking payload as encrypted" {

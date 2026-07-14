@@ -50,7 +50,7 @@ Note:
 - `conn stats: active=... hs_inflight=... accepted+=... closed+=... tracked_fds=... total=... paused=<fd>/<saturation>` is the current 10s heartbeat for production visibility.
 - `paused=true/false` means fd-quota backoff is active; `paused=false/true` means 90%/80% saturation hysteresis is active.
 - Fatal hangups during `connecting_upstream` are now cleaned through the connect-completion path; repeated CPU spin on dead upstream sockets should no longer be expected.
-- `drops: ... hs_budget+=...` means the handshake-inflight budget (30% of `max_connections`) rejected excess new handshakes.
+- `drops: ... hs_budget+=...` means the global handshake-inflight budget or the per-subnet unauthenticated concurrency allowance rejected a new handshake.
 - `drops: ... mp_fallback+=...` means MiddleProxy degraded and the proxy recovered by reconnecting directly to the same DC.
 - `drops: ... rate+=...` means the per-subnet token bucket rejected new connections; IPv4-mapped IPv6 addresses are grouped with their native IPv4 `/24`.
 
@@ -124,9 +124,9 @@ ssh root@<SERVER_IP> 'cd /root/mtproto.zig && zig build && python3 test/daemon_s
 
 Interpretation helpers:
 
-- `auto-clamping max_connections ...` means the startup RAM-safety clamp reduced the configured cap. `max_connections clamped ... due to RLIMIT_NOFILE` means the later fd-budget clamp reduced it again.
+- `auto-clamping max_connections ...` means the startup effective-memory clamp (host RAM plus cgroup limit) reduced the configured cap. `max_connections clamped ... due to RLIMIT_NOFILE` means the later fd-budget clamp reduced it again.
 - `fd quota reached ...` means the listener paused accepts; expect the first `paused=` flag to flip to `true` in nearby `conn stats` lines until the retry window clears.
-- `hs_budget+=...` means connection churn is exhausting the handshake budget before established relays become the bottleneck.
+- `hs_budget+=...` means connection churn is exhausting either the global handshake budget or a source subnet's unauthenticated concurrency allowance before established relays become the bottleneck.
 - `mp_fallback+=...` means users are still being served, but MiddleProxy path quality is degraded enough to trigger direct fallback.
 - A valid Telegram-style FakeTLS ClientHello must have a 32-byte Session ID; non-32-byte test clients are expected to be rejected/masked.
 - `connection saturation ...` / `saturation eased ...` is RAM/capacity admission control, not an fd-limit incident.
