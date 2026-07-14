@@ -42,6 +42,8 @@ const min_nofile_soft: usize = 65535;
 const client_hello_inline_size: usize = 512;
 const mp_handshake_frame_buf_size: usize = 2048;
 const read_buf_size: usize = 4096;
+const pre_first_byte_timeout_ms: i64 = 10 * std.time.ms_per_s;
+const middle_proxy_stage_timeout_ms: i64 = 5 * std.time.ms_per_s;
 
 const invalid_fd: posix.fd_t = switch (builtin.os.tag) {
     .windows => std.os.windows.INVALID_HANDLE_VALUE,
@@ -367,7 +369,7 @@ const StandardMsgBlock = struct {
 const max_scatter_parts: usize = 64;
 
 fn hasFatalEpollHangup(events: u32) bool {
-    return (events & (linux.EPOLL.ERR | linux.EPOLL.HUP | linux.EPOLL.RDHUP)) != 0;
+    return (events & (linux.EPOLL.ERR | linux.EPOLL.HUP)) != 0;
 }
 
 fn hasGracefulEpollRdhup(events: u32) bool {
@@ -832,6 +834,75 @@ const ReplayCache = struct {
     }
 };
 
+/// Bounds unauthenticated connections per IPv4 /24 or IPv6 /48. The charge is
+/// taken after a pool slot is acquired and released only after authentication
+/// succeeds (or the slot closes), so silent and one-byte clients share one
+/// finite allowance without penalizing established relays behind large NATs.
+const SubnetHandshakeLimit = struct {
+    const BUCKETS = 16384;
+    const MAX_PROBES = 8;
+
+    const Entry = struct {
+        used: bool = false,
+        subnet_key: u32 = 0,
+        inflight: u16 = 0,
+    };
+
+    hash_seed: u64 = 0,
+    entries: [BUCKETS]Entry = [_]Entry{.{}} ** BUCKETS,
+
+    fn init() SubnetHandshakeLimit {
+        return .{ .hash_seed = crypto.randomInt(u64) };
+    }
+
+    fn indexFor(self: *const SubnetHandshakeLimit, key: u32) usize {
+        var x = self.hash_seed ^ @as(u64, key);
+        x +%= 0x9E3779B97F4A7C15;
+        x ^= x >> 30;
+        x *%= 0xBF58476D1CE4E5B9;
+        x ^= x >> 27;
+        x *%= 0x94D049BB133111EB;
+        x ^= x >> 31;
+        return @as(usize, @intCast(x & (BUCKETS - 1)));
+    }
+
+    fn reserve(self: *SubnetHandshakeLimit, key: u32, limit: u16) bool {
+        const start = self.indexFor(key);
+        var free_idx: ?usize = null;
+        var probe: usize = 0;
+        while (probe < MAX_PROBES) : (probe += 1) {
+            const idx = (start + probe) & (BUCKETS - 1);
+            const entry = &self.entries[idx];
+            if (entry.used and entry.subnet_key == key) {
+                if (entry.inflight >= limit) return false;
+                entry.inflight += 1;
+                return true;
+            }
+            if ((!entry.used or entry.inflight == 0) and free_idx == null) free_idx = idx;
+        }
+
+        const idx = free_idx orelse return false;
+        self.entries[idx] = .{ .used = true, .subnet_key = key, .inflight = 1 };
+        return true;
+    }
+
+    fn release(self: *SubnetHandshakeLimit, key: u32) void {
+        const start = self.indexFor(key);
+        var probe: usize = 0;
+        while (probe < MAX_PROBES) : (probe += 1) {
+            const entry = &self.entries[(start + probe) & (BUCKETS - 1)];
+            if (!entry.used or entry.subnet_key != key) continue;
+            if (entry.inflight > 0) entry.inflight -= 1;
+            if (entry.inflight == 0) entry.used = false;
+            return;
+        }
+    }
+};
+
+fn subnetHandshakeLimit(max_connections: u32) u16 {
+    return @intCast(@min(@as(u32, 128), @max(@as(u32, 16), max_connections / 8)));
+}
+
 const middle_proxy_connect_cooldown_ms: i64 = 60 * std.time.ms_per_s;
 const middle_proxy_cooldown_slots = 32;
 
@@ -855,6 +926,8 @@ const ConnectionSlot = struct {
     /// Set after the first client byte reserves a handshake-budget slot.
     /// Silent pre-warmed TCP sessions deliberately do not consume this budget.
     hs_counted: bool = false,
+    subnet_key: u32 = 0,
+    subnet_hs_counted: bool = false,
 
     created_at_ms: i64 = 0,
     first_byte_at_ms: i64 = 0,
@@ -961,6 +1034,7 @@ const ConnectionSlot = struct {
     mp_frame_padded_len: usize = 0,
     mp_frame_encrypted: bool = false,
     mp_frame_first_decrypted: bool = false,
+    mp_step_deadline_ms: i64 = 0,
 
     // Current epoll interests
     client_interest_in: bool = false,
@@ -1778,6 +1852,7 @@ const EventLoop = struct {
     accepted_since_log: u64,
     closed_since_log: u64,
     subnet_limiter: SubnetRateLimit,
+    subnet_handshakes: SubnetHandshakeLimit,
     // Snapshot of degradation counters for delta logging
     prev_dropped_cap: u64,
     prev_dropped_saturation: u64,
@@ -1806,6 +1881,7 @@ const EventLoop = struct {
             .accepted_since_log = 0,
             .closed_since_log = 0,
             .subnet_limiter = SubnetRateLimit.init(),
+            .subnet_handshakes = SubnetHandshakeLimit.init(),
             .prev_dropped_cap = 0,
             .prev_dropped_saturation = 0,
             .prev_dropped_rate_limit = 0,
@@ -1913,7 +1989,14 @@ const EventLoop = struct {
             return;
         }
 
-        const fatal_hangup = hasFatalEpollHangup(events);
+        const graceful_rdhup = hasGracefulEpollRdhup(events);
+        if (graceful_rdhup and (slot.phase == .relaying or slot.phase == .mask_relaying)) {
+            self.drainRelayRdhup(slot, fd, events);
+            return;
+        }
+
+        const fatal_hangup = hasFatalEpollHangup(events) or
+            ((events & linux.EPOLL.RDHUP) != 0 and slot.phase != .relaying and slot.phase != .mask_relaying);
 
         if (fd == slot.client_fd) {
             if ((events & linux.EPOLL.OUT) != 0) {
@@ -2013,8 +2096,19 @@ const EventLoop = struct {
                 continue;
             };
 
+            const subnet_key = SubnetRateLimit.subnetKey(client_addr);
+            if (!self.subnet_handshakes.reserve(subnet_key, subnetHandshakeLimit(max))) {
+                _ = self.state.active_connections.fetchSub(1, .monotonic);
+                _ = self.state.stats_dropped_hs_budget.fetchAdd(1, .monotonic);
+                self.pool.release(slot);
+                closeFd(cfd);
+                continue;
+            }
+
             slot.active_reserved = true;
             slot.hs_counted = false;
+            slot.subnet_key = subnet_key;
+            slot.subnet_hs_counted = true;
             slot.conn_id = self.state.connection_count.fetchAdd(1, .monotonic);
             slot.client_fd = cfd;
             slot.peer_addr = client_addr;
@@ -2026,6 +2120,8 @@ const EventLoop = struct {
             slot.drs = DynamicRecordSizer.init(self.state.config.drs);
 
             if (self.addFd(cfd, true, false)) |_| {
+                slot.client_interest_in = true;
+                slot.client_interest_out = false;
                 self.pool.mapFd(cfd, slot.index) catch {
                     self.closeSlot(slot, "fd map failed");
                     continue;
@@ -2315,6 +2411,13 @@ const EventLoop = struct {
         if (!slot.hs_counted) return;
         _ = self.state.handshakes_inflight.fetchSub(1, .monotonic);
         slot.hs_counted = false;
+    }
+
+    fn releaseSubnetHandshake(self: *EventLoop, slot: *ConnectionSlot) void {
+        if (!slot.subnet_hs_counted) return;
+        self.subnet_handshakes.release(slot.subnet_key);
+        slot.subnet_hs_counted = false;
+        slot.subnet_key = 0;
     }
 
     fn readTlsHeader(self: *EventLoop, slot: *ConnectionSlot) void {
@@ -2611,14 +2714,13 @@ const EventLoop = struct {
         slot.client_encryptor = result.params.createEncryptor();
         if (slot.client_decryptor) |*dec| dec.ctr +%= 4;
 
-        const dc_abs: usize = if (slot.dc_idx > 0)
-            @as(usize, @intCast(slot.dc_idx))
-        else if (slot.dc_idx < 0)
-            @as(usize, @abs(slot.dc_idx))
-        else {
+        const dc_idx_wide: i32 = slot.dc_idx;
+        const dc_abs_wide = if (dc_idx_wide < 0) -dc_idx_wide else dc_idx_wide;
+        if (dc_abs_wide == 0) {
             self.closeSlot(slot, "invalid dc index");
             return;
-        };
+        }
+        const dc_abs: usize = @intCast(dc_abs_wide);
 
         const snapshot = if (shouldUseMiddleProxySnapshot(&self.state.config, dc_abs, slot.dc_idx))
             self.state.getMiddleProxySnapshot()
@@ -2717,6 +2819,8 @@ const EventLoop = struct {
         errdefer self.pool.unmapFd(fd);
 
         slot.upstream_fd = fd;
+        slot.upstream_interest_in = false;
+        slot.upstream_interest_out = true;
         slot.upstream_kind = kind;
         slot.current_upstream_addr = addr;
         slot.phase = .connecting_upstream;
@@ -2946,7 +3050,7 @@ const EventLoop = struct {
 
         // Promotion tag (optional), only for primary DC1..5
         if (self.state.config.tag) |tag| {
-            const dc_abs = if (params.dc_idx > 0) @as(usize, @intCast(params.dc_idx)) else @as(usize, @abs(params.dc_idx));
+            const dc_abs: usize = slot.dc_abs;
             if (dc_abs >= 1 and dc_abs <= constants.tg_datacenters_v4.len and dc_abs != 203) {
                 var promote_buf: [32]u8 = undefined;
                 var packet_len: usize = 0;
@@ -2992,6 +3096,7 @@ const EventLoop = struct {
     fn startRelay(self: *EventLoop, slot: *ConnectionSlot) void {
         // Handshake complete — release from handshake budget.
         self.releaseHandshakeBudget(slot);
+        self.releaseSubnetHandshake(slot);
         slot.phase = .relaying;
 
         if (slot.pipelined_data) |buf| {
@@ -3127,7 +3232,7 @@ const EventLoop = struct {
 
     fn middleProxyBegin(self: *EventLoop, slot: *ConnectionSlot) void {
         slot.phase = .middle_proxy_handshake;
-        slot.mp_step = .sending_rpc_nonce;
+        self.setMiddleProxyStep(slot, .sending_rpc_nonce);
         slot.mp_write_seq_no = -2;
         slot.mp_read_seq_no = -2;
         slot.mp_frame_have = 0;
@@ -3163,22 +3268,21 @@ const EventLoop = struct {
         };
 
         if (!slot.hasUpstreamPending()) {
-            slot.mp_step = .waiting_rpc_nonce_response;
+            self.setMiddleProxyStep(slot, .waiting_rpc_nonce_response);
             mpReadReset(slot, false);
         }
     }
 
     fn middleProxyOnWritable(self: *EventLoop, slot: *ConnectionSlot) void {
-        _ = self;
         if (slot.hasUpstreamPending()) return;
 
         switch (slot.mp_step) {
             .sending_rpc_nonce => {
-                slot.mp_step = .waiting_rpc_nonce_response;
+                self.setMiddleProxyStep(slot, .waiting_rpc_nonce_response);
                 mpReadReset(slot, false);
             },
             .sending_rpc_handshake => {
-                slot.mp_step = .waiting_rpc_handshake_response;
+                self.setMiddleProxyStep(slot, .waiting_rpc_handshake_response);
                 mpReadReset(slot, true);
             },
             else => {},
@@ -3346,7 +3450,7 @@ const EventLoop = struct {
                     return;
                 };
 
-                slot.mp_step = if (slot.hasUpstreamPending()) .sending_rpc_handshake else .waiting_rpc_handshake_response;
+                self.setMiddleProxyStep(slot, if (slot.hasUpstreamPending()) .sending_rpc_handshake else .waiting_rpc_handshake_response);
                 if (!slot.hasUpstreamPending()) {
                     mpReadReset(slot, true);
                 }
@@ -3417,7 +3521,7 @@ const EventLoop = struct {
                     return;
                 };
 
-                slot.mp_step = .done;
+                self.setMiddleProxyStep(slot, .done);
                 self.promoteSuccessfulMiddleProxyCandidate(slot);
                 self.startRelay(slot);
             },
@@ -3438,13 +3542,23 @@ const EventLoop = struct {
     }
 
     fn fallbackFromMiddleProxyToDirect(self: *EventLoop, slot: *ConnectionSlot) bool {
+        if (slot.use_middle_proxy) {
+            if (slot.current_upstream_addr) |addr| {
+                if (self.state.cooldownMiddleProxyCandidate(addr)) {
+                    log.info("[{d}] cooling failed middle-proxy endpoint after handshake failure: dc_idx={d}", .{
+                        slot.conn_id,
+                        slot.dc_idx,
+                    });
+                }
+            }
+        }
         if (slot.direct_fallback_addr == null or slot.direct_fallback_used) return false;
 
         _ = slot.obf_params orelse return false;
         slot.direct_fallback_used = true;
         _ = self.state.stats_mp_fallback.fetchAdd(1, .monotonic);
         slot.use_middle_proxy = false;
-        slot.mp_step = .none;
+        self.setMiddleProxyStep(slot, .none);
         if (slot.mp_enc) |*enc| enc.wipe();
         if (slot.mp_dec) |*dec| dec.wipe();
         slot.mp_enc = null;
@@ -3488,6 +3602,17 @@ const EventLoop = struct {
         const fb_str = formatAddress(fallback, &fb_buf);
         log.warn("[{d}] middle-proxy handshake failed, reconnecting direct to {s}", .{ slot.conn_id, fb_str });
         return true;
+    }
+
+    fn setMiddleProxyStep(self: *EventLoop, slot: *ConnectionSlot, step: MiddleProxyHandshakeStep) void {
+        slot.mp_step = step;
+        slot.mp_step_deadline_ms = switch (step) {
+            .none, .done => 0,
+            else => compat.milliTimestamp() + @min(
+                secondsToMs(self.state.config.handshake_timeout_sec),
+                middle_proxy_stage_timeout_ms,
+            ),
+        };
     }
 
     fn mpWriteFrame(self: *EventLoop, slot: *ConnectionSlot, payload: []const u8, encrypted: bool) !void {
@@ -3711,9 +3836,19 @@ const EventLoop = struct {
                 continue;
             }
 
+            if (slot.phase == .middle_proxy_handshake and
+                slot.mp_step_deadline_ms > 0 and
+                now_ms > slot.mp_step_deadline_ms)
+            {
+                self.state.requestMiddleProxyRefresh();
+                if (self.fallbackFromMiddleProxyToDirect(slot)) continue;
+                self.closeSlot(slot, "middle-proxy stage timeout");
+                continue;
+            }
+
             if (slot.handshakeInProgress()) {
                 if (slot.first_byte_at_ms == 0) {
-                    if (now_ms - slot.created_at_ms > self.idleTimeoutMs(slot)) {
+                    if (now_ms - slot.created_at_ms > @min(self.idleTimeoutMs(slot), pre_first_byte_timeout_ms)) {
                         self.closeSlot(slot, "idle pre-first-byte timeout");
                         continue;
                     }
@@ -3721,6 +3856,7 @@ const EventLoop = struct {
                     _ = self.state.stats_hs_timeout.fetchAdd(1, .monotonic);
                     if (slot.phase == .middle_proxy_handshake and slot.mp_step.awaitingMiddleProxy()) {
                         self.state.requestMiddleProxyRefresh();
+                        if (self.fallbackFromMiddleProxyToDirect(slot)) continue;
                     }
                     self.closeSlot(slot, "handshake timeout");
                     continue;
@@ -3895,6 +4031,78 @@ const EventLoop = struct {
         return true;
     }
 
+    fn drainRelayRdhup(self: *EventLoop, slot: *ConnectionSlot, hung_fd: posix.fd_t, events: u32) void {
+        const from_client = hung_fd == slot.client_fd;
+        const from_upstream = hung_fd == slot.upstream_fd;
+        if (!from_client and !from_upstream) return;
+
+        var reached_eof = false;
+        if (slot.phase == .relaying) {
+            while (slot.phase == .relaying) {
+                const progress = if (from_client)
+                    relayClientToUpstreamStep(self, slot)
+                else
+                    relayUpstreamToClientStep(self, slot);
+
+                const step = progress catch |err| {
+                    if (err == error.EndOfStream) {
+                        reached_eof = true;
+                        break;
+                    }
+                    self.closeSlot(slot, if (from_client) "relay client rdhup drain failed" else "relay upstream rdhup drain failed");
+                    return;
+                };
+
+                if (step == .none) break;
+                const now_ms = compat.milliTimestamp();
+                slot.last_activity_ms = now_ms;
+                if (from_client) {
+                    slot.last_client_byte_ms = now_ms;
+                } else {
+                    slot.last_server_byte_ms = now_ms;
+                }
+            }
+        } else {
+            const read_buf = ensureReadBuf(slot, self.state.allocator) catch {
+                self.closeSlot(slot, "mask rdhup read buffer alloc failed");
+                return;
+            };
+            while (slot.phase == .mask_relaying) {
+                const n = posix.read(hung_fd, read_buf) catch |err| {
+                    if (err == error.WouldBlock) break;
+                    self.closeSlot(slot, "mask rdhup drain failed");
+                    return;
+                };
+                if (n == 0) {
+                    reached_eof = true;
+                    break;
+                }
+                if (from_client) {
+                    _ = queueUpstream(slot, read_buf[0..n]) catch {
+                        self.closeSlot(slot, "mask rdhup queue upstream failed");
+                        return;
+                    };
+                } else {
+                    _ = queueClient(slot, read_buf[0..n]) catch {
+                        self.closeSlot(slot, "mask rdhup queue client failed");
+                        return;
+                    };
+                }
+                slot.last_activity_ms = compat.milliTimestamp();
+            }
+        }
+
+        if (reached_eof) {
+            if (self.tryBeginRelayHalfClose(slot, hung_fd, events)) return;
+            self.closeSlot(slot, "relay peer eof");
+            return;
+        }
+
+        self.syncInterests(slot) catch {
+            self.closeSlot(slot, "rdhup interest sync failed");
+        };
+    }
+
     fn closeSlot(self: *EventLoop, slot: *ConnectionSlot, reason: []const u8) void {
         if (slot.phase == .idle) return;
         log.debug("[{d}] closing: dc_idx={d} media={} phase={s} reason={s} c2s={d} s2c={d}", .{
@@ -3922,6 +4130,7 @@ const EventLoop = struct {
         }
 
         self.releaseHandshakeBudget(slot);
+        self.releaseSubnetHandshake(slot);
         slot.resetOwnedBuffers(self.state.allocator);
 
         if (slot.active_reserved) {
@@ -3966,7 +4175,9 @@ const EventLoop = struct {
     fn delFd(self: *EventLoop, fd: posix.fd_t) !void {
         const rc = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_DEL, fd, null);
         switch (posix.errno(rc)) {
-            .SUCCESS, .NOENT => return,
+            // EPERM means the target fd type cannot be registered with epoll.
+            // Cleanup is already complete from the event loop's perspective.
+            .SUCCESS, .NOENT, .PERM => return,
             else => |err| return posix.unexpectedErrno(err),
         }
     }
@@ -4531,6 +4742,7 @@ fn promoteMiddleProxyCandidateInList(candidates: *[16]net.Address, candidate_len
         candidates[0] = promoted;
         return true;
     }
+
     return false;
 }
 
@@ -4980,6 +5192,7 @@ test "middle proxy nonce response failures fall back to direct path" {
         .accepted_since_log = 0,
         .closed_since_log = 0,
         .subnet_limiter = SubnetRateLimit.init(),
+        .subnet_handshakes = SubnetHandshakeLimit.init(),
         .prev_dropped_cap = 0,
         .prev_dropped_saturation = 0,
         .prev_dropped_rate_limit = 0,
@@ -5270,7 +5483,7 @@ test "message queue trims retained standard free blocks after traffic spike" {
 }
 
 test "epoll hangup helper" {
-    try std.testing.expect(hasFatalEpollHangup(linux.EPOLL.RDHUP));
+    try std.testing.expect(!hasFatalEpollHangup(linux.EPOLL.RDHUP));
     try std.testing.expect(hasFatalEpollHangup(linux.EPOLL.HUP));
     try std.testing.expect(hasFatalEpollHangup(linux.EPOLL.ERR));
     try std.testing.expect(!hasFatalEpollHangup(linux.EPOLL.IN));
@@ -5620,6 +5833,7 @@ test "handshake budget is charged once after the first client byte" {
         .accepted_since_log = 0,
         .closed_since_log = 0,
         .subnet_limiter = SubnetRateLimit.init(),
+        .subnet_handshakes = SubnetHandshakeLimit.init(),
         .prev_dropped_cap = 0,
         .prev_dropped_saturation = 0,
         .prev_dropped_rate_limit = 0,
@@ -5650,4 +5864,25 @@ test "handshake budget is charged once after the first client byte" {
     loop.releaseHandshakeBudget(slot);
     try std.testing.expect(!slot.hs_counted);
     try std.testing.expectEqual(@as(u32, 0), state.handshakes_inflight.load(.monotonic));
+}
+
+test "subnet handshake limit bounds and releases unauthenticated slots" {
+    var limiter = SubnetHandshakeLimit.init();
+    limiter.hash_seed = 0;
+    const key: u32 = 0x010203;
+
+    try std.testing.expect(limiter.reserve(key, 2));
+    try std.testing.expect(limiter.reserve(key, 2));
+    try std.testing.expect(!limiter.reserve(key, 2));
+
+    limiter.release(key);
+    try std.testing.expect(limiter.reserve(key, 2));
+    limiter.release(key);
+    limiter.release(key);
+}
+
+test "subnet handshake limit scales within defensive bounds" {
+    try std.testing.expectEqual(@as(u16, 16), subnetHandshakeLimit(32));
+    try std.testing.expectEqual(@as(u16, 64), subnetHandshakeLimit(512));
+    try std.testing.expectEqual(@as(u16, 128), subnetHandshakeLimit(100_000));
 }

@@ -21,7 +21,7 @@ Production MTProto proxy implemented in Zig with FakeTLS entry, obfuscated MTPro
 - Relay path is a single-threaded Linux `epoll` event loop.
 - Connections are represented by pooled `ConnectionSlot` state objects.
 - File descriptors are tracked via epoll + fd-to-slot mapping.
-- Recent runtime changes added safer failed-connect cleanup, bounded timer scanning, fd-budget clamping, 90%/80% saturation hysteresis, low-noise periodic connection stats, classed message-queue blocks, and lazy MiddleProxy stream/scratch buffers.
+- Recent runtime changes added safer failed-connect cleanup, bounded timer scanning, fd-budget clamping, 90%/80% saturation hysteresis, per-subnet unauthenticated admission limits, graceful RDHUP draining, low-noise periodic connection stats, classed message-queue blocks, and lazy MiddleProxy stream/scratch buffers.
 - Outbound data uses `MessageQueue` block classes (64/512/2048 byte storage) with `writev` flushing and a 4 MiB pending-byte cap per direction queue.
 - When any MiddleProxy path is enabled (`use_middle_proxy` or `force_media_middle_proxy`), a joinable background updater thread refreshes MiddleProxy metadata from Telegram core endpoints hourly, can wake early after stalled MiddleProxy handshakes, and is stopped on `ProxyState.deinit`.
 
@@ -58,6 +58,7 @@ Code anchors:
 Important behavior:
 
 - If a MiddleProxy endpoint is unavailable, direct path is allowed by the current connect-plan logic to avoid dropping valid users.
+- Each MiddleProxy handshake stage has a 5-second deadline. A stalled or malformed endpoint is cooled for 60 seconds, triggers reactive refresh, and falls back directly when possible.
 - `force_media_middle_proxy=true` is the default, so `direct` only affects regular DC traffic; media path still prefers MiddleProxy when available unless that knob is disabled.
 - `[access.direct_users]` / `[access.admins]` bypass MiddleProxy entirely, including media paths.
 - `datacenter_override` is test-only and disables MiddleProxy snapshot/updater routing.
@@ -76,14 +77,15 @@ For config compatibility, `fast_mode` is accepted in `[general]`, `[server]`, or
 
 Current runtime timeout control is event-loop based:
 
-- `idle_timeout_sec`: pre-first-byte wait and relay idle timeout.
+- Pre-first-byte wait: fixed 10 seconds.
+- `idle_timeout_sec`: established relay idle timeout.
 - `handshake_timeout_sec`: timeout for handshake stages after first byte.
 
 There is no active `SO_RCVTIMEO`-driven relay timeout model in current code.
 
 ## Capacity Model (as implemented)
 
-Startup banner computes a safety estimate from host RAM:
+Startup computes a safety estimate from the effective process memory limit:
 
 ```text
 tls_working_bytes = ~6 KiB
@@ -93,15 +95,16 @@ middleproxy_shared_bytes   = (effective_mp_cap + 256) + effective_mp_cap (if ME 
 overhead_bytes    = ~2 KiB
 per_conn_bytes    = tls_working_bytes + middleproxy_per_conn_bytes + overhead_bytes
 
-usable_bytes  = RAM * 70%
-reserve_bytes = max(256 MiB, RAM * 10%)
+effective_memory = min(host RAM, cgroup v2/v1 memory limit when present)
+usable_bytes  = effective_memory * 70%
+reserve_bytes = max(256 MiB, effective_memory * 10%)
 budget_bytes  = max(0, usable_bytes - reserve_bytes - middleproxy_shared_bytes)
-safe_connections = max(32, budget_bytes / per_conn_bytes)
+safe_connections = budget_bytes / per_conn_bytes
 ```
 
 Runtime allocation is lazier than this estimate: MiddleProxy per-connection stream buffers start at 16 KiB per direction and grow only when traffic requires it. The capacity estimate intentionally budgets the full effective cap so the startup clamp is conservative under worst-case media traffic.
 
-If `max_connections` exceeds the RAM-safe estimate, startup auto-clamps it before the proxy starts unless `[server].unsafe_override_limits = true`. With the override enabled, startup keeps the configured value and logs a RAM-safety warning. If `/proc/meminfo` cannot be read on Linux, startup logs that the RAM clamp was skipped.
+If `max_connections` exceeds the memory-safe estimate, startup auto-clamps it before the proxy starts unless `[server].unsafe_override_limits = true`. If the estimate is below the supported minimum of 32 slots, safe mode fails startup instead of forcing 32. With the override enabled, startup keeps the configured value and logs a warning. If neither host nor cgroup memory can be read on Linux, startup logs that the clamp was skipped.
 
 `ProxyState.run` then applies a second, independent `RLIMIT_NOFILE` clamp before creating the event loop when the process soft fd limit cannot cover the effective connection cap.
 
