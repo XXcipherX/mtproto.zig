@@ -173,9 +173,9 @@ pub fn buildServerHelloWithTemplateCipher(
     // 2. Patch Session ID (echo from client). Template assumes 32-byte session ID.
     @memcpy(response[tmpl_session_id_offset..][0..32], session_id);
 
-    // 3. Patch X25519 public key with fresh random bytes
-    var x25519_key: [32]u8 = undefined;
-    crypto.randomBytes(&x25519_key);
+    // 3. Patch a canonical X25519 public key. Arbitrary random bytes are not a
+    // valid encoding distribution and expose a passive high-bit fingerprint.
+    const x25519_key = try randomX25519PublicKey();
     @memcpy(response[tmpl_x25519_key_offset..][0..32], &x25519_key);
 
     // 3b. Randomize fake encrypted-certificate AppData per connection. TLS 1.3
@@ -205,11 +205,14 @@ pub fn buildServerHelloWithTemplateCipher(
 // is a passive group-downgrade tell, so when the client provided a 0x11ec
 // key_share we emit a 0x11ec ServerHello key_share of the correct wire size.
 //
-// The bytes are intentionally high-entropy placeholder bytes, not a real
-// ML-KEM encapsulation: MTProto FakeTLS clients validate record framing plus
-// the HMAC in server-random, and the proxy is not a TLS terminator.
+// The ML-KEM ciphertext bytes are intentionally high-entropy placeholders,
+// not a real encapsulation; the X25519 suffix is a canonical derived public
+// key. MTProto FakeTLS clients validate framing plus the server-random HMAC.
 
 pub const pq_named_group: u16 = 0x11ec;
+/// X25519MLKEM768 client share: ML-KEM-768 public key (1184) || X25519 (32).
+const pq_client_key_share_len: usize = 1216;
+const pq_mlkem_ciphertext_len: usize = 1088;
 /// X25519MLKEM768 server share: ML-KEM-768 ciphertext (1088) || X25519 (32).
 const pq_key_share_len: usize = 1120;
 /// PQ ServerHello record length: 5(rec hdr)+4(hs hdr)+2(ver)+32(rand)+1+32(sid)
@@ -225,49 +228,71 @@ const pq_appdata_offset: usize = pq_server_hello_record_len + 6 + 5;
 
 /// Return true when the ClientHello carries a key_share entry for X25519MLKEM768.
 pub fn clientOffersPqKeyShare(handshake: []const u8) bool {
-    if (handshake.len < 43 or handshake[0] != constants.tls_record_handshake) return false;
-    var pos: usize = 5;
-    if (pos >= handshake.len or handshake[pos] != 0x01) return false;
-    pos += 4; // handshake type + 3-byte length
-    pos += 2 + 32; // legacy_version + random
-    if (pos + 1 > handshake.len) return false;
-    const sid_len: usize = handshake[pos];
-    pos += 1 + sid_len;
-    if (pos + 2 > handshake.len) return false;
-    const cs_len = std.mem.readInt(u16, handshake[pos..][0..2], .big);
-    pos += 2;
-    if (cs_len % 2 != 0 or pos + cs_len > handshake.len) return false;
-    pos += cs_len;
-    if (pos + 1 > handshake.len) return false;
-    const comp_len: usize = handshake[pos];
-    pos += 1 + comp_len;
-    if (pos + 2 > handshake.len) return false;
-    const ext_total = std.mem.readInt(u16, handshake[pos..][0..2], .big);
-    pos += 2;
-    const ext_end = @min(pos + ext_total, handshake.len);
+    if (handshake.len < 9 or handshake[0] != constants.tls_record_handshake) return false;
+    const record_len: usize = std.mem.readInt(u16, handshake[3..5], .big);
+    if (record_len != handshake.len - 5) return false;
+    const hello_len: usize = std.mem.readInt(u24, handshake[6..9], .big);
+    if (hello_len != record_len - 4) return false;
 
-    while (pos + 4 <= ext_end) {
+    const hello_end = handshake.len;
+    var pos: usize = 5;
+    if (handshake[pos] != 0x01) return false;
+    pos += 4; // handshake type + 3-byte length
+    if (pos + 2 + 32 > hello_end) return false;
+    pos += 2 + 32; // legacy_version + random
+    if (pos + 1 > hello_end) return false;
+    const sid_len: usize = handshake[pos];
+    pos += 1;
+    if (pos + sid_len > hello_end) return false;
+    pos += sid_len;
+    if (pos + 2 > hello_end) return false;
+    const cs_len: usize = std.mem.readInt(u16, handshake[pos..][0..2], .big);
+    pos += 2;
+    if (cs_len < 2 or cs_len % 2 != 0 or pos + cs_len > hello_end) return false;
+    pos += cs_len;
+    if (pos + 1 > hello_end) return false;
+    const comp_len: usize = handshake[pos];
+    pos += 1;
+    if (comp_len == 0 or pos + comp_len > hello_end) return false;
+    pos += comp_len;
+    if (pos + 2 > hello_end) return false;
+    const ext_total: usize = std.mem.readInt(u16, handshake[pos..][0..2], .big);
+    pos += 2;
+    if (pos + ext_total != hello_end) return false;
+    const ext_end = hello_end;
+    var found_pq = false;
+
+    while (pos < ext_end) {
+        if (pos + 4 > ext_end) return false;
         const etype = std.mem.readInt(u16, handshake[pos..][0..2], .big);
-        const elen = std.mem.readInt(u16, handshake[pos + 2 ..][0..2], .big);
+        const elen: usize = std.mem.readInt(u16, handshake[pos + 2 ..][0..2], .big);
         pos += 4;
-        if (pos + elen > ext_end) break;
-        if (etype == 0x0033 and elen >= 2) {
-            const list_len = std.mem.readInt(u16, handshake[pos..][0..2], .big);
+        if (pos + elen > ext_end) return false;
+        if (etype == 0x0033) {
+            if (elen < 2) return false;
+            const list_len: usize = std.mem.readInt(u16, handshake[pos..][0..2], .big);
+            if (list_len != elen - 2) return false;
             var kp: usize = pos + 2;
-            const ks_end = @min(pos + 2 + list_len, pos + elen);
-            while (kp + 4 <= ks_end) {
+            const ks_end = pos + elen;
+            while (kp < ks_end) {
+                if (kp + 4 > ks_end) return false;
                 const group = std.mem.readInt(u16, handshake[kp..][0..2], .big);
-                const key_len = std.mem.readInt(u16, handshake[kp + 2 ..][0..2], .big);
+                const key_len: usize = std.mem.readInt(u16, handshake[kp + 2 ..][0..2], .big);
                 kp += 4;
-                if (kp + key_len > ks_end) break;
-                if (group == pq_named_group) return true;
+                if (key_len == 0 or kp + key_len > ks_end) return false;
+                if (group == pq_named_group) {
+                    if (key_len != pq_client_key_share_len or found_pq) return false;
+                    found_pq = true;
+                } else if (group == 0x001d and key_len != 32) {
+                    return false;
+                }
                 kp += key_len;
             }
         }
         pos += elen;
     }
 
-    return false;
+    return found_pq;
 }
 
 /// Build a ServerHello that answers an X25519MLKEM768-offering client with a
@@ -317,7 +342,9 @@ pub fn buildServerHelloPq(
     std.mem.writeInt(u16, response[89..][0..2], @intCast(4 + pq_key_share_len), .big);
     std.mem.writeInt(u16, response[91..][0..2], pq_named_group, .big);
     std.mem.writeInt(u16, response[93..][0..2], @intCast(pq_key_share_len), .big);
-    crypto.randomBytes(response[pq_key_offset..][0..pq_key_share_len]);
+    crypto.randomBytes(response[pq_key_offset..][0..pq_mlkem_ciphertext_len]);
+    const x25519_key = try randomX25519PublicKey();
+    @memcpy(response[pq_key_offset + pq_mlkem_ciphertext_len ..][0..32], &x25519_key);
 
     // Record 2: Change Cipher Spec.
     const ccs = pq_server_hello_record_len;
@@ -364,8 +391,15 @@ const tmpl_random_offset: usize = 11;
 const tmpl_session_id_offset: usize = 44;
 /// Offset of the 2-byte cipher suite, immediately after the 32-byte session_id.
 const tmpl_cipher_offset: usize = tmpl_session_id_offset + 32;
-/// Offset of X25519 public key (32 bytes) — filled with random at runtime
+/// Offset of X25519 public key (32 bytes) — filled canonically at runtime
 const tmpl_x25519_key_offset: usize = 95;
+
+fn randomX25519PublicKey() ![32]u8 {
+    var secret_key: [32]u8 = undefined;
+    crypto.randomBytes(&secret_key);
+    defer @memset(secret_key[0..], 0);
+    return std.crypto.dh.X25519.recoverPublicKey(secret_key);
+}
 
 /// Fake encrypted certificate payload size.
 /// 2878 bytes matches a typical Let's Encrypt ECDSA P-256 cert chain:
@@ -537,7 +571,7 @@ fn fillServerHelloTemplate(t: []u8, seed: u64, cert_payload_size: usize) !void {
     t[pos + 7] = 0x20; // key length = 32
     pos += 8;
 
-    // X25519 public key: 32 zero bytes (PLACEHOLDER — random at runtime)
+    // X25519 public key: 32 zero bytes (placeholder — derived at runtime)
     for (0..32) |i| {
         t[pos + i] = 0x00;
     }
@@ -924,8 +958,8 @@ test "buildServerHelloWithTemplateCipher echoes chosen cipher" {
     try std.testing.expectEqual(@as(u16, 0x1303), std.mem.readInt(u16, resp[tmpl_cipher_offset..][0..2], .big));
 }
 
-test "clientOffersPqKeyShare detects a 0x11ec key_share entry" {
-    var ch: [96]u8 = undefined;
+test "clientOffersPqKeyShare detects a complete 0x11ec key_share entry" {
+    var ch: [1400]u8 = undefined;
     var n: usize = 0;
     const W = struct {
         fn b(buf: []u8, pos: *usize, v: u8) void {
@@ -940,8 +974,10 @@ test "clientOffersPqKeyShare detects a 0x11ec key_share entry" {
 
     W.b(&ch, &n, constants.tls_record_handshake);
     W.h(&ch, &n, 0x0301);
+    const record_len_at = n;
     W.h(&ch, &n, 0);
     W.b(&ch, &n, 0x01);
+    const hello_len_at = n;
     W.b(&ch, &n, 0);
     W.h(&ch, &n, 0);
     W.h(&ch, &n, 0x0303);
@@ -963,16 +999,17 @@ test "clientOffersPqKeyShare detects a 0x11ec key_share entry" {
     W.h(&ch, &n, 0);
     const shares_start = n;
     W.h(&ch, &n, pq_named_group);
-    W.h(&ch, &n, 4);
-    @memset(ch[n..][0..4], 0xCC);
-    n += 4;
+    W.h(&ch, &n, @intCast(pq_client_key_share_len));
+    @memset(ch[n..][0..pq_client_key_share_len], 0xCC);
+    n += pq_client_key_share_len;
     std.mem.writeInt(u16, ch[list_len_at..][0..2], @intCast(n - shares_start), .big);
     std.mem.writeInt(u16, ch[ext_len_at..][0..2], @intCast(n - ext_payload_start), .big);
     std.mem.writeInt(u16, ch[ext_total_at..][0..2], @intCast(n - ext_start), .big);
+    std.mem.writeInt(u16, ch[record_len_at..][0..2], @intCast(n - 5), .big);
+    std.mem.writeInt(u24, ch[hello_len_at..][0..3], @intCast(n - 9), .big);
 
     try std.testing.expect(clientOffersPqKeyShare(ch[0..n]));
-    ch[shares_start] = 0x00;
-    ch[shares_start + 1] = 0x1d;
+    std.mem.writeInt(u16, ch[shares_start + 2 ..][0..2], 4, .big);
     try std.testing.expect(!clientOffersPqKeyShare(ch[0..n]));
 }
 

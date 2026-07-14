@@ -42,7 +42,7 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 | **PQ FakeTLS** | DPI Evasion | Echoes `X25519MLKEM768` (`0x11ec`) ServerHello key_share for modern Desktop/Android ClientHellos |
 | **Fast Mode** | Direct-Path S2C Offload | Reduces CPU usage by delegating S2C AES work to Telegram DCs on direct paths (non-MiddleProxy) |
 | **MiddleProxy** | Telemt-Compatible ME | Optional ME transport for DC1..5 (`use_middle_proxy`); retries TCP candidates, applies a 5-second per-stage handshake deadline, cools failed endpoints for 60 seconds, and falls back directly when ME stalls |
-| **Auto Refresh** | Telegram Metadata | Periodically updates regular/media MiddleProxy endpoints and secret from Telegram core endpoints when any ME route is enabled |
+| **Auto Refresh** | Runtime Discovery | Periodically updates regular/media MiddleProxy metadata and re-resolves all masking DNS candidates without delaying listener startup |
 | **Promotion** | Tag Support | Optional promotion tag for sponsored proxy channel registration |
 | **IPv6 Hopping** | DPI Evasion | Rotates IPv6 from a routed /64 and updates Cloudflare AAAA records; installers schedule a hop every 5 minutes, while `--auto` provides foreground ban-detection mode |
 | **Optional TCPMSS=88** | Legacy DPI fallback | Disabled by default; can force tiny ClientHello fragmentation when explicitly enabled |
@@ -59,9 +59,9 @@ Connection-capacity methodology and command profiles: `test/README.md`.
 ## Runtime Model
 
 - Client relay is handled by a single-threaded Linux `epoll` event loop.
-- When any MiddleProxy path is enabled (`use_middle_proxy` or `force_media_middle_proxy`), a background updater immediately refreshes metadata from Telegram core endpoints, then refreshes hourly and can wake early after stalled MiddleProxy handshakes. The listener starts on bundled fallback endpoints without waiting for that first fetch.
+- External discovery never delays the listening socket: MiddleProxy metadata/NAT detection and hostname-based masking resolution run in a joinable background worker. Metadata and masking candidates refresh hourly, and stalled MiddleProxy handshakes can request an early refresh.
 - FakeTLS validation expects Telegram-style 32-byte ClientHello Session IDs and copies the Session ID into the synthetic ServerHello.
-- Handshake and relay lifetimes are controlled by event-loop timers (`handshake_timeout_sec`, `idle_timeout_sec`), not by `SO_RCVTIMEO`; a silent connection gets at most 10 seconds to send its first byte.
+- Handshake and relay lifetimes are controlled by monotonic event-loop timers (`handshake_timeout_sec`, `idle_timeout_sec`), not by `SO_RCVTIMEO`; a silent connection gets at most 10 seconds to send its first byte.
 - Unauthenticated sockets share a per-/24 or per-/48 concurrent allowance (`clamp(max_connections / 8, 16, 128)`). The global handshake-inflight budget is charged after the first byte and released after authentication.
 - Graceful `EPOLLRDHUP` is drained to EOF before the source fd is detached, preserving data queued immediately before a peer half-closes.
 - Failed non-blocking upstream connects are reclaimed immediately on fatal hangup events; the relay loop should not spin on dead upstream sockets.
@@ -184,7 +184,7 @@ For a fresh self-domain install, pass `MASK_DOMAIN` as shown below or enter the 
 
 ## Docker image
 
-The repository includes a **multi-stage Dockerfile**: Zig is bootstrapped from the official tarball inside the build stage; the runtime image is Debian **bookworm-slim** with `curl` and CA certs. The proxy binary performs HTTPS public-IP detection and MiddleProxy metadata refresh itself, so CA certs are required; `curl` is kept for container-side diagnostics and as a fallback when the Zig resolver rejects a malformed `/etc/resolv.conf`. That fallback follows only a bounded number of HTTPS-to-HTTPS redirects. The process runs as **root** inside the container (simple bind to port 443). The image ships `config.toml.example` as `/etc/mtproto-proxy/config.toml` for a quick start; mount your own file for real secrets and settings.
+The repository includes a **multi-stage Dockerfile**: Zig is bootstrapped from the official tarball inside the build stage; the runtime image is Debian **bookworm-slim** with `curl` and CA certs. The proxy binary performs background HTTPS public-IPv4 detection for MiddleProxy NAT derivation and refreshes Telegram metadata itself, so CA certs are required; `curl` is kept for container-side diagnostics and as a fallback when the Zig resolver rejects a malformed `/etc/resolv.conf`. That fallback follows only a bounded number of HTTPS-to-HTTPS redirects. The process runs as **root** inside the container (simple bind to port 443). The image ships `config.toml.example` as `/etc/mtproto-proxy/config.toml` for a quick start; mount your own file for real secrets and settings.
 
 ### Build
 
@@ -765,7 +765,7 @@ alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eli
 | `[general]` | `force_media_middle_proxy` | `true` | Keep media-path traffic (`dc=203` / negative `dc_idx`) on MiddleProxy when ME endpoints are available, even if regular DC traffic stays direct |
 | `[general]` | `ad_tag` | _(none)_ | Telemt-compatible alias for promotion tag; ignored if `[server].tag` is set |
 | `[server]` | `port` | `443` | TCP port to listen on |
-| `[server]` | `public_ip` | _(auto-detect)_ | Override the IP/domain shown in startup links. For self-domain masking, set this to the same domain as `tls_domain`. Tunnel deploy scripts preserve an existing domain instead of replacing it with the tunnel exit IP |
+| `[server]` | `public_ip` | _(none)_ | IP/domain shown in startup links. Set it explicitly when using `--show-secrets`; external discovery is intentionally not allowed to delay listener startup. For self-domain masking, use the same domain as `tls_domain`. Tunnel deploy scripts preserve an existing domain instead of replacing it with the tunnel exit IP |
 | `[server]` | `middle_proxy_nat_ip` | _(auto-detect)_ | Optional IPv4 override used in MiddleProxy NAT/AES derivation. Useful when `public_ip` is a hostname or when tunnel egress/detection would choose the wrong IPv4 |
 | `[server]` | `backlog` | `4096` | TCP listen queue size (for high-traffic loads) |
 | `[server]` | `max_connections` | `512` | Concurrent connection cap (small-VPS tuned default, parser lower bound 32). On Linux, startup first auto-clamps this to the effective-memory estimate (host/cgroup) unless `unsafe_override_limits=true`; the proxy then clamps again if `RLIMIT_NOFILE` cannot cover the fd budget |
@@ -802,6 +802,8 @@ alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eli
 
 > **Operational note** &nbsp; The FakeTLS path rejects non-32-byte ClientHello Session IDs. Current Telegram MTProto-over-TLS clients use a 32-byte Session ID, which the proxy echoes in its TLS-like ServerHello template.
 
+> **Operational note** &nbsp; The parser rejects unknown sections, unknown proxy keys, keys outside a section, and malformed non-comment lines. `[monitor].host` and `[monitor].port` remain accepted for the separate dashboard service. Socket ports must be in `1..65535`, and `backlog` must fit Linux's signed listen backlog range; invalid numeric values keep their safe defaults with a warning. Config load failures exit non-zero.
+
 > **Operational note** &nbsp; If `accept()` hits `EMFILE`/`ENFILE`, the listener temporarily disables `EPOLLIN`, waits 500ms, and retries. In periodic `conn stats`, the first `paused=` flag reflects this fd-quota backoff.
 
 > **Operational note** &nbsp; On startup, `max_connections` is automatically clamped to an effective-memory estimate derived from host RAM and cgroup limits. Set `unsafe_override_limits = true` to disable this. Admission control also pauses `accept()` at 90% capacity, resumes at 80%, and limits concurrent unauthenticated sockets per source subnet.
@@ -814,13 +816,13 @@ alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eli
 
 > **Tip** &nbsp; Generate a random secret: `openssl rand -hex 16`
 
-> **Note** &nbsp; The configuration format is compatible with the Rust-based `telemt` proxy.
+> **Note** &nbsp; The documented sections and aliases are compatible with the Rust-based `telemt` proxy; unsupported keys are rejected instead of silently falling back to defaults.
 
 > **Note** &nbsp; For compatibility, `fast_mode` is accepted in `[general]`, `[server]`, or `[censorship]`; all three set the same runtime flag.
 
 > **Note** &nbsp; The parser supports inline `#` / `;` comments after values and treats duplicate owned string/user/direct-user entries as last-write-wins without leaking previous allocations.
 
-> **Note** &nbsp; MiddleProxy settings (regular DC1..5 endpoints + media-path endpoints + shared secret) are refreshed immediately in the background after startup, then hourly, with reactive early refresh after stalled MiddleProxy handshakes and bundled defaults as fallback.
+> **Note** &nbsp; MiddleProxy settings (regular DC1..5 endpoints + media-path endpoints + shared secret), NAT discovery, and masking DNS resolution run after the listener is ready. Metadata and all masking candidates refresh hourly, with reactive early refresh after stalled MiddleProxy handshakes and bundled MiddleProxy defaults as fallback.
 
 ## &nbsp; Troubleshooting ("Updating...")
 
@@ -828,7 +830,7 @@ If your Telegram app is stuck on "Updating...", your provider or network is drop
 
 ### 0. Runtime expectations (important)
 
-This proxy uses a Linux `epoll` event loop (single-thread relay path). Timeouts are controlled by config (`idle_timeout_sec`, `handshake_timeout_sec`) and event-loop timers. If you see stale guidance mentioning `poll()`/`SO_RCVTIMEO`/fixed max-lifetime, treat it as outdated.
+This proxy uses a Linux `epoll` event loop (single-thread relay path). Timeouts use a monotonic clock and a 5 ms event-loop/timer cadence, and every active slot is checked on each timer pass. If you see stale guidance mentioning `poll()`/`SO_RCVTIMEO`/fixed max-lifetime, treat it as outdated.
 
 ### 1. Check runtime health and fd pressure first
 

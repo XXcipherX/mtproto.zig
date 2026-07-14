@@ -41,7 +41,7 @@ ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy --since "1 hour ago" --no-page
 ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy --since "24 hours ago" --no-pager | grep -E "Middle-proxy cache updated|Middle-proxy reactive refresh|Initial middle-proxy refresh failed|Middle-proxy refresh failed"'
 
 # Startup masking / NAT translation decisions
-ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy -n 120 --no-pager | grep -E "Mask target|mask_port=.*netns|middle-proxy NAT translation|auto-detecting middle-proxy NAT IP"'
+ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy -n 120 --no-pager | grep -E "Mask target|mask_port=.*netns|middle-proxy NAT translation|will be detected in the background"'
 ```
 
 Note:

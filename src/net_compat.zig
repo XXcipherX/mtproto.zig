@@ -191,7 +191,7 @@ fn linuxListen(a: Address, options: Address.ListenOptions) ListenError!Server {
     const linux = std.os.linux;
     const socket_rc = linux.socket(
         @intCast(a.any.family),
-        linux.SOCK.STREAM | linux.SOCK.CLOEXEC,
+        linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK,
         0,
     );
     const fd: posix.fd_t = switch (posix.errno(socket_rc)) {
@@ -207,6 +207,9 @@ fn linuxListen(a: Address, options: Address.ListenOptions) ListenError!Server {
 
     if (options.reuse_address) try linuxSetSockOptInt(fd, linux.SO.REUSEADDR, 1);
     if (options.reuse_port) try linuxSetSockOptInt(fd, linux.SO.REUSEPORT, 1);
+    if (a.any.family == posix.AF.INET6) {
+        try linuxSetSockOptIntAtLevel(fd, linux.SOL.IPV6, linux.IPV6.V6ONLY, 0);
+    }
 
     const bind_rc = linux.bind(fd, &a.any, a.getOsSockLen());
     switch (posix.errno(bind_rc)) {
@@ -235,11 +238,15 @@ fn linuxListen(a: Address, options: Address.ListenOptions) ListenError!Server {
 }
 
 fn linuxSetSockOptInt(fd: posix.fd_t, optname: u32, value: i32) ListenError!void {
+    return linuxSetSockOptIntAtLevel(fd, std.os.linux.SOL.SOCKET, optname, value);
+}
+
+fn linuxSetSockOptIntAtLevel(fd: posix.fd_t, level: i32, optname: u32, value: i32) ListenError!void {
     const linux = std.os.linux;
     const bytes = std.mem.asBytes(&value);
     const rc = linux.setsockopt(
         fd,
-        linux.SOL.SOCKET,
+        level,
         optname,
         bytes.ptr,
         @intCast(bytes.len),

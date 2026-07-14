@@ -31,6 +31,7 @@ pub const Flag = struct {
     pub const magic: u32 = 0x1000;
     pub const extmode2: u32 = 0x20000;
     pub const pad: u32 = 0x8000000;
+    pub const dropped: u32 = 0x10000000;
     pub const intermediate: u32 = 0x20000000;
     pub const abridged: u32 = 0x40000000;
     pub const quickack: u32 = 0x80000000;
@@ -130,6 +131,7 @@ pub const MiddleProxyContext = struct {
     pub const initial_stream_buffer_size: usize = 16 * 1024;
     pub const shrink_stream_buffer_threshold: usize = initial_stream_buffer_size * 4;
     pub const max_stream_buffer_size: usize = config.Config.middle_proxy_stream_buffer_cap_bytes;
+    pub const min_client_payload_size: usize = 20;
     const C2sPayloadInfo = struct {
         actual_len: usize,
         is_plain: bool,
@@ -313,9 +315,7 @@ pub const MiddleProxyContext = struct {
     }
 
     fn encryptedMtprotoActualPayloadLen(frame_payload_len: usize) !usize {
-        if (frame_payload_len < 24) {
-            return frame_payload_len - (frame_payload_len % 4);
-        }
+        if (frame_payload_len < 24) return error.InvalidPayloadLength;
 
         const padding_len = (frame_payload_len - 24) & 15;
         const actual_len = frame_payload_len - padding_len;
@@ -331,6 +331,17 @@ pub const MiddleProxyContext = struct {
             } else |_| {}
         }
         return .{ .actual_len = try encryptedMtprotoActualPayloadLen(payload.len), .is_plain = false };
+    }
+
+    fn validateC2sPayloadLength(self: *const MiddleProxyContext, header_len: usize, payload_len: usize) !void {
+        if (payload_len < min_client_payload_size or
+            (self.proto_tag != .secure and (payload_len & 3) != 0))
+        {
+            return error.InvalidPayloadLength;
+        }
+        if (header_len > self.buffer_limit or payload_len > self.buffer_limit - header_len) {
+            return error.MiddleProxyBufferOverflow;
+        }
     }
 
     fn securePayloadInfoBuffered(
@@ -393,6 +404,8 @@ pub const MiddleProxyContext = struct {
                 },
             }
 
+            try self.validateC2sPayloadLength(header_len, payload_len);
+
             if (total_input_len - pos < header_len + payload_len) break;
 
             var actual_payload_len = payload_len;
@@ -450,6 +463,8 @@ pub const MiddleProxyContext = struct {
                     payload_len = len_u32;
                 },
             }
+
+            try self.validateC2sPayloadLength(header_len, payload_len);
 
             if (self.c2s_len - pos < header_len + payload_len) {
                 break; // Need more data
@@ -646,16 +661,30 @@ pub const MiddleProxyContext = struct {
             // Payload is after Length (4) and SeqNo (4), and before CRC32 (4)
             const payload = self.s2c_buf[parse_pos + 8 .. frame_end - 4];
 
-            if (payload.len >= 16 and std.mem.eql(u8, payload[0..4], &rpc_simple_ack)) {
+            if (payload.len >= 4 and std.mem.eql(u8, payload[0..4], &rpc_simple_ack)) {
                 // RPC_SIMPLE_ACK format: type(4) + conn_id(8) + confirm(4)
+                if (payload.len != 16) return error.BadMiddleProxyPayload;
+                if (!std.mem.eql(u8, payload[4..12], &self.conn_id)) return error.BadMiddleProxyConnId;
                 const confirm = payload[12..16];
                 if (out_pos + confirm.len > out_buf.len) return error.OutBufOverflow;
-                @memcpy(out_buf[out_pos .. out_pos + confirm.len], confirm);
+                const confirm_value = std.mem.readInt(u32, confirm, .little);
+                std.mem.writeInt(
+                    u32,
+                    out_buf[out_pos..][0..4],
+                    confirm_value,
+                    if (self.proto_tag == .abridged) .big else .little,
+                );
                 out_pos += confirm.len;
             } else if (payload.len >= 4 and std.mem.eql(u8, payload[0..4], &rpc_close_ext)) {
+                if (payload.len != 12) return error.BadMiddleProxyPayload;
+                if (!std.mem.eql(u8, payload[4..12], &self.conn_id)) return error.BadMiddleProxyConnId;
                 return error.ConnectionReset;
-            } else if (payload.len >= 16 and std.mem.eql(u8, payload[0..4], &rpc_proxy_ans)) {
+            } else if (payload.len >= 4 and std.mem.eql(u8, payload[0..4], &rpc_proxy_ans)) {
                 // RPC_PROXY_ANS format: type(4) + flags(4) + conn_id(8) + conn_data
+                if (payload.len < 16) return error.BadMiddleProxyPayload;
+                const flags = std.mem.readInt(u32, payload[4..8], .little);
+                try self.validateProxyAnsFlags(flags);
+                if (!std.mem.eql(u8, payload[8..16], &self.conn_id)) return error.BadMiddleProxyConnId;
                 const conn_data = payload[16..];
 
                 var pad_len: usize = 0;
@@ -719,6 +748,33 @@ pub const MiddleProxyContext = struct {
         }
 
         return out_buf[0..out_pos];
+    }
+
+    fn validateProxyAnsFlags(self: *const MiddleProxyContext, flags: u32) !void {
+        const known_flags = Flag.not_encrypted | Flag.has_ad_tag | Flag.magic | Flag.extmode2 |
+            Flag.pad | Flag.dropped | Flag.intermediate | Flag.abridged | Flag.quickack;
+        if ((flags & ~known_flags) != 0) return error.BadMiddleProxyFlags;
+        if ((flags & Flag.dropped) != 0) return error.MiddleProxyDroppedResponse;
+        const mode_header = flags & (Flag.magic | Flag.extmode2);
+        if (mode_header != 0 and mode_header != (Flag.magic | Flag.extmode2)) {
+            return error.BadMiddleProxyFlags;
+        }
+        if ((flags & Flag.has_ad_tag) != 0 and self.ad_tag == null) {
+            return error.BadMiddleProxyFlags;
+        }
+
+        switch (self.proto_tag) {
+            .abridged => {
+                if ((flags & (Flag.intermediate | Flag.pad)) != 0) return error.BadMiddleProxyFlags;
+            },
+            .intermediate => {
+                if ((flags & (Flag.abridged | Flag.pad)) != 0) return error.BadMiddleProxyFlags;
+            },
+            .secure => {
+                if ((flags & Flag.abridged) != 0) return error.BadMiddleProxyFlags;
+                if ((flags & Flag.pad) != 0 and (flags & Flag.intermediate) == 0) return error.BadMiddleProxyFlags;
+            },
+        }
     }
 };
 
@@ -888,14 +944,15 @@ test "required c2s scratch capacity accounts for buffered partial frame" {
     );
     defer ctx.deinit();
 
-    ctx.c2s_buf[0] = 4;
+    ctx.c2s_buf[0] = @intCast(MiddleProxyContext.min_client_payload_size);
     ctx.c2s_buf[1] = 0;
     ctx.c2s_len = 2;
 
-    const tail = [_]u8{ 0, 0, 0xde, 0xad, 0xbe, 0xef };
+    var tail = [_]u8{0} ** (2 + MiddleProxyContext.min_client_payload_size);
+    @memset(tail[2..], 0xef);
     const required = try ctx.requiredC2sScratchCapacity(tail[0..]);
 
-    try std.testing.expectEqual(ctx.c2sFrameEncryptedLen(4), required);
+    try std.testing.expectEqual(ctx.c2sFrameEncryptedLen(MiddleProxyContext.min_client_payload_size), required);
 }
 
 test "secure c2s strips encrypted padded-intermediate padding" {
@@ -1118,7 +1175,7 @@ test "decapsulate s2c skips noop padding words" {
 
     // payload: type(4) + conn_id(8) + confirm(4)
     @memcpy(plain[off + 8 .. off + 12], &rpc_simple_ack);
-    @memset(plain[off + 12 .. off + 20], 0);
+    @memcpy(plain[off + 12 .. off + 20], &ctx.conn_id);
     const confirm = [_]u8{ 0xaa, 0xbb, 0xcc, 0xdd };
     @memcpy(plain[off + 20 .. off + 24], &confirm);
 
@@ -1165,7 +1222,7 @@ test "decapsulate s2c validates seq" {
     std.mem.writeInt(i32, plain[4..8], 0, .little);
     @memcpy(plain[8..12], &rpc_proxy_ans);
     std.mem.writeInt(u32, plain[12..16], 0, .little); // flags
-    @memset(plain[16..24], 0); // conn_id
+    @memcpy(plain[16..24], &ctx.conn_id);
     std.mem.writeInt(u32, plain[24..28], 0x12345678, .little); // data
     const checksum = crc32(plain[0..28]);
     std.mem.writeInt(u32, plain[28..32], checksum, .little);
@@ -1184,7 +1241,7 @@ test "decapsulate s2c validates seq" {
     std.mem.writeInt(i32, plain2[4..8], 5, .little);
     @memcpy(plain2[8..12], &rpc_proxy_ans);
     std.mem.writeInt(u32, plain2[12..16], 0, .little);
-    @memset(plain2[16..24], 0);
+    @memcpy(plain2[16..24], &ctx.conn_id);
     std.mem.writeInt(u32, plain2[24..28], 0x01020304, .little);
     const checksum2 = crc32(plain2[0..28]);
     std.mem.writeInt(u32, plain2[28..32], checksum2, .little);
@@ -1220,7 +1277,7 @@ test "decapsulate s2c rejects checksum mismatch without resyncing" {
     std.mem.writeInt(i32, plain[4..8], 0, .little);
     @memcpy(plain[8..12], &rpc_proxy_ans);
     std.mem.writeInt(u32, plain[12..16], 0, .little);
-    @memset(plain[16..24], 0);
+    @memcpy(plain[16..24], &ctx.conn_id);
     std.mem.writeInt(u32, plain[24..28], 0x12345678, .little);
     const checksum = crc32(plain[0..28]);
     std.mem.writeInt(u32, plain[28..32], checksum ^ 0x1, .little);
@@ -1270,7 +1327,7 @@ test "middle proxy sequence counters wrap without panicking" {
     std.mem.writeInt(i32, plain[4..8], std.math.maxInt(i32), .little);
     @memcpy(plain[8..12], &rpc_proxy_ans);
     std.mem.writeInt(u32, plain[12..16], 0, .little);
-    @memset(plain[16..24], 0);
+    @memcpy(plain[16..24], &ctx.conn_id);
     std.mem.writeInt(u32, plain[24..28], 0x12345678, .little);
     const checksum = crc32(plain[0..28]);
     std.mem.writeInt(u32, plain[28..32], checksum, .little);
@@ -1452,7 +1509,7 @@ test "middle proxy context grows s2c buffer on demand within configured cap" {
     std.mem.writeInt(i32, plain[4..8], 0, .little);
     @memcpy(plain[8..12], &rpc_proxy_ans);
     std.mem.writeInt(u32, plain[12..16], 0, .little);
-    @memset(plain[16..24], 0);
+    @memcpy(plain[16..24], &ctx.conn_id);
     @memset(plain[24 .. 24 + conn_data_len], 0x5a);
     const checksum = crc32(plain[0 .. total_len - 4]);
     std.mem.writeInt(u32, plain[total_len - 4 .. total_len], checksum, .little);
