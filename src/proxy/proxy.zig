@@ -21,14 +21,14 @@ const Config = @import("../config.zig").Config;
 const log = std.log.scoped(.proxy);
 
 const tls_header_len = 5;
-// Prime-ish timeout avoids lockstep with the 5 ms timer tick while keeping idle CPU low.
-const event_loop_wait_ms = 37;
+// Bound epoll sleep by the shortest timer cadence. Longer sleeps make the
+// 3-5 ms desynchronization deadlines observationally meaningless.
+const event_loop_wait_ms = 5;
 const accept_backoff_ms: i64 = 500;
 const accept_backoff_ns: i128 = @as(i128, accept_backoff_ms) * std.time.ns_per_ms;
 const accept_batch_limit: usize = 256;
 const stats_log_interval_s: i64 = 10;
 const stats_log_interval_ns: i128 = @as(i128, stats_log_interval_s) * std.time.ns_per_s;
-const timer_scan_budget: usize = 512;
 const nofile_fd_overhead: usize = 512;
 const middle_proxy_config_url = "https://core.telegram.org/getProxyConfig";
 const middle_proxy_secret_url = "https://core.telegram.org/getProxySecret";
@@ -44,6 +44,8 @@ const mp_handshake_frame_buf_size: usize = 2048;
 const read_buf_size: usize = 4096;
 const pre_first_byte_timeout_ms: i64 = 10 * std.time.ms_per_s;
 const middle_proxy_stage_timeout_ms: i64 = 5 * std.time.ms_per_s;
+const tls_control_record_budget: usize = 8;
+const tls_control_byte_budget: usize = 64 * 1024;
 
 const invalid_fd: posix.fd_t = switch (builtin.os.tag) {
     .windows => std.os.windows.INVALID_HANDLE_VALUE,
@@ -269,7 +271,7 @@ const SubnetRateLimit = struct {
     fn check(self: *SubnetRateLimit, addr: net.Address, max_per_sec: u8) bool {
         if (max_per_sec == 0) return true;
         const key = subnetKey(addr);
-        const now_s = @divTrunc(compat.milliTimestamp(), 1000);
+        const now_s = @divTrunc(compat.monotonicMilliTimestamp(), 1000);
 
         const start = self.indexFor(key);
         var first_stale_idx: ?usize = null;
@@ -797,7 +799,7 @@ const ReplayCache = struct {
 
     pub fn checkAndInsert(self: *ReplayCache, digest: *const [32]u8) bool {
         const key = digestKey(digest);
-        const now_s = @divTrunc(compat.milliTimestamp(), 1000);
+        const now_s = @divTrunc(compat.monotonicMilliTimestamp(), 1000);
         const start = self.indexFor(key);
 
         var first_stale_idx: ?usize = null;
@@ -959,6 +961,7 @@ const ConnectionSlot = struct {
     validation_session_id_len: u8 = 0,
     validation_user: [32]u8 = [_]u8{0} ** 32,
     validation_user_len: u8 = 0,
+    validation_force_direct: bool = false,
 
     server_hello: ?[]u8 = null,
     server_hello_off: usize = 0,
@@ -1035,6 +1038,9 @@ const ConnectionSlot = struct {
     mp_frame_encrypted: bool = false,
     mp_frame_first_decrypted: bool = false,
     mp_step_deadline_ms: i64 = 0,
+    mp_secret: [256]u8 = [_]u8{0} ** 256,
+    mp_secret_len: usize = 0,
+    mp_nat_ip4: ?[4]u8 = null,
 
     // Current epoll interests
     client_interest_in: bool = false,
@@ -1076,8 +1082,7 @@ const ConnectionSlot = struct {
         self.client_queue = .{ .allocator = allocator };
         self.upstream_queue = .{ .allocator = allocator };
 
-        if (self.client_hello_heap) |buf| allocator.free(buf);
-        self.client_hello_heap = null;
+        self.releaseClientHello(allocator);
 
         if (self.server_hello) |buf| allocator.free(buf);
         self.server_hello = null;
@@ -1128,6 +1133,20 @@ const ConnectionSlot = struct {
         self.tg_decryptor = null;
         self.mp_enc = null;
         self.mp_dec = null;
+        @memset(self.mp_secret[0..], 0);
+        self.mp_secret_len = 0;
+        self.mp_nat_ip4 = null;
+    }
+
+    fn releaseClientHello(self: *ConnectionSlot, allocator: std.mem.Allocator) void {
+        if (self.client_hello_heap) |buf| {
+            @memset(buf, 0);
+            allocator.free(buf);
+            self.client_hello_heap = null;
+        } else if (self.client_hello_len > 0) {
+            @memset(self.client_hello_inline[0..self.client_hello_len], 0);
+        }
+        self.client_hello_len = 0;
     }
 
     fn clientHelloBuf(self: *ConnectionSlot) []u8 {
@@ -1141,7 +1160,7 @@ const ConnectionPool = struct {
     slots: []?*ConnectionSlot,
     free_stack: []u32,
     free_count: u32,
-    allocated_hi: u32,
+    active_hi: u32,
     fd_to_slot: std.AutoHashMapUnmanaged(posix.fd_t, u32) = .{},
 
     fn init(allocator: std.mem.Allocator, capacity: u32) !ConnectionPool {
@@ -1165,7 +1184,7 @@ const ConnectionPool = struct {
             .slots = slots,
             .free_stack = free_stack,
             .free_count = capacity,
-            .allocated_hi = 0,
+            .active_hi = 0,
             .fd_to_slot = .{},
         };
         try pool.fd_to_slot.ensureTotalCapacity(allocator, @as(u32, capacity * 2));
@@ -1196,8 +1215,6 @@ const ConnectionPool = struct {
             };
             fresh.* = .{};
             self.slots[idx] = fresh;
-            const hi = idx + 1;
-            if (hi > self.allocated_hi) self.allocated_hi = hi;
         }
 
         const slot = self.slots[idx].?;
@@ -1205,6 +1222,8 @@ const ConnectionPool = struct {
         slot.index = idx;
         slot.client_queue.allocator = self.allocator;
         slot.upstream_queue.allocator = self.allocator;
+        const active_hi = idx + 1;
+        if (active_hi > self.active_hi) self.active_hi = active_hi;
         return slot;
     }
 
@@ -1212,6 +1231,16 @@ const ConnectionPool = struct {
         self.free_stack[self.free_count] = slot.index;
         self.free_count += 1;
         slot.phase = .idle;
+        if (slot.index + 1 == self.active_hi) {
+            while (self.active_hi > 0) {
+                const top = self.slots[self.active_hi - 1] orelse {
+                    self.active_hi -= 1;
+                    continue;
+                };
+                if (top.phase != .idle) break;
+                self.active_hi -= 1;
+            }
+        }
     }
 
     fn mapFd(self: *ConnectionPool, fd: posix.fd_t, idx: u32) !void {
@@ -1248,7 +1277,8 @@ pub const ProxyState = struct {
     connection_count: std.atomic.Value(u64),
     active_connections: std.atomic.Value(u32),
     handshakes_inflight: std.atomic.Value(u32),
-    mask_addr: ?net.Address,
+    mask_target: ?[]const u8,
+    mask_addrs: []net.Address,
     replay_cache: ReplayCache,
     tls_server_hello_template: []u8,
 
@@ -1305,9 +1335,11 @@ pub const ProxyState = struct {
         );
         errdefer allocator.free(tls_template);
 
-        var resolved_addr: ?net.Address = null;
+        var mask_target: ?[]const u8 = null;
+        var resolved_addrs: []net.Address = &.{};
+        errdefer if (resolved_addrs.len > 0) allocator.free(resolved_addrs);
         if (cfg.mask) {
-            const mask_target = blk: {
+            mask_target = blk: {
                 if (cfg.mask_port == 443) break :blk cfg.tls_domain;
 
                 if (isRunningInNonInitNetns()) {
@@ -1320,16 +1352,16 @@ pub const ProxyState = struct {
 
                 break :blk "127.0.0.1";
             };
-            const list = net.getAddressList(allocator, mask_target, cfg.mask_port) catch |err| blk: {
-                log.err("Failed to resolve mask target '{s}': {any}", .{ mask_target, err });
-                break :blk null;
-            };
-            if (list) |al| {
-                defer al.deinit();
-                if (al.addrs.len > 0) {
-                    resolved_addr = al.addrs[0];
-                    log.info("Mask target '{s}:{d}' resolved at startup", .{ mask_target, cfg.mask_port });
+            if (std.Io.net.IpAddress.parse(mask_target.?, cfg.mask_port)) |_| {
+                const list = try net.getAddressList(allocator, mask_target.?, cfg.mask_port);
+                if (list.addrs.len > 0) {
+                    resolved_addrs = list.addrs;
+                    log.info("Using literal mask target '{s}:{d}'", .{ mask_target.?, cfg.mask_port });
+                } else {
+                    list.deinit();
                 }
+            } else |_| {
+                log.info("Mask target '{s}:{d}' will be resolved in the background", .{ mask_target.?, cfg.mask_port });
             }
         }
 
@@ -1349,30 +1381,14 @@ pub const ProxyState = struct {
             }
 
             if (detected_nat_ip4 == null) {
-                if (detectAwgEndpointIpv4(allocator)) |awg_ip| {
-                    detected_nat_ip4 = awg_ip;
-                    var awg_ip_buf: [16]u8 = undefined;
-                    log.info("Using AWG endpoint IPv4 for middle-proxy NAT translation: {s}", .{formatIpv4Bytes(awg_ip, &awg_ip_buf)});
-                }
-            }
-
-            if (detected_nat_ip4 == null) {
                 if (cfg.public_ip) |configured_public_ip| {
                     if (parseIpv4Literal(configured_public_ip)) |parsed_ip| {
                         detected_nat_ip4 = parsed_ip;
                         var ip_buf: [16]u8 = undefined;
                         log.info("Using server.public_ip for middle-proxy NAT translation: {s}", .{formatIpv4Bytes(parsed_ip, &ip_buf)});
                     } else {
-                        log.info("server.public_ip='{s}' is not an IPv4 literal; auto-detecting middle-proxy NAT IP", .{configured_public_ip});
+                        log.info("server.public_ip='{s}' is not an IPv4 literal; middle-proxy NAT IP will be detected in the background", .{configured_public_ip});
                     }
-                }
-            }
-
-            if (detected_nat_ip4 == null) {
-                detected_nat_ip4 = detectPublicIpv4(allocator);
-                if (detected_nat_ip4) |ip| {
-                    var ip_buf: [16]u8 = undefined;
-                    log.info("Detected public IPv4 for middle-proxy NAT translation: {s}", .{formatIpv4Bytes(ip, &ip_buf)});
                 }
             }
         }
@@ -1384,7 +1400,8 @@ pub const ProxyState = struct {
             .connection_count = std.atomic.Value(u64).init(0),
             .active_connections = std.atomic.Value(u32).init(0),
             .handshakes_inflight = std.atomic.Value(u32).init(0),
-            .mask_addr = resolved_addr,
+            .mask_target = mask_target,
+            .mask_addrs = resolved_addrs,
             .replay_cache = ReplayCache.init(),
             .tls_server_hello_template = tls_template,
             .stats_dropped_cap = std.atomic.Value(u64).init(0),
@@ -1419,6 +1436,7 @@ pub const ProxyState = struct {
         self.middle_proxy_secret_len = 0;
         self.middle_proxy_lock.unlock();
         self.allocator.free(self.tls_server_hello_template);
+        if (self.mask_addrs.len > 0) self.allocator.free(self.mask_addrs);
         freeUserSecrets(self.allocator, self.user_secrets);
     }
 
@@ -1455,14 +1473,14 @@ pub const ProxyState = struct {
             log.info("Listening on 0.0.0.0:{d} (epoll, single-thread)", .{self.config.port});
         }
 
-        setNonBlocking(server.stream.handle);
-
         var middle_proxy_updater_started = false;
         defer {
             if (middle_proxy_updater_started) self.stopMiddleProxyUpdater();
         }
 
-        if (self.config.datacenter_override == null and self.config.usesAnyMiddleProxy()) {
+        if (self.config.datacenter_override == null and
+            (self.config.usesAnyMiddleProxy() or (self.config.mask and self.mask_target != null)))
+        {
             self.startMiddleProxyUpdater();
             middle_proxy_updater_started = self.middle_proxy_updater_thread != null;
         }
@@ -1500,6 +1518,7 @@ pub const ProxyState = struct {
         candidates_203_len: usize,
         secret: [256]u8,
         secret_len: usize,
+        nat_ip4: ?[4]u8 = null,
 
         fn candidatesForDc(self: *const MiddleProxySnapshot, dc_abs: usize, media: bool) []const net.Address {
             if (dc_abs == 203) return self.candidates_203[0..self.candidates_203_len];
@@ -1525,8 +1544,9 @@ pub const ProxyState = struct {
             .candidates_203_len = self.middle_proxy_candidates_203_len,
             .secret = self.middle_proxy_secret,
             .secret_len = self.middle_proxy_secret_len,
+            .nat_ip4 = self.middle_proxy_nat_ip4,
         };
-        const now_ms = compat.milliTimestamp();
+        const now_ms = compat.monotonicMilliTimestamp();
         for (0..snapshot.candidates.len) |i| {
             prioritizeMiddleProxyCandidates(&snapshot.candidates[i], snapshot.candidate_lens[i], &self.middle_proxy_cooldowns, now_ms);
             prioritizeMiddleProxyCandidates(&snapshot.media_candidates[i], snapshot.media_candidate_lens[i], &self.middle_proxy_cooldowns, now_ms);
@@ -1568,7 +1588,7 @@ pub const ProxyState = struct {
         self.middle_proxy_lock.lock();
         defer self.middle_proxy_lock.unlock();
 
-        const now_ms = compat.milliTimestamp();
+        const now_ms = compat.monotonicMilliTimestamp();
         var replacement_index: usize = 0;
         var replacement_until_ms: i64 = std.math.maxInt(i64);
         for (&self.middle_proxy_cooldowns, 0..) |*entry, i| {
@@ -1646,24 +1666,78 @@ pub const ProxyState = struct {
 
     fn middleProxyUpdaterMain(self: *ProxyState) void {
         if (self.config.usesAnyMiddleProxy()) {
+            self.ensureMiddleProxyNatIp();
             // Serve immediately with bundled fallback endpoints. Fetching metadata
             // in this worker keeps a censored or slow core.telegram.org from
             // delaying accepts after a proxy restart.
             self.refreshMiddleProxyInfo() catch |err| {
+                if (err == error.UpdateCancelled or self.middle_proxy_updater_stop.load(.acquire)) return;
                 log.warn("Initial middle-proxy refresh failed, using bundled defaults: {any}", .{err});
             };
         }
+        self.refreshMaskAddresses();
 
         while (self.waitMiddleProxyUpdatePeriod()) {
-            self.refreshMiddleProxyInfo() catch |err| {
-                log.warn("Middle-proxy refresh failed: {any}", .{err});
-            };
+            if (self.config.usesAnyMiddleProxy()) {
+                self.ensureMiddleProxyNatIp();
+                self.refreshMiddleProxyInfo() catch |err| {
+                    if (err == error.UpdateCancelled or self.middle_proxy_updater_stop.load(.acquire)) return;
+                    log.warn("Middle-proxy refresh failed: {any}", .{err});
+                };
+            }
+            self.refreshMaskAddresses();
         }
+    }
+
+    fn ensureMiddleProxyNatIp(self: *ProxyState) void {
+        self.middle_proxy_lock.lock();
+        const already_known = self.middle_proxy_nat_ip4 != null;
+        self.middle_proxy_lock.unlock();
+        if (already_known or self.middle_proxy_updater_stop.load(.acquire)) return;
+
+        var detected = detectAwgEndpointIpv4(self.allocator);
+        if (detected == null and !self.middle_proxy_updater_stop.load(.acquire)) {
+            detected = detectPublicIpv4(self.allocator);
+        }
+        const ip = detected orelse return;
+
+        self.middle_proxy_lock.lock();
+        if (self.middle_proxy_nat_ip4 == null) self.middle_proxy_nat_ip4 = ip;
+        self.middle_proxy_lock.unlock();
+
+        var ip_buf: [16]u8 = undefined;
+        log.info("Detected IPv4 for middle-proxy NAT translation: {s}", .{formatIpv4Bytes(ip, &ip_buf)});
+    }
+
+    fn refreshMaskAddresses(self: *ProxyState) void {
+        const target = self.mask_target orelse return;
+        if (self.middle_proxy_updater_stop.load(.acquire)) return;
+
+        const list = net.getAddressList(self.allocator, target, self.config.mask_port) catch |err| {
+            if (!self.middle_proxy_updater_stop.load(.acquire)) {
+                log.warn("Failed to resolve mask target '{s}:{d}': {any}", .{ target, self.config.mask_port, err });
+            }
+            return;
+        };
+        if (list.addrs.len == 0) {
+            list.deinit();
+            return;
+        }
+        prioritizeIpv4Addresses(list.addrs);
+
+        self.middle_proxy_lock.lock();
+        const old_addrs = self.mask_addrs;
+        self.mask_addrs = list.addrs;
+        self.middle_proxy_lock.unlock();
+        if (old_addrs.len > 0) self.allocator.free(old_addrs);
+
+        log.info("Mask target '{s}:{d}' resolved to {d} candidate(s)", .{ target, self.config.mask_port, list.addrs.len });
     }
 
     fn fetchMiddleProxyMetadata(self: *ProxyState, label: []const u8, url: []const u8) ![]u8 {
         var attempt: u8 = 0;
         while (attempt < 2) : (attempt += 1) {
+            if (self.middle_proxy_updater_stop.load(.acquire)) return error.UpdateCancelled;
             const bytes = http_fetch.fetchUrlBytes(
                 self.allocator,
                 url,
@@ -1671,7 +1745,11 @@ pub const ProxyState = struct {
             ) catch |err| {
                 if (err == error.HttpRequestTimedOut and attempt == 0) {
                     log.info("Middle-proxy {s} request timed out; retrying once in 1s", .{label});
-                    compat.sleep(std.time.ns_per_s);
+                    var waited: u64 = 0;
+                    while (waited < std.time.ns_per_s) : (waited += 100 * std.time.ns_per_ms) {
+                        if (self.middle_proxy_updater_stop.load(.acquire)) return error.UpdateCancelled;
+                        compat.sleep(100 * std.time.ns_per_ms);
+                    }
                     continue;
                 }
                 if (err == error.HttpRequestTimedOut) {
@@ -1689,6 +1767,7 @@ pub const ProxyState = struct {
     }
 
     fn refreshMiddleProxyInfo(self: *ProxyState) !void {
+        if (self.middle_proxy_updater_stop.load(.acquire)) return error.UpdateCancelled;
         const cfg_bytes = try self.fetchMiddleProxyMetadata("getProxyConfig", middle_proxy_config_url);
         defer self.allocator.free(cfg_bytes);
 
@@ -1699,6 +1778,7 @@ pub const ProxyState = struct {
         var next_media_candidates: [5][16]net.Address = undefined;
         var next_media_candidate_lens: [5]usize = [_]usize{0} ** 5;
         for (0..next_primary.len) |i| {
+            if (self.middle_proxy_updater_stop.load(.acquire)) return error.UpdateCancelled;
             const dc_num: i16 = @intCast(i + 1);
 
             var candidates: [16]net.Address = undefined;
@@ -1707,7 +1787,7 @@ pub const ProxyState = struct {
                 null
             else if (i == 3)
                 candidates[0]
-            else if (trySelectReachableMiddleProxy(candidates[0..count], 1200)) |reachable|
+            else if (trySelectReachableMiddleProxy(candidates[0..count], 1200, &self.middle_proxy_updater_stop)) |reachable|
                 reachable
             else
                 candidates[0];
@@ -1722,7 +1802,7 @@ pub const ProxyState = struct {
                 null
             else if (i == 3)
                 media_candidates[0]
-            else if (trySelectReachableMiddleProxy(media_candidates[0..media_count], 1200)) |reachable|
+            else if (trySelectReachableMiddleProxy(media_candidates[0..media_count], 1200, &self.middle_proxy_updater_stop)) |reachable|
                 reachable
             else
                 media_candidates[0];
@@ -1741,6 +1821,7 @@ pub const ProxyState = struct {
         }
         const next_addr_203 = if (count_203 == 0) null else candidates_203[0];
 
+        if (self.middle_proxy_updater_stop.load(.acquire)) return error.UpdateCancelled;
         const next_secret = try self.fetchMiddleProxyMetadata("getProxySecret", middle_proxy_secret_url);
         defer self.allocator.free(next_secret);
 
@@ -1877,7 +1958,7 @@ const EventLoop = struct {
             .accept_resume_ns = 0,
             .saturation_paused = false,
             .timer_scan_cursor = 0,
-            .stats_next_log_ns = compat.nanoTimestamp() + stats_log_interval_ns,
+            .stats_next_log_ns = compat.monotonicNanoTimestamp() + stats_log_interval_ns,
             .accepted_since_log = 0,
             .closed_since_log = 0,
             .subnet_limiter = SubnetRateLimit.init(),
@@ -1931,7 +2012,7 @@ const EventLoop = struct {
     fn run(self: *EventLoop) !void {
         var events: [256]linux.epoll_event = undefined;
         const timer_tick_ns: i128 = 5 * std.time.ns_per_ms;
-        var next_timer_tick_ns: i128 = compat.nanoTimestamp();
+        var next_timer_tick_ns: i128 = compat.monotonicNanoTimestamp();
 
         while (true) {
             self.drainPendingCloses();
@@ -1958,7 +2039,7 @@ const EventLoop = struct {
                 self.processSlotEvent(slot, fd, ev_flags);
             }
 
-            const now_ns = compat.nanoTimestamp();
+            const now_ns = compat.monotonicNanoTimestamp();
             if (self.accept_paused and now_ns >= self.accept_resume_ns) {
                 self.resumeAccepting();
             }
@@ -2113,7 +2194,7 @@ const EventLoop = struct {
             slot.client_fd = cfd;
             slot.peer_addr = client_addr;
             slot.phase = .reading_tls_header;
-            slot.created_at_ms = compat.milliTimestamp();
+            slot.created_at_ms = compat.monotonicMilliTimestamp();
             slot.last_activity_ms = slot.created_at_ms;
             slot.last_client_byte_ms = 0;
             slot.last_server_byte_ms = 0;
@@ -2198,7 +2279,7 @@ const EventLoop = struct {
     }
 
     fn pauseAccepting(self: *EventLoop, err: anyerror) void {
-        self.accept_resume_ns = compat.nanoTimestamp() + accept_backoff_ns;
+        self.accept_resume_ns = compat.monotonicNanoTimestamp() + accept_backoff_ns;
         if (self.accept_paused) return;
 
         self.accept_paused = true;
@@ -2223,7 +2304,7 @@ const EventLoop = struct {
         self.syncAcceptInterest() catch |err| {
             if (!self.saturation_paused) {
                 self.accept_paused = true;
-                self.accept_resume_ns = compat.nanoTimestamp() + accept_backoff_ns;
+                self.accept_resume_ns = compat.monotonicNanoTimestamp() + accept_backoff_ns;
             }
             log.warn("failed to update accept interest after fd quota resume: {any}", .{err});
             return;
@@ -2269,7 +2350,7 @@ const EventLoop = struct {
     }
 
     fn onClientReadable(self: *EventLoop, slot: *ConnectionSlot) void {
-        slot.last_activity_ms = compat.milliTimestamp();
+        slot.last_activity_ms = compat.monotonicMilliTimestamp();
 
         switch (slot.phase) {
             .reading_tls_header => self.readTlsHeader(slot),
@@ -2282,16 +2363,12 @@ const EventLoop = struct {
     }
 
     fn onClientWritable(self: *EventLoop, slot: *ConnectionSlot) void {
-        const had_pending = slot.hasClientPending();
-        if (flushClientPending(slot)) |progressed| {
-            if (!progressed) {}
+        if (flushClientPending(slot)) |written| {
+            if (written > 0) slot.last_activity_ms = compat.monotonicMilliTimestamp();
         } else |err| {
             log.debug("[{d}] client flush error: {any}", .{ slot.conn_id, err });
             self.closeSlot(slot, "client flush error");
             return;
-        }
-        if (had_pending and !slot.hasClientPending()) {
-            slot.last_activity_ms = compat.milliTimestamp();
         }
         if (slot.relay_half_closed and slot.upstream_detached and !slot.hasClientPending()) {
             self.closeSlot(slot, "relay drained after upstream half-close");
@@ -2322,7 +2399,7 @@ const EventLoop = struct {
     }
 
     fn onUpstreamReadable(self: *EventLoop, slot: *ConnectionSlot) void {
-        slot.last_activity_ms = compat.milliTimestamp();
+        slot.last_activity_ms = compat.monotonicMilliTimestamp();
 
         switch (slot.phase) {
             .middle_proxy_handshake => self.middleProxyOnReadable(slot),
@@ -2336,15 +2413,13 @@ const EventLoop = struct {
         switch (slot.phase) {
             .connecting_upstream => self.onUpstreamConnectComplete(slot),
             .writing_dc_nonce, .relaying, .mask_relaying, .middle_proxy_handshake => {
-                const had_pending = slot.hasUpstreamPending();
-                if (flushUpstreamPending(slot)) |_| {} else |err| {
+                if (flushUpstreamPending(slot)) |written| {
+                    if (written > 0) slot.last_activity_ms = compat.monotonicMilliTimestamp();
+                } else |err| {
                     log.debug("[{d}] upstream flush error: {any}", .{ slot.conn_id, err });
                     if (slot.phase == .middle_proxy_handshake and self.fallbackFromMiddleProxyToDirect(slot)) return;
                     self.closeSlot(slot, "upstream flush error");
                     return;
-                }
-                if (had_pending and !slot.hasUpstreamPending()) {
-                    slot.last_activity_ms = compat.milliTimestamp();
                 }
                 if (slot.relay_half_closed and slot.client_detached and !slot.hasUpstreamPending()) {
                     self.closeSlot(slot, "relay drained after client half-close");
@@ -2432,14 +2507,14 @@ const EventLoop = struct {
                 return;
             }
             if (slot.first_byte_at_ms == 0) {
-                slot.first_byte_at_ms = compat.milliTimestamp();
+                slot.first_byte_at_ms = compat.monotonicMilliTimestamp();
                 if (!self.reserveHandshakeBudget(slot)) {
                     self.closeSlot(slot, "handshake budget exhausted");
                     return;
                 }
             }
             slot.tls_hdr_pos += @intCast(n);
-            slot.last_activity_ms = compat.milliTimestamp();
+            slot.last_activity_ms = compat.monotonicMilliTimestamp();
         }
 
         if (!tls.isTlsHandshake(slot.tls_hdr_buf[0..])) {
@@ -2488,7 +2563,7 @@ const EventLoop = struct {
                 return;
             }
             slot.tls_body_pos += @intCast(n);
-            slot.last_activity_ms = compat.milliTimestamp();
+            slot.last_activity_ms = compat.monotonicMilliTimestamp();
         }
 
         const client_hello = hello_buf[0..slot.client_hello_len];
@@ -2538,6 +2613,7 @@ const EventLoop = struct {
         const ulen = @min(v.user.len, slot.validation_user.len);
         slot.validation_user_len = @intCast(ulen);
         @memcpy(slot.validation_user[0..ulen], v.user[0..ulen]);
+        slot.validation_force_direct = self.state.config.userBypassesMiddleProxy(v.user);
 
         const offers_pq = tls.clientOffersPqKeyShare(client_hello);
         const echoed_cipher = tls.extractFirstTls13Cipher(client_hello);
@@ -2575,6 +2651,7 @@ const EventLoop = struct {
             return;
         };
         slot.server_hello_off = 0;
+        slot.releaseClientHello(self.state.allocator);
 
         if (self.state.config.desync and slot.server_hello.?.len > 1) {
             slot.phase = .writing_server_hello_first;
@@ -2596,6 +2673,8 @@ const EventLoop = struct {
 
     fn readMtprotoHandshake(self: *EventLoop, slot: *ConnectionSlot) void {
         // Phase pair: read TLS header then body, reusing tls_* fields.
+        var control_records: usize = 0;
+        var control_bytes: usize = 0;
         while (true) {
             if (slot.phase == .reading_mtproto_tls_header) {
                 while (slot.tls_hdr_pos < tls_header_len) {
@@ -2663,6 +2742,7 @@ const EventLoop = struct {
             }
 
             slot.tls_body_pos += @intCast(n);
+            control_bytes += n;
 
             if (slot.tls_record_type == constants.tls_record_change_cipher) {
                 // discard body
@@ -2687,10 +2767,16 @@ const EventLoop = struct {
             }
 
             if (slot.tls_body_pos == slot.tls_body_len) {
+                if (slot.tls_record_type == constants.tls_record_change_cipher) {
+                    control_records += 1;
+                }
                 slot.tls_hdr_pos = 0;
                 slot.phase = .reading_mtproto_tls_header;
                 if (slot.handshake_pos >= constants.handshake_len) {
                     self.finishClientHandshake(slot);
+                    return;
+                }
+                if (control_records >= tls_control_record_budget or control_bytes >= tls_control_byte_budget) {
                     return;
                 }
             }
@@ -2722,12 +2808,13 @@ const EventLoop = struct {
         }
         const dc_abs: usize = @intCast(dc_abs_wide);
 
-        const snapshot = if (shouldUseMiddleProxySnapshot(&self.state.config, dc_abs, slot.dc_idx))
+        var snapshot = if (shouldUseMiddleProxySnapshot(&self.state.config, dc_abs, slot.dc_idx))
             self.state.getMiddleProxySnapshot()
         else
             null;
+        defer if (snapshot) |*snap| @memset(snap.secret[0..], 0);
 
-        const plan = buildDcConnectPlan(&self.state.config, dc_abs, slot.dc_idx, if (snapshot) |*s| s else null, result.user);
+        const plan = buildDcConnectPlan(&self.state.config, dc_abs, slot.dc_idx, if (snapshot) |*s| s else null, slot.validation_force_direct);
         if (plan.count == 0) {
             self.closeSlot(slot, "no upstream candidates");
             return;
@@ -2739,6 +2826,19 @@ const EventLoop = struct {
         slot.use_fast_mode = self.state.config.fast_mode and !slot.use_middle_proxy and (dc_abs >= 1 and dc_abs <= constants.tg_datacenters_v4.len);
         slot.direct_fallback_addr = plan.direct_fallback;
         slot.direct_fallback_used = false;
+        if (plan.use_middle_proxy) {
+            const snap = if (snapshot) |*s| s else {
+                self.closeSlot(slot, "missing middle-proxy snapshot");
+                return;
+            };
+            if (snap.secret_len < 4 or snap.secret_len > slot.mp_secret.len) {
+                self.closeSlot(slot, "invalid middle-proxy secret snapshot");
+                return;
+            }
+            @memcpy(slot.mp_secret[0..snap.secret_len], snap.secret[0..snap.secret_len]);
+            slot.mp_secret_len = snap.secret_len;
+            slot.mp_nat_ip4 = snap.nat_ip4;
+        }
 
         // Log DC routing decisions at debug level (enable with log_level = "debug" in config)
         if (plan.is_media_path) {
@@ -2781,13 +2881,31 @@ const EventLoop = struct {
 
     fn startMasking(self: *EventLoop, slot: *ConnectionSlot, buffered: []const u8) !void {
         if (!self.state.config.mask) return error.MaskingDisabled;
+        self.state.middle_proxy_lock.lock();
+        const candidates = self.state.allocator.dupe(net.Address, self.state.mask_addrs) catch |err| {
+            self.state.middle_proxy_lock.unlock();
+            return err;
+        };
+        self.state.middle_proxy_lock.unlock();
+        if (candidates.len == 0) {
+            self.state.allocator.free(candidates);
+            return error.NoMaskAddress;
+        }
 
-        const addr = self.state.mask_addr orelse return error.NoMaskAddress;
-        const pre = try self.state.allocator.alloc(u8, buffered.len);
+        const pre = self.state.allocator.alloc(u8, buffered.len) catch |err| {
+            self.state.allocator.free(candidates);
+            return err;
+        };
         @memcpy(pre, buffered);
         slot.mask_prebuffer = pre;
 
-        try self.startConnectUpstream(slot, addr, .mask);
+        slot.upstream_candidates = candidates;
+        slot.upstream_candidate_next = 1;
+        const first = slot.upstream_candidates.?[0];
+        self.startConnectUpstream(slot, first, .mask) catch |err| {
+            if (self.tryNextMaskEndpoint(slot, err, first)) return;
+            return err;
+        };
     }
 
     fn upstreamConnectDeadlineMs(self: *EventLoop, slot: *const ConnectionSlot, started_at_ms: i64) i64 {
@@ -2824,7 +2942,7 @@ const EventLoop = struct {
         slot.upstream_kind = kind;
         slot.current_upstream_addr = addr;
         slot.phase = .connecting_upstream;
-        slot.upstream_connect_started_ms = compat.milliTimestamp();
+        slot.upstream_connect_started_ms = compat.monotonicMilliTimestamp();
         slot.upstream_connect_deadline_ms = self.upstreamConnectDeadlineMs(slot, slot.upstream_connect_started_ms);
         errdefer {
             slot.upstream_fd = invalid_fd;
@@ -2849,6 +2967,9 @@ const EventLoop = struct {
             self.cleanupFailedUpstreamConnect(slot);
 
             if (failed_kind == .dc and self.tryNextDcEndpoint(slot, err, failed_addr)) {
+                return;
+            }
+            if (failed_kind == .mask and self.tryNextMaskEndpoint(slot, err, failed_addr)) {
                 return;
             }
 
@@ -2898,7 +3019,7 @@ const EventLoop = struct {
         if (jitter_ms > 0) {
             delay_ms += crypto.randomRange(u64, @as(u64, jitter_ms) + 1);
         }
-        return compat.nanoTimestamp() + (@as(i128, @intCast(delay_ms)) * std.time.ns_per_ms);
+        return compat.monotonicNanoTimestamp() + (@as(i128, @intCast(delay_ms)) * std.time.ns_per_ms);
     }
 
     fn cleanupFailedUpstreamConnect(self: *EventLoop, slot: *ConnectionSlot) void {
@@ -3000,6 +3121,30 @@ const EventLoop = struct {
             log.warn("[{d}] media path connect failed after all candidates: {any}", .{ slot.conn_id, err });
         }
         return false;
+    }
+
+    fn tryNextMaskEndpoint(self: *EventLoop, slot: *ConnectionSlot, err: anyerror, attempt_addr: ?net.Address) bool {
+        const candidates = slot.upstream_candidates orelse return false;
+        if (slot.upstream_candidate_next >= candidates.len) return false;
+
+        const next_idx = slot.upstream_candidate_next;
+        const next_addr = candidates[next_idx];
+        slot.upstream_candidate_next += 1;
+        self.startConnectUpstream(slot, next_addr, .mask) catch |next_err| {
+            return self.tryNextMaskEndpoint(slot, next_err, next_addr);
+        };
+
+        if (attempt_addr) |addr| {
+            var prev_buf: [64]u8 = undefined;
+            log.debug("[{d}] mask connect failed ({any}), retry candidate {d}/{d} after {s}", .{
+                slot.conn_id,
+                err,
+                next_idx + 1,
+                candidates.len,
+                formatAddress(addr, &prev_buf),
+            });
+        }
+        return true;
     }
 
     fn sendDcNonce(self: *EventLoop, slot: *ConnectionSlot) void {
@@ -3138,7 +3283,7 @@ const EventLoop = struct {
             }
 
             slot.c2s_bytes += data.len;
-            slot.last_activity_ms = compat.milliTimestamp();
+            slot.last_activity_ms = compat.monotonicMilliTimestamp();
             slot.last_client_byte_ms = slot.last_activity_ms;
             self.state.allocator.free(buf);
             slot.pipelined_data = null;
@@ -3159,7 +3304,7 @@ const EventLoop = struct {
             return;
         };
         if (progress == .forwarded or progress == .partial) {
-            slot.last_activity_ms = compat.milliTimestamp();
+            slot.last_activity_ms = compat.monotonicMilliTimestamp();
             slot.last_client_byte_ms = slot.last_activity_ms;
         }
     }
@@ -3177,7 +3322,7 @@ const EventLoop = struct {
             return;
         };
         if (progress == .forwarded or progress == .partial) {
-            slot.last_activity_ms = compat.milliTimestamp();
+            slot.last_activity_ms = compat.monotonicMilliTimestamp();
             slot.last_server_byte_ms = slot.last_activity_ms;
         }
     }
@@ -3249,13 +3394,12 @@ const EventLoop = struct {
 
         var msg: [32]u8 = undefined;
         @memcpy(msg[0..4], &middleproxy.rpc_nonce_req);
-        self.state.middle_proxy_lock.lockShared();
         @memset(msg[4..8], 0);
-        if (self.state.middle_proxy_secret_len > 0) msg[4] = self.state.middle_proxy_secret[0];
-        if (self.state.middle_proxy_secret_len > 1) msg[5] = self.state.middle_proxy_secret[1];
-        if (self.state.middle_proxy_secret_len > 2) msg[6] = self.state.middle_proxy_secret[2];
-        if (self.state.middle_proxy_secret_len > 3) msg[7] = self.state.middle_proxy_secret[3];
-        self.state.middle_proxy_lock.unlockShared();
+        if (slot.mp_secret_len < 4) {
+            if (!self.fallbackFromMiddleProxyToDirect(slot)) self.closeSlot(slot, "missing middle-proxy secret snapshot");
+            return;
+        }
+        @memcpy(msg[4..8], slot.mp_secret[0..4]);
         @memcpy(msg[8..12], &middleproxy.rpc_crypto_aes);
         @memcpy(msg[12..16], &crypto_ts);
         @memcpy(msg[16..32], &slot.mp_nonce);
@@ -3316,21 +3460,9 @@ const EventLoop = struct {
                 var enc_keys: struct { [32]u8, [16]u8 } = undefined;
                 var dec_keys: struct { [32]u8, [16]u8 } = undefined;
                 var middle_local_addr: net.Address = undefined;
-                var secret_snapshot = [_]u8{0} ** 256;
-                defer @memset(secret_snapshot[0..], 0);
-                var secret_len: usize = 0;
-
-                {
-                    self.state.middle_proxy_lock.lockShared();
-                    defer self.state.middle_proxy_lock.unlockShared();
-
-                    secret_len = self.state.middle_proxy_secret_len;
-                    @memcpy(secret_snapshot[0..secret_len], self.state.middle_proxy_secret[0..secret_len]);
-                }
-
                 const mp_handshake_error: ?[]const u8 = handshake: {
-                    const key_sel = secret_snapshot[0..@min(@as(usize, 4), secret_len)];
-                    const secret_slice = secret_snapshot[0..secret_len];
+                    const key_sel = slot.mp_secret[0..4];
+                    const secret_slice = slot.mp_secret[0..slot.mp_secret_len];
                     if (!std.mem.eql(u8, payload[4..8], key_sel)) {
                         break :handshake "mp key selector mismatch";
                     }
@@ -3367,7 +3499,7 @@ const EventLoop = struct {
                         tg_ip_v4_opt = ipv4AddressBytesForMiddleProxyKdf(peer_addr);
                         var my_ip_v4 = ipv4AddressBytesForMiddleProxyKdf(local_addr);
 
-                        if (self.state.middle_proxy_nat_ip4) |nat_ip| {
+                        if (slot.mp_nat_ip4) |nat_ip| {
                             my_ip_v4 = ipv4BytesForMiddleProxyKdf(nat_ip);
                             middle_local_addr = net.Address.initIp4(nat_ip, std.mem.bigToNative(u16, local_addr.in.sa.port));
                         }
@@ -3494,7 +3626,7 @@ const EventLoop = struct {
                 };
 
                 var middle_local_addr = local_addr;
-                if (self.state.middle_proxy_nat_ip4) |nat_ip| {
+                if (slot.mp_nat_ip4) |nat_ip| {
                     if (local_addr.any.family == posix.AF.INET) {
                         middle_local_addr = net.Address.initIp4(nat_ip, std.mem.bigToNative(u16, local_addr.in.sa.port));
                     }
@@ -3558,6 +3690,9 @@ const EventLoop = struct {
         slot.direct_fallback_used = true;
         _ = self.state.stats_mp_fallback.fetchAdd(1, .monotonic);
         slot.use_middle_proxy = false;
+        @memset(slot.mp_secret[0..], 0);
+        slot.mp_secret_len = 0;
+        slot.mp_nat_ip4 = null;
         self.setMiddleProxyStep(slot, .none);
         if (slot.mp_enc) |*enc| enc.wipe();
         if (slot.mp_dec) |*dec| dec.wipe();
@@ -3608,7 +3743,7 @@ const EventLoop = struct {
         slot.mp_step = step;
         slot.mp_step_deadline_ms = switch (step) {
             .none, .done => 0,
-            else => compat.milliTimestamp() + @min(
+            else => compat.monotonicMilliTimestamp() + @min(
                 secondsToMs(self.state.config.handshake_timeout_sec),
                 middle_proxy_stage_timeout_ms,
             ),
@@ -3783,18 +3918,17 @@ const EventLoop = struct {
     }
 
     fn runTimers(self: *EventLoop) void {
-        const now_ms = compat.milliTimestamp();
-        const now_ns = compat.nanoTimestamp();
+        const now_ms = compat.monotonicMilliTimestamp();
+        const now_ns = compat.monotonicNanoTimestamp();
 
-        const hi: usize = @intCast(self.pool.allocated_hi);
+        const hi: usize = @intCast(self.pool.active_hi);
         if (hi == 0) return;
 
         var idx: usize = @intCast(self.timer_scan_cursor);
         if (idx >= hi) idx = 0;
 
-        const budget = @min(hi, timer_scan_budget);
         var scanned: usize = 0;
-        while (scanned < budget) : (scanned += 1) {
+        while (scanned < hi) : (scanned += 1) {
             const slot_opt = self.pool.slots[idx];
             idx += 1;
             if (idx >= hi) idx = 0;
@@ -3829,6 +3963,9 @@ const EventLoop = struct {
                 self.cleanupFailedUpstreamConnect(slot);
 
                 if (failed_kind == .dc and self.tryNextDcEndpoint(slot, error.ConnectionTimedOut, failed_addr)) {
+                    continue;
+                }
+                if (failed_kind == .mask and self.tryNextMaskEndpoint(slot, error.ConnectionTimedOut, failed_addr)) {
                     continue;
                 }
 
@@ -4022,7 +4159,7 @@ const EventLoop = struct {
             slot.upstream_interest_out = false;
         }
         slot.relay_half_closed = true;
-        slot.last_activity_ms = compat.milliTimestamp();
+        slot.last_activity_ms = compat.monotonicMilliTimestamp();
 
         self.syncInterests(slot) catch {
             self.closeSlot(slot, "half-close interest sync failed");
@@ -4054,7 +4191,7 @@ const EventLoop = struct {
                 };
 
                 if (step == .none) break;
-                const now_ms = compat.milliTimestamp();
+                const now_ms = compat.monotonicMilliTimestamp();
                 slot.last_activity_ms = now_ms;
                 if (from_client) {
                     slot.last_client_byte_ms = now_ms;
@@ -4088,7 +4225,7 @@ const EventLoop = struct {
                         return;
                     };
                 }
-                slot.last_activity_ms = compat.milliTimestamp();
+                slot.last_activity_ms = compat.monotonicMilliTimestamp();
             }
         }
 
@@ -4403,23 +4540,6 @@ fn checkNofileLimit(required: usize, max_connections: u32) void {
         required,
         max_connections,
     });
-}
-
-fn setNonBlocking(fd: posix.fd_t) void {
-    if (builtin.os.tag != .linux) return;
-
-    const get_rc = linux.fcntl(fd, linux.F.GETFL, 0);
-    var fl_flags = switch (posix.errno(get_rc)) {
-        .SUCCESS => get_rc,
-        else => return,
-    };
-    const nonblock: @TypeOf(fl_flags) = @as(usize, 1) << @bitOffsetOf(linux.O, "NONBLOCK");
-    fl_flags |= nonblock;
-    const set_rc = linux.fcntl(fd, linux.F.SETFL, fl_flags);
-    switch (posix.errno(set_rc)) {
-        .SUCCESS => {},
-        else => return,
-    }
 }
 
 fn secondsToMs(sec: u32) i64 {
@@ -4798,6 +4918,20 @@ fn appendUniqueAddress(addrs: *[16]net.Address, count: *usize, addr: net.Address
     count.* += 1;
 }
 
+fn prioritizeIpv4Addresses(addrs: []net.Address) void {
+    var write: usize = 0;
+    var read: usize = 0;
+    while (read < addrs.len) : (read += 1) {
+        if (addrs[read].any.family != posix.AF.INET) continue;
+        if (read != write) {
+            const ipv4 = addrs[read];
+            std.mem.copyBackwards(net.Address, addrs[write + 1 .. read + 1], addrs[write..read]);
+            addrs[write] = ipv4;
+        }
+        write += 1;
+    }
+}
+
 fn shouldUseMiddleProxySnapshot(cfg: *const Config, dc_abs: usize, dc_idx: i16) bool {
     if (cfg.datacenter_override != null) return false;
     if (cfg.use_middle_proxy) return true;
@@ -4818,7 +4952,7 @@ fn buildDcConnectPlan(
     dc_abs: usize,
     dc_idx: i16,
     snapshot: ?*const ProxyState.MiddleProxySnapshot,
-    user_name: []const u8,
+    bypass_middle_proxy: bool,
 ) DcConnectPlan {
     var plan = DcConnectPlan{};
     plan.is_media_path = (dc_idx < 0) or (dc_abs == 203);
@@ -4831,7 +4965,7 @@ fn buildDcConnectPlan(
         return plan;
     }
 
-    if (cfg.userBypassesMiddleProxy(user_name)) {
+    if (bypass_middle_proxy) {
         plan.candidates[0] = directDcAddressV4(dc_abs);
         plan.count = 1;
         plan.use_middle_proxy = false;
@@ -4937,9 +5071,16 @@ fn parseMiddleProxyAddressesForDc(config_text: []const u8, target_dc: i16, sign:
     return count;
 }
 
-fn trySelectReachableMiddleProxy(candidates: []const net.Address, timeout_ms: i32) ?net.Address {
+fn trySelectReachableMiddleProxy(
+    candidates: []const net.Address,
+    timeout_ms: i32,
+    stop: ?*const std.atomic.Value(bool),
+) ?net.Address {
     for (candidates) |addr| {
-        if (isAddressReachable(addr, timeout_ms)) return addr;
+        if (stop) |flag| {
+            if (flag.load(.acquire)) return null;
+        }
+        if (isAddressReachable(addr, timeout_ms, stop)) return addr;
     }
     return null;
 }
@@ -4952,7 +5093,7 @@ fn addressesEqual(a: []const net.Address, b: []const net.Address) bool {
     return true;
 }
 
-fn isAddressReachable(address: net.Address, timeout_ms: i32) bool {
+fn isAddressReachable(address: net.Address, timeout_ms: i32, stop: ?*const std.atomic.Value(bool)) bool {
     if (builtin.os.tag != .linux) return false;
 
     const sock_flags = linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK;
@@ -4971,12 +5112,23 @@ fn isAddressReachable(address: net.Address, timeout_ms: i32) bool {
     }
 
     var fds = [_]linux.pollfd{.{ .fd = fd, .events = linux.POLL.OUT, .revents = 0 }};
-    const poll_rc = linux.poll(&fds, fds.len, timeout_ms);
-    const ready = switch (posix.errno(poll_rc)) {
-        .SUCCESS => poll_rc,
-        else => return false,
-    };
-    if (ready == 0) return false;
+    var remaining_ms = @max(timeout_ms, 0);
+    while (true) {
+        if (stop) |flag| {
+            if (flag.load(.acquire)) return false;
+        }
+        const chunk_ms = @min(remaining_ms, 100);
+        fds[0].revents = 0;
+        const poll_rc = linux.poll(&fds, fds.len, chunk_ms);
+        const ready = switch (posix.errno(poll_rc)) {
+            .SUCCESS => poll_rc,
+            .INTR => continue,
+            else => return false,
+        };
+        if (ready > 0) break;
+        if (remaining_ms <= chunk_ms) return false;
+        remaining_ms -= chunk_ms;
+    }
 
     const revents = fds[0].revents;
     if ((revents & linux.POLL.OUT) == 0) return false;
@@ -5071,27 +5223,29 @@ fn queueOrWriteMsgPair(fd: posix.fd_t, queue: *MessageQueue, first: []const u8, 
     return false;
 }
 
-fn flushQueue(fd: posix.fd_t, queue: *MessageQueue) !bool {
-    if (queue.isEmpty()) return true;
+fn flushQueue(fd: posix.fd_t, queue: *MessageQueue) !usize {
+    if (queue.isEmpty()) return 0;
 
     var iovecs: [max_scatter_parts]posix.iovec_const = undefined;
+    var total_written: usize = 0;
 
     while (!queue.isEmpty()) {
         const n_iov = queue.prepareIovecs(iovecs[0..]);
-        if (n_iov == 0) return true;
+        if (n_iov == 0) return total_written;
 
         const n = writevFd(fd, iovecs[0..n_iov]) catch |err| {
-            if (err == error.WouldBlock) return false;
+            if (err == error.WouldBlock) return total_written;
             return err;
         };
 
         if (n == 0) return error.ConnectionReset;
         try queue.consume(n);
+        total_written += n;
 
-        if (n < iovecs[0].len) return false;
+        if (n < iovecs[0].len) return total_written;
     }
 
-    return true;
+    return total_written;
 }
 
 fn queueClient(slot: *ConnectionSlot, data: []const u8) !bool {
@@ -5106,11 +5260,11 @@ fn queueUpstream(slot: *ConnectionSlot, data: []const u8) !bool {
     return queueOrWriteMsg(slot.upstream_fd, &slot.upstream_queue, data);
 }
 
-fn flushClientPending(slot: *ConnectionSlot) !bool {
+fn flushClientPending(slot: *ConnectionSlot) !usize {
     return flushQueue(slot.client_fd, &slot.client_queue);
 }
 
-fn flushUpstreamPending(slot: *ConnectionSlot) !bool {
+fn flushUpstreamPending(slot: *ConnectionSlot) !usize {
     return flushQueue(slot.upstream_fd, &slot.upstream_queue);
 }
 
@@ -5374,25 +5528,25 @@ test "direct users bypass middle-proxy routing" {
         .secret_len = 16,
     };
 
-    const regular_plan = buildDcConnectPlan(&cfg, 4, 4, &snapshot, "regular");
+    const regular_plan = buildDcConnectPlan(&cfg, 4, 4, &snapshot, false);
     try std.testing.expect(regular_plan.use_middle_proxy);
     try std.testing.expect(regular_plan.direct_fallback != null);
     try std.testing.expect(regular_plan.candidates[0].eql(mp_dc4));
 
-    const admin_plan = buildDcConnectPlan(&cfg, 4, 4, &snapshot, "admin");
+    const admin_plan = buildDcConnectPlan(&cfg, 4, 4, &snapshot, true);
     try std.testing.expect(!admin_plan.use_middle_proxy);
     try std.testing.expect(admin_plan.direct_fallback == null);
     try std.testing.expect(admin_plan.candidates[0].eql(constants.getDcAddressV4(4)));
 
-    const regular_media = buildDcConnectPlan(&cfg, 203, -203, &snapshot, "regular");
+    const regular_media = buildDcConnectPlan(&cfg, 203, -203, &snapshot, false);
     try std.testing.expect(regular_media.use_middle_proxy);
     try std.testing.expect(regular_media.candidates[0].eql(mp_dc203));
 
-    const regular_media_dc5 = buildDcConnectPlan(&cfg, 5, -5, &snapshot, "regular");
+    const regular_media_dc5 = buildDcConnectPlan(&cfg, 5, -5, &snapshot, false);
     try std.testing.expectEqual(@as(usize, 2), regular_media_dc5.count);
     try std.testing.expect(regular_media_dc5.candidates[1].eql(mp_media_dc5_secondary));
 
-    const admin_media = buildDcConnectPlan(&cfg, 203, -203, &snapshot, "admin");
+    const admin_media = buildDcConnectPlan(&cfg, 203, -203, &snapshot, true);
     try std.testing.expect(!admin_media.use_middle_proxy);
     try std.testing.expect(admin_media.candidates[0].eql(constants.getDcAddressV4(203)));
 }
@@ -5711,7 +5865,7 @@ test "subnet rate limit - live probe window is not evicted" {
     const addr = net.Address.initIp4(.{ 203, 0, 113, 42 }, 443);
     const key = SubnetRateLimit.subnetKey(addr);
     const start = limiter.indexFor(key);
-    const now_s = @divTrunc(compat.milliTimestamp(), 1000);
+    const now_s = @divTrunc(compat.monotonicMilliTimestamp(), 1000);
 
     var probe: usize = 0;
     while (probe < SubnetRateLimit.MAX_PROBES) : (probe += 1) {

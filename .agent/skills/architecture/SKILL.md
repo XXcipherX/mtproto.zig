@@ -21,15 +21,15 @@ Production MTProto proxy implemented in Zig with FakeTLS entry, obfuscated MTPro
 - Relay path is a single-threaded Linux `epoll` event loop.
 - Connections are represented by pooled `ConnectionSlot` state objects.
 - File descriptors are tracked via epoll + fd-to-slot mapping.
-- Recent runtime changes added safer failed-connect cleanup, bounded timer scanning, fd-budget clamping, 90%/80% saturation hysteresis, per-subnet unauthenticated admission limits, graceful RDHUP draining, low-noise periodic connection stats, classed message-queue blocks, and lazy MiddleProxy stream/scratch buffers.
+- Recent runtime changes added safer failed-connect cleanup, monotonic full-active-prefix timer scanning, fd-budget clamping, 90%/80% saturation hysteresis, per-subnet unauthenticated admission limits, graceful RDHUP draining, low-noise periodic connection stats, classed message-queue blocks, and lazy MiddleProxy stream/scratch buffers.
 - Outbound data uses `MessageQueue` block classes (64/512/2048 byte storage) with `writev` flushing and a 4 MiB pending-byte cap per direction queue.
-- When any MiddleProxy path is enabled (`use_middle_proxy` or `force_media_middle_proxy`), a joinable background updater thread refreshes MiddleProxy metadata from Telegram core endpoints hourly, can wake early after stalled MiddleProxy handshakes, and is stopped on `ProxyState.deinit`.
+- A joinable background updater starts after the listener when MiddleProxy or masking discovery is needed. It refreshes MiddleProxy metadata, detects the NAT IPv4, re-resolves all masking candidates hourly, can wake early after stalled MiddleProxy handshakes, and is stopped cooperatively on `ProxyState.deinit`.
 
 Code anchors:
 
 - `src/proxy/proxy.zig` (`EventLoop`, `ConnectionSlot`, `runTimers`, `logPeriodicStats`, `requiredFdsForConnections`, `buildDcConnectPlan`)
 - `src/main.zig` (startup banner, capacity estimate, lock-free logger, public-IP detection)
-- `src/http_fetch.zig` (bounded HTTPS fetch helper for public-IP and MiddleProxy metadata)
+- `src/http_fetch.zig` (bounded HTTPS fetch helper for background public-IPv4 and MiddleProxy metadata discovery)
 - `deploy/setup_tunnel.sh` (namespace + AmneziaWG deployment path)
 
 ## Connection Flow
@@ -111,10 +111,11 @@ If `max_connections` exceeds the memory-safe estimate, startup auto-clamps it be
 ## DPI Evasion Components
 
 - FakeTLS ServerHello template with runtime digest patching.
-- FakeTLS accepts only 32-byte Session IDs, stores the Session ID by value, and builds response HMAC without heap-copying the ClientHello.
+- FakeTLS accepts only 32-byte Session IDs, stores the Session ID by value, and releases/zeroes the full ClientHello as soon as the synthetic ServerHello is built.
 - Anti-replay cache keyed by the full canonical HMAC digest, not just the first hash key bytes.
 - MTProto obfuscation rejects reserved nonces before decrypting protocol tags.
-- Masking target selection for unauthenticated clients: `mask_port=443` resolves/connects to `tls_domain:443`; non-443 `mask_port` connects to a local address on that port (`127.0.0.1` in the init namespace, `10.200.200.1` inside the tunnel netns), so that port must be served by Caddy or another local masking backend.
+- Masking target selection for unauthenticated clients: `mask_port=443` resolves every address for `tls_domain:443` in the background, prefers IPv4, and fails over across candidates; non-443 `mask_port` connects to a local address on that port (`127.0.0.1` in the init namespace, `10.200.200.1` inside the tunnel netns). Hostname candidates are re-resolved hourly.
+- Config parsing is strict for proxy-owned sections/keys and malformed lines; `[monitor].host`/`port` remain accepted for the external dashboard. Config load errors propagate as a non-zero process exit.
 - TCPMSS clamping and optional zapret/nfqws integration via deploy scripts.
 - Split-TLS desync (`desync=true`) as split write of fake ServerHello.
 - Self-domain masking setup (`setup_masking.sh`) configures Caddy 2.10+ on `127.0.0.1:8443` and, in tunnel netns mode, `10.200.200.1:8443`; non-proxy requests receive 404. Source installs use `mtproto-mask-caddy.service`; Docker Compose installs use the `mtproto-mask-caddy` service/container.

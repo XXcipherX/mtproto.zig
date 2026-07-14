@@ -9,7 +9,6 @@ const posix = std.posix;
 const constants = @import("protocol/constants.zig");
 const crypto = @import("crypto/crypto.zig");
 const compat = @import("compat.zig");
-const http_fetch = @import("http_fetch.zig");
 const obfuscation = @import("protocol/obfuscation.zig");
 const tls = @import("protocol/tls.zig");
 const config = @import("config.zig");
@@ -86,48 +85,6 @@ fn ignoreSigpipe() void {
         .flags = 0,
     };
     posix.sigaction(.PIPE, &action, null);
-}
-
-// ============= Public IP Detection =============
-
-/// Try to detect the server's public IP address via external services.
-/// Returns the IP string (caller owns memory) or null on failure.
-fn detectPublicIp(allocator: std.mem.Allocator) ?[]const u8 {
-    // Try multiple services in order
-    const services = [_][]const u8{
-        "https://ifconfig.me",
-        "https://api.ipify.org",
-        "https://icanhazip.com",
-    };
-
-    for (services) |url| {
-        const stdout = http_fetch.fetchUrlBytes(
-            allocator,
-            url,
-            .{ .max_response_bytes = 64 * 1024 },
-        ) catch continue;
-        // Trim whitespace/newlines
-        const trimmed = std.mem.trim(u8, stdout, &[_]u8{ ' ', '\t', '\n', '\r' });
-        if (trimmed.len == 0 or trimmed.len > 45) {
-            allocator.free(stdout);
-            continue;
-        }
-
-        // Basic validation: should look like an IP
-        if (std.mem.indexOfScalar(u8, trimmed, '.') != null or
-            std.mem.indexOfScalar(u8, trimmed, ':') != null)
-        {
-            // If trimmed is a sub-slice of stdout, dupe it so we can free stdout
-            const ip = allocator.dupe(u8, trimmed) catch {
-                allocator.free(stdout);
-                continue;
-            };
-            allocator.free(stdout);
-            return ip;
-        }
-        allocator.free(stdout);
-    }
-    return null;
 }
 
 const CapacityEstimate = struct {
@@ -341,7 +298,7 @@ fn enforceCapacitySafety(cfg: *config.Config, capacity_estimate: ?CapacityEstima
 // ============= Startup Banner =============
 
 /// Print a stylish startup banner with config summary and connection links.
-fn printBanner(allocator: std.mem.Allocator, cfg: config.Config, capacity_estimate: ?CapacityEstimate, show_secrets: bool) void {
+fn printBanner(cfg: config.Config, capacity_estimate: ?CapacityEstimate, show_secrets: bool) void {
     const R = "\x1b[0m";
     const B = "\x1b[1m";
     const D = "\x1b[2m";
@@ -352,17 +309,10 @@ fn printBanner(allocator: std.mem.Allocator, cfg: config.Config, capacity_estima
     const white = "\x1b[97m";
     const red = "\x1b[31m";
 
-    // Detect public IP
-    var public_ip_alloc: ?[]const u8 = null;
-    if (cfg.public_ip == null) {
-        writeRaw("\n" ++ D ++ "  Detecting public IP..." ++ R);
-        public_ip_alloc = detectPublicIp(allocator);
-        writeRaw("\r\x1b[K");
-    }
-    defer if (public_ip_alloc) |ip| allocator.free(ip);
-
-    const has_ip = cfg.public_ip != null or public_ip_alloc != null;
-    const server_ip = cfg.public_ip orelse (public_ip_alloc orelse "<SERVER_IP>");
+    // Public discovery used by MiddleProxy runs after the listener is ready.
+    // Connection links therefore use only an explicitly configured address.
+    const has_ip = cfg.public_ip != null;
+    const server_ip = cfg.public_ip orelse "<SERVER_IP>";
 
     // Logo
     writeRaw("\n" ++ B ++ cyan);
@@ -501,7 +451,7 @@ pub fn main(init: std.process.Init) !void {
     var cfg = config.Config.loadFromFile(allocator, config_path) catch |err| {
         writeStderr("\x1b[1m\x1b[31m  ✗ Failed to load config '{s}': {}\x1b[0m\n", .{ config_path, err });
         writeStderr("\n  Usage: mtproto-proxy [config.toml] [--show-secrets]\n\n", .{});
-        return;
+        return err;
     };
     defer cfg.deinit(allocator);
 
@@ -524,8 +474,8 @@ pub fn main(init: std.process.Init) !void {
 
     try enforceCapacitySafety(&cfg, capacity_estimate);
 
-    // Print the startup banner (includes IP detection)
-    printBanner(allocator, cfg, capacity_estimate, show_secrets);
+    // Print the startup banner without blocking on external discovery.
+    printBanner(cfg, capacity_estimate, show_secrets);
 
     // Emit config warnings (e.g. buffer too small, memory concerns)
     cfg.emitWarnings();

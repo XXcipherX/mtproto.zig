@@ -224,6 +224,12 @@ pub const Config = struct {
         });
     }
 
+    fn failConfigLine(err: anyerror, line_number: usize, line: []const u8) anyerror {
+        const log = std.log.scoped(.config);
+        log.warn("invalid config at line {d}: {s}", .{ line_number, line });
+        return err;
+    }
+
     fn parseBoolSetting(key: []const u8, value: []const u8) ?bool {
         if (std.mem.eql(u8, value, "true") or
             std.mem.eql(u8, value, "1") or
@@ -301,13 +307,18 @@ pub const Config = struct {
         var in_censorship_section = false;
         var in_server_section = false;
         var in_general_section = false;
+        var in_monitor_section = false;
         var server_tag_set = false;
+        var line_number: usize = 0;
 
         while (lines.next()) |raw_line| {
-            const line = std.mem.trim(u8, raw_line, &[_]u8{ ' ', '\t', '\r' });
+            line_number += 1;
+            var line = std.mem.trim(u8, raw_line, &[_]u8{ ' ', '\t', '\r' });
 
             // Skip empty lines and comments
-            if (line.len == 0 or line[0] == '#') continue;
+            if (line.len == 0 or line[0] == '#' or line[0] == ';') continue;
+            line = stripInlineComment(line);
+            if (line.len == 0) continue;
 
             // Section headers
             if (line[0] == '[') {
@@ -316,6 +327,12 @@ pub const Config = struct {
                 in_censorship_section = std.mem.eql(u8, line, "[censorship]");
                 in_server_section = std.mem.eql(u8, line, "[server]");
                 in_general_section = std.mem.eql(u8, line, "[general]");
+                in_monitor_section = std.mem.eql(u8, line, "[monitor]");
+                if (!in_users_section and !in_direct_users_section and !in_censorship_section and
+                    !in_server_section and !in_general_section and !in_monitor_section)
+                {
+                    return failConfigLine(error.UnknownConfigSection, line_number, line);
+                }
                 continue;
             }
 
@@ -324,6 +341,9 @@ pub const Config = struct {
                 const key = std.mem.trim(u8, line[0..eq_pos], &[_]u8{ ' ', '\t' });
                 var value = std.mem.trim(u8, line[eq_pos + 1 ..], &[_]u8{ ' ', '\t' });
                 value = stripInlineComment(value);
+                if (key.len == 0 or ((value.len > 0 and value[0] == '"') != (value.len > 0 and value[value.len - 1] == '"'))) {
+                    return failConfigLine(error.MalformedConfigLine, line_number, line);
+                }
 
                 // Strip quotes from value
                 if (value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"') {
@@ -359,12 +379,21 @@ pub const Config = struct {
                                 cfg.tag = tag;
                             }
                         }
+                    } else {
+                        return failConfigLine(error.UnknownConfigKey, line_number, line);
                     }
                 } else if (in_server_section) {
                     if (std.mem.eql(u8, key, "port")) {
-                        if (parseIntSetting(u16, key, value)) |parsed| cfg.port = parsed;
+                        if (parseIntSetting(u16, key, value)) |parsed| {
+                            if (parsed == 0) warnInvalidValue(key, value, "integer in 1..65535") else cfg.port = parsed;
+                        }
                     } else if (std.mem.eql(u8, key, "backlog")) {
-                        if (parseIntSetting(u32, key, value)) |parsed| cfg.backlog = parsed;
+                        if (parseIntSetting(u32, key, value)) |parsed| {
+                            if (parsed == 0 or parsed > std.math.maxInt(u31))
+                                warnInvalidValue(key, value, "integer in 1..2147483647")
+                            else
+                                cfg.backlog = parsed;
+                        }
                     } else if (std.mem.eql(u8, key, "max_connections")) {
                         if (parseIntSetting(u32, key, value)) |parsed| {
                             cfg.max_connections = @max(@as(u32, 32), parsed);
@@ -420,6 +449,8 @@ pub const Config = struct {
                         if (parseIntSetting(u8, key, value)) |parsed| cfg.rate_limit_per_subnet = parsed;
                     } else if (std.mem.eql(u8, key, "unsafe_override_limits")) {
                         if (parseBoolSetting(key, value)) |parsed| cfg.unsafe_override_limits = parsed;
+                    } else {
+                        return failConfigLine(error.UnknownConfigKey, line_number, line);
                     }
                 } else if (in_censorship_section) {
                     if (std.mem.eql(u8, key, "tls_domain")) {
@@ -432,7 +463,9 @@ pub const Config = struct {
                     } else if (std.mem.eql(u8, key, "mask")) {
                         if (parseBoolSetting(key, value)) |parsed| cfg.mask = parsed;
                     } else if (std.mem.eql(u8, key, "mask_port")) {
-                        if (parseIntSetting(u16, key, value)) |parsed| cfg.mask_port = parsed;
+                        if (parseIntSetting(u16, key, value)) |parsed| {
+                            if (parsed == 0) warnInvalidValue(key, value, "integer in 1..65535") else cfg.mask_port = parsed;
+                        }
                     } else if (std.mem.eql(u8, key, "mask_relay_max_secs")) {
                         if (parseIntSetting(u32, key, value)) |parsed| cfg.mask_relay_max_secs = parsed;
                     } else if (std.mem.eql(u8, key, "desync")) {
@@ -452,8 +485,18 @@ pub const Config = struct {
                         if (parseBoolSetting(key, value)) |parsed| cfg.drs = parsed;
                     } else if (std.mem.eql(u8, key, "fast_mode")) {
                         if (parseBoolSetting(key, value)) |parsed| cfg.fast_mode = parsed;
+                    } else {
+                        return failConfigLine(error.UnknownConfigKey, line_number, line);
                     }
+                } else if (in_monitor_section) {
+                    if (!std.mem.eql(u8, key, "host") and !std.mem.eql(u8, key, "port")) {
+                        return failConfigLine(error.UnknownConfigKey, line_number, line);
+                    }
+                } else {
+                    return failConfigLine(error.ConfigKeyOutsideSection, line_number, line);
                 }
+            } else {
+                return failConfigLine(error.MalformedConfigLine, line_number, line);
             }
         }
 
@@ -1084,6 +1127,37 @@ test "parse config - invalid rate_limit keeps default" {
     defer cfg.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u8, 30), cfg.rate_limit_per_subnet);
+}
+
+test "parse config - rejects unknown sections keys and malformed lines" {
+    try std.testing.expectError(
+        error.UnknownConfigSection,
+        Config.parse(std.testing.allocator, "[serve]\nport = 443\n"),
+    );
+    try std.testing.expectError(
+        error.UnknownConfigKey,
+        Config.parse(std.testing.allocator, "[server]\nprot = 443\n"),
+    );
+    try std.testing.expectError(
+        error.MalformedConfigLine,
+        Config.parse(std.testing.allocator, "[server]\nport 443\n"),
+    );
+}
+
+test "parse config - unsafe socket ranges keep safe defaults" {
+    const content =
+        \\[server]
+        \\port = 0
+        \\backlog = 4294967295
+        \\[censorship]
+        \\mask_port = 0
+    ;
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 443), cfg.port);
+    try std.testing.expectEqual(@as(u32, 4096), cfg.backlog);
+    try std.testing.expectEqual(@as(u16, 443), cfg.mask_port);
 }
 
 test "parse config - censorship section booleans" {
