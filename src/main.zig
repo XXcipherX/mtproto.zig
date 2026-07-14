@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const posix = std.posix;
 const constants = @import("protocol/constants.zig");
 const crypto = @import("crypto/crypto.zig");
 const compat = @import("compat.zig");
@@ -77,6 +78,16 @@ fn writeRaw(s: []const u8) void {
     compat.writeStdout(s);
 }
 
+fn ignoreSigpipe() void {
+    if (builtin.os.tag != .linux) return;
+    const action = posix.Sigaction{
+        .handler = .{ .handler = posix.SIG.IGN },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    };
+    posix.sigaction(.PIPE, &action, null);
+}
+
 // ============= Public IP Detection =============
 
 /// Try to detect the server's public IP address via external services.
@@ -120,7 +131,7 @@ fn detectPublicIp(allocator: std.mem.Allocator) ?[]const u8 {
 }
 
 const CapacityEstimate = struct {
-    total_ram_bytes: u64,
+    effective_memory_bytes: u64,
     per_conn_bytes: u64,
     safe_connections: u32,
 };
@@ -166,6 +177,73 @@ fn detectTotalRamBytesSysinfo() ?u64 {
     return @intCast(total_bytes);
 }
 
+fn parseCgroupMemoryLimit(content: []const u8) ?u64 {
+    const trimmed = std.mem.trim(u8, content, &[_]u8{ ' ', '\t', '\n', '\r' });
+    if (trimmed.len == 0 or std.mem.eql(u8, trimmed, "max")) return null;
+    const limit = std.fmt.parseInt(u64, trimmed, 10) catch return null;
+    // cgroup v1 represents an unlimited controller with a huge sentinel.
+    if (limit == 0 or limit >= (@as(u64, 1) << 60)) return null;
+    return limit;
+}
+
+fn readCgroupMemoryLimitFile(allocator: std.mem.Allocator, path: []const u8) ?u64 {
+    const content = compat.readFileAbsoluteAlloc(allocator, path, 256) catch return null;
+    defer allocator.free(content);
+    return parseCgroupMemoryLimit(content);
+}
+
+fn minMemoryLimit(current: ?u64, candidate: ?u64) ?u64 {
+    const value = candidate orelse return current;
+    return if (current) |existing| @min(existing, value) else value;
+}
+
+fn detectCgroupMemoryLimitBytes(allocator: std.mem.Allocator) ?u64 {
+    if (builtin.os.tag != .linux) return null;
+
+    const paths = [_][]const u8{
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+    };
+    var best: ?u64 = null;
+    for (paths) |path| {
+        best = minMemoryLimit(best, readCgroupMemoryLimitFile(allocator, path));
+    }
+
+    const membership = compat.readFileAbsoluteAlloc(allocator, "/proc/self/cgroup", 64 * 1024) catch return best;
+    defer allocator.free(membership);
+    var lines = std.mem.splitScalar(u8, membership, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const first_colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const second_rel = std.mem.indexOfScalar(u8, line[first_colon + 1 ..], ':') orelse continue;
+        const second_colon = first_colon + 1 + second_rel;
+        const hierarchy = line[0..first_colon];
+        const controllers = line[first_colon + 1 .. second_colon];
+        const cgroup_path = line[second_colon + 1 ..];
+        if (cgroup_path.len == 0 or cgroup_path[0] != '/') continue;
+
+        var limit_path_buf: [4096]u8 = undefined;
+        const limit_path = if (std.mem.eql(u8, hierarchy, "0") and controllers.len == 0)
+            std.fmt.bufPrint(&limit_path_buf, "/sys/fs/cgroup{s}/memory.max", .{cgroup_path}) catch continue
+        else if (std.mem.indexOf(u8, controllers, "memory") != null)
+            std.fmt.bufPrint(&limit_path_buf, "/sys/fs/cgroup/memory{s}/memory.limit_in_bytes", .{cgroup_path}) catch continue
+        else
+            continue;
+        best = minMemoryLimit(best, readCgroupMemoryLimitFile(allocator, limit_path));
+    }
+    return best;
+}
+
+fn detectEffectiveMemoryBytes(allocator: std.mem.Allocator) ?u64 {
+    const host = detectTotalRamBytes(allocator);
+    const cgroup = detectCgroupMemoryLimitBytes(allocator);
+    if (host) |host_bytes| {
+        if (cgroup) |limit| return @min(host_bytes, limit);
+        return host_bytes;
+    }
+    return cgroup;
+}
+
 fn estimateCapacity(cfg: *const config.Config, total_ram_bytes: u64) CapacityEstimate {
     // Approximate per-connection user-space working set in the epoll model:
     // - preallocated slot state and small relay buffers
@@ -193,10 +271,10 @@ fn estimateCapacity(cfg: *const config.Config, total_ram_bytes: u64) CapacityEst
     const budget_bytes = if (usable_bytes > fixed_overhead_bytes) usable_bytes - fixed_overhead_bytes else 0;
 
     const raw_cap = if (per_conn_bytes > 0) budget_bytes / per_conn_bytes else 0;
-    const safe_connections_u64 = @max(@as(u64, 32), @min(raw_cap, @as(u64, std.math.maxInt(u32))));
+    const safe_connections_u64 = @min(raw_cap, @as(u64, std.math.maxInt(u32)));
 
     return .{
-        .total_ram_bytes = total_ram_bytes,
+        .effective_memory_bytes = total_ram_bytes,
         .per_conn_bytes = per_conn_bytes,
         .safe_connections = @intCast(safe_connections_u64),
     };
@@ -215,6 +293,23 @@ fn enforceCapacitySafety(cfg: *config.Config, capacity_estimate: ?CapacityEstima
         return;
     };
 
+    if (est.safe_connections < 32) {
+        const log_main = std.log.scoped(.config);
+        if (cfg.unsafe_override_limits) {
+            log_main.warn(
+                "effective memory budget supports only {d} connections; " ++
+                    "unsafe_override_limits=true, keeping configured limit {d}",
+                .{ est.safe_connections, cfg.max_connections },
+            );
+            return;
+        }
+        log_main.warn(
+            "effective memory budget supports only {d} connections, below the minimum safe capacity of 32",
+            .{est.safe_connections},
+        );
+        return error.InsufficientMemoryBudget;
+    }
+
     if (cfg.max_connections <= est.safe_connections) return;
 
     const log_main = std.log.scoped(.config);
@@ -232,12 +327,12 @@ fn enforceCapacitySafety(cfg: *config.Config, capacity_estimate: ?CapacityEstima
 
     log_main.warn(
         "auto-clamping max_connections from {d} to {d} " ++
-            "(host has {d} MiB RAM, ~{d} KiB/connection). " ++
+            "(effective memory limit {d} MiB, ~{d} KiB/connection). " ++
             "To disable this safety clamp, set unsafe_override_limits = true in [server].",
         .{
             configured_limit,
             est.safe_connections,
-            est.total_ram_bytes / (1024 * 1024),
+            est.effective_memory_bytes / (1024 * 1024),
             est.per_conn_bytes / 1024,
         },
     );
@@ -246,7 +341,7 @@ fn enforceCapacitySafety(cfg: *config.Config, capacity_estimate: ?CapacityEstima
 // ============= Startup Banner =============
 
 /// Print a stylish startup banner with config summary and connection links.
-fn printBanner(allocator: std.mem.Allocator, cfg: config.Config, capacity_estimate: ?CapacityEstimate) void {
+fn printBanner(allocator: std.mem.Allocator, cfg: config.Config, capacity_estimate: ?CapacityEstimate, show_secrets: bool) void {
     const R = "\x1b[0m";
     const B = "\x1b[1m";
     const D = "\x1b[2m";
@@ -303,7 +398,7 @@ fn printBanner(allocator: std.mem.Allocator, cfg: config.Config, capacity_estima
         else
             "direct mode";
         writeRaw("  " ++ D ++ "───" ++ R ++ " " ++ B ++ cyan ++ "CAPACITY" ++ R ++ " " ++ D ++ "────────────────────────────────────" ++ R ++ "\n");
-        writeStdout("      Host RAM     " ++ B ++ "{d} MiB" ++ R ++ "\n", .{est.total_ram_bytes / (1024 * 1024)});
+        writeStdout("      Memory limit " ++ B ++ "{d} MiB" ++ R ++ "\n", .{est.effective_memory_bytes / (1024 * 1024)});
         writeStdout("      Per conn     ~{d} KiB ({s})\n", .{
             est.per_conn_bytes / 1024,
             capacity_mode,
@@ -320,9 +415,14 @@ fn printBanner(allocator: std.mem.Allocator, cfg: config.Config, capacity_estima
     var users = cfg.users;
     var it = users.iterator();
     while (it.next()) |entry| {
-        writeStdout("      " ++ green ++ "●" ++ R ++ " " ++ B ++ "{s}" ++ R ++ "  " ++ D, .{entry.key_ptr.*});
-        for (entry.value_ptr.*) |byte| {
-            writeHexByte(byte);
+        writeStdout("      " ++ green ++ "●" ++ R ++ " " ++ B ++ "{s}" ++ R, .{entry.key_ptr.*});
+        if (show_secrets) {
+            writeRaw("  " ++ D);
+            for (entry.value_ptr.*) |byte| {
+                writeHexByte(byte);
+            }
+        } else {
+            writeRaw("  " ++ D ++ "secret redacted");
         }
         writeRaw(R ++ "\n");
     }
@@ -330,35 +430,40 @@ fn printBanner(allocator: std.mem.Allocator, cfg: config.Config, capacity_estima
 
     // ─── LINKS ──────────────────────────────────────
     writeRaw("  " ++ D ++ "───" ++ R ++ " " ++ B ++ cyan ++ "LINKS" ++ R ++ " " ++ D ++ "──────────────────────────────────────" ++ R ++ "\n");
-    if (!has_ip) {
+    if (!show_secrets) {
+        writeRaw("      Secrets and connection links are hidden by default.\n");
+        writeRaw("      Use --show-secrets only in a private terminal.\n");
+    } else if (!has_ip) {
         writeRaw("      " ++ red ++ "⚠  Could not detect IP. Replace <SERVER_IP> manually." ++ R ++ "\n");
     }
 
-    var users_for_links = cfg.users;
-    var it2 = users_for_links.iterator();
-    while (it2.next()) |entry| {
-        writeStdout("      " ++ B ++ magenta ++ "{s}" ++ R ++ "\n", .{entry.key_ptr.*});
+    if (show_secrets) {
+        var users_for_links = cfg.users;
+        var it2 = users_for_links.iterator();
+        while (it2.next()) |entry| {
+            writeStdout("      " ++ B ++ magenta ++ "{s}" ++ R ++ "\n", .{entry.key_ptr.*});
 
-        // tg:// deep link
-        writeStdout("      " ++ cyan ++ "tg://" ++ R ++ "proxy?server={s}&port={d}&secret=", .{ server_ip, cfg.port });
-        writeRaw(green ++ "ee");
-        for (entry.value_ptr.*) |byte| {
-            writeHexByte(byte);
-        }
-        for (cfg.tls_domain) |byte| {
-            writeHexByte(byte);
-        }
-        writeRaw(R ++ "\n");
+            // tg:// deep link
+            writeStdout("      " ++ cyan ++ "tg://" ++ R ++ "proxy?server={s}&port={d}&secret=", .{ server_ip, cfg.port });
+            writeRaw(green ++ "ee");
+            for (entry.value_ptr.*) |byte| {
+                writeHexByte(byte);
+            }
+            for (cfg.tls_domain) |byte| {
+                writeHexByte(byte);
+            }
+            writeRaw(R ++ "\n");
 
-        // t.me link
-        writeStdout("      " ++ D ++ "t.me/proxy?server={s}&port={d}&secret=ee", .{ server_ip, cfg.port });
-        for (entry.value_ptr.*) |byte| {
-            writeHexByte(byte);
+            // t.me link
+            writeStdout("      " ++ D ++ "t.me/proxy?server={s}&port={d}&secret=ee", .{ server_ip, cfg.port });
+            for (entry.value_ptr.*) |byte| {
+                writeHexByte(byte);
+            }
+            for (cfg.tls_domain) |byte| {
+                writeHexByte(byte);
+            }
+            writeRaw(R ++ "\n");
         }
-        for (cfg.tls_domain) |byte| {
-            writeHexByte(byte);
-        }
-        writeRaw(R ++ "\n");
     }
 
     // Footer
@@ -371,17 +476,31 @@ pub fn main(init: std.process.Init) !void {
     // GPA has an internal mutex that causes deadlocks under heavy thread contention
     // (1000+ simultaneous connections all doing TLS validation allocations).
     const allocator = std.heap.page_allocator;
+    ignoreSigpipe();
 
-    // Parse config path from args
+    // Parse config path and explicit secret-display opt-in.
     var args = try init.minimal.args.iterateAllocator(allocator);
     defer args.deinit();
     _ = args.next(); // skip program name
-    const config_path = args.next() orelse "config.toml";
+    var config_path: []const u8 = "config.toml";
+    var config_path_set = false;
+    var show_secrets = false;
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--show-secrets")) {
+            show_secrets = true;
+        } else if (!config_path_set) {
+            config_path = arg;
+            config_path_set = true;
+        } else {
+            writeStderr("\n  Usage: mtproto-proxy [config.toml] [--show-secrets]\n\n", .{});
+            return error.InvalidArguments;
+        }
+    }
 
     // Parse config
     var cfg = config.Config.loadFromFile(allocator, config_path) catch |err| {
         writeStderr("\x1b[1m\x1b[31m  ✗ Failed to load config '{s}': {}\x1b[0m\n", .{ config_path, err });
-        writeStderr("\n  Usage: mtproto-proxy [config.toml]\n\n", .{});
+        writeStderr("\n  Usage: mtproto-proxy [config.toml] [--show-secrets]\n\n", .{});
         return;
     };
     defer cfg.deinit(allocator);
@@ -398,15 +517,15 @@ pub fn main(init: std.process.Init) !void {
         );
     }
 
-    const capacity_estimate = if (detectTotalRamBytes(allocator)) |total_ram|
-        estimateCapacity(&cfg, total_ram)
+    const capacity_estimate = if (detectEffectiveMemoryBytes(allocator)) |memory_limit|
+        estimateCapacity(&cfg, memory_limit)
     else
         null;
 
     try enforceCapacitySafety(&cfg, capacity_estimate);
 
     // Print the startup banner (includes IP detection)
-    printBanner(allocator, cfg, capacity_estimate);
+    printBanner(allocator, cfg, capacity_estimate, show_secrets);
 
     // Emit config warnings (e.g. buffer too small, memory concerns)
     cfg.emitWarnings();
@@ -438,7 +557,7 @@ test "capacity safety clamp enforces safe cap when override disabled" {
     defer cfg.deinit(std.testing.allocator);
 
     const est = CapacityEstimate{
-        .total_ram_bytes = 2 * 1024 * 1024 * 1024,
+        .effective_memory_bytes = 2 * 1024 * 1024 * 1024,
         .per_conn_bytes = 2 * 1024 * 1024,
         .safe_connections = 585,
     };
@@ -457,7 +576,7 @@ test "capacity safety clamp keeps configured limit when override enabled" {
     defer cfg.deinit(std.testing.allocator);
 
     const est = CapacityEstimate{
-        .total_ram_bytes = 2 * 1024 * 1024 * 1024,
+        .effective_memory_bytes = 2 * 1024 * 1024 * 1024,
         .per_conn_bytes = 2 * 1024 * 1024,
         .safe_connections = 585,
     };
@@ -491,4 +610,28 @@ test "capacity estimate accounts for media-only middle proxy overhead" {
 
     try std.testing.expect(media_est.per_conn_bytes > direct_est.per_conn_bytes);
     try std.testing.expect(media_est.safe_connections < direct_est.safe_connections);
+}
+
+test "cgroup memory limit parser handles finite and unlimited values" {
+    try std.testing.expectEqual(@as(?u64, 536_870_912), parseCgroupMemoryLimit("536870912\n"));
+    try std.testing.expectEqual(@as(?u64, null), parseCgroupMemoryLimit("max\n"));
+    try std.testing.expectEqual(@as(?u64, null), parseCgroupMemoryLimit("9223372036854771712\n"));
+    try std.testing.expectEqual(@as(?u64, null), parseCgroupMemoryLimit("invalid\n"));
+}
+
+test "capacity safety refuses a budget below the supported minimum" {
+    var cfg = config.Config{
+        .users = std.StringHashMap([16]u8).init(std.testing.allocator),
+        .direct_users = std.StringHashMap(void).init(std.testing.allocator),
+        .max_connections = 32,
+        .unsafe_override_limits = false,
+    };
+    defer cfg.deinit(std.testing.allocator);
+
+    const est = CapacityEstimate{
+        .effective_memory_bytes = 128 * 1024 * 1024,
+        .per_conn_bytes = 8 * 1024,
+        .safe_connections = 0,
+    };
+    try std.testing.expectError(error.InsufficientMemoryBudget, enforceCapacitySafety(&cfg, est));
 }

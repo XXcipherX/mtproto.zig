@@ -19,6 +19,7 @@ const Options = struct {
 
 const SoakShared = struct {
     deadline_ms: i64,
+    stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     total_ops: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     total_in_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     total_out_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -124,8 +125,16 @@ fn runSoak(allocator: std.mem.Allocator, opts: Options) !void {
         opts.max_payload,
     });
 
-    var threads: std.ArrayList(std.Thread) = .empty;
-    defer threads.deinit(allocator);
+    const threads = try allocator.alloc(std.Thread, opts.threads);
+    defer allocator.free(threads);
+    var spawned: usize = 0;
+    var joined = false;
+    errdefer {
+        if (!joined) {
+            shared.stop.store(true, .release);
+            for (threads[0..spawned]) |thread| thread.join();
+        }
+    }
 
     for (0..opts.threads) |worker_id| {
         const worker = WorkerArgs{
@@ -133,13 +142,14 @@ fn runSoak(allocator: std.mem.Allocator, opts: Options) !void {
             .max_payload = opts.max_payload,
             .shared = &shared,
         };
-        const thread = try std.Thread.spawn(.{}, soakWorker, .{worker});
-        try threads.append(allocator, thread);
+        threads[spawned] = try std.Thread.spawn(.{}, soakWorker, .{worker});
+        spawned += 1;
     }
 
-    for (threads.items) |thread| {
+    for (threads[0..spawned]) |thread| {
         thread.join();
     }
+    joined = true;
 
     const end_ms = compat.milliTimestamp();
     const elapsed_ms_i64 = @max(@as(i64, 1), end_ms - start_ms);
@@ -187,7 +197,7 @@ fn soakWorker(args: WorkerArgs) void {
 
     var rng_state = makeSeed(args.worker_id);
 
-    while (compat.milliTimestamp() < args.shared.deadline_ms) {
+    while (!args.shared.stop.load(.acquire) and compat.milliTimestamp() < args.shared.deadline_ms) {
         const payload_len = nextPayloadLen(&rng_state, args.max_payload);
         payload_buf[0] +%= 1;
         const quickack = (nextRand(&rng_state) & 1) == 1;

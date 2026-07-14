@@ -23,6 +23,7 @@ Do not reintroduce thread-per-connection or blocking relay loops.
 - Project uses custom lock-free `logFn` in `src/main.zig`.
 - Keep hot-path logging minimal (`debug` only where needed, avoid noisy per-packet logs).
 - Do not force global `.log_level = .debug` in production builds.
+- Startup output redacts user secrets and connection links by default. `--show-secrets` is an explicit private-terminal opt-in; never add secrets back to normal service logs.
 
 ## Allocator and Concurrency
 
@@ -35,6 +36,8 @@ Do not reintroduce thread-per-connection or blocking relay loops.
 - Sockets are non-blocking and epoll-driven.
 - `SO_SNDTIMEO` and TCP keepalive are configured for relay sockets.
 - Handshake/idle behavior is timer-driven (`idle_timeout_sec`, `handshake_timeout_sec`) in `runTimers`.
+- Pre-first-byte admission has a separate fixed 10-second deadline, and unauthenticated sockets are capped concurrently per IPv4 `/24` or IPv6 `/48`.
+- `SIGPIPE` is ignored process-wide before socket relay starts; write paths must continue handling `EPIPE` as a normal connection failure.
 - There is no active `SO_RCVTIMEO`-based relay timeout path in current code.
 - FakeTLS validation requires a 32-byte ClientHello Session ID. The Session ID is stored by value and echoed into the fixed Nginx-like ServerHello template.
 - Extra TLS appdata bytes after the 64-byte MTProto obfuscation nonce are buffered as `pipelined_data` and flushed after the DC/MiddleProxy path is ready.
@@ -51,6 +54,7 @@ Do not reintroduce thread-per-connection or blocking relay loops.
 
 - Endpoints and secret are refreshed from Telegram core endpoints; bundled defaults remain fallback.
 - Candidate rotation and direct fallback behavior are part of normal operation.
+- MiddleProxy handshake stages have a 5-second deadline; protocol/read stalls cool the endpoint, request refresh, and use direct fallback when available.
 - Direct fallback can happen for both regular and media traffic when MiddleProxy candidates are missing or ME transport fails.
 - `middleproxy_buffer_kb` is a per-direction cap, not an eager allocation. Each MiddleProxy context starts with 16 KiB C2S/S2C buffers and grows on demand up to `min(middleproxy_buffer_kb, 16384)` KiB.
 - The event loop keeps lazy reusable C2S/S2C scratch buffers. C2S scratch is `effective_cap + 256`; S2C scratch is `effective_cap`.
@@ -67,7 +71,7 @@ Do not reintroduce thread-per-connection or blocking relay loops.
 
 ## Timeout and Lifetime Notes
 
-- Current runtime enforces pre-first-byte idle timeout, handshake timeout after first byte, and relay idle timeout.
+- Current runtime enforces a fixed 10-second pre-first-byte timeout, configured handshake timeout after first byte, and configured relay idle timeout.
 - Fixed max connection lifetime (for example "30 minutes hard cap") is not implemented in current code.
 
 ## Practical Change Guardrails

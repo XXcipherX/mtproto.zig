@@ -41,7 +41,7 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 | **Masking** | Connection Cloaking | Forwards unauthenticated clients either to `tls_domain:443` or, for self-domain installs, to a local Caddy 404 backend |
 | **PQ FakeTLS** | DPI Evasion | Echoes `X25519MLKEM768` (`0x11ec`) ServerHello key_share for modern Desktop/Android ClientHellos |
 | **Fast Mode** | Direct-Path S2C Offload | Reduces CPU usage by delegating S2C AES work to Telegram DCs on direct paths (non-MiddleProxy) |
-| **MiddleProxy** | Telemt-Compatible ME | Optional ME transport for DC1..5 (`use_middle_proxy`); retries TCP candidates, cools failed endpoints for 60 seconds, promotes successful fallbacks, and prefers the earliest-recovering endpoint when all are cooled |
+| **MiddleProxy** | Telemt-Compatible ME | Optional ME transport for DC1..5 (`use_middle_proxy`); retries TCP candidates, applies a 5-second per-stage handshake deadline, cools failed endpoints for 60 seconds, and falls back directly when ME stalls |
 | **Auto Refresh** | Telegram Metadata | Periodically updates regular/media MiddleProxy endpoints and secret from Telegram core endpoints when any ME route is enabled |
 | **Promotion** | Tag Support | Optional promotion tag for sponsored proxy channel registration |
 | **IPv6 Hopping** | DPI Evasion | Rotates IPv6 from a routed /64 and updates Cloudflare AAAA records; installers schedule a hop every 5 minutes, while `--auto` provides foreground ban-detection mode |
@@ -61,8 +61,9 @@ Connection-capacity methodology and command profiles: `test/README.md`.
 - Client relay is handled by a single-threaded Linux `epoll` event loop.
 - When any MiddleProxy path is enabled (`use_middle_proxy` or `force_media_middle_proxy`), a background updater immediately refreshes metadata from Telegram core endpoints, then refreshes hourly and can wake early after stalled MiddleProxy handshakes. The listener starts on bundled fallback endpoints without waiting for that first fetch.
 - FakeTLS validation expects Telegram-style 32-byte ClientHello Session IDs and copies the Session ID into the synthetic ServerHello.
-- Handshake and relay lifetimes are controlled by event-loop timers (`idle_timeout_sec`, `handshake_timeout_sec`), not by `SO_RCVTIMEO`.
-- The handshake-inflight budget is charged only after the first client byte, so silent pre-warmed TCP sessions cannot consume the 30%-of-capacity handshake allowance.
+- Handshake and relay lifetimes are controlled by event-loop timers (`handshake_timeout_sec`, `idle_timeout_sec`), not by `SO_RCVTIMEO`; a silent connection gets at most 10 seconds to send its first byte.
+- Unauthenticated sockets share a per-/24 or per-/48 concurrent allowance (`clamp(max_connections / 8, 16, 128)`). The global handshake-inflight budget is charged after the first byte and released after authentication.
+- Graceful `EPOLLRDHUP` is drained to EOF before the source fd is detached, preserving data queued immediately before a peer half-closes.
 - Failed non-blocking upstream connects are reclaimed immediately on fatal hangup events; the relay loop should not spin on dead upstream sockets.
 - Timer maintenance runs on a fixed cadence and scans only the allocated connection-slot prefix; production builds also emit aggregated `conn stats` every 10 seconds.
 - Client payload bytes pipelined after the 64-byte MTProto obfuscation nonce are buffered and forwarded once the upstream path is ready.
@@ -475,7 +476,9 @@ EOF
 
 ### &nbsp; Capacity & RAM Monitoring
 
-On startup, the proxy automatically detects host RAM and prints a **CAPACITY** banner. If your configured `max_connections` is above the RAM-safe estimate, it auto-clamps and logs a warning unless `unsafe_override_limits = true`.
+On startup, the proxy uses the lower of host RAM and the active cgroup v2/v1 memory limit and prints a **CAPACITY** banner. If `max_connections` is above the safe estimate, it auto-clamps unless `unsafe_override_limits = true`; if the safe budget cannot support the minimum 32 slots, startup fails instead of forcing an unsafe minimum.
+
+User secrets and `tg://`/`t.me` links are redacted from the daemon banner by default so they do not enter journald or container logs. To reveal them intentionally in a private terminal, run `mtproto-proxy [config.toml] --show-secrets`.
 
 **4. Install the systemd service**
 
@@ -765,8 +768,8 @@ alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eli
 | `[server]` | `public_ip` | _(auto-detect)_ | Override the IP/domain shown in startup links. For self-domain masking, set this to the same domain as `tls_domain`. Tunnel deploy scripts preserve an existing domain instead of replacing it with the tunnel exit IP |
 | `[server]` | `middle_proxy_nat_ip` | _(auto-detect)_ | Optional IPv4 override used in MiddleProxy NAT/AES derivation. Useful when `public_ip` is a hostname or when tunnel egress/detection would choose the wrong IPv4 |
 | `[server]` | `backlog` | `4096` | TCP listen queue size (for high-traffic loads) |
-| `[server]` | `max_connections` | `512` | Concurrent connection cap (small-VPS tuned default, parser lower bound 32). On Linux, startup first auto-clamps this to the RAM-safe estimate unless `unsafe_override_limits=true`; the proxy then clamps again if `RLIMIT_NOFILE` cannot cover the fd budget |
-| `[server]` | `idle_timeout_sec` | `120` | Connection idle timeout in seconds (also used before first client byte; parser lower bound 5) |
+| `[server]` | `max_connections` | `512` | Concurrent connection cap (small-VPS tuned default, parser lower bound 32). On Linux, startup first auto-clamps this to the effective-memory estimate (host/cgroup) unless `unsafe_override_limits=true`; the proxy then clamps again if `RLIMIT_NOFILE` cannot cover the fd budget |
+| `[server]` | `idle_timeout_sec` | `120` | Established relay idle timeout in seconds (parser lower bound 5). Pre-first-byte admission uses a separate fixed 10-second deadline |
 | `[server]` | `idle_timeout_jitter_pct` | `15` | Per-connection random jitter applied to `idle_timeout_sec` (`±N%`, clamped to `0..100`). The effective timeout is floored to at least 5 seconds and at least half the base timeout. Set `0` to disable |
 | `[server]` | `client_silence_close_sec` | `0` | Close an established relay when the server's last reply has gone unanswered by the client for N seconds. This bounds an iOS MtProtoKit bad_salt wedge where "Updating" can hang until the DC closes the socket. Fires only when the last relayed payload was server→client and the client has sent relay payload before. `0` disables it; if enabled, start around `10`-`15` and tune to taste |
 | `[server]` | `handshake_timeout_sec` | `15` | Timeout for completing handshake after first byte (parser lower bound 5) |
@@ -775,7 +778,7 @@ alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eli
 | `[server]` | `tag` | _(none)_ | Optional 32 hex-char promotion tag from [@MTProxybot](https://t.me/MTProxybot) |
 | `[server]` | `log_level` | `"info"` | Runtime log verbosity: `debug` (all DC routing, relay, close details), `info` (default — connection stats, warnings), `warn`, `err`. Change without recompilation; takes effect on restart |
 | `[server]` | `rate_limit_per_subnet` | `30` | Max new connections per second per /24 (IPv4) or /48 (IPv6) subnet. Blocks scanner/DPI-probe flood. Set `0` to disable |
-| `[server]` | `unsafe_override_limits` | `false` | Disable auto-clamping of `max_connections` to the RAM-safe estimate. Use only if you're sure your host has enough memory |
+| `[server]` | `unsafe_override_limits` | `false` | Disable auto-clamping of `max_connections` to the effective-memory estimate. Use only when the container/service limit as well as host RAM are sufficient |
 | `[monitor]` | `host` | `"127.0.0.1"` | Bind address for the optional monitoring dashboard HTTP server. This section is read by `proxy-monitor`, not by the proxy binary. Set to `"0.0.0.0"` to expose on all interfaces (warning: no built-in auth) |
 | `[monitor]` | `port` | `61208` | TCP port for the optional monitoring dashboard HTTP server |
 | `[censorship]` | `tls_domain` | `"google.com"` | FakeTLS SNI domain. With `mask_port=443`, unauthenticated clients are forwarded to this domain directly. For self-domain masking, set it to your own domain and point its DNS A record to the VPS. Since June 2026, the real masking endpoint should negotiate X25519MLKEM768 (`0x11ec`) in one round; classical-x25519-only domains can be a passive marker |
@@ -801,7 +804,7 @@ alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eli
 
 > **Operational note** &nbsp; If `accept()` hits `EMFILE`/`ENFILE`, the listener temporarily disables `EPOLLIN`, waits 500ms, and retries. In periodic `conn stats`, the first `paused=` flag reflects this fd-quota backoff.
 
-> **Operational note** &nbsp; On startup, `max_connections` is automatically clamped to a RAM-safe estimate (with a warning). Set `unsafe_override_limits = true` in `[server]` to disable this. The proxy also has built-in admission control: at 90% capacity it pauses `accept()` and resumes at 80%, preventing CPU-wasteful accept→close spin loops.
+> **Operational note** &nbsp; On startup, `max_connections` is automatically clamped to an effective-memory estimate derived from host RAM and cgroup limits. Set `unsafe_override_limits = true` to disable this. Admission control also pauses `accept()` at 90% capacity, resumes at 80%, and limits concurrent unauthenticated sockets per source subnet.
 
 > **Operational note** &nbsp; The RAM-safety estimate intentionally budgets MiddleProxy at full configured per-direction cap even though active C2S/S2C buffers grow lazily from 16 KiB. Configured `middleproxy_buffer_kb` values above 16384 are accepted but the effective runtime cap is 16 MiB per direction and startup logs a warning.
 
@@ -838,11 +841,11 @@ ssh root@<VPS_IP> 'cat /proc/$(pgrep -f mtproto-proxy)/limits | grep "open files
 
 Interpretation:
 
-- `auto-clamping max_connections ...` means startup reduced configured capacity to the RAM-safe estimate. `max_connections clamped ... due to RLIMIT_NOFILE` means runtime reduced it again to fit the process fd limit.
+- `auto-clamping max_connections ...` means startup reduced configured capacity to the host/cgroup effective-memory estimate. `max_connections clamped ... due to RLIMIT_NOFILE` means runtime reduced it again to fit the process fd limit.
 - `fd quota reached ... pausing accepts for 500ms` means the listener hit `EMFILE`/`ENFILE` and intentionally backed off instead of busy-looping.
 - `conn stats ... paused=<fd_pause>/<saturation_pause>` exposes two pause reasons: fd-quota backoff first, saturation hysteresis second.
 - `drops: ... rate+=...` means the per-subnet rate limiter rejected excess new connections.
-- `drops: ... hs_budget+=...` means the handshake-inflight budget rejected excess handshakes after their first client byte and the 30%-of-capacity threshold.
+- `drops: ... hs_budget+=...` means either the global handshake-inflight budget or the per-subnet unauthenticated-socket allowance rejected a new handshake.
 - `drops: ... mp_fallback+=...` means the MiddleProxy path degraded and the proxy recovered by reconnecting directly to the same DC.
 - `connection saturation ...` and `saturation eased ...` are the 90%/80% admission-control logs; if the second `paused=` flag is `true`, raise capacity only after checking RAM and probe results.
 
