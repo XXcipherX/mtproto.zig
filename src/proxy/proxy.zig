@@ -3399,6 +3399,7 @@ const EventLoop = struct {
 
         if (!slot.direct_fallback_used and slot.direct_fallback_addr != null and slot.use_middle_proxy) {
             slot.direct_fallback_used = true;
+            self.state.stats_mp_fallback +|= 1;
             slot.use_middle_proxy = false;
             const fallback = slot.direct_fallback_addr.?;
             slot.upstream_candidate_next = 1;
