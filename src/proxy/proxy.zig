@@ -782,9 +782,17 @@ const WedgeTracker = struct {
     resume_idle_ms: i64 = 0,
     response_latency_ms: i64 = 0,
     fast_eligible: bool = false,
+    // Set only after the client continues following a fully delivered reply.
+    // This proof survives later exchanges but never crosses a slot reset.
+    fallback_eligible: bool = false,
 
     fn reset(self: *WedgeTracker) void {
         self.* = .{};
+    }
+
+    fn resetExchange(self: *WedgeTracker) void {
+        const fallback_eligible = self.fallback_eligible;
+        self.* = .{ .fallback_eligible = fallback_eligible };
     }
 
     fn noteClientPayload(
@@ -794,6 +802,7 @@ const WedgeTracker = struct {
         fast_after_idle_ms: i64,
     ) bool {
         const cancelled = self.phase == .reply_pending_delivery or self.phase == .waiting_for_client;
+        const fallback_eligible = self.fallback_eligible or (self.phase == .waiting_for_client);
         const continued_request = self.phase == .waiting_for_reply;
         const idle_ms = if (previous_relay_ms > 0) @max(now_ms - previous_relay_ms, 0) else 0;
         const resumed = previous_relay_ms > 0 and idle_ms >= fast_after_idle_ms;
@@ -804,6 +813,7 @@ const WedgeTracker = struct {
                 .request_ms = now_ms,
                 .resume_idle_ms = if (resumed) idle_ms else 0,
                 .fast_eligible = resumed,
+                .fallback_eligible = fallback_eligible,
             };
         } else {
             self.request_ms = now_ms;
@@ -817,7 +827,8 @@ const WedgeTracker = struct {
 
     fn cancelForClientProgress(self: *WedgeTracker) bool {
         if (self.phase != .reply_pending_delivery and self.phase != .waiting_for_client) return false;
-        self.reset();
+        if (self.phase == .waiting_for_client) self.fallback_eligible = true;
+        self.resetExchange();
         return true;
     }
 
@@ -826,7 +837,7 @@ const WedgeTracker = struct {
             .waiting_for_reply => {
                 const response_latency_ms = @max(now_ms - self.request_ms, 0);
                 if (response_latency_ms > client_response_window_ms) {
-                    self.reset();
+                    self.resetExchange();
                     return false;
                 }
                 self.phase = .reply_pending_delivery;
@@ -859,7 +870,7 @@ const WedgeTracker = struct {
         if (self.phase != .waiting_for_client or self.reply_delivered_ms <= 0) return null;
 
         var timeout_ms: i64 = 0;
-        if (fallback_sec > 0) timeout_ms = secondsToMs(fallback_sec);
+        if (self.fallback_eligible and fallback_sec > 0) timeout_ms = secondsToMs(fallback_sec);
         if (self.fast_eligible and fast_resume_sec > 0) {
             const fast_ms = secondsToMs(fast_resume_sec);
             timeout_ms = if (timeout_ms > 0) @min(timeout_ms, fast_ms) else fast_ms;
@@ -876,7 +887,9 @@ const WedgeTracker = struct {
         {
             return .fast_resume;
         }
-        if (fallback_sec > 0 and now_ms - self.reply_delivered_ms >= secondsToMs(fallback_sec)) {
+        if (self.fallback_eligible and fallback_sec > 0 and
+            now_ms - self.reply_delivered_ms >= secondsToMs(fallback_sec))
+        {
             return .fallback;
         }
         return null;
@@ -930,16 +943,42 @@ test "MiddleProxyHandshakeStep.awaitingMiddleProxy gates reactive refresh" {
     try std.testing.expect(!MiddleProxyHandshakeStep.done.awaitingMiddleProxy());
 }
 
-test "wedge tracker uses fallback for a fresh request-response exchange" {
+test "wedge tracker does not fallback on a fresh request-response exchange" {
     var tracker = WedgeTracker{};
     try std.testing.expect(!tracker.noteClientPayload(1_000, 0, 30_000));
     try std.testing.expect(tracker.noteServerPayload(1_100));
     tracker.noteReplyDelivered(1_200);
 
     try std.testing.expect(!tracker.fast_eligible);
-    try std.testing.expectEqual(@as(?i64, 16_200), tracker.nextDeadlineMs(15, 2));
-    try std.testing.expectEqual(@as(?WedgeCloseKind, null), tracker.closeKind(16_199, 15, 2));
-    try std.testing.expectEqual(WedgeCloseKind.fallback, tracker.closeKind(16_200, 15, 2).?);
+    try std.testing.expect(!tracker.fallback_eligible);
+    try std.testing.expectEqual(@as(?i64, null), tracker.nextDeadlineMs(15, 2));
+    try std.testing.expectEqual(@as(?WedgeCloseKind, null), tracker.closeKind(60_000, 15, 2));
+}
+
+test "wedge tracker enables fallback after a healthy reply continuation" {
+    var tracker = WedgeTracker{};
+    _ = tracker.noteClientPayload(1_000, 0, 30_000);
+    _ = tracker.noteServerPayload(1_100);
+    tracker.noteReplyDelivered(1_200);
+
+    try std.testing.expect(tracker.noteClientPayload(1_300, 1_100, 30_000));
+    try std.testing.expect(tracker.fallback_eligible);
+    try std.testing.expect(tracker.noteServerPayload(1_400));
+    tracker.noteReplyDelivered(1_500);
+
+    try std.testing.expectEqual(@as(?i64, 16_500), tracker.nextDeadlineMs(15, 2));
+    try std.testing.expectEqual(@as(?WedgeCloseKind, null), tracker.closeKind(16_499, 15, 2));
+    try std.testing.expectEqual(WedgeCloseKind.fallback, tracker.closeKind(16_500, 15, 2).?);
+}
+
+test "wedge tracker does not prove fallback before reply delivery" {
+    var tracker = WedgeTracker{};
+    _ = tracker.noteClientPayload(1_000, 0, 30_000);
+    _ = tracker.noteServerPayload(1_100);
+
+    try std.testing.expect(tracker.cancelForClientProgress());
+    try std.testing.expect(!tracker.fallback_eligible);
+    try std.testing.expectEqual(WedgePhase.inactive, tracker.phase);
 }
 
 test "wedge tracker fast-closes a response after resumed relay traffic" {
@@ -949,6 +988,7 @@ test "wedge tracker fast-closes a response after resumed relay traffic" {
     tracker.noteReplyDelivered(31_200);
 
     try std.testing.expect(tracker.fast_eligible);
+    try std.testing.expect(!tracker.fallback_eligible);
     try std.testing.expectEqual(@as(i64, 30_000), tracker.resume_idle_ms);
     try std.testing.expectEqual(@as(?i64, 33_200), tracker.nextDeadlineMs(15, 2));
     try std.testing.expectEqual(WedgeCloseKind.fast_resume, tracker.closeKind(33_200, 15, 2).?);

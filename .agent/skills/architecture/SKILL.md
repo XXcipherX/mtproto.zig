@@ -81,10 +81,10 @@ Current runtime timeout control is event-loop based:
 - Pre-first-byte wait: fixed 10 seconds.
 - `idle_timeout_sec`: established relay idle timeout.
 - `handshake_timeout_sec`: timeout for handshake stages after first byte.
-- `client_silence_close_sec`: conservative unanswered-reply fallback on generic DC relays.
+- `client_silence_close_sec`: conservative unanswered-reply fallback on generic DC relays, enabled only after a delivered reply is followed by further client traffic on the same connection.
 - `client_silence_fast_close_sec`: optional fast unanswered-reply close after an established generic relay resumes from `client_silence_fast_after_idle_sec` of silence.
 
-Each slot stores one current absolute deadline in the indexed heap. Idle jitter is computed once at admission and reused when activity moves that deadline. iOS wedge candidates use the same heap, exclude media relays, require a server response within the 12-second client response window, and start only after the userspace client queue drains.
+Each slot stores one current absolute deadline in the indexed heap. Idle jitter is computed once at admission and reused when activity moves that deadline. iOS wedge candidates use the same heap, exclude media relays, require a server response within the 12-second client response window, and start only after the userspace client queue drains. The conservative fallback is suppressed on a fresh relay until the client continues after an earlier delivered reply, preventing breaker-driven reconnect loops.
 
 There is no active `SO_RCVTIMEO`-driven relay timeout model in current code.
 
