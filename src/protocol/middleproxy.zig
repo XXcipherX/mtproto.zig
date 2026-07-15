@@ -121,8 +121,8 @@ pub fn getAesKeyAndIv(
 
 pub const MiddleProxyContext = struct {
     allocator: std.mem.Allocator,
-    encryptor: crypto.AesCbc,
-    decryptor: crypto.AesCbc,
+    encryptor: crypto.AesCbcEncryptor,
+    decryptor: crypto.AesCbcDecryptor,
     seq_no: i32 = -2,
     read_seq_no: i32 = 0,
     conn_id: [8]u8,
@@ -154,8 +154,8 @@ pub const MiddleProxyContext = struct {
 
     pub fn init(
         allocator: std.mem.Allocator,
-        encryptor: crypto.AesCbc,
-        decryptor: crypto.AesCbc,
+        encryptor: anytype,
+        decryptor: anytype,
         conn_id: [8]u8,
         initial_seq_no: i32,
         remote_addr: net.Address,
@@ -179,8 +179,8 @@ pub const MiddleProxyContext = struct {
 
     pub fn initWithBuffer(
         allocator: std.mem.Allocator,
-        encryptor: crypto.AesCbc,
-        decryptor: crypto.AesCbc,
+        encryptor: anytype,
+        decryptor: anytype,
         conn_id: [8]u8,
         initial_seq_no: i32,
         remote_addr: net.Address,
@@ -226,8 +226,8 @@ pub const MiddleProxyContext = struct {
 
         return .{
             .allocator = allocator,
-            .encryptor = encryptor,
-            .decryptor = decryptor,
+            .encryptor = normalizeEncryptor(encryptor),
+            .decryptor = normalizeDecryptor(decryptor),
             .seq_no = initial_seq_no,
             .read_seq_no = 0,
             .conn_id = conn_id,
@@ -239,6 +239,18 @@ pub const MiddleProxyContext = struct {
             .c2s_buf = c2s_buf,
             .buffer_limit = buffer_limit,
         };
+    }
+
+    fn normalizeEncryptor(value: anytype) crypto.AesCbcEncryptor {
+        if (comptime @TypeOf(value) == crypto.AesCbcEncryptor) return value;
+        if (comptime @TypeOf(value) == crypto.AesCbc) return value.intoEncryptor();
+        @compileError("expected an AES-CBC encryptor");
+    }
+
+    fn normalizeDecryptor(value: anytype) crypto.AesCbcDecryptor {
+        if (comptime @TypeOf(value) == crypto.AesCbcDecryptor) return value;
+        if (comptime @TypeOf(value) == crypto.AesCbc) return value.intoDecryptor();
+        @compileError("expected an AES-CBC decryptor");
     }
 
     pub fn deinit(self: *MiddleProxyContext) void {
@@ -304,11 +316,6 @@ pub const MiddleProxyContext = struct {
         self.s2c_buf = next;
     }
 
-    fn peekBufferedC2sByte(self: *const MiddleProxyContext, client_data: []const u8, idx: usize) u8 {
-        if (idx < self.c2s_len) return self.c2s_buf[idx];
-        return client_data[idx - self.c2s_len];
-    }
-
     fn c2sFrameEncryptedLen(self: *const MiddleProxyContext, client_payload_len: usize) usize {
         const extra_len: usize = if (self.ad_tag != null) 28 else 0;
         const frame_total_len = 68 + extra_len + client_payload_len;
@@ -322,21 +329,6 @@ pub const MiddleProxyContext = struct {
             if (b != 0) return false;
         }
         return true;
-    }
-
-    fn bufferedFirstEightAllZero(self: *const MiddleProxyContext, client_data: []const u8, start: usize) bool {
-        for (0..8) |i| {
-            if (self.peekBufferedC2sByte(client_data, start + i) != 0) return false;
-        }
-        return true;
-    }
-
-    fn readBufferedU32(self: *const MiddleProxyContext, client_data: []const u8, start: usize) u32 {
-        var buf: [4]u8 = undefined;
-        for (0..buf.len) |i| {
-            buf[i] = self.peekBufferedC2sByte(client_data, start + i);
-        }
-        return std.mem.readInt(u32, buf[0..4], .little);
     }
 
     fn plainMtprotoActualPayloadLen(frame_payload_len: usize, message_data_len: u32) !usize {
@@ -378,80 +370,16 @@ pub const MiddleProxyContext = struct {
         }
     }
 
-    fn securePayloadInfoBuffered(
-        self: *const MiddleProxyContext,
-        client_data: []const u8,
-        payload_start: usize,
-        payload_len: usize,
-    ) !C2sPayloadInfo {
-        if (payload_len >= 20 and self.bufferedFirstEightAllZero(client_data, payload_start)) {
-            const message_data_len = self.readBufferedU32(client_data, payload_start + 16);
-            if (plainMtprotoActualPayloadLen(payload_len, message_data_len)) |actual_len| {
-                return .{ .actual_len = actual_len, .is_plain = true };
-            } else |_| {}
-        }
-        return .{ .actual_len = try encryptedMtprotoActualPayloadLen(payload_len), .is_plain = false };
-    }
-
     pub fn requiredC2sScratchCapacity(self: *const MiddleProxyContext, client_data: []const u8) !usize {
         const total_input_len = try self.requiredBufferedCapacity(self.c2s_len, client_data.len);
-        var pos: usize = 0;
-        var total_written: usize = 0;
-
-        while (pos < total_input_len) {
-            var payload_len: usize = 0;
-            var header_len: usize = 0;
-
-            switch (self.proto_tag) {
-                .abridged => {
-                    if (total_input_len - pos < 1) break;
-                    const first = self.peekBufferedC2sByte(client_data, pos);
-                    const len_val = first & 0x7F;
-                    if (len_val < 127) {
-                        header_len = 1;
-                        payload_len = @as(usize, len_val) * 4;
-                    } else {
-                        if (total_input_len - pos < 4) break;
-
-                        var header_buf: [4]u8 = undefined;
-                        for (0..header_buf.len) |i| {
-                            header_buf[i] = self.peekBufferedC2sByte(client_data, pos + i);
-                        }
-
-                        header_len = 4;
-                        payload_len = std.mem.readInt(u32, header_buf[0..4], .little) >> 8;
-                        payload_len *= 4;
-                    }
-                },
-                .intermediate, .secure => {
-                    if (total_input_len - pos < 4) break;
-
-                    var header_buf: [4]u8 = undefined;
-                    for (0..header_buf.len) |i| {
-                        header_buf[i] = self.peekBufferedC2sByte(client_data, pos + i);
-                    }
-
-                    header_len = 4;
-                    var len_u32 = std.mem.readInt(u32, header_buf[0..4], .little);
-                    len_u32 &= 0x7FFFFFFF;
-                    payload_len = len_u32;
-                },
-            }
-
-            try self.validateC2sPayloadLength(header_len, payload_len);
-
-            if (total_input_len - pos < header_len + payload_len) break;
-
-            var actual_payload_len = payload_len;
-            if (self.proto_tag == .secure) {
-                actual_payload_len = (try self.securePayloadInfoBuffered(client_data, pos + header_len, payload_len)).actual_len;
-            }
-
-            total_written += self.c2sFrameEncryptedLen(actual_payload_len);
-            pos += header_len + payload_len;
-        }
-
-        return total_written;
+        // c2s_buf contains at most one incomplete frame: every complete frame is
+        // consumed before encapsulateC2S returns. Bound new complete frames from
+        // the incoming chunk without walking their headers a second time.
+        const min_wire_frame_len = min_client_payload_size + 1;
+        const max_new_frames = 1 + client_data.len / min_wire_frame_len;
+        const max_frame_overhead: usize = 68 + 28 + 15;
+        const overhead = try std.math.mul(usize, max_new_frames, max_frame_overhead);
+        return try std.math.add(usize, total_input_len, overhead);
     }
 
     /// Takes arbitrary bytes from the client stream, wraps them in RPC_PROXY_REQ,
@@ -986,7 +914,7 @@ test "required c2s scratch capacity accounts for buffered partial frame" {
     @memset(tail[2..], 0xef);
     const required = try ctx.requiredC2sScratchCapacity(tail[0..]);
 
-    try std.testing.expectEqual(ctx.c2sFrameEncryptedLen(MiddleProxyContext.min_client_payload_size), required);
+    try std.testing.expect(required >= ctx.c2sFrameEncryptedLen(MiddleProxyContext.min_client_payload_size));
 }
 
 test "secure c2s strips encrypted padded-intermediate padding" {
@@ -1019,7 +947,7 @@ test "secure c2s strips encrypted padded-intermediate padding" {
     @memset(packet[4 + mtproto_payload.len ..], 0x7b);
 
     const required = try ctx.requiredC2sScratchCapacity(packet[0..]);
-    try std.testing.expectEqual(ctx.c2sFrameEncryptedLen(mtproto_payload.len), required);
+    try std.testing.expect(required >= ctx.c2sFrameEncryptedLen(mtproto_payload.len));
 
     var encrypted_out: [512]u8 = undefined;
     const out = try ctx.encapsulateC2S(packet[0..], encrypted_out[0..]);
@@ -1067,7 +995,7 @@ test "secure c2s strips plain padded-intermediate padding" {
     @memset(packet[4 + mtproto_payload.len ..], 0x5d);
 
     const required = try ctx.requiredC2sScratchCapacity(packet[0..]);
-    try std.testing.expectEqual(ctx.c2sFrameEncryptedLen(mtproto_payload.len), required);
+    try std.testing.expect(required >= ctx.c2sFrameEncryptedLen(mtproto_payload.len));
 
     var encrypted_out: [512]u8 = undefined;
     const out = try ctx.encapsulateC2S(packet[0..], encrypted_out[0..]);
@@ -1116,7 +1044,7 @@ test "secure c2s rejects unaligned plain mtproto payload data" {
     @memset(packet[4 + mtproto_payload.len ..], 0xa7);
 
     const required = try ctx.requiredC2sScratchCapacity(packet[0..]);
-    try std.testing.expectEqual(ctx.c2sFrameEncryptedLen(mtproto_payload.len), required);
+    try std.testing.expect(required >= ctx.c2sFrameEncryptedLen(mtproto_payload.len));
 
     var encrypted_out: [512]u8 = undefined;
     try std.testing.expectError(error.InvalidPayloadLength, ctx.encapsulateC2S(packet[0..], encrypted_out[0..]));
@@ -1152,7 +1080,7 @@ test "secure c2s treats invalid plain-looking payload as encrypted" {
 
     const actual_payload_len: usize = 104;
     const required = try ctx.requiredC2sScratchCapacity(packet[0..]);
-    try std.testing.expectEqual(ctx.c2sFrameEncryptedLen(actual_payload_len), required);
+    try std.testing.expect(required >= ctx.c2sFrameEncryptedLen(actual_payload_len));
 
     var encrypted_out: [512]u8 = undefined;
     const out = try ctx.encapsulateC2S(packet[0..], encrypted_out[0..]);

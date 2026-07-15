@@ -51,11 +51,21 @@ const log = std.log.scoped(.mtproto);
 
 // ============= Output Helpers (Zig 0.16 compatible) =============
 
+threadlocal var stdout_accumulator: ?*std.Io.Writer = null;
+
+fn writeStdoutBytes(bytes: []const u8) void {
+    if (stdout_accumulator) |writer| {
+        writer.writeAll(bytes) catch {};
+        return;
+    }
+    compat.writeStdout(bytes);
+}
+
 /// Write a formatted string to stdout via posix write.
 fn writeStdout(comptime fmt: []const u8, args: anytype) void {
     var buf: [4096]u8 = undefined;
     const slice = std.fmt.bufPrint(&buf, fmt, args) catch return;
-    compat.writeStdout(slice);
+    writeStdoutBytes(slice);
 }
 
 /// Write a formatted string to stderr.
@@ -69,12 +79,12 @@ fn writeStderr(comptime fmt: []const u8, args: anytype) void {
 fn writeHexByte(byte: u8) void {
     const hex = "0123456789abcdef";
     const out = [2]u8{ hex[byte >> 4], hex[byte & 0x0f] };
-    compat.writeStdout(&out);
+    writeStdoutBytes(&out);
 }
 
 /// Write raw string to stdout.
 fn writeRaw(s: []const u8) void {
-    compat.writeStdout(s);
+    writeStdoutBytes(s);
 }
 
 fn ignoreSigpipe() void {
@@ -299,6 +309,11 @@ fn enforceCapacitySafety(cfg: *config.Config, capacity_estimate: ?CapacityEstima
 
 /// Print a stylish startup banner with config summary and connection links.
 fn printBanner(cfg: config.Config, capacity_estimate: ?CapacityEstimate, show_secrets: bool) void {
+    var output = std.Io.Writer.Allocating.init(std.heap.page_allocator);
+    defer output.deinit();
+    stdout_accumulator = &output.writer;
+    defer stdout_accumulator = null;
+
     const R = "\x1b[0m";
     const B = "\x1b[1m";
     const D = "\x1b[2m";
@@ -419,6 +434,9 @@ fn printBanner(cfg: config.Config, capacity_estimate: ?CapacityEstimate, show_se
     // Footer
     writeRaw("\n  " ++ D ++ "──────────────────────────────────────────────────" ++ R ++ "\n");
     writeRaw("  " ++ B ++ cyan ++ "⏳ Waiting for connections..." ++ R ++ "\n\n");
+
+    stdout_accumulator = null;
+    compat.writeStdout(output.written());
 }
 
 pub fn main(init: std.process.Init) !void {

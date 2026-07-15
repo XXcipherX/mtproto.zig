@@ -85,7 +85,64 @@ pub fn randomBytes(buf: []u8) void {
     randomBytesSecure(buf) catch @panic("secure random entropy unavailable");
 }
 
+const SecureDrbg = struct {
+    const ChaCha20 = std.crypto.stream.chacha.ChaCha20IETF;
+    const buffer_size = 1024;
+    const reseed_interval = 1024 * 1024;
+
+    key: [ChaCha20.key_length]u8 = [_]u8{0} ** ChaCha20.key_length,
+    nonce: [ChaCha20.nonce_length]u8 = [_]u8{0} ** ChaCha20.nonce_length,
+    buffer: [buffer_size]u8 = [_]u8{0} ** buffer_size,
+    buffer_pos: usize = buffer_size,
+    counter: u32 = 0,
+    generated: usize = reseed_interval,
+    initialized: bool = false,
+
+    fn fill(self: *SecureDrbg, out: []u8) !void {
+        var offset: usize = 0;
+        while (offset < out.len) {
+            if (!self.initialized or self.generated >= reseed_interval) try self.reseed();
+            if (self.buffer_pos == self.buffer.len) self.refill();
+
+            const until_reseed = reseed_interval - self.generated;
+            const take = @min(out.len - offset, @min(self.buffer.len - self.buffer_pos, until_reseed));
+            @memcpy(out[offset .. offset + take], self.buffer[self.buffer_pos .. self.buffer_pos + take]);
+            self.buffer_pos += take;
+            self.generated += take;
+            offset += take;
+        }
+    }
+
+    fn reseed(self: *SecureDrbg) !void {
+        var seed: [ChaCha20.key_length + ChaCha20.nonce_length]u8 = undefined;
+        defer std.crypto.secureZero(u8, &seed);
+        try randomBytesFromOs(&seed);
+
+        std.crypto.secureZero(u8, &self.key);
+        std.crypto.secureZero(u8, &self.nonce);
+        std.crypto.secureZero(u8, &self.buffer);
+        @memcpy(self.key[0..], seed[0..ChaCha20.key_length]);
+        @memcpy(self.nonce[0..], seed[ChaCha20.key_length..]);
+        self.buffer_pos = self.buffer.len;
+        self.counter = 0;
+        self.generated = 0;
+        self.initialized = true;
+    }
+
+    fn refill(self: *SecureDrbg) void {
+        ChaCha20.stream(&self.buffer, self.counter, self.key, self.nonce);
+        self.counter +%= self.buffer.len / ChaCha20.block_length;
+        self.buffer_pos = 0;
+    }
+};
+
+threadlocal var secure_drbg: SecureDrbg = .{};
+
 fn randomBytesSecure(buf: []u8) !void {
+    try secure_drbg.fill(buf);
+}
+
+fn randomBytesFromOs(buf: []u8) !void {
     if (builtin.os.tag == .linux) {
         try randomBytesSecureLinux(buf);
         return;
@@ -112,15 +169,41 @@ pub fn randomRange(comptime T: type, max: T) T {
 }
 
 pub fn writeStdout(bytes: []const u8) void {
+    if (builtin.os.tag == .linux) {
+        writeLinuxFd(std.os.linux.STDOUT_FILENO, bytes);
+        return;
+    }
+
     var threaded_io = initThreadedIo();
     defer threaded_io.deinit();
     std.Io.File.stdout().writeStreamingAll(threaded_io.io(), bytes) catch {};
 }
 
 pub fn writeStderr(bytes: []const u8) void {
+    if (builtin.os.tag == .linux) {
+        writeLinuxFd(std.os.linux.STDERR_FILENO, bytes);
+        return;
+    }
+
     var threaded_io = initThreadedIo();
     defer threaded_io.deinit();
     std.Io.File.stderr().writeStreamingAll(threaded_io.io(), bytes) catch {};
+}
+
+fn writeLinuxFd(fd: i32, bytes: []const u8) void {
+    const linux = std.os.linux;
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const rc = linux.write(fd, bytes[offset..].ptr, bytes.len - offset);
+        switch (posix.errno(rc)) {
+            .SUCCESS => {
+                if (rc == 0) return;
+                offset += rc;
+            },
+            .INTR => continue,
+            else => return,
+        }
+    }
 }
 
 pub const Mutex = struct {

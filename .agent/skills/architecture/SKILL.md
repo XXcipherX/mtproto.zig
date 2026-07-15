@@ -20,10 +20,11 @@ Production MTProto proxy implemented in Zig with FakeTLS entry, obfuscated MTPro
 
 - Relay path is a single-threaded Linux `epoll` event loop. The large `EventLoop` container (including fixed admission tables) is allocated once on the heap and initialized in place so Debug builds do not reserve multi-megabyte stack frames.
 - Connections are represented by pooled `ConnectionSlot` state objects.
-- File descriptors are tracked via epoll + fd-to-slot mapping.
-- Recent runtime changes added safer failed-connect cleanup, monotonic full-active-prefix timer scanning, fd-budget clamping, 90%/80% saturation hysteresis, per-subnet unauthenticated admission limits, graceful RDHUP draining, low-noise periodic connection stats, classed message-queue blocks, and lazy MiddleProxy stream/scratch buffers.
-- Outbound data uses `MessageQueue` block classes (64/512/2048 byte storage) with `writev` flushing and a 4 MiB pending-byte cap per direction queue.
-- A joinable background updater starts after the listener when MiddleProxy or masking discovery is needed. It refreshes MiddleProxy metadata, detects the NAT IPv4, re-resolves all masking candidates hourly, can wake early after stalled MiddleProxy handshakes, and is stopped cooperatively on `ProxyState.deinit`.
+- Epoll payloads encode slot index, generation, and client/upstream role directly in `epoll_event.data.u64`; dispatch has no fd hash lookup, and generation checks reject stale events after slot/fd reuse.
+- Connection deadlines live in an indexed min-heap with one entry per active slot. A monotonic `timerfd` is armed to the earliest slot, accept-backoff, or stats deadline, eliminating the historical full-slot timer scan.
+- Outbound data uses `MessageQueue` block classes (64/512/2048 byte storage) from one event-loop-wide block pool, bounded `writev` flushing, and a 4 MiB pending-byte cap per direction queue. Read/drain/write loops have explicit byte and operation budgets per dispatch.
+- A joinable background updater starts after the listener when MiddleProxy or masking discovery is needed. It refreshes MiddleProxy metadata, detects the NAT IPv4, re-resolves all masking candidates hourly, probes endpoints in cancellable batches of four, can wake early after stalled MiddleProxy handshakes, and is stopped cooperatively on `ProxyState.deinit`.
+- MiddleProxy handshakes copy only the selected route candidates and a secret version/NAT value, release handshake-only storage at relay start, and parse each C2S frame header once. Current and immediately previous secrets live centrally under the metadata lock, so selector/KDF inputs stay consistent without a per-handshake secret copy. Runtime CBC state is direction-specific; high-frequency protocol randomness comes from a per-thread ChaCha20 DRBG reseeded from the OS CSPRNG.
 
 Code anchors:
 
@@ -80,6 +81,8 @@ Current runtime timeout control is event-loop based:
 - Pre-first-byte wait: fixed 10 seconds.
 - `idle_timeout_sec`: established relay idle timeout.
 - `handshake_timeout_sec`: timeout for handshake stages after first byte.
+
+Each slot stores one current absolute deadline in the indexed heap. Idle jitter is computed once at admission and reused when activity moves that deadline.
 
 There is no active `SO_RCVTIMEO`-driven relay timeout model in current code.
 
