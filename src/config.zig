@@ -32,10 +32,15 @@ pub const Config = struct {
     idle_timeout_sec: u32 = 120,
     /// Per-connection idle timeout jitter in percent; 0 disables.
     idle_timeout_jitter_pct: u8 = 15,
-    /// Close a relay when the server has replied but the client stays silent for
-    /// this many seconds; 0 = disabled. This bounds an iOS MtProtoKit bad_salt
-    /// wedge where the client stops sending until the DC closes the socket.
+    /// Conservative close for an unanswered generic-DC reply; 0 = disabled.
+    /// This bounds an iOS MtProtoKit bad_salt wedge where the client stops
+    /// sending until the DC closes the socket.
     client_silence_close_sec: u32 = 0,
+    /// Faster close for the same silence pattern after an established client
+    /// resumes from a quiet relay period; 0 = disabled.
+    client_silence_fast_close_sec: u32 = 0,
+    /// Relay quiet period required before fast silence handling is eligible.
+    client_silence_fast_after_idle_sec: u32 = 30,
     /// Handshake read timeout after first byte arrives
     handshake_timeout_sec: u32 = 15,
     /// Per-endpoint TCP connect deadline for Telegram DC candidates.
@@ -413,6 +418,14 @@ pub const Config = struct {
                         if (parseIntSetting(u32, key, value)) |parsed| {
                             cfg.client_silence_close_sec = parsed;
                         }
+                    } else if (std.mem.eql(u8, key, "client_silence_fast_close_sec")) {
+                        if (parseIntSetting(u32, key, value)) |parsed| {
+                            cfg.client_silence_fast_close_sec = parsed;
+                        }
+                    } else if (std.mem.eql(u8, key, "client_silence_fast_after_idle_sec")) {
+                        if (parseIntSetting(u32, key, value)) |parsed| {
+                            cfg.client_silence_fast_after_idle_sec = @max(@as(u32, 5), parsed);
+                        }
                     } else if (std.mem.eql(u8, key, "handshake_timeout_sec")) {
                         if (parseIntSetting(u32, key, value)) |parsed| {
                             cfg.handshake_timeout_sec = @max(@as(u32, 5), parsed);
@@ -563,6 +576,9 @@ test "parse config - valid complete" {
         \\max_connections = 6000
         \\idle_timeout_sec = 180
         \\idle_timeout_jitter_pct = 25
+        \\client_silence_close_sec = 15
+        \\client_silence_fast_close_sec = 2
+        \\client_silence_fast_after_idle_sec = 30
         \\handshake_timeout_sec = 30
         \\dc_connect_timeout_sec = 7
         \\fast_mode = true
@@ -589,6 +605,9 @@ test "parse config - valid complete" {
     try std.testing.expectEqual(@as(u32, 6000), cfg.max_connections);
     try std.testing.expectEqual(@as(u32, 180), cfg.idle_timeout_sec);
     try std.testing.expectEqual(@as(u8, 25), cfg.idle_timeout_jitter_pct);
+    try std.testing.expectEqual(@as(u32, 15), cfg.client_silence_close_sec);
+    try std.testing.expectEqual(@as(u32, 2), cfg.client_silence_fast_close_sec);
+    try std.testing.expectEqual(@as(u32, 30), cfg.client_silence_fast_after_idle_sec);
     try std.testing.expectEqual(@as(u32, 30), cfg.handshake_timeout_sec);
     try std.testing.expectEqual(@as(u32, 7), cfg.dc_connect_timeout_sec);
     try std.testing.expectEqualStrings("example.com", cfg.tls_domain);
@@ -620,6 +639,9 @@ test "parse config - missing fields defaults" {
     try std.testing.expectEqual(@as(u32, 512), cfg.max_connections);
     try std.testing.expectEqual(@as(u32, 120), cfg.idle_timeout_sec);
     try std.testing.expectEqual(@as(u8, 15), cfg.idle_timeout_jitter_pct);
+    try std.testing.expectEqual(@as(u32, 0), cfg.client_silence_close_sec);
+    try std.testing.expectEqual(@as(u32, 0), cfg.client_silence_fast_close_sec);
+    try std.testing.expectEqual(@as(u32, 30), cfg.client_silence_fast_after_idle_sec);
     try std.testing.expectEqual(@as(u32, 15), cfg.handshake_timeout_sec);
     try std.testing.expectEqual(@as(u32, 10), cfg.dc_connect_timeout_sec);
     try std.testing.expectEqualStrings("google.com", cfg.tls_domain);
@@ -818,6 +840,22 @@ test "parse config - idle timeout jitter clamps to 100 percent" {
     defer cfg.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u8, 100), cfg.idle_timeout_jitter_pct);
+}
+
+test "parse config - fast client silence idle threshold clamps to five seconds" {
+    const content =
+        \\[server]
+        \\client_silence_fast_close_sec = 2
+        \\client_silence_fast_after_idle_sec = 1
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 2), cfg.client_silence_fast_close_sec);
+    try std.testing.expectEqual(@as(u32, 5), cfg.client_silence_fast_after_idle_sec);
 }
 
 test "parse config - spaces and tabs" {

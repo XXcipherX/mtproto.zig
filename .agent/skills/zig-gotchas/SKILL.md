@@ -80,6 +80,7 @@ Do not reintroduce thread-per-connection or blocking relay loops.
 ## Timeout and Lifetime Notes
 
 - Current runtime enforces a fixed 10-second pre-first-byte timeout, configured handshake timeout after first byte, and configured relay idle timeout.
+- iOS silence recovery is an encrypted-stream heuristic, not MTProto parsing: it excludes media paths, accepts only server replies inside a 12-second response window, and arms after the userspace client queue drains. Preserve those guards when changing `client_silence_*` handling.
 - Fixed max connection lifetime (for example "30 minutes hard cap") is not implemented in current code.
 
 ## Practical Change Guardrails

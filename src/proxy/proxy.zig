@@ -44,6 +44,10 @@ const mp_handshake_frame_buf_size: usize = 2048;
 const read_buf_size: usize = 4096;
 const pre_first_byte_timeout_ms: i64 = 10 * std.time.ms_per_s;
 const middle_proxy_stage_timeout_ms: i64 = 5 * std.time.ms_per_s;
+// Telegram iOS arms a 12-second response watchdog for requests that expect a
+// reply. A later server push is not strong enough evidence to arm the wedge
+// breaker, so only responses inside the same window are considered.
+const client_response_window_ms: i64 = 12 * std.time.ms_per_s;
 const tls_control_record_budget: usize = 8;
 const tls_control_byte_budget: usize = 64 * 1024;
 const no_timer_heap_index = std.math.maxInt(u32);
@@ -759,6 +763,126 @@ const ConnectionPhase = enum {
     closing,
 };
 
+const WedgePhase = enum {
+    inactive,
+    waiting_for_reply,
+    reply_pending_delivery,
+    waiting_for_client,
+};
+
+const WedgeCloseKind = enum {
+    fast_resume,
+    fallback,
+};
+
+const WedgeTracker = struct {
+    phase: WedgePhase = .inactive,
+    request_ms: i64 = 0,
+    reply_delivered_ms: i64 = 0,
+    resume_idle_ms: i64 = 0,
+    response_latency_ms: i64 = 0,
+    fast_eligible: bool = false,
+
+    fn reset(self: *WedgeTracker) void {
+        self.* = .{};
+    }
+
+    fn noteClientPayload(
+        self: *WedgeTracker,
+        now_ms: i64,
+        previous_relay_ms: i64,
+        fast_after_idle_ms: i64,
+    ) bool {
+        const cancelled = self.phase == .reply_pending_delivery or self.phase == .waiting_for_client;
+        const continued_request = self.phase == .waiting_for_reply;
+        const idle_ms = if (previous_relay_ms > 0) @max(now_ms - previous_relay_ms, 0) else 0;
+        const resumed = previous_relay_ms > 0 and idle_ms >= fast_after_idle_ms;
+
+        if (!continued_request) {
+            self.* = .{
+                .phase = .waiting_for_reply,
+                .request_ms = now_ms,
+                .resume_idle_ms = if (resumed) idle_ms else 0,
+                .fast_eligible = resumed,
+            };
+        } else {
+            self.request_ms = now_ms;
+            if (resumed) {
+                self.resume_idle_ms = idle_ms;
+                self.fast_eligible = true;
+            }
+        }
+        return cancelled;
+    }
+
+    fn cancelForClientProgress(self: *WedgeTracker) bool {
+        if (self.phase != .reply_pending_delivery and self.phase != .waiting_for_client) return false;
+        self.reset();
+        return true;
+    }
+
+    fn noteServerPayload(self: *WedgeTracker, now_ms: i64) bool {
+        switch (self.phase) {
+            .waiting_for_reply => {
+                const response_latency_ms = @max(now_ms - self.request_ms, 0);
+                if (response_latency_ms > client_response_window_ms) {
+                    self.reset();
+                    return false;
+                }
+                self.phase = .reply_pending_delivery;
+                self.reply_delivered_ms = 0;
+                self.response_latency_ms = response_latency_ms;
+                return true;
+            },
+            .reply_pending_delivery, .waiting_for_client => {
+                self.phase = .reply_pending_delivery;
+                self.reply_delivered_ms = 0;
+                return false;
+            },
+            .inactive => return false,
+        }
+    }
+
+    fn noteReplyDelivered(self: *WedgeTracker, now_ms: i64) void {
+        if (self.phase != .reply_pending_delivery) return;
+        self.phase = .waiting_for_client;
+        self.reply_delivered_ms = now_ms;
+    }
+
+    fn deferForClientBackpressure(self: *WedgeTracker) void {
+        if (self.phase != .waiting_for_client) return;
+        self.phase = .reply_pending_delivery;
+        self.reply_delivered_ms = 0;
+    }
+
+    fn nextDeadlineMs(self: *const WedgeTracker, fallback_sec: u32, fast_resume_sec: u32) ?i64 {
+        if (self.phase != .waiting_for_client or self.reply_delivered_ms <= 0) return null;
+
+        var timeout_ms: i64 = 0;
+        if (fallback_sec > 0) timeout_ms = secondsToMs(fallback_sec);
+        if (self.fast_eligible and fast_resume_sec > 0) {
+            const fast_ms = secondsToMs(fast_resume_sec);
+            timeout_ms = if (timeout_ms > 0) @min(timeout_ms, fast_ms) else fast_ms;
+        }
+        if (timeout_ms <= 0) return null;
+        return self.reply_delivered_ms + timeout_ms;
+    }
+
+    fn closeKind(self: *const WedgeTracker, now_ms: i64, fallback_sec: u32, fast_resume_sec: u32) ?WedgeCloseKind {
+        if (self.phase != .waiting_for_client or self.reply_delivered_ms <= 0) return null;
+
+        if (self.fast_eligible and fast_resume_sec > 0 and
+            now_ms - self.reply_delivered_ms >= secondsToMs(fast_resume_sec))
+        {
+            return .fast_resume;
+        }
+        if (fallback_sec > 0 and now_ms - self.reply_delivered_ms >= secondsToMs(fallback_sec)) {
+            return .fallback;
+        }
+        return null;
+    }
+};
+
 fn shouldCloseOnFatalHangup(phase: ConnectionPhase, event_fd: posix.fd_t, upstream_fd: posix.fd_t) bool {
     if (phase == .idle) return false;
 
@@ -804,6 +928,82 @@ test "MiddleProxyHandshakeStep.awaitingMiddleProxy gates reactive refresh" {
     try std.testing.expect(MiddleProxyHandshakeStep.sending_rpc_handshake.awaitingMiddleProxy());
     try std.testing.expect(MiddleProxyHandshakeStep.waiting_rpc_handshake_response.awaitingMiddleProxy());
     try std.testing.expect(!MiddleProxyHandshakeStep.done.awaitingMiddleProxy());
+}
+
+test "wedge tracker uses fallback for a fresh request-response exchange" {
+    var tracker = WedgeTracker{};
+    try std.testing.expect(!tracker.noteClientPayload(1_000, 0, 30_000));
+    try std.testing.expect(tracker.noteServerPayload(1_100));
+    tracker.noteReplyDelivered(1_200);
+
+    try std.testing.expect(!tracker.fast_eligible);
+    try std.testing.expectEqual(@as(?i64, 16_200), tracker.nextDeadlineMs(15, 2));
+    try std.testing.expectEqual(@as(?WedgeCloseKind, null), tracker.closeKind(16_199, 15, 2));
+    try std.testing.expectEqual(WedgeCloseKind.fallback, tracker.closeKind(16_200, 15, 2).?);
+}
+
+test "wedge tracker fast-closes a response after resumed relay traffic" {
+    var tracker = WedgeTracker{};
+    try std.testing.expect(!tracker.noteClientPayload(31_000, 1_000, 30_000));
+    try std.testing.expect(tracker.noteServerPayload(31_100));
+    tracker.noteReplyDelivered(31_200);
+
+    try std.testing.expect(tracker.fast_eligible);
+    try std.testing.expectEqual(@as(i64, 30_000), tracker.resume_idle_ms);
+    try std.testing.expectEqual(@as(?i64, 33_200), tracker.nextDeadlineMs(15, 2));
+    try std.testing.expectEqual(WedgeCloseKind.fast_resume, tracker.closeKind(33_200, 15, 2).?);
+}
+
+test "wedge tracker cancels on client progress after a server reply" {
+    var tracker = WedgeTracker{};
+    _ = tracker.noteClientPayload(31_000, 1_000, 30_000);
+    try std.testing.expect(tracker.noteServerPayload(31_100));
+    tracker.noteReplyDelivered(31_200);
+
+    try std.testing.expect(tracker.noteClientPayload(31_300, 31_100, 30_000));
+    try std.testing.expectEqual(WedgePhase.waiting_for_reply, tracker.phase);
+    try std.testing.expectEqual(@as(?i64, null), tracker.nextDeadlineMs(15, 2));
+}
+
+test "wedge tracker cancels on a fragmented client record header" {
+    var tracker = WedgeTracker{};
+    _ = tracker.noteClientPayload(31_000, 1_000, 30_000);
+    try std.testing.expect(tracker.noteServerPayload(31_100));
+    tracker.noteReplyDelivered(31_200);
+
+    try std.testing.expect(tracker.cancelForClientProgress());
+    try std.testing.expectEqual(WedgePhase.inactive, tracker.phase);
+    try std.testing.expectEqual(@as(?i64, null), tracker.nextDeadlineMs(15, 2));
+}
+
+test "wedge tracker keeps waiting while a client request header is fragmented" {
+    var tracker = WedgeTracker{};
+    _ = tracker.noteClientPayload(31_000, 1_000, 30_000);
+
+    try std.testing.expect(!tracker.cancelForClientProgress());
+    try std.testing.expectEqual(WedgePhase.waiting_for_reply, tracker.phase);
+}
+
+test "wedge tracker rearms after a queued reply is delivered" {
+    var tracker = WedgeTracker{};
+    _ = tracker.noteClientPayload(31_000, 1_000, 30_000);
+    try std.testing.expect(tracker.noteServerPayload(31_100));
+    tracker.noteReplyDelivered(31_200);
+
+    tracker.deferForClientBackpressure();
+    try std.testing.expectEqual(WedgePhase.reply_pending_delivery, tracker.phase);
+    try std.testing.expectEqual(@as(?i64, null), tracker.nextDeadlineMs(15, 2));
+
+    tracker.noteReplyDelivered(31_500);
+    try std.testing.expectEqual(@as(?i64, 33_500), tracker.nextDeadlineMs(15, 2));
+}
+
+test "wedge tracker ignores a server push outside the response window" {
+    var tracker = WedgeTracker{};
+    _ = tracker.noteClientPayload(1_000, 0, 30_000);
+
+    try std.testing.expect(!tracker.noteServerPayload(1_000 + client_response_window_ms + 1));
+    try std.testing.expectEqual(WedgePhase.inactive, tracker.phase);
 }
 
 const DcConnectPlan = struct {
@@ -1050,6 +1250,7 @@ const ConnectionSlot = struct {
     /// recently than the client, the server reply is unanswered.
     last_client_byte_ms: i64 = 0,
     last_server_byte_ms: i64 = 0,
+    wedge: WedgeTracker = .{},
     desync_deadline_ns: i128 = 0,
 
     // Initial TLS handshake reassembly
@@ -2209,6 +2410,10 @@ const EventLoop = struct {
     stats_next_log_ns: i128,
     accepted_since_log: u64,
     closed_since_log: u64,
+    wedge_candidates_since_log: u64 = 0,
+    wedge_cancelled_since_log: u64 = 0,
+    wedge_fast_closes_since_log: u64 = 0,
+    wedge_fallback_closes_since_log: u64 = 0,
     subnet_limiter: SubnetRateLimit,
     subnet_handshakes: SubnetHandshakeLimit,
     // Snapshot of degradation counters for delta logging
@@ -2249,6 +2454,10 @@ const EventLoop = struct {
         loop.stats_next_log_ns = compat.monotonicNanoTimestamp() + stats_log_interval_ns;
         loop.accepted_since_log = 0;
         loop.closed_since_log = 0;
+        loop.wedge_candidates_since_log = 0;
+        loop.wedge_cancelled_since_log = 0;
+        loop.wedge_fast_closes_since_log = 0;
+        loop.wedge_fallback_closes_since_log = 0;
         loop.subnet_limiter.hash_seed = crypto.randomInt(u64);
         for (&loop.subnet_limiter.entries) |*entry| entry.* = .{};
         loop.subnet_handshakes.hash_seed = crypto.randomInt(u64);
@@ -2575,8 +2784,23 @@ const EventLoop = struct {
             });
         }
 
+        if (self.wedge_candidates_since_log + self.wedge_cancelled_since_log +
+            self.wedge_fast_closes_since_log + self.wedge_fallback_closes_since_log > 0)
+        {
+            log.info("  ios_wedge: candidates+={d} cancelled+={d} fast_close+={d} fallback_close+={d}", .{
+                self.wedge_candidates_since_log,
+                self.wedge_cancelled_since_log,
+                self.wedge_fast_closes_since_log,
+                self.wedge_fallback_closes_since_log,
+            });
+        }
+
         self.accepted_since_log = 0;
         self.closed_since_log = 0;
+        self.wedge_candidates_since_log = 0;
+        self.wedge_cancelled_since_log = 0;
+        self.wedge_fast_closes_since_log = 0;
+        self.wedge_fallback_closes_since_log = 0;
 
         while (self.stats_next_log_ns <= now_ns) {
             self.stats_next_log_ns += stats_log_interval_ns;
@@ -2676,12 +2900,22 @@ const EventLoop = struct {
     }
 
     fn onClientWritable(self: *EventLoop, slot: *ConnectionSlot) void {
+        if (slot.phase == .relaying and !slot.is_media_path and slot.hasClientPending()) {
+            slot.wedge.deferForClientBackpressure();
+        }
+        var flushed_at_ms: i64 = 0;
         if (flushClientPending(slot)) |written| {
-            if (written > 0) slot.last_activity_ms = compat.monotonicMilliTimestamp();
+            if (written > 0) {
+                flushed_at_ms = compat.monotonicMilliTimestamp();
+                slot.last_activity_ms = flushed_at_ms;
+            }
         } else |err| {
             log.debug("[{d}] client flush error: {any}", .{ slot.conn_id, err });
             self.closeSlot(slot, "client flush error");
             return;
+        }
+        if (flushed_at_ms > 0 and !slot.hasClientPending()) {
+            noteServerReplyDelivered(slot, flushed_at_ms);
         }
         if (slot.relay_half_closed and slot.upstream_detached and !slot.hasClientPending()) {
             self.closeSlot(slot, "relay drained after upstream half-close");
@@ -3558,6 +3792,59 @@ const EventLoop = struct {
         slot.phase = .writing_dc_nonce;
     }
 
+    fn wedgeTrackingEnabled(self: *const EventLoop) bool {
+        return self.state.config.client_silence_close_sec > 0 or
+            self.state.config.client_silence_fast_close_sec > 0;
+    }
+
+    fn noteClientRelayPayload(self: *EventLoop, slot: *ConnectionSlot, now_ms: i64) void {
+        const previous_relay_ms = @max(slot.last_client_byte_ms, slot.last_server_byte_ms);
+        if (slot.is_media_path or !self.wedgeTrackingEnabled()) {
+            slot.wedge.reset();
+        } else {
+            const fast_after_idle_ms = secondsToMs(self.state.config.client_silence_fast_after_idle_sec);
+            if (slot.wedge.noteClientPayload(now_ms, previous_relay_ms, fast_after_idle_ms)) {
+                self.wedge_cancelled_since_log +|= 1;
+            }
+        }
+        slot.last_client_byte_ms = now_ms;
+    }
+
+    fn noteClientRelayProgress(self: *EventLoop, slot: *ConnectionSlot) void {
+        if (slot.is_media_path or !self.wedgeTrackingEnabled()) {
+            slot.wedge.reset();
+        } else if (slot.wedge.cancelForClientProgress()) {
+            self.wedge_cancelled_since_log +|= 1;
+        }
+    }
+
+    fn noteServerRelayPayload(self: *EventLoop, slot: *ConnectionSlot, now_ms: i64) void {
+        slot.last_server_byte_ms = now_ms;
+        if (slot.is_media_path or !self.wedgeTrackingEnabled()) {
+            slot.wedge.reset();
+            return;
+        }
+
+        if (slot.wedge.noteServerPayload(now_ms)) {
+            self.wedge_candidates_since_log +|= 1;
+        }
+        if (!slot.hasClientPending()) noteServerReplyDelivered(slot, now_ms);
+    }
+
+    fn noteServerReplyDelivered(slot: *ConnectionSlot, now_ms: i64) void {
+        if (slot.phase != .relaying or slot.is_media_path or slot.hasClientPending()) return;
+        const was_pending = slot.wedge.phase == .reply_pending_delivery;
+        slot.wedge.noteReplyDelivered(now_ms);
+        if (was_pending and slot.wedge.phase == .waiting_for_client and slot.wedge.fast_eligible) {
+            log.debug("[{d}] armed fast iOS wedge breaker: dc_idx={d} idle_before={d}ms response={d}ms", .{
+                slot.conn_id,
+                slot.dc_idx,
+                slot.wedge.resume_idle_ms,
+                slot.wedge.response_latency_ms,
+            });
+        }
+    }
+
     fn startRelay(self: *EventLoop, slot: *ConnectionSlot) void {
         // Handshake complete — release from handshake budget.
         self.releaseHandshakeBudget(slot);
@@ -3604,7 +3891,7 @@ const EventLoop = struct {
 
             slot.c2s_bytes += data.len;
             slot.last_activity_ms = compat.monotonicMilliTimestamp();
-            slot.last_client_byte_ms = slot.last_activity_ms;
+            self.noteClientRelayPayload(slot, slot.last_activity_ms);
             secureFree(self.state.allocator, buf);
             slot.pipelined_data = null;
             slot.pipelined_len = 0;
@@ -3616,6 +3903,7 @@ const EventLoop = struct {
     fn relayClientToUpstream(self: *EventLoop, slot: *ConnectionSlot) void {
         if (slot.hasUpstreamPending()) return;
 
+        const c2s_before = slot.c2s_bytes;
         const progress = relayClientToUpstreamStep(self, slot) catch |err| {
             if (slot.is_media_path) {
                 log.debug("[{d}] relay c2s error: dc_idx={d} err={any} c2s={d} s2c={d}", .{
@@ -3627,13 +3915,18 @@ const EventLoop = struct {
         };
         if (progress == .forwarded or progress == .partial) {
             slot.last_activity_ms = compat.monotonicMilliTimestamp();
-            slot.last_client_byte_ms = slot.last_activity_ms;
+            if (slot.c2s_bytes > c2s_before) {
+                self.noteClientRelayPayload(slot, slot.last_activity_ms);
+            } else {
+                self.noteClientRelayProgress(slot);
+            }
         }
     }
 
     fn relayUpstreamToClient(self: *EventLoop, slot: *ConnectionSlot) void {
         if (slot.hasClientPending()) return;
 
+        const s2c_before = slot.s2c_bytes;
         const progress = relayUpstreamToClientStep(self, slot) catch |err| {
             if (slot.is_media_path) {
                 if (slot.middle_ctx) |*mp| {
@@ -3664,7 +3957,9 @@ const EventLoop = struct {
         };
         if (progress == .forwarded or progress == .partial) {
             slot.last_activity_ms = compat.monotonicMilliTimestamp();
-            slot.last_server_byte_ms = slot.last_activity_ms;
+            if (slot.s2c_bytes > s2c_before) {
+                self.noteServerRelayPayload(slot, slot.last_activity_ms);
+            }
         }
     }
 
@@ -4301,13 +4596,13 @@ const EventLoop = struct {
                     deadlineMsToNs(slot.created_at_ms + secondsToMs(self.state.config.mask_relay_max_secs)),
                 );
             }
-            if (slot.phase == .relaying and self.state.config.client_silence_close_sec > 0 and
-                slot.last_client_byte_ms > 0 and slot.last_server_byte_ms > slot.last_client_byte_ms)
-            {
-                deadline = earlierDeadline(
-                    deadline,
-                    deadlineMsToNs(slot.last_server_byte_ms + secondsToMs(self.state.config.client_silence_close_sec)),
-                );
+            if (slot.phase == .relaying and !slot.is_media_path and !slot.hasClientPending()) {
+                if (slot.wedge.nextDeadlineMs(
+                    self.state.config.client_silence_close_sec,
+                    self.state.config.client_silence_fast_close_sec,
+                )) |wedge_deadline_ms| {
+                    deadline = earlierDeadline(deadline, deadlineMsToNs(wedge_deadline_ms));
+                }
             }
         }
         return deadline;
@@ -4477,13 +4772,37 @@ const EventLoop = struct {
                 self.closeSlot(slot, "mask relay max lifetime");
                 return;
             }
-            if (slot.phase == .relaying and self.state.config.client_silence_close_sec > 0 and
-                slot.last_client_byte_ms > 0 and slot.last_server_byte_ms > slot.last_client_byte_ms and
-                now_ms - slot.last_server_byte_ms >= secondsToMs(self.state.config.client_silence_close_sec))
-            {
-                log.info("[{d}] closing relay: server reply unanswered {d}s (iOS bad_salt wedge breaker)", .{ slot.conn_id, self.state.config.client_silence_close_sec });
-                self.closeSlot(slot, "client silence wedge breaker");
-                return;
+            if (slot.phase == .relaying and !slot.is_media_path and !slot.hasClientPending()) {
+                if (slot.wedge.closeKind(
+                    now_ms,
+                    self.state.config.client_silence_close_sec,
+                    self.state.config.client_silence_fast_close_sec,
+                )) |kind| {
+                    switch (kind) {
+                        .fast_resume => {
+                            self.wedge_fast_closes_since_log +|= 1;
+                            log.info("[{d}] closing resumed relay: client silent {d}s after server reply (iOS wedge fast breaker, dc_idx={d}, idle_before={d}ms, response={d}ms)", .{
+                                slot.conn_id,
+                                self.state.config.client_silence_fast_close_sec,
+                                slot.dc_idx,
+                                slot.wedge.resume_idle_ms,
+                                slot.wedge.response_latency_ms,
+                            });
+                            self.closeSlot(slot, "client silence fast wedge breaker");
+                        },
+                        .fallback => {
+                            self.wedge_fallback_closes_since_log +|= 1;
+                            log.info("[{d}] closing relay: client silent {d}s after server reply (iOS wedge fallback, dc_idx={d}, response={d}ms)", .{
+                                slot.conn_id,
+                                self.state.config.client_silence_close_sec,
+                                slot.dc_idx,
+                                slot.wedge.response_latency_ms,
+                            });
+                            self.closeSlot(slot, "client silence wedge fallback");
+                        },
+                    }
+                    return;
+                }
             }
             if (now_ms - slot.last_activity_ms >= slot.idle_timeout_ms) {
                 self.closeSlot(slot, "relay idle timeout");
@@ -4635,6 +4954,8 @@ const EventLoop = struct {
             var operations: usize = 0;
             var processed_bytes: usize = 0;
             while (slot.phase == .relaying and operations < event_io_operation_budget and processed_bytes < event_io_byte_budget) {
+                const c2s_before = slot.c2s_bytes;
+                const s2c_before = slot.s2c_bytes;
                 const progress = if (from_client)
                     relayClientToUpstreamStep(self, slot)
                 else
@@ -4655,9 +4976,13 @@ const EventLoop = struct {
                 const now_ms = compat.monotonicMilliTimestamp();
                 slot.last_activity_ms = now_ms;
                 if (from_client) {
-                    slot.last_client_byte_ms = now_ms;
-                } else {
-                    slot.last_server_byte_ms = now_ms;
+                    if (slot.c2s_bytes > c2s_before) {
+                        self.noteClientRelayPayload(slot, now_ms);
+                    } else {
+                        self.noteClientRelayProgress(slot);
+                    }
+                } else if (slot.s2c_bytes > s2c_before) {
+                    self.noteServerRelayPayload(slot, now_ms);
                 }
             }
         } else {
