@@ -51,12 +51,18 @@ port = 443
 # and at least half the base timeout. Set 0 to disable.
 # idle_timeout_jitter_pct = 15
 
-# Close an established relay where the server's last reply has gone unanswered
-# by the client for this many seconds. This bounds an iOS MtProtoKit bad_salt
-# wedge where "Updating" hangs until the DC closes the socket. Fires only after
-# the client has sent relay payload and the last relayed payload was server->client.
-# 0 = disabled (default). If enabled, start around 10-15 and tune to taste.
+# Conservative iOS wedge fallback for generic DC relays. A server reply is
+# eligible only when it follows client payload within 12 seconds, and the timer
+# starts after the userspace client queue drains. Media relays are excluded.
+# 0 = disabled (default). If enabled, 15 is the recommended fallback.
 # client_silence_close_sec = 0
+
+# Optional fast path for an established generic relay that resumes after a quiet
+# period. Any client payload cancels the candidate. The reconnect is not fast-
+# eligible until it has itself been idle, which prevents reconnect loops.
+# Recommended iOS tuning: 2-second close after at least 30 seconds idle.
+# client_silence_fast_close_sec = 0
+# client_silence_fast_after_idle_sec = 30
 
 # Seconds to complete TLS+MTProto handshake after first byte arrives.
 # Default is 15; parser enforces a minimum of 5.

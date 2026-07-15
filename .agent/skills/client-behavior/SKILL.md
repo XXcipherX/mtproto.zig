@@ -35,6 +35,7 @@ Source-backed behavior:
 - TCP connect timeout: `12s`
 - Response watchdog base: `MTMinTcpResponseTimeout = 12.0`
 - Response timeout includes payload-dependent term and resets on partial reads
+- Incoming message confirmations may be queued for a later transaction rather than producing an immediate client write, so a short server→client silence alone is not proof of a wedge
 - Transport-level watchdog: `20s`
 - Reconnect backoff: `1s`, then `4s`, then `8s`
 
@@ -58,6 +59,7 @@ Proxy implications:
 - Continue assembling MTProto handshake until full 64 bytes are collected.
 - Preserve pipelined appdata after the 64-byte MTProto nonce; some clients can send early payload without waiting for a separate relay read.
 - Do not treat short idle prewarmed sockets as protocol failure.
+- Keep proxy-side wedge recovery limited to generic DC relays. The fast path is only eligible after established relay traffic resumes from a configured quiet period; media relays and fresh reconnects must not enter it.
 
 ## Android (Telegram Android)
 
