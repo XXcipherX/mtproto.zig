@@ -51,11 +51,12 @@ port = 443
 # and at least half the base timeout. Set 0 to disable.
 # idle_timeout_jitter_pct = 15
 
-# Conservative iOS wedge fallback for proven generic DC relays. A fresh relay
-# becomes eligible only after a delivered server reply is followed by further
-# client traffic, preventing first-exchange reconnect loops. A later server
-# reply must follow client payload within 12 seconds, and the timer starts after
-# the userspace client queue drains. Media relays are excluded.
+# Conservative iOS wedge fallback for proven generic DC relays. Eligibility
+# requires at least 30 seconds in the relay phase and a delivered server reply
+# followed by further client traffic, so startup exchanges on fresh reconnects
+# cannot arm a close loop. A later server reply must follow client payload within
+# 12 seconds, and the timer starts after the userspace client queue drains.
+# Media relays are excluded.
 # 0 = disabled (default). If enabled, 15 is the recommended fallback.
 # client_silence_close_sec = 0
 

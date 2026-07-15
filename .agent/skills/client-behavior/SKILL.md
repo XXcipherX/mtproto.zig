@@ -59,7 +59,7 @@ Proxy implications:
 - Continue assembling MTProto handshake until full 64 bytes are collected.
 - Preserve pipelined appdata after the 64-byte MTProto nonce; some clients can send early payload without waiting for a separate relay read.
 - Do not treat short idle prewarmed sockets as protocol failure.
-- Keep proxy-side wedge recovery limited to generic DC relays. The fast path is only eligible after established relay traffic resumes from a configured quiet period; media relays and fresh reconnects must not enter it. Do not arm the conservative fallback on a fresh relay until a delivered server reply has been followed by further client traffic on the same connection.
+- Keep proxy-side wedge recovery limited to generic DC relays. The fast path is only eligible after established relay traffic resumes from a configured quiet period; media relays and fresh reconnects must not enter it. Do not arm the conservative fallback before 30 seconds in relay, and then require a delivered server reply followed by further client traffic on the same connection.
 
 ## Android (Telegram Android)
 
