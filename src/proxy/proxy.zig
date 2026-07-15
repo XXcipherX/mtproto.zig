@@ -3635,9 +3635,28 @@ const EventLoop = struct {
 
         const progress = relayUpstreamToClientStep(self, slot) catch |err| {
             if (slot.is_media_path) {
-                log.debug("[{d}] relay s2c error: dc_idx={d} err={any} c2s={d} s2c={d}", .{
-                    slot.conn_id, slot.dc_idx, err, slot.c2s_bytes, slot.s2c_bytes,
-                });
+                if (slot.middle_ctx) |*mp| {
+                    if (mp.diagnostic_proxy_ans_flags) |flags| {
+                        log.debug("[{d}] relay s2c error: dc_idx={d} err={any} mp_flags=0x{x} proto={s} ad_tag={} c2s={d} s2c={d}", .{
+                            slot.conn_id,
+                            slot.dc_idx,
+                            err,
+                            flags,
+                            @tagName(mp.proto_tag),
+                            mp.ad_tag != null,
+                            slot.c2s_bytes,
+                            slot.s2c_bytes,
+                        });
+                    } else {
+                        log.debug("[{d}] relay s2c error: dc_idx={d} err={any} c2s={d} s2c={d}", .{
+                            slot.conn_id, slot.dc_idx, err, slot.c2s_bytes, slot.s2c_bytes,
+                        });
+                    }
+                } else {
+                    log.debug("[{d}] relay s2c error: dc_idx={d} err={any} c2s={d} s2c={d}", .{
+                        slot.conn_id, slot.dc_idx, err, slot.c2s_bytes, slot.s2c_bytes,
+                    });
+                }
             }
             self.closeSlot(slot, "relay s2c failed");
             return;
@@ -4944,6 +4963,16 @@ fn relayUpstreamToClientStep(self: *EventLoop, slot: *ConnectionSlot) !RelayProg
         const required = try mp.requiredS2cScratchCapacity(raw);
         const scratch = try self.ensureMpS2cScratch(required);
         const payload = try mp.decapsulateS2C(raw, scratch);
+        if (mp.diagnostic_unexpected_proxy_ans_flags) |flags| {
+            log.debug("[{d}] accepting advisory middle-proxy response flags: dc_idx={d} mp_flags=0x{x} proto={s} ad_tag={}", .{
+                slot.conn_id,
+                slot.dc_idx,
+                flags,
+                @tagName(mp.proto_tag),
+                mp.ad_tag != null,
+            });
+            mp.diagnostic_unexpected_proxy_ans_flags = null;
+        }
         if (payload.len == 0) return .partial;
         if (slot.client_encryptor) |*enc| enc.apply(payload);
         try queueTlsAppRecords(slot, payload);

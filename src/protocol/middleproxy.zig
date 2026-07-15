@@ -135,6 +135,13 @@ pub const MiddleProxyContext = struct {
     s2c_buf: []u8,
     s2c_len: usize = 0,
     s2c_decrypted_len: usize = 0,
+    /// Set only while parsing an RPC_PROXY_ANS frame so relay error logs can
+    /// include the advisory flags without exposing payload or secret data.
+    diagnostic_proxy_ans_flags: ?u32 = null,
+    /// A forward-compatible flag combination that the old strict validator
+    /// would have rejected. Report each distinct value once per connection.
+    diagnostic_unexpected_proxy_ans_flags: ?u32 = null,
+    reported_unexpected_proxy_ans_flags: ?u32 = null,
 
     // For C2S fragment parsing
     c2s_buf: []u8,
@@ -569,6 +576,8 @@ pub const MiddleProxyContext = struct {
     /// Takes raw AES-CBC bytes from DC, decrypts them block by block, parses MTProtoFrames,
     /// strips RPC_PROXY_ANS, and writes the inner payload into `out_buf`.
     pub fn decapsulateS2C(self: *MiddleProxyContext, dc_chunk: []const u8, out_buf: []u8) ![]u8 {
+        self.diagnostic_proxy_ans_flags = null;
+        self.diagnostic_unexpected_proxy_ans_flags = null;
         const total_input_len = try self.requiredBufferedCapacity(self.s2c_len, dc_chunk.len);
         try self.ensureS2cCapacity(total_input_len);
         @memcpy(self.s2c_buf[self.s2c_len .. self.s2c_len + dc_chunk.len], dc_chunk);
@@ -591,6 +600,7 @@ pub const MiddleProxyContext = struct {
         // Mirrors telemt behavior: parse by frame_len, treat 0x04 words as NO-OP,
         // keep decrypt stream running continuously across arbitrary read boundaries.
         while (self.s2c_decrypted_len - parse_pos >= 4) {
+            self.diagnostic_proxy_ans_flags = null;
             const frame_len = std.mem.readInt(u32, self.s2c_buf[parse_pos..][0..4], .little);
 
             // MTProto CBC stream may contain standalone NO-OP padding words
@@ -645,7 +655,16 @@ pub const MiddleProxyContext = struct {
                 // RPC_PROXY_ANS format: type(4) + flags(4) + conn_id(8) + conn_data
                 if (payload.len < 16) return error.BadMiddleProxyPayload;
                 const flags = std.mem.readInt(u32, payload[4..8], .little);
-                try self.validateProxyAnsFlags(flags);
+                self.diagnostic_proxy_ans_flags = flags;
+                const already_reported = if (self.reported_unexpected_proxy_ans_flags) |reported|
+                    reported == flags
+                else
+                    false;
+                if (!proxyAnsFlagsMatchRequestTransport(flags, self.proto_tag, self.ad_tag != null) and !already_reported) {
+                    self.diagnostic_unexpected_proxy_ans_flags = flags;
+                    self.reported_unexpected_proxy_ans_flags = flags;
+                }
+                try validateProxyAnsFlags(flags);
                 if (!std.mem.eql(u8, payload[8..16], &self.conn_id)) return error.BadMiddleProxyConnId;
                 const conn_data = payload[16..];
 
@@ -712,36 +731,52 @@ pub const MiddleProxyContext = struct {
         return out_buf[0..out_pos];
     }
 
-    fn validateProxyAnsFlags(self: *const MiddleProxyContext, flags: u32) !void {
+    fn validateProxyAnsFlags(flags: u32) !void {
+        // Telegram treats RPC_PROXY_ANS flags as advisory output metadata and
+        // may extend or vary them independently of the request transport. The
+        // payload framing, checksum, sequence number, and conn_id are validated
+        // separately above, so rejecting unknown or non-echoed mode bits only
+        // breaks forward compatibility. The explicit dropped marker is the one
+        // status bit that must still terminate the relay.
+        if ((flags & Flag.dropped) != 0) return error.MiddleProxyDroppedResponse;
+    }
+
+    fn proxyAnsFlagsMatchRequestTransport(flags: u32, proto_tag: constants.ProtoTag, has_ad_tag: bool) bool {
         const known_flags = Flag.not_encrypted | Flag.has_ad_tag | Flag.magic | Flag.extmode2 |
             Flag.pad | Flag.dropped | Flag.intermediate | Flag.abridged | Flag.quickack;
-        if ((flags & ~known_flags) != 0) return error.BadMiddleProxyFlags;
-        if ((flags & Flag.dropped) != 0) return error.MiddleProxyDroppedResponse;
-        const mode_header = flags & (Flag.magic | Flag.extmode2);
-        if (mode_header != 0 and mode_header != (Flag.magic | Flag.extmode2)) {
-            return error.BadMiddleProxyFlags;
-        }
-        if ((flags & Flag.has_ad_tag) != 0 and self.ad_tag == null) {
-            return error.BadMiddleProxyFlags;
-        }
+        if ((flags & ~known_flags) != 0) return false;
 
-        switch (self.proto_tag) {
-            .abridged => {
-                if ((flags & (Flag.intermediate | Flag.pad)) != 0) return error.BadMiddleProxyFlags;
-            },
-            .intermediate => {
-                if ((flags & (Flag.abridged | Flag.pad)) != 0) return error.BadMiddleProxyFlags;
-            },
-            .secure => {
-                if ((flags & Flag.abridged) != 0) return error.BadMiddleProxyFlags;
-                if ((flags & Flag.pad) != 0 and (flags & Flag.intermediate) == 0) return error.BadMiddleProxyFlags;
-            },
-        }
+        const mode_header = flags & (Flag.magic | Flag.extmode2);
+        if (mode_header != 0 and mode_header != (Flag.magic | Flag.extmode2)) return false;
+        if ((flags & Flag.has_ad_tag) != 0 and !has_ad_tag) return false;
+
+        return switch (proto_tag) {
+            .abridged => (flags & (Flag.intermediate | Flag.pad)) == 0,
+            .intermediate => (flags & (Flag.abridged | Flag.pad)) == 0,
+            .secure => (flags & Flag.abridged) == 0 and
+                ((flags & Flag.pad) == 0 or (flags & Flag.intermediate) != 0),
+        };
     }
 };
 
 pub fn crc32(data: []const u8) u32 {
     return std.hash.Crc32.hash(data);
+}
+
+test "proxy answer flags remain forward-compatible except for dropped responses" {
+    // EXTMODE1 and an otherwise unknown advisory bit must not make a valid,
+    // independently framed RPC_PROXY_ANS fail closed.
+    try MiddleProxyContext.validateProxyAnsFlags(Flag.magic | 0x0001_0000 | Flag.abridged);
+    try MiddleProxyContext.validateProxyAnsFlags(0x0040_0000);
+    try std.testing.expect(!MiddleProxyContext.proxyAnsFlagsMatchRequestTransport(
+        Flag.magic | 0x0001_0000 | Flag.abridged,
+        .secure,
+        false,
+    ));
+    try std.testing.expectError(
+        error.MiddleProxyDroppedResponse,
+        MiddleProxyContext.validateProxyAnsFlags(Flag.dropped | Flag.intermediate),
+    );
 }
 
 test "encapsulated c2s keeps rpc_proxy_req header" {
