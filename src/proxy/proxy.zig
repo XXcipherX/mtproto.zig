@@ -48,6 +48,10 @@ const middle_proxy_stage_timeout_ms: i64 = 5 * std.time.ms_per_s;
 // reply. A later server push is not strong enough evidence to arm the wedge
 // breaker, so only responses inside the same window are considered.
 const client_response_window_ms: i64 = 12 * std.time.ms_per_s;
+// Fresh Telegram relays perform multiple request/reply exchanges during
+// startup. Do not treat that churn as proof for the conservative fallback:
+// field captures showed it can otherwise close every reconnect in a loop.
+const wedge_fallback_maturity_ms: i64 = 30 * std.time.ms_per_s;
 const tls_control_record_budget: usize = 8;
 const tls_control_byte_budget: usize = 64 * 1024;
 const no_timer_heap_index = std.math.maxInt(u32);
@@ -782,8 +786,9 @@ const WedgeTracker = struct {
     resume_idle_ms: i64 = 0,
     response_latency_ms: i64 = 0,
     fast_eligible: bool = false,
-    // Set only after the client continues following a fully delivered reply.
-    // This proof survives later exchanges but never crosses a slot reset.
+    // Set only after a mature relay's client continues following a fully
+    // delivered reply. This proof survives later exchanges but never crosses
+    // a slot reset.
     fallback_eligible: bool = false,
 
     fn reset(self: *WedgeTracker) void {
@@ -795,14 +800,21 @@ const WedgeTracker = struct {
         self.* = .{ .fallback_eligible = fallback_eligible };
     }
 
+    fn relayCanProveFallback(now_ms: i64, relay_started_at_ms: i64) bool {
+        return relay_started_at_ms > 0 and
+            now_ms - relay_started_at_ms >= wedge_fallback_maturity_ms;
+    }
+
     fn noteClientPayload(
         self: *WedgeTracker,
         now_ms: i64,
         previous_relay_ms: i64,
+        relay_started_at_ms: i64,
         fast_after_idle_ms: i64,
     ) bool {
         const cancelled = self.phase == .reply_pending_delivery or self.phase == .waiting_for_client;
-        const fallback_eligible = self.fallback_eligible or (self.phase == .waiting_for_client);
+        const fallback_eligible = self.fallback_eligible or
+            (self.phase == .waiting_for_client and relayCanProveFallback(now_ms, relay_started_at_ms));
         const continued_request = self.phase == .waiting_for_reply;
         const idle_ms = if (previous_relay_ms > 0) @max(now_ms - previous_relay_ms, 0) else 0;
         const resumed = previous_relay_ms > 0 and idle_ms >= fast_after_idle_ms;
@@ -825,9 +837,11 @@ const WedgeTracker = struct {
         return cancelled;
     }
 
-    fn cancelForClientProgress(self: *WedgeTracker) bool {
+    fn cancelForClientProgress(self: *WedgeTracker, now_ms: i64, relay_started_at_ms: i64) bool {
         if (self.phase != .reply_pending_delivery and self.phase != .waiting_for_client) return false;
-        if (self.phase == .waiting_for_client) self.fallback_eligible = true;
+        if (self.phase == .waiting_for_client and relayCanProveFallback(now_ms, relay_started_at_ms)) {
+            self.fallback_eligible = true;
+        }
         self.resetExchange();
         return true;
     }
@@ -945,7 +959,7 @@ test "MiddleProxyHandshakeStep.awaitingMiddleProxy gates reactive refresh" {
 
 test "wedge tracker does not fallback on a fresh request-response exchange" {
     var tracker = WedgeTracker{};
-    try std.testing.expect(!tracker.noteClientPayload(1_000, 0, 30_000));
+    try std.testing.expect(!tracker.noteClientPayload(1_000, 0, 900, 30_000));
     try std.testing.expect(tracker.noteServerPayload(1_100));
     tracker.noteReplyDelivered(1_200);
 
@@ -955,35 +969,50 @@ test "wedge tracker does not fallback on a fresh request-response exchange" {
     try std.testing.expectEqual(@as(?WedgeCloseKind, null), tracker.closeKind(60_000, 15, 2));
 }
 
-test "wedge tracker enables fallback after a healthy reply continuation" {
+test "wedge tracker keeps fallback disabled across fresh relay exchanges" {
     var tracker = WedgeTracker{};
-    _ = tracker.noteClientPayload(1_000, 0, 30_000);
+    _ = tracker.noteClientPayload(1_000, 0, 900, 30_000);
     _ = tracker.noteServerPayload(1_100);
     tracker.noteReplyDelivered(1_200);
 
-    try std.testing.expect(tracker.noteClientPayload(1_300, 1_100, 30_000));
-    try std.testing.expect(tracker.fallback_eligible);
+    try std.testing.expect(tracker.noteClientPayload(1_300, 1_100, 900, 30_000));
+    try std.testing.expect(!tracker.fallback_eligible);
     try std.testing.expect(tracker.noteServerPayload(1_400));
     tracker.noteReplyDelivered(1_500);
 
-    try std.testing.expectEqual(@as(?i64, 16_500), tracker.nextDeadlineMs(15, 2));
-    try std.testing.expectEqual(@as(?WedgeCloseKind, null), tracker.closeKind(16_499, 15, 2));
-    try std.testing.expectEqual(WedgeCloseKind.fallback, tracker.closeKind(16_500, 15, 2).?);
+    try std.testing.expectEqual(@as(?i64, null), tracker.nextDeadlineMs(15, 2));
+    try std.testing.expectEqual(@as(?WedgeCloseKind, null), tracker.closeKind(60_000, 15, 2));
+}
+
+test "wedge tracker enables fallback after a mature healthy continuation" {
+    var tracker = WedgeTracker{};
+    _ = tracker.noteClientPayload(30_000, 0, 1_000, 30_000);
+    _ = tracker.noteServerPayload(30_100);
+    tracker.noteReplyDelivered(30_200);
+
+    try std.testing.expect(tracker.noteClientPayload(31_000, 30_100, 1_000, 30_000));
+    try std.testing.expect(tracker.fallback_eligible);
+    try std.testing.expect(tracker.noteServerPayload(31_100));
+    tracker.noteReplyDelivered(31_200);
+
+    try std.testing.expectEqual(@as(?i64, 46_200), tracker.nextDeadlineMs(15, 2));
+    try std.testing.expectEqual(@as(?WedgeCloseKind, null), tracker.closeKind(46_199, 15, 2));
+    try std.testing.expectEqual(WedgeCloseKind.fallback, tracker.closeKind(46_200, 15, 2).?);
 }
 
 test "wedge tracker does not prove fallback before reply delivery" {
     var tracker = WedgeTracker{};
-    _ = tracker.noteClientPayload(1_000, 0, 30_000);
-    _ = tracker.noteServerPayload(1_100);
+    _ = tracker.noteClientPayload(31_000, 0, 1_000, 30_000);
+    _ = tracker.noteServerPayload(31_100);
 
-    try std.testing.expect(tracker.cancelForClientProgress());
+    try std.testing.expect(tracker.cancelForClientProgress(31_200, 1_000));
     try std.testing.expect(!tracker.fallback_eligible);
     try std.testing.expectEqual(WedgePhase.inactive, tracker.phase);
 }
 
 test "wedge tracker fast-closes a response after resumed relay traffic" {
     var tracker = WedgeTracker{};
-    try std.testing.expect(!tracker.noteClientPayload(31_000, 1_000, 30_000));
+    try std.testing.expect(!tracker.noteClientPayload(31_000, 1_000, 30_900, 30_000));
     try std.testing.expect(tracker.noteServerPayload(31_100));
     tracker.noteReplyDelivered(31_200);
 
@@ -996,37 +1025,48 @@ test "wedge tracker fast-closes a response after resumed relay traffic" {
 
 test "wedge tracker cancels on client progress after a server reply" {
     var tracker = WedgeTracker{};
-    _ = tracker.noteClientPayload(31_000, 1_000, 30_000);
+    _ = tracker.noteClientPayload(31_000, 1_000, 30_900, 30_000);
     try std.testing.expect(tracker.noteServerPayload(31_100));
     tracker.noteReplyDelivered(31_200);
 
-    try std.testing.expect(tracker.noteClientPayload(31_300, 31_100, 30_000));
+    try std.testing.expect(tracker.noteClientPayload(31_300, 31_100, 30_900, 30_000));
     try std.testing.expectEqual(WedgePhase.waiting_for_reply, tracker.phase);
     try std.testing.expectEqual(@as(?i64, null), tracker.nextDeadlineMs(15, 2));
 }
 
 test "wedge tracker cancels on a fragmented client record header" {
     var tracker = WedgeTracker{};
-    _ = tracker.noteClientPayload(31_000, 1_000, 30_000);
+    _ = tracker.noteClientPayload(31_000, 1_000, 30_900, 30_000);
     try std.testing.expect(tracker.noteServerPayload(31_100));
     tracker.noteReplyDelivered(31_200);
 
-    try std.testing.expect(tracker.cancelForClientProgress());
+    try std.testing.expect(tracker.cancelForClientProgress(31_300, 30_900));
     try std.testing.expectEqual(WedgePhase.inactive, tracker.phase);
     try std.testing.expectEqual(@as(?i64, null), tracker.nextDeadlineMs(15, 2));
 }
 
+test "wedge tracker accepts mature fragmented client progress as fallback proof" {
+    var tracker = WedgeTracker{};
+    _ = tracker.noteClientPayload(30_000, 0, 1_000, 30_000);
+    try std.testing.expect(tracker.noteServerPayload(30_100));
+    tracker.noteReplyDelivered(30_200);
+
+    try std.testing.expect(tracker.cancelForClientProgress(31_000, 1_000));
+    try std.testing.expect(tracker.fallback_eligible);
+    try std.testing.expectEqual(WedgePhase.inactive, tracker.phase);
+}
+
 test "wedge tracker keeps waiting while a client request header is fragmented" {
     var tracker = WedgeTracker{};
-    _ = tracker.noteClientPayload(31_000, 1_000, 30_000);
+    _ = tracker.noteClientPayload(31_000, 1_000, 30_900, 30_000);
 
-    try std.testing.expect(!tracker.cancelForClientProgress());
+    try std.testing.expect(!tracker.cancelForClientProgress(31_100, 30_900));
     try std.testing.expectEqual(WedgePhase.waiting_for_reply, tracker.phase);
 }
 
 test "wedge tracker rearms after a queued reply is delivered" {
     var tracker = WedgeTracker{};
-    _ = tracker.noteClientPayload(31_000, 1_000, 30_000);
+    _ = tracker.noteClientPayload(31_000, 1_000, 30_900, 30_000);
     try std.testing.expect(tracker.noteServerPayload(31_100));
     tracker.noteReplyDelivered(31_200);
 
@@ -1040,7 +1080,7 @@ test "wedge tracker rearms after a queued reply is delivered" {
 
 test "wedge tracker ignores a server push outside the response window" {
     var tracker = WedgeTracker{};
-    _ = tracker.noteClientPayload(1_000, 0, 30_000);
+    _ = tracker.noteClientPayload(1_000, 0, 900, 30_000);
 
     try std.testing.expect(!tracker.noteServerPayload(1_000 + client_response_window_ms + 1));
     try std.testing.expectEqual(WedgePhase.inactive, tracker.phase);
@@ -1279,6 +1319,8 @@ const ConnectionSlot = struct {
     subnet_hs_counted: bool = false,
 
     created_at_ms: i64 = 0,
+    /// Set when the upstream handshake completes and bidirectional relay starts.
+    relay_started_at_ms: i64 = 0,
     first_byte_at_ms: i64 = 0,
     /// Timestamp for the current upstream connect attempt. Reset per candidate.
     upstream_connect_started_ms: i64 = 0,
@@ -3843,17 +3885,22 @@ const EventLoop = struct {
             slot.wedge.reset();
         } else {
             const fast_after_idle_ms = secondsToMs(self.state.config.client_silence_fast_after_idle_sec);
-            if (slot.wedge.noteClientPayload(now_ms, previous_relay_ms, fast_after_idle_ms)) {
+            if (slot.wedge.noteClientPayload(
+                now_ms,
+                previous_relay_ms,
+                slot.relay_started_at_ms,
+                fast_after_idle_ms,
+            )) {
                 self.wedge_cancelled_since_log +|= 1;
             }
         }
         slot.last_client_byte_ms = now_ms;
     }
 
-    fn noteClientRelayProgress(self: *EventLoop, slot: *ConnectionSlot) void {
+    fn noteClientRelayProgress(self: *EventLoop, slot: *ConnectionSlot, now_ms: i64) void {
         if (slot.is_media_path or !self.wedgeTrackingEnabled()) {
             slot.wedge.reset();
-        } else if (slot.wedge.cancelForClientProgress()) {
+        } else if (slot.wedge.cancelForClientProgress(now_ms, slot.relay_started_at_ms)) {
             self.wedge_cancelled_since_log +|= 1;
         }
     }
@@ -3889,6 +3936,7 @@ const EventLoop = struct {
         // Handshake complete — release from handshake budget.
         self.releaseHandshakeBudget(slot);
         self.releaseSubnetHandshake(slot);
+        slot.relay_started_at_ms = compat.monotonicMilliTimestamp();
         slot.phase = .relaying;
 
         if (slot.pipelined_data) |buf| {
@@ -3958,7 +4006,7 @@ const EventLoop = struct {
             if (slot.c2s_bytes > c2s_before) {
                 self.noteClientRelayPayload(slot, slot.last_activity_ms);
             } else {
-                self.noteClientRelayProgress(slot);
+                self.noteClientRelayProgress(slot, slot.last_activity_ms);
             }
         }
     }
@@ -4832,10 +4880,11 @@ const EventLoop = struct {
                         },
                         .fallback => {
                             self.wedge_fallback_closes_since_log +|= 1;
-                            log.info("[{d}] closing relay: client silent {d}s after server reply (iOS wedge fallback, dc_idx={d}, response={d}ms)", .{
+                            log.info("[{d}] closing relay: client silent {d}s after server reply (iOS wedge fallback, dc_idx={d}, relay_age={d}ms, response={d}ms)", .{
                                 slot.conn_id,
                                 self.state.config.client_silence_close_sec,
                                 slot.dc_idx,
+                                @max(now_ms - slot.relay_started_at_ms, 0),
                                 slot.wedge.response_latency_ms,
                             });
                             self.closeSlot(slot, "client silence wedge fallback");
@@ -5019,7 +5068,7 @@ const EventLoop = struct {
                     if (slot.c2s_bytes > c2s_before) {
                         self.noteClientRelayPayload(slot, now_ms);
                     } else {
-                        self.noteClientRelayProgress(slot);
+                        self.noteClientRelayProgress(slot, now_ms);
                     }
                 } else if (slot.s2c_bytes > s2c_before) {
                     self.noteServerRelayPayload(slot, now_ms);

@@ -463,7 +463,7 @@ port = 443
 public_ip = "proxy.example.com"
 # tag = "<your-promotion-tag>"   # Optional: 32 hex-char promotion tag from @MTProxybot
 # max_connections = 10000        # Optional high-capacity override; startup auto-clamps unless unsafe_override_limits=true
-# client_silence_close_sec = 0             # Fallback after a proven healthy exchange; fresh relays excluded
+# client_silence_close_sec = 0             # Fallback after a mature (30s+) proven healthy relay exchange
 # client_silence_fast_close_sec = 0        # Fast close after resumed generic relay traffic; 0 = off
 # client_silence_fast_after_idle_sec = 30  # Quiet relay period required by the fast path
 
@@ -726,7 +726,7 @@ middleproxy_buffer_kb = 2048               # ME C2S/S2C buffers grow on demand u
 max_connections = 512                      # Safe default for small (1 vCPU / ~1 GB) VPS
 idle_timeout_sec = 120
 # idle_timeout_jitter_pct = 15             # Per-connection idle timeout jitter in percent; 0 disables
-# client_silence_close_sec = 0             # Fallback after a proven healthy exchange; fresh relays excluded
+# client_silence_close_sec = 0             # Fallback after a mature (30s+) proven healthy relay exchange
 # client_silence_fast_close_sec = 0        # Fast close after resumed generic relay traffic; 0 = off
 # client_silence_fast_after_idle_sec = 30  # Quiet relay period required by the fast path
 handshake_timeout_sec = 15
@@ -777,7 +777,7 @@ alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eli
 | `[server]` | `max_connections` | `512` | Concurrent connection cap (small-VPS tuned default, parser lower bound 32). On Linux, startup first auto-clamps this to the effective-memory estimate (host/cgroup) unless `unsafe_override_limits=true`; the proxy then clamps again if `RLIMIT_NOFILE` can support at least 32 slots, otherwise startup fails safely |
 | `[server]` | `idle_timeout_sec` | `120` | Established relay idle timeout in seconds (parser lower bound 5). Pre-first-byte admission uses a separate fixed 10-second deadline |
 | `[server]` | `idle_timeout_jitter_pct` | `15` | Per-connection random jitter applied once when the slot is admitted to `idle_timeout_sec` (`±N%`, clamped to `0..100`). The effective timeout is then reused for every deadline update, floored to at least 5 seconds and at least half the base timeout. Set `0` to disable |
-| `[server]` | `client_silence_close_sec` | `0` | Conservative iOS MtProtoKit wedge fallback for proven generic DC relays. A fresh relay becomes eligible only after a delivered server reply is followed by further client traffic, preventing first-exchange reconnect loops. A later server payload is considered a reply only when it arrives within the client's 12-second response window, and the timer starts after the userspace client queue drains. Media relays are excluded. `0` disables it; `15` is the recommended fallback |
+| `[server]` | `client_silence_close_sec` | `0` | Conservative iOS MtProtoKit wedge fallback for proven generic DC relays. Eligibility requires at least 30 seconds in the relay phase and a delivered server reply followed by further client traffic, so startup exchanges on fresh reconnects cannot arm a close loop. A later server payload is considered a reply only when it arrives within the client's 12-second response window, and the timer starts after the userspace client queue drains. Media relays are excluded. `0` disables it; `15` is the recommended fallback |
 | `[server]` | `client_silence_fast_close_sec` | `0` | Optional fast close for the same unanswered-reply pattern when an established generic relay has just resumed after `client_silence_fast_after_idle_sec` of silence. Any client payload cancels the candidate, and a fresh reconnect is not immediately eligible, preventing reconnect loops. `0` disables it; `2` is the recommended iOS value |
 | `[server]` | `client_silence_fast_after_idle_sec` | `30` | Minimum quiet relay period before the fast iOS wedge path is eligible (parser lower bound 5). Has no effect while `client_silence_fast_close_sec=0` |
 | `[server]` | `handshake_timeout_sec` | `15` | Timeout for completing handshake after first byte (parser lower bound 5) |
