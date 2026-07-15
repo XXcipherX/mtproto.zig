@@ -21,12 +21,12 @@ const Config = @import("../config.zig").Config;
 const log = std.log.scoped(.proxy);
 
 const tls_header_len = 5;
-// Bound epoll sleep by the shortest timer cadence. Longer sleeps make the
-// 3-5 ms desynchronization deadlines observationally meaningless.
-const event_loop_wait_ms = 5;
 const accept_backoff_ms: i64 = 500;
 const accept_backoff_ns: i128 = @as(i128, accept_backoff_ms) * std.time.ns_per_ms;
-const accept_batch_limit: usize = 256;
+const event_io_byte_budget: usize = 256 * 1024;
+const event_io_operation_budget: usize = 64;
+const queue_flush_operation_budget: usize = 8;
+const accept_batch_limit: usize = event_io_operation_budget;
 const stats_log_interval_s: i64 = 10;
 const stats_log_interval_ns: i128 = @as(i128, stats_log_interval_s) * std.time.ns_per_s;
 const nofile_fd_overhead: usize = 512;
@@ -46,11 +46,52 @@ const pre_first_byte_timeout_ms: i64 = 10 * std.time.ms_per_s;
 const middle_proxy_stage_timeout_ms: i64 = 5 * std.time.ms_per_s;
 const tls_control_record_budget: usize = 8;
 const tls_control_byte_budget: usize = 64 * 1024;
+const no_timer_heap_index = std.math.maxInt(u32);
 
 const invalid_fd: posix.fd_t = switch (builtin.os.tag) {
     .windows => std.os.windows.INVALID_HANDLE_VALUE,
     else => -1,
 };
+
+const epoll_listener_token: u64 = 0;
+const epoll_timer_token: u64 = 1;
+const max_slot_generation: u32 = 0x7fff_ffff;
+
+const SlotFdRole = enum(u1) {
+    client = 0,
+    upstream = 1,
+};
+
+const SlotEventToken = struct {
+    index: u32,
+    generation: u32,
+    role: SlotFdRole,
+};
+
+fn nextSlotGeneration(current: u32) u32 {
+    const next = (current +% 1) & max_slot_generation;
+    return if (next == 0) 1 else next;
+}
+
+fn encodeSlotEventToken(slot: *const ConnectionSlot, role: SlotFdRole) u64 {
+    const generation = switch (role) {
+        .client => slot.client_event_generation,
+        .upstream => slot.upstream_event_generation,
+    };
+    return @as(u64, slot.index) |
+        (@as(u64, generation) << 32) |
+        (@as(u64, @intFromEnum(role)) << 63);
+}
+
+fn decodeSlotEventToken(token: u64) ?SlotEventToken {
+    const generation: u32 = @intCast((token >> 32) & @as(u64, max_slot_generation));
+    if (generation == 0) return null;
+    return .{
+        .index = @truncate(token),
+        .generation = generation,
+        .role = @enumFromInt(@as(u1, @truncate(token >> 63))),
+    };
+}
 
 fn isInvalidFd(fd: posix.fd_t) bool {
     return fd == invalid_fd;
@@ -68,6 +109,50 @@ fn closeFd(fd: posix.fd_t) void {
         _ = linux.close(fd);
     } else if (builtin.os.tag == .windows) {
         std.os.windows.CloseHandle(fd);
+    }
+}
+
+fn createTimerFd() !posix.fd_t {
+    if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
+    const rc = linux.timerfd_create(.MONOTONIC, .{ .NONBLOCK = true, .CLOEXEC = true });
+    switch (posix.errno(rc)) {
+        .SUCCESS => return @intCast(rc),
+        else => |err| return posix.unexpectedErrno(err),
+    }
+}
+
+fn armTimerFd(fd: posix.fd_t, deadline_ns: ?i128) !void {
+    if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
+
+    const value = deadline_ns orelse 0;
+    const spec = linux.itimerspec{
+        .it_interval = .{ .sec = 0, .nsec = 0 },
+        .it_value = if (value <= 0)
+            .{ .sec = 0, .nsec = 0 }
+        else
+            .{
+                .sec = @intCast(@divTrunc(value, std.time.ns_per_s)),
+                .nsec = @intCast(@mod(value, std.time.ns_per_s)),
+            },
+    };
+    const rc = linux.timerfd_settime(fd, .{ .ABSTIME = true }, &spec, null);
+    switch (posix.errno(rc)) {
+        .SUCCESS => {},
+        else => |err| return posix.unexpectedErrno(err),
+    }
+}
+
+fn drainTimerFd(fd: posix.fd_t) void {
+    var expirations: u64 = 0;
+    while (true) {
+        const bytes = std.mem.asBytes(&expirations);
+        const rc = linux.read(fd, bytes.ptr, bytes.len);
+        switch (posix.errno(rc)) {
+            .SUCCESS => return,
+            .INTR => continue,
+            .AGAIN => return,
+            else => return,
+        }
     }
 }
 
@@ -436,16 +521,93 @@ fn blockStorageConst(blk: *const MsgBlock) []const u8 {
     };
 }
 
-const MessageQueue = struct {
-    const max_pending_bytes: usize = 4 * 1024 * 1024;
-    const max_free_tiny_blocks: usize = 128;
-    const max_free_small_blocks: usize = 96;
-    const max_free_standard_blocks: usize = 128;
+fn allocateMsgBlock(allocator: std.mem.Allocator, class: MsgBlockClass) !*MsgBlock {
+    return switch (class) {
+        .tiny => blk: {
+            const tiny = try allocator.create(TinyMsgBlock);
+            tiny.* = .{};
+            break :blk &tiny.header;
+        },
+        .small => blk: {
+            const small = try allocator.create(SmallMsgBlock);
+            small.* = .{};
+            break :blk &small.header;
+        },
+        .standard => blk: {
+            const standard = try allocator.create(StandardMsgBlock);
+            standard.* = .{};
+            break :blk &standard.header;
+        },
+    };
+}
+
+fn destroyMsgBlock(allocator: std.mem.Allocator, blk: *MsgBlock) void {
+    std.crypto.secureZero(u8, blockStorage(blk));
+    switch (blk.class) {
+        .tiny => allocator.destroy(@as(*TinyMsgBlock, @fieldParentPtr("header", blk))),
+        .small => allocator.destroy(@as(*SmallMsgBlock, @fieldParentPtr("header", blk))),
+        .standard => allocator.destroy(@as(*StandardMsgBlock, @fieldParentPtr("header", blk))),
+    }
+}
+
+const MessageBlockPool = struct {
+    const max_free_tiny_blocks: usize = 1024;
+    const max_free_small_blocks: usize = 1024;
+    const max_free_standard_blocks: usize = 1024;
 
     allocator: std.mem.Allocator,
     tiny_free: std.ArrayList(*MsgBlock) = .empty,
     small_free: std.ArrayList(*MsgBlock) = .empty,
     std_free: std.ArrayList(*MsgBlock) = .empty,
+
+    fn deinit(self: *MessageBlockPool) void {
+        for (self.tiny_free.items) |blk| destroyMsgBlock(self.allocator, blk);
+        for (self.small_free.items) |blk| destroyMsgBlock(self.allocator, blk);
+        for (self.std_free.items) |blk| destroyMsgBlock(self.allocator, blk);
+        self.tiny_free.deinit(self.allocator);
+        self.small_free.deinit(self.allocator);
+        self.std_free.deinit(self.allocator);
+    }
+
+    fn acquire(self: *MessageBlockPool, class: MsgBlockClass) !*MsgBlock {
+        const list = self.freeList(class);
+        if (list.items.len > 0) return list.pop().?;
+        return allocateMsgBlock(self.allocator, class);
+    }
+
+    fn recycle(self: *MessageBlockPool, blk: *MsgBlock) void {
+        std.crypto.secureZero(u8, blockStorage(blk));
+        blk.len = 0;
+        const list = self.freeList(blk.class);
+        if (list.items.len >= freeListLimit(blk.class)) {
+            destroyMsgBlock(self.allocator, blk);
+            return;
+        }
+        list.append(self.allocator, blk) catch destroyMsgBlock(self.allocator, blk);
+    }
+
+    fn freeList(self: *MessageBlockPool, class: MsgBlockClass) *std.ArrayList(*MsgBlock) {
+        return switch (class) {
+            .tiny => &self.tiny_free,
+            .small => &self.small_free,
+            .standard => &self.std_free,
+        };
+    }
+
+    fn freeListLimit(class: MsgBlockClass) usize {
+        return switch (class) {
+            .tiny => max_free_tiny_blocks,
+            .small => max_free_small_blocks,
+            .standard => max_free_standard_blocks,
+        };
+    }
+};
+
+const MessageQueue = struct {
+    const max_pending_bytes: usize = 4 * 1024 * 1024;
+
+    allocator: std.mem.Allocator,
+    pool: ?*MessageBlockPool = null,
     blocks: std.ArrayList(*MsgBlock) = .empty,
     head_idx: usize = 0,
     offset: usize = 0,
@@ -453,22 +615,12 @@ const MessageQueue = struct {
 
     fn deinit(self: *MessageQueue) void {
         self.clear();
-
-        for (self.tiny_free.items) |blk| self.destroyBlock(blk);
-        for (self.small_free.items) |blk| self.destroyBlock(blk);
-        for (self.std_free.items) |blk| self.destroyBlock(blk);
-
-        self.tiny_free.deinit(self.allocator);
-        self.small_free.deinit(self.allocator);
-        self.std_free.deinit(self.allocator);
         self.blocks.deinit(self.allocator);
     }
 
     fn clear(self: *MessageQueue) void {
         for (self.blocks.items[self.head_idx..]) |blk| {
-            self.recycleBlock(blk) catch {
-                self.destroyBlock(blk);
-            };
+            self.recycleBlock(blk);
         }
         self.blocks.clearRetainingCapacity();
         self.head_idx = 0;
@@ -495,7 +647,7 @@ const MessageQueue = struct {
             blk.len = take;
             @memcpy(blockStorage(blk)[0..take], data[off .. off + take]);
             self.blocks.append(self.allocator, blk) catch |err| {
-                self.recycleBlock(blk) catch self.destroyBlock(blk);
+                self.recycleBlock(blk);
                 return err;
             };
             self.total_len += take;
@@ -509,13 +661,14 @@ const MessageQueue = struct {
         }
     }
 
-    fn prepareIovecs(self: *const MessageQueue, out: []posix.iovec_const) usize {
-        if (self.head_idx >= self.blocks.items.len) return 0;
+    fn prepareIovecs(self: *const MessageQueue, out: []posix.iovec_const, max_bytes: usize) usize {
+        if (self.head_idx >= self.blocks.items.len or max_bytes == 0) return 0;
 
         var count: usize = 0;
+        var prepared: usize = 0;
         var local_off = self.offset;
         for (self.blocks.items[self.head_idx..]) |blk| {
-            if (count >= out.len) break;
+            if (count >= out.len or prepared >= max_bytes) break;
 
             if (local_off >= blk.len) {
                 local_off -= blk.len;
@@ -523,8 +676,10 @@ const MessageQueue = struct {
             }
 
             const storage = blockStorageConst(blk);
-            out[count] = .{ .base = storage[local_off..blk.len].ptr, .len = blk.len - local_off };
+            const take = @min(blk.len - local_off, max_bytes - prepared);
+            out[count] = .{ .base = storage[local_off..blk.len].ptr, .len = take };
             count += 1;
+            prepared += take;
             local_off = 0;
         }
         return count;
@@ -549,9 +704,7 @@ const MessageQueue = struct {
             remaining -= blk_left;
             self.offset = 0;
             self.head_idx += 1;
-            self.recycleBlock(blk) catch {
-                self.destroyBlock(blk);
-            };
+            self.recycleBlock(blk);
         }
 
         if (self.head_idx > 0 and (self.head_idx >= self.blocks.items.len or self.head_idx >= 64)) {
@@ -570,73 +723,15 @@ const MessageQueue = struct {
     }
 
     fn acquireBlock(self: *MessageQueue, class: MsgBlockClass) !*MsgBlock {
-        const list = switch (class) {
-            .tiny => &self.tiny_free,
-            .small => &self.small_free,
-            .standard => &self.std_free,
-        };
-
-        if (list.items.len > 0) {
-            return list.pop().?;
-        }
-
-        return switch (class) {
-            .tiny => blk: {
-                const tiny = try self.allocator.create(TinyMsgBlock);
-                tiny.* = .{};
-                break :blk &tiny.header;
-            },
-            .small => blk: {
-                const small = try self.allocator.create(SmallMsgBlock);
-                small.* = .{};
-                break :blk &small.header;
-            },
-            .standard => blk: {
-                const standard = try self.allocator.create(StandardMsgBlock);
-                standard.* = .{};
-                break :blk &standard.header;
-            },
-        };
+        if (self.pool) |pool| return pool.acquire(class);
+        return allocateMsgBlock(self.allocator, class);
     }
 
-    fn recycleBlock(self: *MessageQueue, blk: *MsgBlock) !void {
-        std.crypto.secureZero(u8, blockStorage(blk));
-        blk.len = 0;
-        const list = switch (blk.class) {
-            .tiny => &self.tiny_free,
-            .small => &self.small_free,
-            .standard => &self.std_free,
-        };
-        if (list.items.len >= freeListLimit(blk.class)) {
-            self.destroyBlock(blk);
-            return;
-        }
-        try list.append(self.allocator, blk);
-    }
-
-    fn freeListLimit(class: MsgBlockClass) usize {
-        return switch (class) {
-            .tiny => max_free_tiny_blocks,
-            .small => max_free_small_blocks,
-            .standard => max_free_standard_blocks,
-        };
-    }
-
-    fn destroyBlock(self: *MessageQueue, blk: *MsgBlock) void {
-        std.crypto.secureZero(u8, blockStorage(blk));
-        switch (blk.class) {
-            .tiny => {
-                const tiny: *TinyMsgBlock = @fieldParentPtr("header", blk);
-                self.allocator.destroy(tiny);
-            },
-            .small => {
-                const small: *SmallMsgBlock = @fieldParentPtr("header", blk);
-                self.allocator.destroy(small);
-            },
-            .standard => {
-                const standard: *StandardMsgBlock = @fieldParentPtr("header", blk);
-                self.allocator.destroy(standard);
-            },
+    fn recycleBlock(self: *MessageQueue, blk: *MsgBlock) void {
+        if (self.pool) |pool| {
+            pool.recycle(blk);
+        } else {
+            destroyMsgBlock(self.allocator, blk);
         }
     }
 };
@@ -924,6 +1019,10 @@ const MiddleProxyCooldown = struct {
 
 const ConnectionSlot = struct {
     index: u32 = 0,
+    event_generation: u32 = 0,
+    client_event_generation: u32 = 0,
+    upstream_event_generation: u32 = 0,
+    timer_heap_index: u32 = no_timer_heap_index,
     conn_id: u64 = 0,
 
     client_fd: posix.fd_t = invalid_fd,
@@ -946,6 +1045,7 @@ const ConnectionSlot = struct {
     /// Fixed deadline for the current upstream connect attempt.
     upstream_connect_deadline_ms: i64 = 0,
     last_activity_ms: i64 = 0,
+    idle_timeout_ms: i64 = 0,
     /// Last relayed payload time in each direction. If the server spoke more
     /// recently than the client, the server reply is unanswered.
     last_client_byte_ms: i64 = 0,
@@ -1036,8 +1136,8 @@ const ConnectionSlot = struct {
     mp_nonce: [16]u8 = [_]u8{0} ** 16,
     mp_timestamp: u32 = 0,
     mp_rpc_nonce_ans: [16]u8 = [_]u8{0} ** 16,
-    mp_enc: ?crypto.AesCbc = null,
-    mp_dec: ?crypto.AesCbc = null,
+    mp_enc: ?crypto.AesCbcEncryptor = null,
+    mp_dec: ?crypto.AesCbcDecryptor = null,
     mp_frame_buf: ?[]u8 = null,
     mp_frame_have: usize = 0,
     mp_frame_need: usize = 0,
@@ -1046,8 +1146,7 @@ const ConnectionSlot = struct {
     mp_frame_encrypted: bool = false,
     mp_frame_first_decrypted: bool = false,
     mp_step_deadline_ms: i64 = 0,
-    mp_secret: [256]u8 = [_]u8{0} ** 256,
-    mp_secret_len: usize = 0,
+    mp_secret_version: u64 = 0,
     mp_nat_ip4: ?[4]u8 = null,
 
     // Current epoll interests
@@ -1055,6 +1154,9 @@ const ConnectionSlot = struct {
     client_interest_out: bool = false,
     upstream_interest_in: bool = false,
     upstream_interest_out: bool = false,
+    client_registered: bool = false,
+    upstream_registered: bool = false,
+    event_io_budget: ?*EventIoBudget = null,
     relay_half_closed: bool = false,
     client_detached: bool = false,
     upstream_detached: bool = false,
@@ -1085,10 +1187,12 @@ const ConnectionSlot = struct {
     }
 
     fn resetOwnedBuffers(self: *ConnectionSlot, allocator: std.mem.Allocator) void {
+        const client_block_pool = self.client_queue.pool;
+        const upstream_block_pool = self.upstream_queue.pool;
         self.client_queue.deinit();
         self.upstream_queue.deinit();
-        self.client_queue = .{ .allocator = allocator };
-        self.upstream_queue = .{ .allocator = allocator };
+        self.client_queue = .{ .allocator = allocator, .pool = client_block_pool };
+        self.upstream_queue = .{ .allocator = allocator, .pool = upstream_block_pool };
 
         self.releaseClientHello(allocator);
 
@@ -1148,13 +1252,12 @@ const ConnectionSlot = struct {
         std.crypto.secureZero(u8, &self.handshake_buf);
         std.crypto.secureZero(u8, &self.mp_nonce);
         std.crypto.secureZero(u8, &self.mp_rpc_nonce_ans);
-        std.crypto.secureZero(u8, &self.mp_secret);
         self.validation_session_id_len = 0;
         self.validation_user_len = 0;
         self.validation_force_direct = false;
         self.handshake_pos = 0;
         self.mp_timestamp = 0;
-        self.mp_secret_len = 0;
+        self.mp_secret_version = 0;
         self.mp_nat_ip4 = null;
     }
 
@@ -1172,6 +1275,73 @@ const ConnectionSlot = struct {
         if (self.client_hello_heap) |buf| return buf;
         return self.client_hello_inline[0..self.client_hello_len];
     }
+
+    fn releaseHandshakeOnly(self: *ConnectionSlot, allocator: std.mem.Allocator) void {
+        self.releaseClientHello(allocator);
+        if (self.server_hello) |buf| secureFree(allocator, buf);
+        self.server_hello = null;
+
+        if (self.upstream_candidates) |buf| allocator.free(buf);
+        self.upstream_candidates = null;
+        self.upstream_candidate_next = 0;
+
+        if (self.mp_frame_buf) |buf| secureFree(allocator, buf);
+        self.mp_frame_buf = null;
+        self.mp_frame_have = 0;
+        self.mp_frame_need = 0;
+        self.mp_frame_total_len = 0;
+        self.mp_frame_padded_len = 0;
+
+        if (self.obf_params) |*params| params.wipe();
+        self.obf_params = null;
+        if (self.mp_enc) |*enc| enc.wipe();
+        if (self.mp_dec) |*dec| dec.wipe();
+        self.mp_enc = null;
+        self.mp_dec = null;
+
+        std.crypto.secureZero(u8, &self.validation_secret);
+        std.crypto.secureZero(u8, &self.validation_digest);
+        std.crypto.secureZero(u8, &self.validation_session_id);
+        std.crypto.secureZero(u8, &self.validation_user);
+        std.crypto.secureZero(u8, &self.handshake_buf);
+        std.crypto.secureZero(u8, &self.mp_nonce);
+        std.crypto.secureZero(u8, &self.mp_rpc_nonce_ans);
+        self.validation_session_id_len = 0;
+        self.validation_user_len = 0;
+        self.validation_force_direct = false;
+        self.handshake_pos = 0;
+        self.mp_secret_version = 0;
+        self.mp_nat_ip4 = null;
+    }
+};
+
+const DeadlineEntry = struct {
+    deadline_ns: i128,
+    slot_index: u32,
+};
+
+const EventIoBudget = struct {
+    bytes_remaining: usize = event_io_byte_budget,
+    operations_remaining: usize = event_io_operation_budget,
+
+    fn exhausted(self: *const EventIoBudget) bool {
+        return self.bytes_remaining == 0 or self.operations_remaining == 0;
+    }
+
+    fn allowedBytes(self: *const EventIoBudget, requested: usize) usize {
+        if (self.operations_remaining == 0) return 0;
+        return @min(requested, self.bytes_remaining);
+    }
+
+    fn beginOperation(self: *EventIoBudget) bool {
+        if (self.exhausted()) return false;
+        self.operations_remaining -= 1;
+        return true;
+    }
+
+    fn recordBytes(self: *EventIoBudget, count: usize) void {
+        self.bytes_remaining -= @min(count, self.bytes_remaining);
+    }
 };
 
 const ConnectionPool = struct {
@@ -1179,8 +1349,6 @@ const ConnectionPool = struct {
     slots: []?*ConnectionSlot,
     free_stack: []u32,
     free_count: u32,
-    active_hi: u32,
-    fd_to_slot: std.AutoHashMapUnmanaged(posix.fd_t, u32) = .{},
 
     fn init(allocator: std.mem.Allocator, capacity: u32) !ConnectionPool {
         const slots = try allocator.alloc(?*ConnectionSlot, capacity);
@@ -1198,16 +1366,12 @@ const ConnectionPool = struct {
             free_stack[i] = @intCast(capacity - 1 - i);
         }
 
-        var pool = ConnectionPool{
+        return ConnectionPool{
             .allocator = allocator,
             .slots = slots,
             .free_stack = free_stack,
             .free_count = capacity,
-            .active_hi = 0,
-            .fd_to_slot = .{},
         };
-        try pool.fd_to_slot.ensureTotalCapacity(allocator, @as(u32, capacity * 2));
-        return pool;
     }
 
     fn deinit(self: *ConnectionPool) void {
@@ -1217,7 +1381,6 @@ const ConnectionPool = struct {
                 self.allocator.destroy(slot_ptr);
             }
         }
-        self.fd_to_slot.deinit(self.allocator);
         self.allocator.free(self.free_stack);
         self.allocator.free(self.slots);
     }
@@ -1237,12 +1400,12 @@ const ConnectionPool = struct {
         }
 
         const slot = self.slots[idx].?;
+        const event_generation = slot.event_generation;
         slot.* = .{};
         slot.index = idx;
+        slot.event_generation = event_generation;
         slot.client_queue.allocator = self.allocator;
         slot.upstream_queue.allocator = self.allocator;
-        const active_hi = idx + 1;
-        if (active_hi > self.active_hi) self.active_hi = active_hi;
         return slot;
     }
 
@@ -1250,31 +1413,74 @@ const ConnectionPool = struct {
         self.free_stack[self.free_count] = slot.index;
         self.free_count += 1;
         slot.phase = .idle;
-        if (slot.index + 1 == self.active_hi) {
-            while (self.active_hi > 0) {
-                const top = self.slots[self.active_hi - 1] orelse {
-                    self.active_hi -= 1;
-                    continue;
-                };
-                if (top.phase != .idle) break;
-                self.active_hi -= 1;
-            }
-        }
     }
 
-    fn mapFd(self: *ConnectionPool, fd: posix.fd_t, idx: u32) !void {
-        try self.fd_to_slot.put(self.allocator, fd, idx);
-    }
-
-    fn unmapFd(self: *ConnectionPool, fd: posix.fd_t) void {
-        _ = self.fd_to_slot.remove(fd);
-    }
-
-    fn getByFd(self: *ConnectionPool, fd: posix.fd_t) ?*ConnectionSlot {
-        const idx = self.fd_to_slot.get(fd) orelse return null;
-        return self.slots[idx];
+    fn getByToken(self: *ConnectionPool, token: SlotEventToken) ?*ConnectionSlot {
+        if (@as(usize, token.index) >= self.slots.len) return null;
+        const slot = self.slots[token.index] orelse return null;
+        if (slot.phase == .idle) return null;
+        const current_generation = switch (token.role) {
+            .client => slot.client_event_generation,
+            .upstream => slot.upstream_event_generation,
+        };
+        if (current_generation != token.generation) return null;
+        return slot;
     }
 };
+
+fn readSlotFd(slot: *ConnectionSlot, fd: posix.fd_t, buffer: []u8) !usize {
+    const limited = if (slot.event_io_budget) |budget|
+        buffer[0..budget.allowedBytes(buffer.len)]
+    else
+        buffer;
+    if (limited.len == 0) return error.WouldBlock;
+
+    if (slot.event_io_budget) |budget| {
+        if (!budget.beginOperation()) return error.WouldBlock;
+    }
+    const count = try posix.read(fd, limited);
+    if (slot.event_io_budget) |budget| budget.recordBytes(count);
+    return count;
+}
+
+fn writeSlotFd(slot: *ConnectionSlot, fd: posix.fd_t, data: []const u8) !usize {
+    const limited = if (slot.event_io_budget) |budget|
+        data[0..budget.allowedBytes(data.len)]
+    else
+        data;
+    if (limited.len == 0) return error.WouldBlock;
+
+    if (slot.event_io_budget) |budget| {
+        if (!budget.beginOperation()) return error.WouldBlock;
+    }
+    const count = try writeFd(fd, limited);
+    if (slot.event_io_budget) |budget| budget.recordBytes(count);
+    return count;
+}
+
+fn writevSlotFd(slot: *ConnectionSlot, fd: posix.fd_t, iovecs: []const posix.iovec_const) !usize {
+    var limited_iovecs: [max_scatter_parts]posix.iovec_const = undefined;
+    var limited_count: usize = 0;
+    var remaining = if (slot.event_io_budget) |budget| budget.allowedBytes(std.math.maxInt(usize)) else std.math.maxInt(usize);
+    if (remaining == 0) return error.WouldBlock;
+
+    for (iovecs) |iov| {
+        if (remaining == 0 or limited_count == limited_iovecs.len) break;
+        const take = @min(iov.len, remaining);
+        if (take == 0) continue;
+        limited_iovecs[limited_count] = .{ .base = iov.base, .len = take };
+        limited_count += 1;
+        remaining -= take;
+    }
+    if (limited_count == 0) return error.WouldBlock;
+
+    if (slot.event_io_budget) |budget| {
+        if (!budget.beginOperation()) return error.WouldBlock;
+    }
+    const count = try writevFd(fd, limited_iovecs[0..limited_count]);
+    if (slot.event_io_budget) |budget| budget.recordBytes(count);
+    return count;
+}
 
 fn secureFree(allocator: std.mem.Allocator, buf: []u8) void {
     std.crypto.secureZero(u8, buf);
@@ -1298,21 +1504,21 @@ pub const ProxyState = struct {
     allocator: std.mem.Allocator,
     config: Config,
     user_secrets: []obfuscation.UserSecret,
-    connection_count: std.atomic.Value(u64),
-    active_connections: std.atomic.Value(u32),
-    handshakes_inflight: std.atomic.Value(u32),
+    connection_count: u64,
+    active_connections: u32,
+    handshakes_inflight: u32,
     mask_target: ?[]const u8,
     mask_addrs: []net.Address,
     replay_cache: ReplayCache,
     tls_server_hello_template: []u8,
 
     // Degradation counters (monotonic totals, delta'd in stats log)
-    stats_dropped_cap: std.atomic.Value(u64),
-    stats_dropped_saturation: std.atomic.Value(u64),
-    stats_dropped_rate_limit: std.atomic.Value(u64),
-    stats_dropped_hs_budget: std.atomic.Value(u64),
-    stats_hs_timeout: std.atomic.Value(u64),
-    stats_mp_fallback: std.atomic.Value(u64),
+    stats_dropped_cap: u64,
+    stats_dropped_saturation: u64,
+    stats_dropped_rate_limit: u64,
+    stats_dropped_hs_budget: u64,
+    stats_hs_timeout: u64,
+    stats_mp_fallback: u64,
 
     middle_proxy_lock: MiddleProxyLock = .{},
     middle_proxy_addrs_primary: [5]net.Address,
@@ -1327,6 +1533,10 @@ pub const ProxyState = struct {
     middle_proxy_cooldowns: [middle_proxy_cooldown_slots]MiddleProxyCooldown,
     middle_proxy_secret: [256]u8,
     middle_proxy_secret_len: usize,
+    middle_proxy_secret_version: u64,
+    middle_proxy_previous_secret: [256]u8,
+    middle_proxy_previous_secret_len: usize,
+    middle_proxy_previous_secret_version: u64,
     middle_proxy_nat_ip4: ?[4]u8,
     middle_proxy_updater_stop: std.atomic.Value(bool),
     middle_proxy_refresh_requested: std.atomic.Value(bool),
@@ -1424,19 +1634,19 @@ pub const ProxyState = struct {
             .allocator = allocator,
             .config = cfg,
             .user_secrets = user_secrets,
-            .connection_count = std.atomic.Value(u64).init(0),
-            .active_connections = std.atomic.Value(u32).init(0),
-            .handshakes_inflight = std.atomic.Value(u32).init(0),
+            .connection_count = 0,
+            .active_connections = 0,
+            .handshakes_inflight = 0,
             .mask_target = mask_target,
             .mask_addrs = resolved_addrs,
             .replay_cache = ReplayCache.init(),
             .tls_server_hello_template = tls_template,
-            .stats_dropped_cap = std.atomic.Value(u64).init(0),
-            .stats_dropped_saturation = std.atomic.Value(u64).init(0),
-            .stats_dropped_rate_limit = std.atomic.Value(u64).init(0),
-            .stats_dropped_hs_budget = std.atomic.Value(u64).init(0),
-            .stats_hs_timeout = std.atomic.Value(u64).init(0),
-            .stats_mp_fallback = std.atomic.Value(u64).init(0),
+            .stats_dropped_cap = 0,
+            .stats_dropped_saturation = 0,
+            .stats_dropped_rate_limit = 0,
+            .stats_dropped_hs_budget = 0,
+            .stats_hs_timeout = 0,
+            .stats_mp_fallback = 0,
             .middle_proxy_addrs_primary = constants.tg_middle_proxies_v4,
             .middle_proxy_addrs_media_primary = constants.tg_media_middle_proxies_v4,
             .middle_proxy_addr_203 = constants.getDcAddressV4(203),
@@ -1449,6 +1659,10 @@ pub const ProxyState = struct {
             .middle_proxy_cooldowns = [_]MiddleProxyCooldown{.{}} ** middle_proxy_cooldown_slots,
             .middle_proxy_secret = default_middle_proxy_secret,
             .middle_proxy_secret_len = middleproxy.proxy_secret.len,
+            .middle_proxy_secret_version = 1,
+            .middle_proxy_previous_secret = [_]u8{0} ** 256,
+            .middle_proxy_previous_secret_len = 0,
+            .middle_proxy_previous_secret_version = 0,
             .middle_proxy_nat_ip4 = detected_nat_ip4,
             .middle_proxy_updater_stop = std.atomic.Value(bool).init(false),
             .middle_proxy_refresh_requested = std.atomic.Value(bool).init(false),
@@ -1461,6 +1675,10 @@ pub const ProxyState = struct {
         self.middle_proxy_lock.lock();
         std.crypto.secureZero(u8, &self.middle_proxy_secret);
         self.middle_proxy_secret_len = 0;
+        self.middle_proxy_secret_version = 0;
+        std.crypto.secureZero(u8, &self.middle_proxy_previous_secret);
+        self.middle_proxy_previous_secret_len = 0;
+        self.middle_proxy_previous_secret_version = 0;
         self.middle_proxy_lock.unlock();
         self.allocator.free(self.tls_server_hello_template);
         if (self.mask_addrs.len > 0) self.allocator.free(self.mask_addrs);
@@ -1547,49 +1765,58 @@ pub const ProxyState = struct {
     }
 
     const MiddleProxySnapshot = struct {
-        candidates: [5][16]net.Address,
-        candidate_lens: [5]usize,
-        media_candidates: [5][16]net.Address,
-        media_candidate_lens: [5]usize,
-        candidates_203: [16]net.Address,
-        candidates_203_len: usize,
-        secret: [256]u8,
-        secret_len: usize,
+        candidates: [16]net.Address,
+        candidate_len: usize,
+        secret_version: u64,
         nat_ip4: ?[4]u8 = null,
 
-        fn candidatesForDc(self: *const MiddleProxySnapshot, dc_abs: usize, media: bool) []const net.Address {
-            if (dc_abs == 203) return self.candidates_203[0..self.candidates_203_len];
-            if (dc_abs >= 1 and dc_abs <= self.candidates.len) {
-                const index = dc_abs - 1;
-                if (media) return self.media_candidates[index][0..self.media_candidate_lens[index]];
-                return self.candidates[index][0..self.candidate_lens[index]];
-            }
-            return &.{};
+        fn selectedCandidates(self: *const MiddleProxySnapshot) []const net.Address {
+            return self.candidates[0..self.candidate_len];
         }
     };
 
-    fn getMiddleProxySnapshot(self: *ProxyState) MiddleProxySnapshot {
+    fn getMiddleProxySnapshot(self: *ProxyState, dc_abs: usize, media: bool) MiddleProxySnapshot {
         self.middle_proxy_lock.lockShared();
         defer self.middle_proxy_lock.unlockShared();
 
         var snapshot = MiddleProxySnapshot{
-            .candidates = self.middle_proxy_candidates,
-            .candidate_lens = self.middle_proxy_candidate_lens,
-            .media_candidates = self.middle_proxy_media_candidates,
-            .media_candidate_lens = self.middle_proxy_media_candidate_lens,
-            .candidates_203 = self.middle_proxy_candidates_203,
-            .candidates_203_len = self.middle_proxy_candidates_203_len,
-            .secret = self.middle_proxy_secret,
-            .secret_len = self.middle_proxy_secret_len,
+            .candidates = undefined,
+            .candidate_len = 0,
+            .secret_version = self.middle_proxy_secret_version,
             .nat_ip4 = self.middle_proxy_nat_ip4,
         };
-        const now_ms = compat.monotonicMilliTimestamp();
-        for (0..snapshot.candidates.len) |i| {
-            prioritizeMiddleProxyCandidates(&snapshot.candidates[i], snapshot.candidate_lens[i], &self.middle_proxy_cooldowns, now_ms);
-            prioritizeMiddleProxyCandidates(&snapshot.media_candidates[i], snapshot.media_candidate_lens[i], &self.middle_proxy_cooldowns, now_ms);
+
+        if (dc_abs == 203) {
+            snapshot.candidate_len = self.middle_proxy_candidates_203_len;
+            @memcpy(snapshot.candidates[0..snapshot.candidate_len], self.middle_proxy_candidates_203[0..snapshot.candidate_len]);
+        } else if (dc_abs >= 1 and dc_abs <= self.middle_proxy_candidates.len) {
+            const index = dc_abs - 1;
+            const selected_len = if (media and self.middle_proxy_media_candidate_lens[index] > 0)
+                self.middle_proxy_media_candidate_lens[index]
+            else
+                self.middle_proxy_candidate_lens[index];
+            const selected = if (media and self.middle_proxy_media_candidate_lens[index] > 0)
+                self.middle_proxy_media_candidates[index][0..selected_len]
+            else
+                self.middle_proxy_candidates[index][0..selected_len];
+            snapshot.candidate_len = selected_len;
+            @memcpy(snapshot.candidates[0..selected_len], selected);
         }
-        prioritizeMiddleProxyCandidates(&snapshot.candidates_203, snapshot.candidates_203_len, &self.middle_proxy_cooldowns, now_ms);
+
+        const now_ms = compat.monotonicMilliTimestamp();
+        prioritizeMiddleProxyCandidates(&snapshot.candidates, snapshot.candidate_len, &self.middle_proxy_cooldowns, now_ms);
         return snapshot;
+    }
+
+    /// Caller must hold middle_proxy_lock for shared or exclusive access.
+    fn middleProxySecretForVersionLocked(self: *const ProxyState, version: u64) ?[]const u8 {
+        if (version != 0 and version == self.middle_proxy_secret_version and self.middle_proxy_secret_len >= 4) {
+            return self.middle_proxy_secret[0..self.middle_proxy_secret_len];
+        }
+        if (version != 0 and version == self.middle_proxy_previous_secret_version and self.middle_proxy_previous_secret_len >= 4) {
+            return self.middle_proxy_previous_secret[0..self.middle_proxy_previous_secret_len];
+        }
+        return null;
     }
 
     fn promoteMiddleProxyCandidate(self: *ProxyState, dc_abs: usize, media: bool, addr: net.Address) bool {
@@ -1930,9 +2157,19 @@ pub const ProxyState = struct {
             if (self.middle_proxy_secret_len != next_secret.len or
                 !std.mem.eql(u8, self.middle_proxy_secret[0..self.middle_proxy_secret_len], next_secret))
             {
+                std.crypto.secureZero(u8, &self.middle_proxy_previous_secret);
+                @memcpy(
+                    self.middle_proxy_previous_secret[0..self.middle_proxy_secret_len],
+                    self.middle_proxy_secret[0..self.middle_proxy_secret_len],
+                );
+                self.middle_proxy_previous_secret_len = self.middle_proxy_secret_len;
+                self.middle_proxy_previous_secret_version = self.middle_proxy_secret_version;
+
                 std.crypto.secureZero(u8, &self.middle_proxy_secret);
                 @memcpy(self.middle_proxy_secret[0..next_secret.len], next_secret);
                 self.middle_proxy_secret_len = next_secret.len;
+                const next_version = self.middle_proxy_secret_version +% 1;
+                self.middle_proxy_secret_version = if (next_version == 0) 1 else next_version;
                 changed = true;
             }
 
@@ -1960,12 +2197,15 @@ pub const ProxyState = struct {
 const EventLoop = struct {
     state: *ProxyState,
     epoll_fd: posix.fd_t,
+    timer_fd: posix.fd_t,
     listen_fd: posix.fd_t,
     pool: ConnectionPool,
+    message_block_pool: MessageBlockPool,
     accept_paused: bool,
     accept_resume_ns: i128,
     saturation_paused: bool,
-    timer_scan_cursor: u32,
+    deadline_heap: std.ArrayList(DeadlineEntry),
+    armed_deadline_ns: i128,
     stats_next_log_ns: i128,
     accepted_since_log: u64,
     closed_since_log: u64,
@@ -1981,23 +2221,31 @@ const EventLoop = struct {
     mp_c2s_scratch: ?[]u8,
     mp_s2c_scratch: ?[]u8,
     pending_close_fds: std.ArrayList(posix.fd_t),
+    tracked_fds: u32,
 
     fn init(state: *ProxyState, listen_fd: posix.fd_t) !*EventLoop {
         const epoll_fd = try epollCreate();
         errdefer closeFd(epoll_fd);
+        const timer_fd = try createTimerFd();
+        errdefer closeFd(timer_fd);
 
         const loop = try state.allocator.create(EventLoop);
         errdefer state.allocator.destroy(loop);
 
         loop.state = state;
         loop.epoll_fd = epoll_fd;
+        loop.timer_fd = timer_fd;
         loop.listen_fd = listen_fd;
         loop.pool = try ConnectionPool.init(state.allocator, state.config.max_connections);
         errdefer loop.pool.deinit();
+        loop.message_block_pool = .{ .allocator = state.allocator };
         loop.accept_paused = false;
         loop.accept_resume_ns = 0;
         loop.saturation_paused = false;
-        loop.timer_scan_cursor = 0;
+        loop.deadline_heap = .empty;
+        try loop.deadline_heap.ensureTotalCapacity(state.allocator, state.config.max_connections);
+        errdefer loop.deadline_heap.deinit(state.allocator);
+        loop.armed_deadline_ns = 0;
         loop.stats_next_log_ns = compat.monotonicNanoTimestamp() + stats_log_interval_ns;
         loop.accepted_since_log = 0;
         loop.closed_since_log = 0;
@@ -2014,8 +2262,11 @@ const EventLoop = struct {
         loop.mp_c2s_scratch = null;
         loop.mp_s2c_scratch = null;
         loop.pending_close_fds = .empty;
+        loop.tracked_fds = 0;
 
-        try loop.addFd(listen_fd, true, false);
+        try loop.addControlFd(listen_fd, epoll_listener_token, true, false);
+        try loop.addControlFd(timer_fd, epoll_timer_token, true, false);
+        try loop.rearmTimer();
         return loop;
     }
 
@@ -2035,6 +2286,9 @@ const EventLoop = struct {
         self.pending_close_fds.deinit(self.state.allocator);
 
         self.pool.deinit();
+        self.message_block_pool.deinit();
+        self.deadline_heap.deinit(self.state.allocator);
+        closeFd(self.timer_fd);
         closeFd(self.epoll_fd);
     }
 
@@ -2051,13 +2305,11 @@ const EventLoop = struct {
 
     fn run(self: *EventLoop) !void {
         var events: [256]linux.epoll_event = undefined;
-        const timer_tick_ns: i128 = 5 * std.time.ns_per_ms;
-        var next_timer_tick_ns: i128 = compat.monotonicNanoTimestamp();
 
         while (true) {
             self.drainPendingCloses();
 
-            const rc = linux.epoll_wait(self.epoll_fd, events[0..].ptr, @intCast(events.len), event_loop_wait_ms);
+            const rc = linux.epoll_wait(self.epoll_fd, events[0..].ptr, @intCast(events.len), -1);
             switch (posix.errno(rc)) {
                 .SUCCESS => {},
                 .INTR => continue,
@@ -2066,16 +2318,27 @@ const EventLoop = struct {
 
             const n: usize = @intCast(rc);
             for (events[0..n]) |ev| {
-                const fd = ev.data.fd;
+                const token = ev.data.u64;
                 const ev_flags = ev.events;
-                if (fd == self.listen_fd) {
+                if (token == epoll_listener_token) {
                     self.acceptNewConnections() catch |err| {
                         log.err("accept loop error: {any}", .{err});
                     };
                     continue;
                 }
+                if (token == epoll_timer_token) {
+                    drainTimerFd(self.timer_fd);
+                    self.armed_deadline_ns = 0;
+                    continue;
+                }
 
-                const slot = self.pool.getByFd(fd) orelse continue;
+                const slot_token = decodeSlotEventToken(token) orelse continue;
+                const slot = self.pool.getByToken(slot_token) orelse continue;
+                const fd = switch (slot_token.role) {
+                    .client => slot.client_fd,
+                    .upstream => slot.upstream_fd,
+                };
+                if (isInvalidFd(fd)) continue;
                 self.processSlotEvent(slot, fd, ev_flags);
             }
 
@@ -2085,19 +2348,17 @@ const EventLoop = struct {
             }
             // Saturation hysteresis: resume accepting when active drops below 80%
             if (self.saturation_paused) {
-                const active = self.state.active_connections.load(.monotonic);
+                const active = self.state.active_connections;
                 const resume_threshold = (self.state.config.max_connections * 8) / 10;
                 if (active <= resume_threshold) {
                     self.resumeSaturation();
                 }
             }
-            if (now_ns >= next_timer_tick_ns) {
-                self.runTimers();
-                next_timer_tick_ns = now_ns + timer_tick_ns;
-            }
+            self.runTimers(now_ns);
             if (now_ns >= self.stats_next_log_ns) {
                 self.logPeriodicStats(now_ns);
             }
+            try self.rearmTimer();
         }
     }
 
@@ -2108,6 +2369,12 @@ const EventLoop = struct {
             (fd == slot.upstream_fd and slot.upstream_detached))
         {
             return;
+        }
+        var io_budget = EventIoBudget{};
+        slot.event_io_budget = &io_budget;
+        defer {
+            slot.event_io_budget = null;
+            self.refreshSlotDeadline(slot);
         }
 
         const graceful_rdhup = hasGracefulEpollRdhup(events);
@@ -2124,7 +2391,7 @@ const EventLoop = struct {
                 self.onClientWritable(slot);
             }
             if (slot.phase == .idle) return;
-            if ((events & linux.EPOLL.IN) != 0) {
+            if ((events & linux.EPOLL.IN) != 0 and !io_budget.exhausted()) {
                 self.onClientReadable(slot);
             }
         } else if (fd == slot.upstream_fd) {
@@ -2132,7 +2399,7 @@ const EventLoop = struct {
                 self.onUpstreamWritable(slot);
             }
             if (slot.phase == .idle) return;
-            if ((events & linux.EPOLL.IN) != 0) {
+            if ((events & linux.EPOLL.IN) != 0 and !io_budget.exhausted()) {
                 self.onUpstreamReadable(slot);
             }
         }
@@ -2166,13 +2433,13 @@ const EventLoop = struct {
     fn acceptNewConnections(self: *EventLoop) !void {
         // Saturation hysteresis: if active > 90% of max, stop accepting entirely.
         // Resume only when active drops below 80% (checked in run() loop).
-        const active_now = self.state.active_connections.load(.monotonic);
+        const active_now = self.state.active_connections;
         const max = self.state.config.max_connections;
         if (active_now >= (max * 9) / 10) {
             if (!self.saturation_paused) {
                 self.pauseSaturation();
             }
-            _ = self.state.stats_dropped_saturation.fetchAdd(1, .monotonic);
+            self.state.stats_dropped_saturation +|= 1;
             return;
         }
 
@@ -2198,29 +2465,32 @@ const EventLoop = struct {
 
             // Per-/24 subnet rate limit (before we allocate any slot)
             if (!self.subnet_limiter.check(client_addr, self.state.config.rate_limit_per_subnet)) {
-                _ = self.state.stats_dropped_rate_limit.fetchAdd(1, .monotonic);
+                self.state.stats_dropped_rate_limit +|= 1;
                 closeFd(cfd);
                 continue;
             }
 
-            const active_before = self.state.active_connections.fetchAdd(1, .monotonic);
+            const active_before = self.state.active_connections;
+            self.state.active_connections +|= 1;
             if (active_before >= self.state.config.max_connections) {
-                _ = self.state.active_connections.fetchSub(1, .monotonic);
-                _ = self.state.stats_dropped_cap.fetchAdd(1, .monotonic);
+                self.state.active_connections -= 1;
+                self.state.stats_dropped_cap +|= 1;
                 closeFd(cfd);
                 continue;
             }
 
             const slot = self.pool.acquire() orelse {
-                _ = self.state.active_connections.fetchSub(1, .monotonic);
+                self.state.active_connections -= 1;
                 closeFd(cfd);
                 continue;
             };
+            slot.client_queue.pool = &self.message_block_pool;
+            slot.upstream_queue.pool = &self.message_block_pool;
 
             const subnet_key = SubnetRateLimit.subnetKey(client_addr);
             if (!self.subnet_handshakes.reserve(subnet_key, subnetHandshakeLimit(max))) {
-                _ = self.state.active_connections.fetchSub(1, .monotonic);
-                _ = self.state.stats_dropped_hs_budget.fetchAdd(1, .monotonic);
+                self.state.active_connections -= 1;
+                self.state.stats_dropped_hs_budget +|= 1;
                 self.pool.release(slot);
                 closeFd(cfd);
                 continue;
@@ -2230,24 +2500,27 @@ const EventLoop = struct {
             slot.hs_counted = false;
             slot.subnet_key = subnet_key;
             slot.subnet_hs_counted = true;
-            slot.conn_id = self.state.connection_count.fetchAdd(1, .monotonic);
+            slot.conn_id = self.state.connection_count;
+            self.state.connection_count +|= 1;
             slot.client_fd = cfd;
             slot.peer_addr = client_addr;
             slot.phase = .reading_tls_header;
             slot.created_at_ms = compat.monotonicMilliTimestamp();
             slot.last_activity_ms = slot.created_at_ms;
+            slot.idle_timeout_ms = jitteredIdleTimeoutMs(
+                self.state.config.idle_timeout_sec,
+                self.state.config.idle_timeout_jitter_pct,
+                idleTimeoutSeed(slot),
+            );
             slot.last_client_byte_ms = 0;
             slot.last_server_byte_ms = 0;
             slot.drs = DynamicRecordSizer.init(self.state.config.drs);
 
-            if (self.addFd(cfd, true, false)) |_| {
+            if (self.addSlotFd(slot, cfd, .client, true, false)) |_| {
                 slot.client_interest_in = true;
                 slot.client_interest_out = false;
-                self.pool.mapFd(cfd, slot.index) catch {
-                    self.closeSlot(slot, "fd map failed");
-                    continue;
-                };
                 self.accepted_since_log += 1;
+                self.refreshSlotDeadline(slot);
             } else |_| {
                 self.closeSlot(slot, "epoll add client failed");
                 continue;
@@ -2256,17 +2529,17 @@ const EventLoop = struct {
     }
 
     fn logPeriodicStats(self: *EventLoop, now_ns: i128) void {
-        const active = self.state.active_connections.load(.monotonic);
-        const hs = self.state.handshakes_inflight.load(.monotonic);
-        const accepted_total = self.state.connection_count.load(.monotonic);
+        const active = self.state.active_connections;
+        const hs = self.state.handshakes_inflight;
+        const accepted_total = self.state.connection_count;
 
         // Snapshot degradation counters and compute deltas
-        const cur_cap = self.state.stats_dropped_cap.load(.monotonic);
-        const cur_sat = self.state.stats_dropped_saturation.load(.monotonic);
-        const cur_rate = self.state.stats_dropped_rate_limit.load(.monotonic);
-        const cur_hs = self.state.stats_dropped_hs_budget.load(.monotonic);
-        const cur_hst = self.state.stats_hs_timeout.load(.monotonic);
-        const cur_mpf = self.state.stats_mp_fallback.load(.monotonic);
+        const cur_cap = self.state.stats_dropped_cap;
+        const cur_sat = self.state.stats_dropped_saturation;
+        const cur_rate = self.state.stats_dropped_rate_limit;
+        const cur_hs = self.state.stats_dropped_hs_budget;
+        const cur_hst = self.state.stats_hs_timeout;
+        const cur_mpf = self.state.stats_mp_fallback;
 
         const d_cap = cur_cap - self.prev_dropped_cap;
         const d_sat = cur_sat - self.prev_dropped_saturation;
@@ -2290,7 +2563,7 @@ const EventLoop = struct {
             hs,
             self.accepted_since_log,
             self.closed_since_log,
-            self.pool.fd_to_slot.count(),
+            self.tracked_fds,
             accepted_total,
             self.accept_paused,
             self.saturation_paused,
@@ -2315,7 +2588,7 @@ const EventLoop = struct {
     }
 
     fn syncAcceptInterest(self: *EventLoop) !void {
-        try self.modFd(self.listen_fd, self.wantsAcceptInterest(), false);
+        try self.modControlFd(self.listen_fd, epoll_listener_token, self.wantsAcceptInterest(), false);
     }
 
     fn pauseAccepting(self: *EventLoop, err: anyerror) void {
@@ -2359,7 +2632,7 @@ const EventLoop = struct {
             log.err("failed to pause accepts for saturation: {any}", .{mod_err});
         };
 
-        const active = self.state.active_connections.load(.monotonic);
+        const active = self.state.active_connections;
         const max = self.state.config.max_connections;
         log.warn(
             "connection saturation: active={d}/{d} (>{d}%); pausing new accepts. " ++
@@ -2381,7 +2654,7 @@ const EventLoop = struct {
             return;
         };
 
-        const active = self.state.active_connections.load(.monotonic);
+        const active = self.state.active_connections;
         if (self.wantsAcceptInterest()) {
             log.info("saturation eased: active={d}/{d}; resuming accepts", .{ active, self.state.config.max_connections });
         } else {
@@ -2508,11 +2781,12 @@ const EventLoop = struct {
     fn reserveHandshakeBudget(self: *EventLoop, slot: *ConnectionSlot) bool {
         if (slot.hs_counted) return true;
 
-        const hs_inflight = self.state.handshakes_inflight.fetchAdd(1, .monotonic);
+        const hs_inflight = self.state.handshakes_inflight;
+        self.state.handshakes_inflight +|= 1;
         const hs_max = (self.state.config.max_connections * 3) / 10;
         if (hs_max > 0 and hs_inflight >= hs_max) {
-            _ = self.state.handshakes_inflight.fetchSub(1, .monotonic);
-            _ = self.state.stats_dropped_hs_budget.fetchAdd(1, .monotonic);
+            self.state.handshakes_inflight -= 1;
+            self.state.stats_dropped_hs_budget +|= 1;
             return false;
         }
 
@@ -2524,7 +2798,7 @@ const EventLoop = struct {
     /// completion can release it early; all error paths funnel through closeSlot.
     fn releaseHandshakeBudget(self: *EventLoop, slot: *ConnectionSlot) void {
         if (!slot.hs_counted) return;
-        _ = self.state.handshakes_inflight.fetchSub(1, .monotonic);
+        self.state.handshakes_inflight -= 1;
         slot.hs_counted = false;
     }
 
@@ -2537,7 +2811,7 @@ const EventLoop = struct {
 
     fn readTlsHeader(self: *EventLoop, slot: *ConnectionSlot) void {
         while (slot.tls_hdr_pos < tls_header_len) {
-            const n = posix.read(slot.client_fd, slot.tls_hdr_buf[slot.tls_hdr_pos..]) catch |err| {
+            const n = readSlotFd(slot, slot.client_fd, slot.tls_hdr_buf[slot.tls_hdr_pos..]) catch |err| {
                 if (err == error.WouldBlock) return;
                 self.closeSlot(slot, "tls header read error");
                 return;
@@ -2593,7 +2867,7 @@ const EventLoop = struct {
         while (slot.tls_body_pos < slot.tls_body_len) {
             const off = tls_header_len + slot.tls_body_pos;
             const end = tls_header_len + slot.tls_body_len;
-            const n = posix.read(slot.client_fd, hello_buf[off..end]) catch |err| {
+            const n = readSlotFd(slot, slot.client_fd, hello_buf[off..end]) catch |err| {
                 if (err == error.WouldBlock) return;
                 self.closeSlot(slot, "client hello body read error");
                 return;
@@ -2718,7 +2992,7 @@ const EventLoop = struct {
         while (true) {
             if (slot.phase == .reading_mtproto_tls_header) {
                 while (slot.tls_hdr_pos < tls_header_len) {
-                    const n = posix.read(slot.client_fd, slot.tls_hdr_buf[slot.tls_hdr_pos..]) catch |err| {
+                    const n = readSlotFd(slot, slot.client_fd, slot.tls_hdr_buf[slot.tls_hdr_pos..]) catch |err| {
                         if (err == error.WouldBlock) return;
                         self.closeSlot(slot, "mtproto tls hdr read error");
                         return;
@@ -2771,7 +3045,7 @@ const EventLoop = struct {
                 return;
             };
             const want = @min(remaining, read_buf.len);
-            const n = posix.read(slot.client_fd, read_buf[0..want]) catch |err| {
+            const n = readSlotFd(slot, slot.client_fd, read_buf[0..want]) catch |err| {
                 if (err == error.WouldBlock) return;
                 self.closeSlot(slot, "mtproto tls body read error");
                 return;
@@ -2853,10 +3127,9 @@ const EventLoop = struct {
         }
 
         var snapshot = if (shouldUseMiddleProxySnapshot(&self.state.config, dc_abs, slot.dc_idx))
-            self.state.getMiddleProxySnapshot()
+            self.state.getMiddleProxySnapshot(dc_abs, slot.dc_idx < 0 or dc_abs == 203)
         else
             null;
-        defer if (snapshot) |*snap| std.crypto.secureZero(u8, &snap.secret);
 
         const plan = buildDcConnectPlan(&self.state.config, dc_abs, slot.dc_idx, if (snapshot) |*s| s else null, slot.validation_force_direct);
         if (plan.count == 0) {
@@ -2875,12 +3148,11 @@ const EventLoop = struct {
                 self.closeSlot(slot, "missing middle-proxy snapshot");
                 return;
             };
-            if (snap.secret_len < 4 or snap.secret_len > slot.mp_secret.len) {
+            if (snap.secret_version == 0) {
                 self.closeSlot(slot, "invalid middle-proxy secret snapshot");
                 return;
             }
-            @memcpy(slot.mp_secret[0..snap.secret_len], snap.secret[0..snap.secret_len]);
-            slot.mp_secret_len = snap.secret_len;
+            slot.mp_secret_version = snap.secret_version;
             slot.mp_nat_ip4 = snap.nat_ip4;
         }
 
@@ -2974,12 +3246,6 @@ const EventLoop = struct {
         const fd = try socketTcpNonblocking(addr.any.family);
         errdefer closeFd(fd);
 
-        try self.addFd(fd, false, true);
-        errdefer _ = self.delFd(fd) catch {};
-
-        try self.pool.mapFd(fd, slot.index);
-        errdefer self.pool.unmapFd(fd);
-
         slot.upstream_fd = fd;
         slot.upstream_interest_in = false;
         slot.upstream_interest_out = true;
@@ -2995,6 +3261,9 @@ const EventLoop = struct {
             slot.upstream_connect_started_ms = 0;
             slot.upstream_connect_deadline_ms = 0;
         }
+
+        try self.addSlotFd(slot, fd, .upstream, false, true);
+        errdefer _ = self.delSlotFd(slot, .upstream) catch {};
 
         connectFd(fd, &addr.any, addr.getOsSockLen()) catch |err| switch (err) {
             error.WouldBlock, error.ConnectionPending => return,
@@ -3045,6 +3314,7 @@ const EventLoop = struct {
             }
             // Handshake complete (mask path) — release from handshake budget.
             self.releaseHandshakeBudget(slot);
+            slot.releaseHandshakeOnly(self.state.allocator);
             slot.phase = .mask_relaying;
             return;
         }
@@ -3069,8 +3339,7 @@ const EventLoop = struct {
     fn cleanupFailedUpstreamConnect(self: *EventLoop, slot: *ConnectionSlot) void {
         if (!isInvalidFd(slot.upstream_fd)) {
             const fd = slot.upstream_fd;
-            _ = self.delFd(fd) catch {};
-            self.pool.unmapFd(fd);
+            _ = self.delSlotFd(slot, .upstream) catch {};
             self.deferClose(fd);
             slot.upstream_fd = invalid_fd;
         }
@@ -3339,6 +3608,8 @@ const EventLoop = struct {
             slot.pipelined_data = null;
             slot.pipelined_len = 0;
         }
+
+        slot.releaseHandshakeOnly(self.state.allocator);
     }
 
     fn relayClientToUpstream(self: *EventLoop, slot: *ConnectionSlot) void {
@@ -3385,7 +3656,7 @@ const EventLoop = struct {
             return;
         };
 
-        const n = posix.read(slot.client_fd, read_buf) catch |err| {
+        const n = readSlotFd(slot, slot.client_fd, read_buf) catch |err| {
             if (err == error.WouldBlock) return;
             self.closeSlot(slot, "mask client read failed");
             return;
@@ -3409,7 +3680,7 @@ const EventLoop = struct {
             return;
         };
 
-        const n = posix.read(slot.upstream_fd, read_buf) catch |err| {
+        const n = readSlotFd(slot, slot.upstream_fd, read_buf) catch |err| {
             if (err == error.WouldBlock) return;
             self.closeSlot(slot, "mask upstream read failed");
             return;
@@ -3445,11 +3716,14 @@ const EventLoop = struct {
         var msg: [32]u8 = undefined;
         @memcpy(msg[0..4], &middleproxy.rpc_nonce_req);
         @memset(msg[4..8], 0);
-        if (slot.mp_secret_len < 4) {
+        self.state.middle_proxy_lock.lockShared();
+        const secret = self.state.middleProxySecretForVersionLocked(slot.mp_secret_version) orelse {
+            self.state.middle_proxy_lock.unlockShared();
             if (!self.fallbackFromMiddleProxyToDirect(slot)) self.closeSlot(slot, "missing middle-proxy secret snapshot");
             return;
-        }
-        @memcpy(msg[4..8], slot.mp_secret[0..4]);
+        };
+        @memcpy(msg[4..8], secret[0..4]);
+        self.state.middle_proxy_lock.unlockShared();
         @memcpy(msg[8..12], &middleproxy.rpc_crypto_aes);
         @memcpy(msg[12..16], &crypto_ts);
         @memcpy(msg[16..32], &slot.mp_nonce);
@@ -3513,9 +3787,11 @@ const EventLoop = struct {
                 defer std.crypto.secureZero(u8, std.mem.asBytes(&dec_keys));
                 var middle_local_addr: net.Address = undefined;
                 const mp_handshake_error: ?[]const u8 = handshake: {
-                    const key_sel = slot.mp_secret[0..4];
-                    const secret_slice = slot.mp_secret[0..slot.mp_secret_len];
-                    if (!std.mem.eql(u8, payload[4..8], key_sel)) {
+                    self.state.middle_proxy_lock.lockShared();
+                    defer self.state.middle_proxy_lock.unlockShared();
+                    const secret_slice = self.state.middleProxySecretForVersionLocked(slot.mp_secret_version) orelse
+                        break :handshake "mp secret version expired";
+                    if (!std.mem.eql(u8, payload[4..8], secret_slice[0..4])) {
                         break :handshake "mp key selector mismatch";
                     }
                     if (!std.mem.eql(u8, payload[8..12], &middleproxy.rpc_crypto_aes)) {
@@ -3618,8 +3894,8 @@ const EventLoop = struct {
                     return;
                 }
 
-                slot.mp_enc = crypto.AesCbc.init(&enc_keys[0], &enc_keys[1]);
-                slot.mp_dec = crypto.AesCbc.init(&dec_keys[0], &dec_keys[1]);
+                slot.mp_enc = crypto.AesCbcEncryptor.init(&enc_keys[0], &enc_keys[1]);
+                slot.mp_dec = crypto.AesCbcDecryptor.init(&dec_keys[0], &dec_keys[1]);
 
                 var hs_msg: [32]u8 = undefined;
                 @memcpy(hs_msg[0..4], &middleproxy.rpc_handshake);
@@ -3740,10 +4016,9 @@ const EventLoop = struct {
 
         _ = slot.obf_params orelse return false;
         slot.direct_fallback_used = true;
-        _ = self.state.stats_mp_fallback.fetchAdd(1, .monotonic);
+        self.state.stats_mp_fallback +|= 1;
         slot.use_middle_proxy = false;
-        std.crypto.secureZero(u8, &slot.mp_secret);
-        slot.mp_secret_len = 0;
+        slot.mp_secret_version = 0;
         slot.mp_nat_ip4 = null;
         self.setMiddleProxyStep(slot, .none);
         if (slot.mp_enc) |*enc| enc.wipe();
@@ -3840,7 +4115,7 @@ const EventLoop = struct {
             }
 
             if (slot.mp_frame_have < slot.mp_frame_need) {
-                const n = posix.read(slot.upstream_fd, frame_buf[slot.mp_frame_have..slot.mp_frame_need]) catch |err| {
+                const n = readSlotFd(slot, slot.upstream_fd, frame_buf[slot.mp_frame_have..slot.mp_frame_need]) catch |err| {
                     if (err == error.WouldBlock) return null;
                     log.debug("[{d}] mp read error: step={s} encrypted={} have={d} need={d} err={any}", .{
                         slot.conn_id,
@@ -3969,127 +4244,237 @@ const EventLoop = struct {
         }
     }
 
-    fn runTimers(self: *EventLoop) void {
-        const now_ms = compat.monotonicMilliTimestamp();
-        const now_ns = compat.monotonicNanoTimestamp();
-
-        const hi: usize = @intCast(self.pool.active_hi);
-        if (hi == 0) return;
-
-        var idx: usize = @intCast(self.timer_scan_cursor);
-        if (idx >= hi) idx = 0;
-
-        var scanned: usize = 0;
-        while (scanned < hi) : (scanned += 1) {
-            const slot_opt = self.pool.slots[idx];
-            idx += 1;
-            if (idx >= hi) idx = 0;
-
-            const slot = slot_opt orelse continue;
-            if (slot.phase == .idle) continue;
-
-            if (slot.phase == .desync_wait and now_ns >= slot.desync_deadline_ns) {
-                slot.phase = .writing_server_hello_rest;
-                if (slot.server_hello) |sh| {
-                    if (slot.server_hello_off < sh.len) {
-                        if (queueClient(slot, sh[slot.server_hello_off..])) |_| {} else |_| {
-                            self.closeSlot(slot, "desync rest write failed");
-                            continue;
-                        }
-                        slot.server_hello_off = sh.len;
-                    }
-                }
-            }
-
-            if (slot.phase == .closing) {
-                self.closeSlot(slot, "closing phase");
-                continue;
-            }
-
-            if (slot.phase == .connecting_upstream and
-                slot.upstream_connect_deadline_ms > 0 and
-                now_ms > slot.upstream_connect_deadline_ms)
-            {
-                const failed_kind = slot.upstream_kind;
-                const failed_addr = slot.current_upstream_addr;
-                self.cleanupFailedUpstreamConnect(slot);
-
-                if (failed_kind == .dc and self.tryNextDcEndpoint(slot, error.ConnectionTimedOut, failed_addr)) {
-                    continue;
-                }
-                if (failed_kind == .mask and self.tryNextMaskEndpoint(slot, error.ConnectionTimedOut, failed_addr)) {
-                    continue;
-                }
-
-                self.closeSlot(slot, "dc connect timeout");
-                continue;
-            }
-
-            if (slot.phase == .middle_proxy_handshake and
-                slot.mp_step_deadline_ms > 0 and
-                now_ms > slot.mp_step_deadline_ms)
-            {
-                self.state.requestMiddleProxyRefresh();
-                if (self.fallbackFromMiddleProxyToDirect(slot)) continue;
-                self.closeSlot(slot, "middle-proxy stage timeout");
-                continue;
-            }
-
-            if (slot.handshakeInProgress()) {
-                if (slot.first_byte_at_ms == 0) {
-                    if (now_ms - slot.created_at_ms > @min(self.idleTimeoutMs(slot), pre_first_byte_timeout_ms)) {
-                        self.closeSlot(slot, "idle pre-first-byte timeout");
-                        continue;
-                    }
-                } else if (now_ms - slot.first_byte_at_ms > secondsToMs(self.state.config.handshake_timeout_sec)) {
-                    _ = self.state.stats_hs_timeout.fetchAdd(1, .monotonic);
-                    if (slot.phase == .middle_proxy_handshake and slot.mp_step.awaitingMiddleProxy()) {
-                        self.state.requestMiddleProxyRefresh();
-                        if (self.fallbackFromMiddleProxyToDirect(slot)) continue;
-                    }
-                    self.closeSlot(slot, "handshake timeout");
-                    continue;
-                }
-            } else if (slot.phase == .relaying or slot.phase == .mask_relaying) {
-                if (slot.phase == .mask_relaying and self.state.config.mask_relay_max_secs > 0 and
-                    now_ms - slot.created_at_ms > secondsToMs(self.state.config.mask_relay_max_secs))
-                {
-                    self.closeSlot(slot, "mask relay max lifetime");
-                    continue;
-                }
-
-                // Break an iOS MtProtoKit bad_salt wedge: after a server reply,
-                // the client may stop sending until the DC closes the socket.
-                if (slot.phase == .relaying and self.state.config.client_silence_close_sec > 0 and
-                    slot.last_client_byte_ms > 0 and
-                    slot.last_server_byte_ms > slot.last_client_byte_ms and
-                    now_ms - slot.last_server_byte_ms > secondsToMs(self.state.config.client_silence_close_sec))
-                {
-                    log.info("[{d}] closing relay: server reply unanswered {d}s (iOS bad_salt wedge breaker)", .{ slot.conn_id, self.state.config.client_silence_close_sec });
-                    self.closeSlot(slot, "client silence wedge breaker");
-                    continue;
-                }
-                if (now_ms - slot.last_activity_ms > self.idleTimeoutMs(slot)) {
-                    self.closeSlot(slot, "relay idle timeout");
-                    continue;
-                }
-            }
-
-            self.syncInterests(slot) catch |err| {
-                log.debug("[{d}] syncInterests error in timer tick: {any}", .{ slot.conn_id, err });
-                self.closeSlot(slot, "sync interest error");
-            };
-        }
-
-        self.timer_scan_cursor = @intCast(idx);
+    fn earlierDeadline(current: ?i128, candidate: i128) i128 {
+        return if (current) |deadline| @min(deadline, candidate) else candidate;
     }
 
-    fn idleTimeoutMs(self: *const EventLoop, slot: *const ConnectionSlot) i64 {
-        return jitteredIdleTimeoutMs(
-            self.state.config.idle_timeout_sec,
-            self.state.config.idle_timeout_jitter_pct,
-            idleTimeoutSeed(slot),
-        );
+    fn deadlineMsToNs(deadline_ms: i64) i128 {
+        return @as(i128, deadline_ms) * std.time.ns_per_ms;
+    }
+
+    fn nextSlotDeadlineNs(self: *const EventLoop, slot: *const ConnectionSlot) ?i128 {
+        if (slot.phase == .idle) return null;
+        if (slot.phase == .closing) return 1;
+
+        var deadline: ?i128 = null;
+        if (slot.phase == .desync_wait) {
+            deadline = earlierDeadline(deadline, slot.desync_deadline_ns);
+        }
+        if (slot.phase == .connecting_upstream and slot.upstream_connect_deadline_ms > 0) {
+            deadline = earlierDeadline(deadline, deadlineMsToNs(slot.upstream_connect_deadline_ms));
+        }
+        if (slot.phase == .middle_proxy_handshake and slot.mp_step_deadline_ms > 0) {
+            deadline = earlierDeadline(deadline, deadlineMsToNs(slot.mp_step_deadline_ms));
+        }
+
+        if (slot.handshakeInProgress()) {
+            const handshake_deadline_ms = if (slot.first_byte_at_ms == 0)
+                slot.created_at_ms + @min(slot.idle_timeout_ms, pre_first_byte_timeout_ms)
+            else
+                slot.first_byte_at_ms + secondsToMs(self.state.config.handshake_timeout_sec);
+            deadline = earlierDeadline(deadline, deadlineMsToNs(handshake_deadline_ms));
+        } else if (slot.phase == .relaying or slot.phase == .mask_relaying) {
+            deadline = earlierDeadline(deadline, deadlineMsToNs(slot.last_activity_ms + slot.idle_timeout_ms));
+            if (slot.phase == .mask_relaying and self.state.config.mask_relay_max_secs > 0) {
+                deadline = earlierDeadline(
+                    deadline,
+                    deadlineMsToNs(slot.created_at_ms + secondsToMs(self.state.config.mask_relay_max_secs)),
+                );
+            }
+            if (slot.phase == .relaying and self.state.config.client_silence_close_sec > 0 and
+                slot.last_client_byte_ms > 0 and slot.last_server_byte_ms > slot.last_client_byte_ms)
+            {
+                deadline = earlierDeadline(
+                    deadline,
+                    deadlineMsToNs(slot.last_server_byte_ms + secondsToMs(self.state.config.client_silence_close_sec)),
+                );
+            }
+        }
+        return deadline;
+    }
+
+    fn deadlineLess(self: *const EventLoop, lhs: usize, rhs: usize) bool {
+        return self.deadline_heap.items[lhs].deadline_ns < self.deadline_heap.items[rhs].deadline_ns;
+    }
+
+    fn swapDeadlines(self: *EventLoop, lhs: usize, rhs: usize) void {
+        if (lhs == rhs) return;
+        std.mem.swap(DeadlineEntry, &self.deadline_heap.items[lhs], &self.deadline_heap.items[rhs]);
+        self.pool.slots[@as(usize, self.deadline_heap.items[lhs].slot_index)].?.timer_heap_index = @intCast(lhs);
+        self.pool.slots[@as(usize, self.deadline_heap.items[rhs].slot_index)].?.timer_heap_index = @intCast(rhs);
+    }
+
+    fn siftDeadlineUp(self: *EventLoop, start: usize) void {
+        var index = start;
+        while (index > 0) {
+            const parent = (index - 1) / 2;
+            if (!self.deadlineLess(index, parent)) break;
+            self.swapDeadlines(index, parent);
+            index = parent;
+        }
+    }
+
+    fn siftDeadlineDown(self: *EventLoop, start: usize) void {
+        var index = start;
+        while (true) {
+            const left = index * 2 + 1;
+            if (left >= self.deadline_heap.items.len) break;
+            const right = left + 1;
+            const child = if (right < self.deadline_heap.items.len and self.deadlineLess(right, left)) right else left;
+            if (!self.deadlineLess(child, index)) break;
+            self.swapDeadlines(index, child);
+            index = child;
+        }
+    }
+
+    fn removeDeadlineAt(self: *EventLoop, index: usize) void {
+        const removed = self.deadline_heap.items[index];
+        self.pool.slots[@as(usize, removed.slot_index)].?.timer_heap_index = no_timer_heap_index;
+        const last = self.deadline_heap.pop().?;
+        if (index == self.deadline_heap.items.len) return;
+
+        self.deadline_heap.items[index] = last;
+        self.pool.slots[@as(usize, last.slot_index)].?.timer_heap_index = @intCast(index);
+        if (index > 0 and self.deadlineLess(index, (index - 1) / 2)) {
+            self.siftDeadlineUp(index);
+        } else {
+            self.siftDeadlineDown(index);
+        }
+    }
+
+    fn removeSlotDeadline(self: *EventLoop, slot: *ConnectionSlot) void {
+        if (slot.timer_heap_index == no_timer_heap_index) return;
+        self.removeDeadlineAt(@as(usize, slot.timer_heap_index));
+    }
+
+    fn refreshSlotDeadline(self: *EventLoop, slot: *ConnectionSlot) void {
+        const next = self.nextSlotDeadlineNs(slot) orelse {
+            self.removeSlotDeadline(slot);
+            self.rearmTimer() catch |err| log.err("failed to rearm deadline timer: {any}", .{err});
+            return;
+        };
+
+        if (slot.timer_heap_index == no_timer_heap_index) {
+            std.debug.assert(self.deadline_heap.items.len < self.deadline_heap.capacity);
+            slot.timer_heap_index = @intCast(self.deadline_heap.items.len);
+            self.deadline_heap.appendAssumeCapacity(.{ .deadline_ns = next, .slot_index = slot.index });
+            self.siftDeadlineUp(@as(usize, slot.timer_heap_index));
+        } else {
+            const index = @as(usize, slot.timer_heap_index);
+            const previous = self.deadline_heap.items[index].deadline_ns;
+            self.deadline_heap.items[index].deadline_ns = next;
+            if (next < previous) self.siftDeadlineUp(index) else self.siftDeadlineDown(index);
+        }
+        self.rearmTimer() catch |err| log.err("failed to rearm deadline timer: {any}", .{err});
+    }
+
+    fn rearmTimer(self: *EventLoop) !void {
+        var next: ?i128 = self.stats_next_log_ns;
+        if (self.accept_paused and self.accept_resume_ns > 0) {
+            next = earlierDeadline(next, self.accept_resume_ns);
+        }
+        if (self.deadline_heap.items.len > 0) {
+            next = earlierDeadline(next, self.deadline_heap.items[0].deadline_ns);
+        }
+
+        const deadline = next orelse 0;
+        if (deadline == self.armed_deadline_ns) return;
+        try armTimerFd(self.timer_fd, next);
+        self.armed_deadline_ns = deadline;
+    }
+
+    fn runTimers(self: *EventLoop, now_ns: i128) void {
+        const now_ms: i64 = @intCast(@divTrunc(now_ns, std.time.ns_per_ms));
+        while (self.deadline_heap.items.len > 0 and self.deadline_heap.items[0].deadline_ns <= now_ns) {
+            const slot_index = self.deadline_heap.items[0].slot_index;
+            self.removeDeadlineAt(0);
+            const slot = self.pool.slots[@as(usize, slot_index)] orelse continue;
+            if (slot.phase == .idle) continue;
+            self.runSlotTimer(slot, now_ms, now_ns);
+            if (slot.phase != .idle) self.refreshSlotDeadline(slot);
+        }
+    }
+
+    fn runSlotTimer(self: *EventLoop, slot: *ConnectionSlot, now_ms: i64, now_ns: i128) void {
+        if (slot.phase == .desync_wait and now_ns >= slot.desync_deadline_ns) {
+            slot.phase = .writing_server_hello_rest;
+            if (slot.server_hello) |sh| {
+                if (slot.server_hello_off < sh.len) {
+                    if (queueClient(slot, sh[slot.server_hello_off..])) |_| {} else |_| {
+                        self.closeSlot(slot, "desync rest write failed");
+                        return;
+                    }
+                    slot.server_hello_off = sh.len;
+                }
+            }
+        }
+
+        if (slot.phase == .closing) {
+            self.closeSlot(slot, "closing phase");
+            return;
+        }
+
+        if (slot.phase == .connecting_upstream and slot.upstream_connect_deadline_ms > 0 and
+            now_ms >= slot.upstream_connect_deadline_ms)
+        {
+            const failed_kind = slot.upstream_kind;
+            const failed_addr = slot.current_upstream_addr;
+            self.cleanupFailedUpstreamConnect(slot);
+            if (failed_kind == .dc and self.tryNextDcEndpoint(slot, error.ConnectionTimedOut, failed_addr)) return;
+            if (failed_kind == .mask and self.tryNextMaskEndpoint(slot, error.ConnectionTimedOut, failed_addr)) return;
+            self.closeSlot(slot, "dc connect timeout");
+            return;
+        }
+
+        if (slot.phase == .middle_proxy_handshake and slot.mp_step_deadline_ms > 0 and
+            now_ms >= slot.mp_step_deadline_ms)
+        {
+            self.state.requestMiddleProxyRefresh();
+            if (self.fallbackFromMiddleProxyToDirect(slot)) return;
+            self.closeSlot(slot, "middle-proxy stage timeout");
+            return;
+        }
+
+        if (slot.handshakeInProgress()) {
+            if (slot.first_byte_at_ms == 0) {
+                if (now_ms - slot.created_at_ms >= @min(slot.idle_timeout_ms, pre_first_byte_timeout_ms)) {
+                    self.closeSlot(slot, "idle pre-first-byte timeout");
+                    return;
+                }
+            } else if (now_ms - slot.first_byte_at_ms >= secondsToMs(self.state.config.handshake_timeout_sec)) {
+                self.state.stats_hs_timeout +|= 1;
+                if (slot.phase == .middle_proxy_handshake and slot.mp_step.awaitingMiddleProxy()) {
+                    self.state.requestMiddleProxyRefresh();
+                    if (self.fallbackFromMiddleProxyToDirect(slot)) return;
+                }
+                self.closeSlot(slot, "handshake timeout");
+                return;
+            }
+        } else if (slot.phase == .relaying or slot.phase == .mask_relaying) {
+            if (slot.phase == .mask_relaying and self.state.config.mask_relay_max_secs > 0 and
+                now_ms - slot.created_at_ms >= secondsToMs(self.state.config.mask_relay_max_secs))
+            {
+                self.closeSlot(slot, "mask relay max lifetime");
+                return;
+            }
+            if (slot.phase == .relaying and self.state.config.client_silence_close_sec > 0 and
+                slot.last_client_byte_ms > 0 and slot.last_server_byte_ms > slot.last_client_byte_ms and
+                now_ms - slot.last_server_byte_ms >= secondsToMs(self.state.config.client_silence_close_sec))
+            {
+                log.info("[{d}] closing relay: server reply unanswered {d}s (iOS bad_salt wedge breaker)", .{ slot.conn_id, self.state.config.client_silence_close_sec });
+                self.closeSlot(slot, "client silence wedge breaker");
+                return;
+            }
+            if (now_ms - slot.last_activity_ms >= slot.idle_timeout_ms) {
+                self.closeSlot(slot, "relay idle timeout");
+                return;
+            }
+        }
+
+        self.syncInterests(slot) catch |err| {
+            log.debug("[{d}] syncInterests error at deadline: {any}", .{ slot.conn_id, err });
+            self.closeSlot(slot, "sync interest error");
+        };
     }
 
     fn syncInterests(self: *EventLoop, slot: *ConnectionSlot) !void {
@@ -4151,7 +4536,7 @@ const EventLoop = struct {
 
         if (!isInvalidFd(slot.client_fd) and !slot.client_detached) {
             if (slot.client_interest_in != want_client_in or slot.client_interest_out != want_client_out) {
-                try self.modFd(slot.client_fd, want_client_in, want_client_out);
+                try self.modSlotFd(slot, slot.client_fd, .client, want_client_in, want_client_out);
                 slot.client_interest_in = want_client_in;
                 slot.client_interest_out = want_client_out;
             }
@@ -4159,7 +4544,7 @@ const EventLoop = struct {
 
         if (!isInvalidFd(slot.upstream_fd) and !slot.upstream_detached) {
             if (slot.upstream_interest_in != want_upstream_in or slot.upstream_interest_out != want_upstream_out) {
-                try self.modFd(slot.upstream_fd, want_upstream_in, want_upstream_out);
+                try self.modSlotFd(slot, slot.upstream_fd, .upstream, want_upstream_in, want_upstream_out);
                 slot.upstream_interest_in = want_upstream_in;
                 slot.upstream_interest_out = want_upstream_out;
             }
@@ -4199,13 +4584,13 @@ const EventLoop = struct {
         const drain_to_client = hung_fd == slot.upstream_fd and slot.hasClientPending();
         if (!drain_to_upstream and !drain_to_client) return false;
 
-        _ = self.delFd(hung_fd) catch {};
-        self.pool.unmapFd(hung_fd);
         if (hung_fd == slot.client_fd) {
+            _ = self.delSlotFd(slot, .client) catch {};
             slot.client_detached = true;
             slot.client_interest_in = false;
             slot.client_interest_out = false;
         } else {
+            _ = self.delSlotFd(slot, .upstream) catch {};
             slot.upstream_detached = true;
             slot.upstream_interest_in = false;
             slot.upstream_interest_out = false;
@@ -4227,7 +4612,9 @@ const EventLoop = struct {
 
         var reached_eof = false;
         if (slot.phase == .relaying) {
-            while (slot.phase == .relaying) {
+            var operations: usize = 0;
+            var processed_bytes: usize = 0;
+            while (slot.phase == .relaying and operations < event_io_operation_budget and processed_bytes < event_io_byte_budget) {
                 const progress = if (from_client)
                     relayClientToUpstreamStep(self, slot)
                 else
@@ -4243,6 +4630,8 @@ const EventLoop = struct {
                 };
 
                 if (step == .none) break;
+                operations += 1;
+                processed_bytes += read_buf_size;
                 const now_ms = compat.monotonicMilliTimestamp();
                 slot.last_activity_ms = now_ms;
                 if (from_client) {
@@ -4256,8 +4645,10 @@ const EventLoop = struct {
                 self.closeSlot(slot, "mask rdhup read buffer alloc failed");
                 return;
             };
-            while (slot.phase == .mask_relaying) {
-                const n = posix.read(hung_fd, read_buf) catch |err| {
+            var operations: usize = 0;
+            var processed_bytes: usize = 0;
+            while (slot.phase == .mask_relaying and operations < event_io_operation_budget and processed_bytes < event_io_byte_budget) {
+                const n = readSlotFd(slot, hung_fd, read_buf) catch |err| {
                     if (err == error.WouldBlock) break;
                     self.closeSlot(slot, "mask rdhup drain failed");
                     return;
@@ -4266,6 +4657,8 @@ const EventLoop = struct {
                     reached_eof = true;
                     break;
                 }
+                operations += 1;
+                processed_bytes += n;
                 if (from_client) {
                     _ = queueUpstream(slot, read_buf[0..n]) catch {
                         self.closeSlot(slot, "mask rdhup queue upstream failed");
@@ -4303,17 +4696,16 @@ const EventLoop = struct {
             slot.c2s_bytes,
             slot.s2c_bytes,
         });
+        self.removeSlotDeadline(slot);
 
         if (!isInvalidFd(slot.client_fd)) {
-            _ = self.delFd(slot.client_fd) catch {};
-            self.pool.unmapFd(slot.client_fd);
+            _ = self.delSlotFd(slot, .client) catch {};
             self.deferClose(slot.client_fd);
             slot.client_fd = invalid_fd;
         }
 
         if (!isInvalidFd(slot.upstream_fd)) {
-            _ = self.delFd(slot.upstream_fd) catch {};
-            self.pool.unmapFd(slot.upstream_fd);
+            _ = self.delSlotFd(slot, .upstream) catch {};
             self.deferClose(slot.upstream_fd);
             slot.upstream_fd = invalid_fd;
         }
@@ -4323,7 +4715,7 @@ const EventLoop = struct {
         slot.resetOwnedBuffers(self.state.allocator);
 
         if (slot.active_reserved) {
-            _ = self.state.active_connections.fetchSub(1, .monotonic);
+            self.state.active_connections -= 1;
             slot.active_reserved = false;
             self.closed_since_log += 1;
         }
@@ -4333,14 +4725,15 @@ const EventLoop = struct {
         slot.upstream_detached = false;
         slot.phase = .idle;
         self.pool.release(slot);
+        self.rearmTimer() catch |err| log.err("failed to rearm deadline timer after close: {any}", .{err});
     }
 
-    fn addFd(self: *EventLoop, fd: posix.fd_t, want_in: bool, want_out: bool) !void {
+    fn addControlFd(self: *EventLoop, fd: posix.fd_t, token: u64, want_in: bool, want_out: bool) !void {
         var events: u32 = linux.EPOLL.ERR | linux.EPOLL.HUP | linux.EPOLL.RDHUP;
         if (want_in) events |= linux.EPOLL.IN;
         if (want_out) events |= linux.EPOLL.OUT;
 
-        var ev = linux.epoll_event{ .events = events, .data = .{ .fd = fd } };
+        var ev = linux.epoll_event{ .events = events, .data = .{ .u64 = token } };
         const rc = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_ADD, fd, &ev);
         switch (posix.errno(rc)) {
             .SUCCESS => return,
@@ -4348,17 +4741,55 @@ const EventLoop = struct {
         }
     }
 
-    fn modFd(self: *EventLoop, fd: posix.fd_t, want_in: bool, want_out: bool) !void {
+    fn addSlotFd(self: *EventLoop, slot: *ConnectionSlot, fd: posix.fd_t, role: SlotFdRole, want_in: bool, want_out: bool) !void {
+        slot.event_generation = nextSlotGeneration(slot.event_generation);
+        switch (role) {
+            .client => slot.client_event_generation = slot.event_generation,
+            .upstream => slot.upstream_event_generation = slot.event_generation,
+        }
+        try self.addControlFd(fd, encodeSlotEventToken(slot, role), want_in, want_out);
+        switch (role) {
+            .client => slot.client_registered = true,
+            .upstream => slot.upstream_registered = true,
+        }
+        self.tracked_fds += 1;
+    }
+
+    fn modControlFd(self: *EventLoop, fd: posix.fd_t, token: u64, want_in: bool, want_out: bool) !void {
         var events: u32 = linux.EPOLL.ERR | linux.EPOLL.HUP | linux.EPOLL.RDHUP;
         if (want_in) events |= linux.EPOLL.IN;
         if (want_out) events |= linux.EPOLL.OUT;
 
-        var ev = linux.epoll_event{ .events = events, .data = .{ .fd = fd } };
+        var ev = linux.epoll_event{ .events = events, .data = .{ .u64 = token } };
         const rc = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_MOD, fd, &ev);
         switch (posix.errno(rc)) {
             .SUCCESS => return,
             else => |err| return posix.unexpectedErrno(err),
         }
+    }
+
+    fn modSlotFd(self: *EventLoop, slot: *ConnectionSlot, fd: posix.fd_t, role: SlotFdRole, want_in: bool, want_out: bool) !void {
+        return self.modControlFd(fd, encodeSlotEventToken(slot, role), want_in, want_out);
+    }
+
+    fn delSlotFd(self: *EventLoop, slot: *ConnectionSlot, role: SlotFdRole) !void {
+        const registered = switch (role) {
+            .client => slot.client_registered,
+            .upstream => slot.upstream_registered,
+        };
+        if (!registered) return;
+
+        const fd = switch (role) {
+            .client => slot.client_fd,
+            .upstream => slot.upstream_fd,
+        };
+        try self.delFd(fd);
+        switch (role) {
+            .client => slot.client_registered = false,
+            .upstream => slot.upstream_registered = false,
+        }
+        std.debug.assert(self.tracked_fds > 0);
+        self.tracked_fds -= 1;
     }
 
     fn delFd(self: *EventLoop, fd: posix.fd_t) !void {
@@ -4418,7 +4849,7 @@ fn relayClientToUpstreamStep(self: *EventLoop, slot: *ConnectionSlot) !RelayProg
 
     while (true) {
         if (slot.relay_tls_hdr_pos < tls_header_len) {
-            const n = posix.read(slot.client_fd, slot.relay_tls_hdr[slot.relay_tls_hdr_pos..]) catch |err| {
+            const n = readSlotFd(slot, slot.client_fd, slot.relay_tls_hdr[slot.relay_tls_hdr_pos..]) catch |err| {
                 if (err == error.WouldBlock) return if (consumed_any) .partial else .none;
                 return err;
             };
@@ -4453,7 +4884,7 @@ fn relayClientToUpstreamStep(self: *EventLoop, slot: *ConnectionSlot) !RelayProg
         }
 
         const want = @min(@as(usize, remaining), read_buf.len);
-        const n = posix.read(slot.client_fd, read_buf[0..want]) catch |err| {
+        const n = readSlotFd(slot, slot.client_fd, read_buf[0..want]) catch |err| {
             if (err == error.WouldBlock) return if (consumed_any) .partial else .none;
             return err;
         };
@@ -4501,7 +4932,7 @@ fn relayClientToUpstreamStep(self: *EventLoop, slot: *ConnectionSlot) !RelayProg
 
 fn relayUpstreamToClientStep(self: *EventLoop, slot: *ConnectionSlot) !RelayProgress {
     const read_buf = try ensureReadBuf(slot, self.state.allocator);
-    const n = posix.read(slot.upstream_fd, read_buf) catch |err| {
+    const n = readSlotFd(slot, slot.upstream_fd, read_buf) catch |err| {
         if (err == error.WouldBlock) return .none;
         return err;
     };
@@ -5028,10 +5459,7 @@ fn buildDcConnectPlan(
 
     var middle_candidates: []const net.Address = &.{};
     if (snapshot) |snap| {
-        middle_candidates = snap.candidatesForDc(dc_abs, plan.is_media_path);
-        if (middle_candidates.len == 0 and plan.is_media_path) {
-            middle_candidates = snap.candidatesForDc(dc_abs, false);
-        }
+        middle_candidates = snap.selectedCandidates();
     }
     const middle_addr = if (middle_candidates.len > 0) middle_candidates[0] else null;
 
@@ -5129,13 +5557,89 @@ fn trySelectReachableMiddleProxy(
     timeout_ms: i32,
     stop: ?*const std.atomic.Value(bool),
 ) ?net.Address {
-    for (candidates) |addr| {
-        if (stop) |flag| {
-            if (flag.load(.acquire)) return null;
-        }
-        if (isAddressReachable(addr, timeout_ms, stop)) return addr;
+    const max_parallel_probes = 4;
+    var start: usize = 0;
+    while (start < candidates.len) : (start += max_parallel_probes) {
+        const end = @min(candidates.len, start + max_parallel_probes);
+        if (trySelectReachableMiddleProxyBatch(candidates[start..end], timeout_ms, stop)) |addr| return addr;
     }
     return null;
+}
+
+fn trySelectReachableMiddleProxyBatch(
+    candidates: []const net.Address,
+    timeout_ms: i32,
+    stop: ?*const std.atomic.Value(bool),
+) ?net.Address {
+    if (builtin.os.tag != .linux) return null;
+
+    var fds: [4]linux.pollfd = undefined;
+    var addrs: [4]net.Address = undefined;
+    var count: usize = 0;
+    defer for (fds[0..count]) |poll_fd| {
+        if (poll_fd.fd >= 0) _ = linux.close(poll_fd.fd);
+    };
+
+    for (candidates) |addr| {
+        if (stop) |flag| if (flag.load(.acquire)) return null;
+
+        const socket_rc = linux.socket(
+            @intCast(addr.any.family),
+            linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK,
+            linux.IPPROTO.TCP,
+        );
+        const fd: linux.fd_t = switch (posix.errno(socket_rc)) {
+            .SUCCESS => @intCast(socket_rc),
+            else => continue,
+        };
+
+        const connect_rc = linux.connect(fd, &addr.any, @intCast(addr.getOsSockLen()));
+        switch (posix.errno(connect_rc)) {
+            .SUCCESS => {
+                _ = linux.close(fd);
+                return addr;
+            },
+            .AGAIN, .INPROGRESS => {
+                fds[count] = .{ .fd = fd, .events = linux.POLL.OUT, .revents = 0 };
+                addrs[count] = addr;
+                count += 1;
+            },
+            else => _ = linux.close(fd),
+        }
+    }
+    if (count == 0) return null;
+
+    var remaining_ms = @max(timeout_ms, 0);
+    while (true) {
+        if (stop) |flag| if (flag.load(.acquire)) return null;
+        const chunk_ms = @min(remaining_ms, 100);
+        for (fds[0..count]) |*poll_fd| poll_fd.revents = 0;
+        const poll_rc = linux.poll(&fds, count, chunk_ms);
+        const ready = switch (posix.errno(poll_rc)) {
+            .SUCCESS => poll_rc,
+            .INTR => continue,
+            else => return null,
+        };
+
+        if (ready > 0) {
+            for (fds[0..count], addrs[0..count]) |*poll_fd, addr| {
+                if (poll_fd.fd < 0 or poll_fd.revents == 0) continue;
+                if (socketConnectSucceeded(poll_fd.fd)) return addr;
+                _ = linux.close(poll_fd.fd);
+                poll_fd.fd = -1;
+            }
+        }
+        if (remaining_ms <= chunk_ms) return null;
+        remaining_ms -= chunk_ms;
+    }
+}
+
+fn socketConnectSucceeded(fd: linux.fd_t) bool {
+    var err_code: i32 = 0;
+    var err_len: linux.socklen_t = @sizeOf(i32);
+    const err_bytes = std.mem.asBytes(&err_code);
+    const opt_rc = linux.getsockopt(fd, linux.SOL.SOCKET, linux.SO.ERROR, err_bytes.ptr, &err_len);
+    return posix.errno(opt_rc) == .SUCCESS and err_code == 0;
 }
 
 fn addressesEqual(a: []const net.Address, b: []const net.Address) bool {
@@ -5146,58 +5650,6 @@ fn addressesEqual(a: []const net.Address, b: []const net.Address) bool {
     return true;
 }
 
-fn isAddressReachable(address: net.Address, timeout_ms: i32, stop: ?*const std.atomic.Value(bool)) bool {
-    if (builtin.os.tag != .linux) return false;
-
-    const sock_flags = linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK;
-    const socket_rc = linux.socket(@intCast(address.any.family), sock_flags, linux.IPPROTO.TCP);
-    const fd: linux.fd_t = switch (posix.errno(socket_rc)) {
-        .SUCCESS => @intCast(socket_rc),
-        else => return false,
-    };
-    defer _ = linux.close(fd);
-
-    const connect_rc = linux.connect(fd, &address.any, @intCast(address.getOsSockLen()));
-    switch (posix.errno(connect_rc)) {
-        .SUCCESS => {},
-        .AGAIN, .INPROGRESS => {},
-        else => return false,
-    }
-
-    var fds = [_]linux.pollfd{.{ .fd = fd, .events = linux.POLL.OUT, .revents = 0 }};
-    var remaining_ms = @max(timeout_ms, 0);
-    while (true) {
-        if (stop) |flag| {
-            if (flag.load(.acquire)) return false;
-        }
-        const chunk_ms = @min(remaining_ms, 100);
-        fds[0].revents = 0;
-        const poll_rc = linux.poll(&fds, fds.len, chunk_ms);
-        const ready = switch (posix.errno(poll_rc)) {
-            .SUCCESS => poll_rc,
-            .INTR => continue,
-            else => return false,
-        };
-        if (ready > 0) break;
-        if (remaining_ms <= chunk_ms) return false;
-        remaining_ms -= chunk_ms;
-    }
-
-    const revents = fds[0].revents;
-    if ((revents & linux.POLL.OUT) == 0) return false;
-    if ((revents & (linux.POLL.ERR | linux.POLL.HUP | linux.POLL.NVAL)) != 0) return false;
-
-    var err_code: i32 = 0;
-    var err_len: linux.socklen_t = @sizeOf(i32);
-    const err_bytes = std.mem.asBytes(&err_code);
-    const opt_rc = linux.getsockopt(fd, linux.SOL.SOCKET, linux.SO.ERROR, err_bytes.ptr, &err_len);
-    switch (posix.errno(opt_rc)) {
-        .SUCCESS => {},
-        else => return false,
-    }
-    return err_code == 0;
-}
-
 fn parseMiddleProxyAddressForDc(config_text: []const u8, target_dc: i16) ?net.Address {
     var one: [1]net.Address = undefined;
     const sign: DcSignFilter = if (target_dc < 0) .negative_only else .positive_only;
@@ -5206,11 +5658,11 @@ fn parseMiddleProxyAddressForDc(config_text: []const u8, target_dc: i16) ?net.Ad
     return one[0];
 }
 
-fn queueOrWriteMsg(fd: posix.fd_t, queue: *MessageQueue, data: []const u8) !bool {
+fn queueOrWriteMsg(slot: *ConnectionSlot, fd: posix.fd_t, queue: *MessageQueue, data: []const u8) !bool {
     if (data.len == 0) return true;
 
     if (queue.isEmpty()) {
-        const n = writeFd(fd, data) catch |err| {
+        const n = writeSlotFd(slot, fd, data) catch |err| {
             if (err == error.WouldBlock) {
                 try queue.appendCopy(data);
                 return false;
@@ -5227,7 +5679,7 @@ fn queueOrWriteMsg(fd: posix.fd_t, queue: *MessageQueue, data: []const u8) !bool
     return false;
 }
 
-fn queueOrWriteMsgPair(fd: posix.fd_t, queue: *MessageQueue, first: []const u8, second: []const u8) !bool {
+fn queueOrWriteMsgPair(slot: *ConnectionSlot, fd: posix.fd_t, queue: *MessageQueue, first: []const u8, second: []const u8) !bool {
     if (first.len == 0 and second.len == 0) return true;
 
     if (queue.isEmpty()) {
@@ -5243,7 +5695,7 @@ fn queueOrWriteMsgPair(fd: posix.fd_t, queue: *MessageQueue, first: []const u8, 
         }
 
         const total_len = first.len + second.len;
-        const n = writevFd(fd, iovecs[0..n_iov]) catch |err| {
+        const n = writevSlotFd(slot, fd, iovecs[0..n_iov]) catch |err| {
             if (err == error.WouldBlock) {
                 try queue.ensureCanAppend(total_len);
                 try queue.appendCopy(first);
@@ -5276,17 +5728,20 @@ fn queueOrWriteMsgPair(fd: posix.fd_t, queue: *MessageQueue, first: []const u8, 
     return false;
 }
 
-fn flushQueue(fd: posix.fd_t, queue: *MessageQueue) !usize {
+fn flushQueue(slot: *ConnectionSlot, fd: posix.fd_t, queue: *MessageQueue) !usize {
     if (queue.isEmpty()) return 0;
 
     var iovecs: [max_scatter_parts]posix.iovec_const = undefined;
     var total_written: usize = 0;
+    var operations: usize = 0;
 
-    while (!queue.isEmpty()) {
-        const n_iov = queue.prepareIovecs(iovecs[0..]);
+    while (!queue.isEmpty() and operations < queue_flush_operation_budget and total_written < event_io_byte_budget) {
+        const local_remaining = event_io_byte_budget - total_written;
+        const max_bytes = if (slot.event_io_budget) |budget| budget.allowedBytes(local_remaining) else local_remaining;
+        const n_iov = queue.prepareIovecs(iovecs[0..], max_bytes);
         if (n_iov == 0) return total_written;
 
-        const n = writevFd(fd, iovecs[0..n_iov]) catch |err| {
+        const n = writevSlotFd(slot, fd, iovecs[0..n_iov]) catch |err| {
             if (err == error.WouldBlock) return total_written;
             return err;
         };
@@ -5294,6 +5749,7 @@ fn flushQueue(fd: posix.fd_t, queue: *MessageQueue) !usize {
         if (n == 0) return error.ConnectionReset;
         try queue.consume(n);
         total_written += n;
+        operations += 1;
 
         if (n < iovecs[0].len) return total_written;
     }
@@ -5302,23 +5758,23 @@ fn flushQueue(fd: posix.fd_t, queue: *MessageQueue) !usize {
 }
 
 fn queueClient(slot: *ConnectionSlot, data: []const u8) !bool {
-    return queueOrWriteMsg(slot.client_fd, &slot.client_queue, data);
+    return queueOrWriteMsg(slot, slot.client_fd, &slot.client_queue, data);
 }
 
 fn queueClientPair(slot: *ConnectionSlot, first: []const u8, second: []const u8) !bool {
-    return queueOrWriteMsgPair(slot.client_fd, &slot.client_queue, first, second);
+    return queueOrWriteMsgPair(slot, slot.client_fd, &slot.client_queue, first, second);
 }
 
 fn queueUpstream(slot: *ConnectionSlot, data: []const u8) !bool {
-    return queueOrWriteMsg(slot.upstream_fd, &slot.upstream_queue, data);
+    return queueOrWriteMsg(slot, slot.upstream_fd, &slot.upstream_queue, data);
 }
 
 fn flushClientPending(slot: *ConnectionSlot) !usize {
-    return flushQueue(slot.client_fd, &slot.client_queue);
+    return flushQueue(slot, slot.client_fd, &slot.client_queue);
 }
 
 fn flushUpstreamPending(slot: *ConnectionSlot) !usize {
-    return flushQueue(slot.upstream_fd, &slot.upstream_queue);
+    return flushQueue(slot, slot.upstream_fd, &slot.upstream_queue);
 }
 
 fn mpReadReset(slot: *ConnectionSlot, encrypted: bool) void {
@@ -5385,17 +5841,24 @@ test "middle proxy nonce response failures fall back to direct path" {
 
     const epoll_fd = try epollCreate();
     defer closeFd(epoll_fd);
+    const timer_fd = try createTimerFd();
+    defer closeFd(timer_fd);
+    var deadlines: std.ArrayList(DeadlineEntry) = .empty;
+    try deadlines.ensureTotalCapacity(std.testing.allocator, 4);
 
     var loop = EventLoop{
         .state = &state,
         .epoll_fd = epoll_fd,
+        .timer_fd = timer_fd,
         .listen_fd = invalid_fd,
         .pool = try ConnectionPool.init(std.testing.allocator, 4),
+        .message_block_pool = .{ .allocator = std.testing.allocator },
         .accept_paused = false,
         .accept_resume_ns = 0,
         .saturation_paused = false,
-        .timer_scan_cursor = 0,
-        .stats_next_log_ns = 0,
+        .deadline_heap = deadlines,
+        .armed_deadline_ns = 0,
+        .stats_next_log_ns = compat.monotonicNanoTimestamp() + stats_log_interval_ns,
         .accepted_since_log = 0,
         .closed_since_log = 0,
         .subnet_limiter = SubnetRateLimit.init(),
@@ -5409,14 +5872,19 @@ test "middle proxy nonce response failures fall back to direct path" {
         .mp_c2s_scratch = null,
         .mp_s2c_scratch = null,
         .pending_close_fds = .empty,
+        .tracked_fds = 0,
     };
     defer {
         loop.drainPendingCloses();
         loop.pending_close_fds.deinit(std.testing.allocator);
         loop.pool.deinit();
+        loop.message_block_pool.deinit();
+        loop.deadline_heap.deinit(std.testing.allocator);
     }
 
     const slot = loop.pool.acquire() orelse return error.TestExpectedEqual;
+    slot.client_queue.pool = &loop.message_block_pool;
+    slot.upstream_queue.pool = &loop.message_block_pool;
     defer {
         if (slot.phase != .idle) {
             if (!isInvalidFd(slot.upstream_fd)) {
@@ -5472,7 +5940,7 @@ test "middle proxy nonce response failures fall back to direct path" {
     try std.testing.expect(slot.upstream_candidates != null);
     try std.testing.expect(slot.current_upstream_addr.?.eql(fallback_addr));
     try std.testing.expect(slot.phase == .connecting_upstream or slot.phase == .writing_dc_nonce);
-    try std.testing.expectEqual(@as(u64, 1), state.stats_mp_fallback.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), state.stats_mp_fallback);
 }
 
 fn initProxyStateAndDeinit(allocator: std.mem.Allocator, cfg: Config) !void {
@@ -5562,44 +6030,42 @@ test "direct users bypass middle-proxy routing" {
     const mp_dc4 = net.Address.initIp4(.{ 11, 11, 11, 11 }, 443);
     const mp_dc203 = net.Address.initIp4(.{ 12, 12, 12, 12 }, 443);
     const mp_media_dc5_secondary = net.Address.initIp4(.{ 13, 13, 13, 13 }, 443);
-    var media_candidates = defaultMiddleProxyCandidateLists(constants.tg_media_middle_proxies_v4);
-    media_candidates[4][1] = mp_media_dc5_secondary;
-    const snapshot = ProxyState.MiddleProxySnapshot{
-        .candidates = defaultMiddleProxyCandidateLists(.{
-            constants.tg_middle_proxies_v4[0],
-            constants.tg_middle_proxies_v4[1],
-            constants.tg_middle_proxies_v4[2],
-            mp_dc4,
-            constants.tg_middle_proxies_v4[4],
-        }),
-        .candidate_lens = [_]usize{1} ** 5,
-        .media_candidates = media_candidates,
-        .media_candidate_lens = .{ 1, 1, 1, 1, 2 },
-        .candidates_203 = [_]net.Address{mp_dc203} ** 16,
-        .candidates_203_len = 1,
-        .secret = [_]u8{0} ** 256,
-        .secret_len = 16,
+    const regular_snapshot = ProxyState.MiddleProxySnapshot{
+        .candidates = [_]net.Address{mp_dc4} ** 16,
+        .candidate_len = 1,
+        .secret_version = 1,
+    };
+    const media_203_snapshot = ProxyState.MiddleProxySnapshot{
+        .candidates = [_]net.Address{mp_dc203} ** 16,
+        .candidate_len = 1,
+        .secret_version = 1,
+    };
+    const media_dc5_snapshot = ProxyState.MiddleProxySnapshot{
+        .candidates = [_]net.Address{ constants.tg_media_middle_proxies_v4[4], mp_media_dc5_secondary } ++
+            ([_]net.Address{constants.tg_media_middle_proxies_v4[4]} ** 14),
+        .candidate_len = 2,
+        .secret_version = 1,
     };
 
-    const regular_plan = buildDcConnectPlan(&cfg, 4, 4, &snapshot, false);
+    const regular_plan = buildDcConnectPlan(&cfg, 4, 4, &regular_snapshot, false);
     try std.testing.expect(regular_plan.use_middle_proxy);
     try std.testing.expect(regular_plan.direct_fallback != null);
     try std.testing.expect(regular_plan.candidates[0].eql(mp_dc4));
 
-    const admin_plan = buildDcConnectPlan(&cfg, 4, 4, &snapshot, true);
+    const admin_plan = buildDcConnectPlan(&cfg, 4, 4, &regular_snapshot, true);
     try std.testing.expect(!admin_plan.use_middle_proxy);
     try std.testing.expect(admin_plan.direct_fallback == null);
     try std.testing.expect(admin_plan.candidates[0].eql(constants.getDcAddressV4(4)));
 
-    const regular_media = buildDcConnectPlan(&cfg, 203, -203, &snapshot, false);
+    const regular_media = buildDcConnectPlan(&cfg, 203, -203, &media_203_snapshot, false);
     try std.testing.expect(regular_media.use_middle_proxy);
     try std.testing.expect(regular_media.candidates[0].eql(mp_dc203));
 
-    const regular_media_dc5 = buildDcConnectPlan(&cfg, 5, -5, &snapshot, false);
+    const regular_media_dc5 = buildDcConnectPlan(&cfg, 5, -5, &media_dc5_snapshot, false);
     try std.testing.expectEqual(@as(usize, 2), regular_media_dc5.count);
     try std.testing.expect(regular_media_dc5.candidates[1].eql(mp_media_dc5_secondary));
 
-    const admin_media = buildDcConnectPlan(&cfg, 203, -203, &snapshot, true);
+    const admin_media = buildDcConnectPlan(&cfg, 203, -203, &media_203_snapshot, true);
     try std.testing.expect(!admin_media.use_middle_proxy);
     try std.testing.expect(admin_media.candidates[0].eql(constants.getDcAddressV4(203)));
 }
@@ -5647,7 +6113,7 @@ test "message queue consume is stable" {
     try std.testing.expectEqual(@as(usize, 5), q.total_len);
 
     var iov: [8]posix.iovec_const = undefined;
-    const n = q.prepareIovecs(iov[0..]);
+    const n = q.prepareIovecs(iov[0..], std.math.maxInt(usize));
     try std.testing.expect(n >= 1);
     try std.testing.expectEqual(@as(u8, 'c'), iov[0].base[0]);
 
@@ -5691,11 +6157,13 @@ test "message queue rejects pending byte overflow" {
     q.total_len = 0;
 }
 
-test "message queue trims retained standard free blocks after traffic spike" {
-    var q = MessageQueue{ .allocator = std.testing.allocator };
+test "shared message block pool trims retained standard blocks after traffic spike" {
+    var pool = MessageBlockPool{ .allocator = std.testing.allocator };
+    defer pool.deinit();
+    var q = MessageQueue{ .allocator = std.testing.allocator, .pool = &pool };
     defer q.deinit();
 
-    const payload_len = (MessageQueue.max_free_standard_blocks + 8) * standard_block_size;
+    const payload_len = (MessageBlockPool.max_free_standard_blocks + 8) * standard_block_size;
     const payload = try std.testing.allocator.alloc(u8, payload_len);
     defer std.testing.allocator.free(payload);
     @memset(payload, 0xA5);
@@ -5704,7 +6172,7 @@ test "message queue trims retained standard free blocks after traffic spike" {
     try q.consume(payload.len);
 
     try std.testing.expect(q.isEmpty());
-    try std.testing.expect(q.std_free.items.len <= MessageQueue.max_free_standard_blocks);
+    try std.testing.expect(pool.std_free.items.len <= MessageBlockPool.max_free_standard_blocks);
 }
 
 test "epoll hangup helper" {
@@ -5716,6 +6184,26 @@ test "epoll hangup helper" {
     try std.testing.expect(hasGracefulEpollRdhup(linux.EPOLL.RDHUP | linux.EPOLL.IN));
     try std.testing.expect(!hasGracefulEpollRdhup(linux.EPOLL.RDHUP | linux.EPOLL.HUP));
     try std.testing.expect(!hasGracefulEpollRdhup(linux.EPOLL.RDHUP | linux.EPOLL.ERR));
+}
+
+test "epoll slot tokens preserve registration generation and fd role" {
+    var slot = ConnectionSlot{
+        .index = 123,
+        .client_event_generation = 77,
+        .upstream_event_generation = 91,
+    };
+
+    const client = decodeSlotEventToken(encodeSlotEventToken(&slot, .client)).?;
+    try std.testing.expectEqual(@as(u32, 123), client.index);
+    try std.testing.expectEqual(@as(u32, 77), client.generation);
+    try std.testing.expectEqual(SlotFdRole.client, client.role);
+
+    const upstream = decodeSlotEventToken(encodeSlotEventToken(&slot, .upstream)).?;
+    try std.testing.expectEqual(@as(u32, 91), upstream.generation);
+    try std.testing.expectEqual(SlotFdRole.upstream, upstream.role);
+    try std.testing.expectEqual(@as(u32, 1), nextSlotGeneration(max_slot_generation));
+    try std.testing.expect(decodeSlotEventToken(epoll_listener_token) == null);
+    try std.testing.expect(decodeSlotEventToken(epoll_timer_token) == null);
 }
 
 test "fatal hangup close policy distinguishes client/upstream while connecting" {
@@ -6087,12 +6575,15 @@ test "handshake budget is charged once after the first client byte" {
     var loop = EventLoop{
         .state = &state,
         .epoll_fd = invalid_fd,
+        .timer_fd = invalid_fd,
         .listen_fd = invalid_fd,
         .pool = try ConnectionPool.init(std.testing.allocator, 1),
+        .message_block_pool = .{ .allocator = std.testing.allocator },
         .accept_paused = false,
         .accept_resume_ns = 0,
         .saturation_paused = false,
-        .timer_scan_cursor = 0,
+        .deadline_heap = .empty,
+        .armed_deadline_ns = 0,
         .stats_next_log_ns = 0,
         .accepted_since_log = 0,
         .closed_since_log = 0,
@@ -6107,27 +6598,30 @@ test "handshake budget is charged once after the first client byte" {
         .mp_c2s_scratch = null,
         .mp_s2c_scratch = null,
         .pending_close_fds = .empty,
+        .tracked_fds = 0,
     };
     defer {
         loop.pending_close_fds.deinit(std.testing.allocator);
         loop.pool.deinit();
+        loop.message_block_pool.deinit();
+        loop.deadline_heap.deinit(std.testing.allocator);
     }
 
     const slot = loop.pool.acquire() orelse return error.TestExpectedEqual;
     defer loop.pool.release(slot);
 
-    try std.testing.expectEqual(@as(u32, 0), state.handshakes_inflight.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 0), state.handshakes_inflight);
     try std.testing.expect(loop.reserveHandshakeBudget(slot));
     try std.testing.expect(slot.hs_counted);
-    try std.testing.expectEqual(@as(u32, 1), state.handshakes_inflight.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 1), state.handshakes_inflight);
 
     try std.testing.expect(loop.reserveHandshakeBudget(slot));
-    try std.testing.expectEqual(@as(u32, 1), state.handshakes_inflight.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 1), state.handshakes_inflight);
 
     loop.releaseHandshakeBudget(slot);
     loop.releaseHandshakeBudget(slot);
     try std.testing.expect(!slot.hs_counted);
-    try std.testing.expectEqual(@as(u32, 0), state.handshakes_inflight.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 0), state.handshakes_inflight);
 }
 
 test "subnet handshake limit bounds and releases unauthenticated slots" {

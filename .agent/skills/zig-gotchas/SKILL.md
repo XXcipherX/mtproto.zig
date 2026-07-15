@@ -10,10 +10,10 @@ This file tracks practical pitfalls and current runtime constraints for `mtproto
 ## Current Architecture Baseline
 
 - Relay core is Linux `epoll` event loop, single-threaded on hot path.
-- The large `EventLoop` container and its fixed subnet tables are heap-allocated and initialized in place; returning it by value can overflow the Debug daemon stack. Connection pools allocate slot indexes/fd maps for the configured cap, while `ConnectionSlot` objects are heap-created on demand.
+- The large `EventLoop` container and its fixed subnet tables are heap-allocated and initialized in place; returning it by value can overflow the Debug daemon stack. Connection pools allocate slot indexes and a deadline-heap entry per active slot, while `ConnectionSlot` objects are heap-created on demand. Epoll payloads carry index/generation/role directly; do not reintroduce an fd hash map.
 - Non-blocking writes are queue-based (`MessageQueue`) and flushed with `writev`.
-- `MessageQueue` has classed storage blocks and a 4 MiB pending-byte cap; queue overflow is a close-worthy backpressure signal.
-- Runtime discovery runs in a joinable updater thread after the listener is ready when MiddleProxy or masking resolution is active; shutdown is cooperative and endpoint probes poll cancellation in short intervals.
+- `MessageQueue` has classed storage blocks from one event-loop-wide pool and a 4 MiB pending-byte cap; queue overflow is a close-worthy backpressure signal.
+- Runtime discovery runs in a joinable updater thread after the listener is ready when MiddleProxy or masking resolution is active; shutdown is cooperative and endpoint probes run in cancellable batches of at most four sockets.
 
 Do not reintroduce thread-per-connection or blocking relay loops.
 
@@ -35,7 +35,7 @@ Do not reintroduce thread-per-connection or blocking relay loops.
 
 - Sockets are non-blocking and epoll-driven.
 - `SO_SNDTIMEO` and TCP keepalive are configured for relay sockets.
-- Handshake/idle behavior is timer-driven (`idle_timeout_sec`, `handshake_timeout_sec`) in `runTimers`.
+- Handshake/idle behavior is driven by monotonic `timerfd` plus an indexed min-heap (`idle_timeout_sec`, `handshake_timeout_sec`); each active slot owns at most one heap entry.
 - Pre-first-byte admission has a separate fixed 10-second deadline, and unauthenticated sockets are capped concurrently per IPv4 `/24` or IPv6 `/48`.
 - IPv6 subnet keys preserve all 48 prefix bits; IPv4-mapped IPv6 intentionally shares the corresponding native IPv4 `/24` key.
 - `SIGPIPE` is ignored process-wide before socket relay starts; write paths must continue handling `EPIPE` as a normal connection failure.
@@ -45,10 +45,11 @@ Do not reintroduce thread-per-connection or blocking relay loops.
 
 ## Queueing and Partial Write Model
 
-- Outbound data is queued in block classes (tiny/small/standard).
-- Recycled/destroyed queue blocks are securely wiped. If appending an acquired block pointer fails, return that block to its free list (or destroy it) before propagating OOM.
+- Outbound data is queued in block classes (tiny/small/standard) served by the shared `MessageBlockPool`.
+- Recycled/destroyed queue blocks are securely wiped. If appending an acquired block pointer fails, return it to the shared pool (or destroy it) before propagating OOM.
 - Flush path uses scatter-gather `writev` with explicit queue consumption.
 - Backpressure is represented by pending queue state and epoll `OUT` interest toggles.
+- Keep per-dispatch byte/operation budgets on queue flushes and RDHUP drains so one fd cannot monopolize the single event-loop thread.
 - Legacy `writeAll` assumptions are outdated for this codebase.
 - Avoid owned-slice queue helpers that require later freeing; current queue paths copy into block storage and keep ownership local.
 
@@ -63,7 +64,9 @@ Do not reintroduce thread-per-connection or blocking relay loops.
 - The startup capacity clamp intentionally budgets the full effective MiddleProxy cap per direction, so it is more conservative than the idle memory footprint.
 - `force_media_middle_proxy` defaults to true, so media traffic keeps preferring ME unless explicitly disabled.
 - `middle_proxy_nat_ip` can override the IPv4 embedded into MiddleProxy NAT/AES derivation when AWG/public-IP detection is not the address you want.
-- A connection snapshots the MiddleProxy secret and NAT IPv4 together with its endpoint plan; secret rotation cannot split key-selector and KDF inputs mid-handshake.
+- A connection snapshots the MiddleProxy secret version and NAT IPv4 together with its endpoint plan. The current and immediately previous secrets remain centrally available under the metadata lock, so rotation cannot split key-selector and KDF inputs mid-handshake without copying the secret into every slot.
+- The snapshot contains only the selected route candidates, not every DC/media list. C2S scratch sizing is a constant-time upper bound; frame headers are parsed once by encapsulation.
+- CBC encrypt/decrypt state is direction-specific, and high-frequency random output uses the thread-local DRBG. New entropy-sensitive code must preserve periodic OS-CSPRNG reseeding.
 
 ## Protocol Validation Notes
 

@@ -58,17 +58,19 @@ Connection-capacity methodology and command profiles: `test/README.md`.
 
 ## Runtime Model
 
-- Client relay is handled by a single-threaded Linux `epoll` event loop.
-- External discovery never delays the listening socket: MiddleProxy metadata/NAT detection and hostname-based masking resolution run in a joinable background worker. Metadata and masking candidates refresh hourly, and stalled MiddleProxy handshakes can request an early refresh.
+- Client relay is handled by a single-threaded Linux `epoll` event loop. `epoll_event.data.u64` carries the slot index, generation, and fd role, so dispatch does not need an fd hash lookup and stale events cannot attach to a reused slot.
+- External discovery never delays the listening socket: MiddleProxy metadata/NAT detection and hostname-based masking resolution run in a joinable background worker. Metadata and masking candidates refresh hourly, reachability probes run in cancellable batches of at most four sockets, and stalled MiddleProxy handshakes can request an early refresh.
 - FakeTLS validation expects Telegram-style 32-byte ClientHello Session IDs and copies the Session ID into the synthetic ServerHello.
-- Handshake and relay lifetimes are controlled by monotonic event-loop timers (`handshake_timeout_sec`, `idle_timeout_sec`), not by `SO_RCVTIMEO`; a silent connection gets at most 10 seconds to send its first byte.
+- Handshake and relay lifetimes are controlled by monotonic `timerfd` deadlines in an indexed min-heap (`handshake_timeout_sec`, `idle_timeout_sec`), not by periodic slot scans or `SO_RCVTIMEO`; a silent connection gets at most 10 seconds to send its first byte.
 - Unauthenticated sockets share a per-/24 or per-/48 concurrent allowance (`clamp(max_connections / 8, 16, 128)`). The global handshake-inflight budget is charged after the first byte and released after authentication.
 - Graceful `EPOLLRDHUP` is drained to EOF before the source fd is detached, preserving data queued immediately before a peer half-closes.
 - Failed non-blocking upstream connects are reclaimed immediately on fatal hangup events; the relay loop should not spin on dead upstream sockets.
-- Timer maintenance runs on a fixed cadence and scans only the allocated connection-slot prefix; production builds also emit aggregated `conn stats` every 10 seconds.
+- The timerfd wakes only for the earliest connection/admission deadline or the 10-second aggregated `conn stats` report; timer maintenance does not scan the slot pool.
 - Client payload bytes pipelined after the 64-byte MTProto obfuscation nonce are buffered and forwarded once the upstream path is ready.
-- Outbound client/upstream writes use classed block queues, `writev`, and a 4 MiB pending-byte cap per queue.
-- MiddleProxy per-direction C2S/S2C buffers start at 16 KiB and grow on demand up to the effective `middleproxy_buffer_kb` cap; shared event-loop scratch buffers are also allocated lazily and reused.
+- Outbound client/upstream writes use classed block queues backed by one event-loop block pool, bounded `writev` dispatches, and a 4 MiB pending-byte cap per queue. Per-event byte/operation budgets prevent one ready fd from monopolizing the loop.
+- MiddleProxy per-direction C2S/S2C buffers start at 16 KiB and grow on demand up to the effective `middleproxy_buffer_kb` cap; shared event-loop scratch buffers are allocated lazily and reused. C2S headers are parsed once during encapsulation, and completed handshakes release route candidates, validation state, and ME handshake buffers immediately.
+- MiddleProxy route snapshots contain only candidates for the selected DC/path plus a versioned secret reference and NAT address. The current and immediately previous secrets are retained centrally, so concurrent rotations do not copy a 256-byte secret into every handshake or split selector/KDF inputs.
+- Runtime AES-CBC state keeps only the key schedule required by its direction, CTR and CBC decryption use four-block AES batches where chaining permits, XOR runs a full 128-bit block at a time, and high-frequency FakeTLS/ME randomness comes from a thread-local ChaCha20 DRBG periodically reseeded from the OS CSPRNG.
 
 ## &nbsp; Quick Start
 
@@ -770,7 +772,7 @@ alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eli
 | `[server]` | `backlog` | `4096` | TCP listen queue size (for high-traffic loads) |
 | `[server]` | `max_connections` | `512` | Concurrent connection cap (small-VPS tuned default, parser lower bound 32). On Linux, startup first auto-clamps this to the effective-memory estimate (host/cgroup) unless `unsafe_override_limits=true`; the proxy then clamps again if `RLIMIT_NOFILE` can support at least 32 slots, otherwise startup fails safely |
 | `[server]` | `idle_timeout_sec` | `120` | Established relay idle timeout in seconds (parser lower bound 5). Pre-first-byte admission uses a separate fixed 10-second deadline |
-| `[server]` | `idle_timeout_jitter_pct` | `15` | Per-connection random jitter applied to `idle_timeout_sec` (`±N%`, clamped to `0..100`). The effective timeout is floored to at least 5 seconds and at least half the base timeout. Set `0` to disable |
+| `[server]` | `idle_timeout_jitter_pct` | `15` | Per-connection random jitter applied once when the slot is admitted to `idle_timeout_sec` (`±N%`, clamped to `0..100`). The effective timeout is then reused for every deadline update, floored to at least 5 seconds and at least half the base timeout. Set `0` to disable |
 | `[server]` | `client_silence_close_sec` | `0` | Close an established relay when the server's last reply has gone unanswered by the client for N seconds. This bounds an iOS MtProtoKit bad_salt wedge where "Updating" can hang until the DC closes the socket. Fires only when the last relayed payload was server→client and the client has sent relay payload before. `0` disables it; if enabled, start around `10`-`15` and tune to taste |
 | `[server]` | `handshake_timeout_sec` | `15` | Timeout for completing handshake after first byte (parser lower bound 5) |
 | `[server]` | `dc_connect_timeout_sec` | `10` | Per-endpoint TCP connect deadline for Telegram DC and MiddleProxy candidates. With multiple candidates, each attempt is capped by an equal share of the remaining global handshake budget, so a black-holed IP cannot consume the next candidate's time. Set `0` to disable |
@@ -830,7 +832,7 @@ If your Telegram app is stuck on "Updating...", your provider or network is drop
 
 ### 0. Runtime expectations (important)
 
-This proxy uses a Linux `epoll` event loop (single-thread relay path). Timeouts use a monotonic clock and a 5 ms event-loop/timer cadence, and every active slot is checked on each timer pass. If you see stale guidance mentioning `poll()`/`SO_RCVTIMEO`/fixed max-lifetime, treat it as outdated.
+This proxy uses a Linux `epoll` event loop (single-thread relay path). Timeouts use a monotonic `timerfd` plus an indexed min-heap with one current deadline per active slot; there is no fixed polling cadence or full-slot timeout scan. If you see stale guidance mentioning `poll()`/`SO_RCVTIMEO`/fixed max-lifetime, treat it as outdated.
 
 ### 1. Check runtime health and fd pressure first
 

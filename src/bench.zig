@@ -219,8 +219,8 @@ fn initContext(allocator: std.mem.Allocator, proto_tag: constants.ProtoTag) !mid
 
     return middleproxy.MiddleProxyContext.init(
         allocator,
-        crypto.AesCbc.init(&key, &iv),
-        crypto.AesCbc.init(&key, &iv),
+        crypto.AesCbcEncryptor.init(&key, &iv),
+        crypto.AesCbcDecryptor.init(&key, &iv),
         [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 },
         -2,
         net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
