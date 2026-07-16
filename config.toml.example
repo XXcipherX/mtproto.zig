@@ -51,21 +51,23 @@ port = 443
 # and at least half the base timeout. Set 0 to disable.
 # idle_timeout_jitter_pct = 15
 
-# Conservative iOS wedge fallback for proven generic DC relays. Eligibility
+# Conservative iOS wedge recovery for generic DC relays. Normal eligibility
 # requires at least 30 seconds in the relay phase and a delivered server reply
 # followed by further client traffic, so startup exchanges on fresh reconnects
-# cannot arm a close loop. A later server reply must follow client payload within
-# 12 seconds, and the timer starts after the userspace client queue drains.
-# Media relays are excluded.
+# cannot arm a normal fallback. If an unproven relay remains unanswered for the
+# same interval and a replacement from the same source/access-user/DC becomes
+# ready, the oldest stale relay is closed once behind a 120-second recovery gate.
+# A server reply must follow client payload within 12 seconds, and the timer starts
+# after the userspace client queue drains. Media relays are excluded.
 # 0 = disabled (default). If enabled, 15 is the recommended fallback.
 # client_silence_close_sec = 0
 
 # Optional fast path for an established generic relay that resumes after a quiet
 # period. Any client payload cancels the candidate. The reconnect is not fast-
 # eligible until it has itself been idle, which prevents reconnect loops.
-# Recommended iOS tuning: 2-second close after at least 30 seconds idle.
+# Recommended iOS tuning: 2-second close after at least 60 seconds idle.
 # client_silence_fast_close_sec = 0
-# client_silence_fast_after_idle_sec = 30
+# client_silence_fast_after_idle_sec = 60
 
 # Seconds to complete TLS+MTProto handshake after first byte arrives.
 # Default is 15; parser enforces a minimum of 5.
