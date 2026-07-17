@@ -81,10 +81,10 @@ Current runtime timeout control is event-loop based:
 - Pre-first-byte wait: fixed 10 seconds.
 - `idle_timeout_sec`: established relay idle timeout.
 - `handshake_timeout_sec`: timeout for handshake stages after first byte.
-- `client_silence_close_sec`: conservative unanswered-reply recovery on generic DC relays. The normal fallback requires at least 30 seconds in relay plus a delivered reply followed by further client traffic; an unproven stale relay can also be closed when a replacement from the same source IP, access user, and DC becomes ready.
+- `client_silence_close_sec`: conservative unanswered-reply fallback on generic DC relays, enabled only after at least 30 seconds in relay and a delivered reply followed by further client traffic on the same connection.
 - `client_silence_fast_close_sec`: optional fast unanswered-reply close after an established generic relay resumes from `client_silence_fast_after_idle_sec` of silence.
 
-Each slot stores one current absolute deadline in the indexed heap. Idle jitter is computed once at admission and reused when activity moves that deadline. iOS wedge candidates use the same heap, exclude media relays, require a server response within the 12-second client response window, and start only after the userspace client queue drains. The conservative fallback cannot become eligible during the first 30 seconds of relay; after that maturity floor, the client must still continue after an earlier delivered reply. A separate cross-slot recovery can close only the oldest unanswered, still-unproven relay after a matching replacement becomes ready. It is keyed by full source IP, access user, and DC and permits at most one close every 120 seconds, so fresh-relay recovery cannot form a reconnect loop.
+Each slot stores one current absolute deadline in the indexed heap. Idle jitter is computed once at admission and reused when activity moves that deadline. iOS wedge candidates use the same heap, exclude media relays, require a server response within the 12-second client response window, and start only after the userspace client queue drains. The conservative fallback cannot become eligible during the first 30 seconds of relay; after that maturity floor, the client must still continue after an earlier delivered reply. This keeps normal startup exchanges from arming breaker-driven reconnect loops.
 
 There is no active `SO_RCVTIMEO`-driven relay timeout model in current code.
 

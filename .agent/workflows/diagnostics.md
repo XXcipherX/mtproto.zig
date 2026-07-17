@@ -52,7 +52,6 @@ Note:
 - Fatal hangups during `connecting_upstream` are now cleaned through the connect-completion path; repeated CPU spin on dead upstream sockets should no longer be expected.
 - `drops: ... hs_budget+=...` means the global handshake-inflight budget or the per-subnet unauthenticated concurrency allowance rejected a new handshake.
 - `drops: ... mp_fallback+=...` means MiddleProxy degraded and the proxy recovered by reconnecting directly to the same DC.
-- `ios_wedge: ... fresh_recovery+=... fresh_suppressed+=...` counts stale fresh relays closed after a matching replacement became ready and extra recovery closes blocked by the 120-second per-client/DC gate.
 - `drops: ... rate+=...` means the per-subnet token bucket rejected new connections; IPv4-mapped IPv6 addresses are grouped with their native IPv4 `/24`.
 
 ## IPv6 Hopping and DNS

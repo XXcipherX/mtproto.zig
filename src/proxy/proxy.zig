@@ -52,10 +52,6 @@ const client_response_window_ms: i64 = 12 * std.time.ms_per_s;
 // startup. Do not treat that churn as proof for the conservative fallback:
 // field captures showed it can otherwise close every reconnect in a loop.
 const wedge_fallback_maturity_ms: i64 = 30 * std.time.ms_per_s;
-// A replacement relay is strong evidence that an older unanswered fresh relay
-// is wedged, but the recovery itself must be bounded so it cannot turn normal
-// client reconnect churn into another close loop.
-const fresh_wedge_recovery_cooldown_ms: i64 = 120 * std.time.ms_per_s;
 const tls_control_record_budget: usize = 8;
 const tls_control_byte_budget: usize = 64 * 1024;
 const no_timer_heap_index = std.math.maxInt(u32);
@@ -444,41 +440,6 @@ const SubnetRateLimit = struct {
     }
 };
 
-fn wedgeClientIdentityKey(addr: net.Address, user: []const u8) u64 {
-    var hash: u64 = 0xcbf2_9ce4_8422_2325;
-    const mix = struct {
-        fn byte(value: *u64, input: u8) void {
-            value.* = (value.* ^ input) *% 0x0000_0100_0000_01b3;
-        }
-
-        fn bytes(value: *u64, input: []const u8) void {
-            for (input) |b| byte(value, b);
-        }
-    };
-
-    if (addr.any.family == posix.AF.INET) {
-        mix.byte(&hash, 4);
-        mix.bytes(&hash, std.mem.asBytes(&addr.in.sa.addr));
-    } else if (addr.any.family == posix.AF.INET6) {
-        const ip6 = &addr.in6.sa.addr;
-        const is_ipv4_mapped = std.mem.eql(u8, ip6[0..10], &[_]u8{0} ** 10) and
-            ip6[10] == 0xff and ip6[11] == 0xff;
-        if (is_ipv4_mapped) {
-            mix.byte(&hash, 4);
-            mix.bytes(&hash, ip6[12..16]);
-        } else {
-            mix.byte(&hash, 6);
-            mix.bytes(&hash, ip6);
-        }
-    } else {
-        return 0;
-    }
-
-    mix.byte(&hash, @intCast(@min(user.len, std.math.maxInt(u8))));
-    mix.bytes(&hash, user);
-    return if (hash == 0) 1 else hash;
-}
-
 const MsgBlockClass = enum(u2) {
     tiny = 0,
     small = 1,
@@ -818,64 +779,6 @@ const WedgeCloseKind = enum {
     fallback,
 };
 
-const FreshWedgeRecoveryGate = struct {
-    const bucket_count = 128;
-    const max_probes = 8;
-
-    const Entry = struct {
-        client_key: u64 = 0,
-        blocked_until_ms: i64 = 0,
-        dc_idx: i16 = 0,
-        used: bool = false,
-    };
-
-    entries: [bucket_count]Entry = [_]Entry{.{}} ** bucket_count,
-
-    fn indexFor(client_key: u64, dc_idx: i16) usize {
-        var x = client_key ^ (@as(u64, @intCast(dc_idx)) *% 0x9E37_79B9_7F4A_7C15);
-        x ^= x >> 30;
-        x *%= 0xBF58_476D_1CE4_E5B9;
-        x ^= x >> 27;
-        x *%= 0x94D0_49BB_1331_11EB;
-        x ^= x >> 31;
-        return @as(usize, @intCast(x & (bucket_count - 1)));
-    }
-
-    /// Allows at most one fresh-relay recovery for a client/DC group during
-    /// the cooldown. A saturated live probe window fails closed by suppressing
-    /// recovery rather than risking an unbounded reconnect loop.
-    fn tryAcquire(self: *FreshWedgeRecoveryGate, client_key: u64, dc_idx: i16, now_ms: i64) bool {
-        if (client_key == 0 or dc_idx <= 0) return false;
-
-        const start = indexFor(client_key, dc_idx);
-        var reusable_idx: ?usize = null;
-        var probe: usize = 0;
-        while (probe < max_probes) : (probe += 1) {
-            const idx = (start + probe) & (bucket_count - 1);
-            const entry = &self.entries[idx];
-
-            if (entry.used and entry.client_key == client_key and entry.dc_idx == dc_idx) {
-                if (now_ms < entry.blocked_until_ms) return false;
-                entry.blocked_until_ms = now_ms + fresh_wedge_recovery_cooldown_ms;
-                return true;
-            }
-
-            if ((!entry.used or now_ms >= entry.blocked_until_ms) and reusable_idx == null) {
-                reusable_idx = idx;
-            }
-        }
-
-        const idx = reusable_idx orelse return false;
-        self.entries[idx] = .{
-            .client_key = client_key,
-            .blocked_until_ms = now_ms + fresh_wedge_recovery_cooldown_ms,
-            .dc_idx = dc_idx,
-            .used = true,
-        };
-        return true;
-    }
-};
-
 const WedgeTracker = struct {
     phase: WedgePhase = .inactive,
     request_ms: i64 = 0,
@@ -1183,16 +1086,6 @@ test "wedge tracker ignores a server push outside the response window" {
     try std.testing.expectEqual(WedgePhase.inactive, tracker.phase);
 }
 
-test "fresh wedge recovery gate bounds reconnect closes" {
-    var gate = FreshWedgeRecoveryGate{};
-
-    try std.testing.expect(gate.tryAcquire(0x1234, 2, 1_000));
-    try std.testing.expect(!gate.tryAcquire(0x1234, 2, 1_000 + fresh_wedge_recovery_cooldown_ms - 1));
-    try std.testing.expect(gate.tryAcquire(0x1234, 2, 1_000 + fresh_wedge_recovery_cooldown_ms));
-    try std.testing.expect(gate.tryAcquire(0x1234, 1, 1_001));
-    try std.testing.expect(gate.tryAcquire(0x5678, 2, 1_001));
-}
-
 const DcConnectPlan = struct {
     candidates: [16]net.Address = undefined,
     count: usize = 0,
@@ -1439,10 +1332,6 @@ const ConnectionSlot = struct {
     /// recently than the client, the server reply is unanswered.
     last_client_byte_ms: i64 = 0,
     last_server_byte_ms: i64 = 0,
-    /// Stable, non-secret source/access-user identity used only to correlate
-    /// replacement generic relays. The client source port is intentionally
-    /// excluded because it changes on every reconnect.
-    wedge_client_key: u64 = 0,
     wedge: WedgeTracker = .{},
     desync_deadline_ns: i128 = 0,
 
@@ -1708,59 +1597,6 @@ const ConnectionSlot = struct {
         self.mp_nat_ip4 = null;
     }
 };
-
-fn isFreshWedgeRecoveryCandidate(
-    existing: *const ConnectionSlot,
-    replacement: *const ConnectionSlot,
-    now_ms: i64,
-    fallback_sec: u32,
-) bool {
-    if (existing == replacement or fallback_sec == 0) return false;
-    if (replacement.phase != .relaying or replacement.is_media_path or replacement.wedge_client_key == 0) return false;
-    if (existing.phase != .relaying or existing.is_media_path or existing.relay_half_closed) return false;
-    if (existing.wedge_client_key != replacement.wedge_client_key or existing.dc_idx != replacement.dc_idx) return false;
-    if (existing.relay_started_at_ms <= 0 or existing.relay_started_at_ms >= replacement.relay_started_at_ms) return false;
-    if (existing.hasClientPending()) return false;
-
-    const wedge = &existing.wedge;
-    if (wedge.phase != .waiting_for_client or wedge.reply_delivered_ms <= 0) return false;
-    if (wedge.fallback_eligible) return false;
-    if (now_ms < wedge.reply_delivered_ms) return false;
-    return now_ms - wedge.reply_delivered_ms >= secondsToMs(fallback_sec);
-}
-
-test "fresh wedge recovery requires a replacement for an unanswered unproven relay" {
-    var existing = ConnectionSlot{
-        .phase = .relaying,
-        .relay_started_at_ms = 1_000,
-        .last_client_byte_ms = 1_500,
-        .last_server_byte_ms = 2_000,
-        .wedge_client_key = 0x1234,
-        .dc_idx = 2,
-        .wedge = .{
-            .phase = .waiting_for_client,
-            .reply_delivered_ms = 2_000,
-        },
-    };
-    var replacement = ConnectionSlot{
-        .phase = .relaying,
-        .relay_started_at_ms = 18_000,
-        .wedge_client_key = 0x1234,
-        .dc_idx = 2,
-    };
-
-    try std.testing.expect(!isFreshWedgeRecoveryCandidate(&existing, &replacement, 16_999, 15));
-    try std.testing.expect(isFreshWedgeRecoveryCandidate(&existing, &replacement, 18_000, 15));
-
-    existing.wedge.fallback_eligible = true;
-    try std.testing.expect(!isFreshWedgeRecoveryCandidate(&existing, &replacement, 18_000, 15));
-    existing.wedge.fallback_eligible = false;
-    replacement.is_media_path = true;
-    try std.testing.expect(!isFreshWedgeRecoveryCandidate(&existing, &replacement, 18_000, 15));
-    replacement.is_media_path = false;
-    replacement.wedge_client_key = 0x5678;
-    try std.testing.expect(!isFreshWedgeRecoveryCandidate(&existing, &replacement, 18_000, 15));
-}
 
 const DeadlineEntry = struct {
     deadline_ns: i128,
@@ -2660,9 +2496,6 @@ const EventLoop = struct {
     wedge_cancelled_since_log: u64 = 0,
     wedge_fast_closes_since_log: u64 = 0,
     wedge_fallback_closes_since_log: u64 = 0,
-    wedge_fresh_recovery_closes_since_log: u64 = 0,
-    wedge_fresh_recovery_suppressed_since_log: u64 = 0,
-    fresh_wedge_recovery_gate: FreshWedgeRecoveryGate = .{},
     subnet_limiter: SubnetRateLimit,
     subnet_handshakes: SubnetHandshakeLimit,
     // Snapshot of degradation counters for delta logging
@@ -2707,9 +2540,6 @@ const EventLoop = struct {
         loop.wedge_cancelled_since_log = 0;
         loop.wedge_fast_closes_since_log = 0;
         loop.wedge_fallback_closes_since_log = 0;
-        loop.wedge_fresh_recovery_closes_since_log = 0;
-        loop.wedge_fresh_recovery_suppressed_since_log = 0;
-        loop.fresh_wedge_recovery_gate = .{};
         loop.subnet_limiter.hash_seed = crypto.randomInt(u64);
         for (&loop.subnet_limiter.entries) |*entry| entry.* = .{};
         loop.subnet_handshakes.hash_seed = crypto.randomInt(u64);
@@ -3037,16 +2867,13 @@ const EventLoop = struct {
         }
 
         if (self.wedge_candidates_since_log + self.wedge_cancelled_since_log +
-            self.wedge_fast_closes_since_log + self.wedge_fallback_closes_since_log +
-            self.wedge_fresh_recovery_closes_since_log + self.wedge_fresh_recovery_suppressed_since_log > 0)
+            self.wedge_fast_closes_since_log + self.wedge_fallback_closes_since_log > 0)
         {
-            log.info("  ios_wedge: candidates+={d} cancelled+={d} fast_close+={d} fallback_close+={d} fresh_recovery+={d} fresh_suppressed+={d}", .{
+            log.info("  ios_wedge: candidates+={d} cancelled+={d} fast_close+={d} fallback_close+={d}", .{
                 self.wedge_candidates_since_log,
                 self.wedge_cancelled_since_log,
                 self.wedge_fast_closes_since_log,
                 self.wedge_fallback_closes_since_log,
-                self.wedge_fresh_recovery_closes_since_log,
-                self.wedge_fresh_recovery_suppressed_since_log,
             });
         }
 
@@ -3056,8 +2883,6 @@ const EventLoop = struct {
         self.wedge_cancelled_since_log = 0;
         self.wedge_fast_closes_since_log = 0;
         self.wedge_fallback_closes_since_log = 0;
-        self.wedge_fresh_recovery_closes_since_log = 0;
-        self.wedge_fresh_recovery_suppressed_since_log = 0;
 
         while (self.stats_next_log_ns <= now_ns) {
             self.stats_next_log_ns += stats_log_interval_ns;
@@ -3631,10 +3456,6 @@ const EventLoop = struct {
         slot.dc_abs = @intCast(dc_abs);
         slot.use_middle_proxy = plan.use_middle_proxy;
         slot.is_media_path = plan.is_media_path;
-        slot.wedge_client_key = if (plan.is_media_path)
-            0
-        else
-            wedgeClientIdentityKey(slot.peer_addr, slot.validation_user[0..slot.validation_user_len]);
         slot.use_fast_mode = self.state.config.fast_mode and !slot.use_middle_proxy and (dc_abs >= 1 and dc_abs <= constants.tg_datacenters_v4.len);
         slot.direct_fallback_addr = plan.direct_fallback;
         slot.direct_fallback_used = false;
@@ -4111,53 +3932,12 @@ const EventLoop = struct {
         }
     }
 
-    fn recoverFreshWedgeOnReplacement(self: *EventLoop, replacement: *ConnectionSlot, now_ms: i64) void {
-        if (replacement.is_media_path or replacement.wedge_client_key == 0 or
-            self.state.config.client_silence_close_sec == 0)
-        {
-            return;
-        }
-
-        var oldest: ?*ConnectionSlot = null;
-        for (self.pool.slots) |slot_opt| {
-            const existing = slot_opt orelse continue;
-            if (!isFreshWedgeRecoveryCandidate(
-                existing,
-                replacement,
-                now_ms,
-                self.state.config.client_silence_close_sec,
-            )) continue;
-
-            if (oldest == null or existing.wedge.reply_delivered_ms < oldest.?.wedge.reply_delivered_ms) {
-                oldest = existing;
-            }
-        }
-
-        const stale = oldest orelse return;
-        if (!self.fresh_wedge_recovery_gate.tryAcquire(replacement.wedge_client_key, replacement.dc_idx, now_ms)) {
-            self.wedge_fresh_recovery_suppressed_since_log +|= 1;
-            return;
-        }
-
-        self.wedge_fresh_recovery_closes_since_log +|= 1;
-        log.info("[{d}] closing stale fresh relay after replacement [{d}] became ready (iOS wedge recovery, dc_idx={d}, silent={d}ms, relay_age={d}ms, cooldown={d}s)", .{
-            stale.conn_id,
-            replacement.conn_id,
-            stale.dc_idx,
-            @max(now_ms - stale.wedge.reply_delivered_ms, 0),
-            @max(now_ms - stale.relay_started_at_ms, 0),
-            @divExact(fresh_wedge_recovery_cooldown_ms, std.time.ms_per_s),
-        });
-        self.closeSlot(stale, "fresh relay replacement wedge recovery");
-    }
-
     fn startRelay(self: *EventLoop, slot: *ConnectionSlot) void {
         // Handshake complete — release from handshake budget.
         self.releaseHandshakeBudget(slot);
         self.releaseSubnetHandshake(slot);
         slot.relay_started_at_ms = compat.monotonicMilliTimestamp();
         slot.phase = .relaying;
-        self.recoverFreshWedgeOnReplacement(slot, slot.relay_started_at_ms);
 
         if (slot.pipelined_data) |buf| {
             const data = buf[0..slot.pipelined_len];
