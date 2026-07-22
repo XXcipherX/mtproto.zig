@@ -18,7 +18,7 @@
 #   PORT=443
 #   SYNFIX_RATE=30/minute
 #   SYNFIX_BURST=1
-#   SYNFIX_ACTION=drop|reject
+#   SYNFIX_ACTION=drop|reject|icmp-host-unreachable
 
 set -euo pipefail
 
@@ -88,6 +88,10 @@ while [[ $# -gt 0 ]]; do
             SYNFIX_ACTION="drop"
             shift
             ;;
+        --icmp-host-unreachable|--icmp)
+            SYNFIX_ACTION="icmp-host-unreachable"
+            shift
+            ;;
         *)
             fail "Unknown argument: $1"
             ;;
@@ -96,8 +100,9 @@ done
 
 case "${SYNFIX_ACTION,,}" in
     reject|rst|reset|tcp-reset) SYNFIX_ACTION="reject" ;;
+    icmp|host-unreachable|icmp-host-unreachable) SYNFIX_ACTION="icmp-host-unreachable" ;;
     drop) SYNFIX_ACTION="drop" ;;
-    *) fail "Invalid SYNFIX_ACTION: ${SYNFIX_ACTION} (expected reject or drop)" ;;
+    *) fail "Invalid SYNFIX_ACTION: ${SYNFIX_ACTION} (expected drop, reject, or icmp-host-unreachable)" ;;
 esac
 
 remove_rules() {
@@ -156,15 +161,23 @@ iptables -A "$CHAIN" \
     --hashlimit-htable-size "$SYNFIX_HTABLE_SIZE" \
     -j ACCEPT
 
-if [[ "$SYNFIX_ACTION" == "reject" ]]; then
-    iptables -A "$CHAIN" \
-        -p tcp --dport "$PORT" --syn \
-        -j REJECT --reject-with tcp-reset
-else
-    iptables -A "$CHAIN" \
-        -p tcp --dport "$PORT" --syn \
-        -j DROP
-fi
+case "$SYNFIX_ACTION" in
+    reject)
+        iptables -A "$CHAIN" \
+            -p tcp --dport "$PORT" --syn \
+            -j REJECT --reject-with tcp-reset
+        ;;
+    icmp-host-unreachable)
+        iptables -A "$CHAIN" \
+            -p tcp --dport "$PORT" --syn \
+            -j REJECT --reject-with icmp-host-unreachable
+        ;;
+    drop)
+        iptables -A "$CHAIN" \
+            -p tcp --dport "$PORT" --syn \
+            -j DROP
+        ;;
+esac
 
 iptables -A "$CHAIN" -j RETURN
 

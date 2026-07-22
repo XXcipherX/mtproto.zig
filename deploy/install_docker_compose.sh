@@ -19,7 +19,7 @@
 #   ENABLE_SYNFIX=true|false
 #   SYNFIX_RATE=30/minute
 #   SYNFIX_BURST=1
-#   SYNFIX_ACTION=drop|reject
+#   SYNFIX_ACTION=drop|reject|icmp-host-unreachable
 #   MASK_PORT=8443
 #   CADDY_IMAGE=caddy:2.10-alpine
 #   GHCR_USER=<user> GHCR_TOKEN=<token>   # for private GHCR packages

@@ -300,7 +300,7 @@ Useful environment variables:
 | `ENABLE_SYNFIX` | `false` | Install inbound SYN pacing rules for Android/Desktop routes that need it |
 | `SYNFIX_RATE` | `30/minute` | Per-source SYN rate for non-iOS-like fingerprints |
 | `SYNFIX_BURST` | `1` | Per-source SYN burst for non-iOS-like fingerprints |
-| `SYNFIX_ACTION` | `drop` | Over-limit SYN action: `drop` is quiet, `reject` sends TCP reset |
+| `SYNFIX_ACTION` | `drop` | Over-limit SYN action: `drop` is quiet, `reject` sends TCP reset, `icmp-host-unreachable` fails the attempt immediately without an RST |
 | `MASK_PORT` | `8443` | Local Caddy HTTPS masking backend port |
 | `CADDY_IMAGE` | `caddy:2.10-alpine` | Caddy image used by the Docker Compose installer |
 | `GHCR_USER` / `GHCR_TOKEN` | _(empty)_ | Optional login for private GHCR packages |
@@ -347,7 +347,7 @@ curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/in
   | sudo env ENABLE_SYNFIX=true bash
 ```
 
-The SYN pacing default is `SYNFIX_RATE=30/minute SYNFIX_BURST=1 SYNFIX_ACTION=drop`. This keeps excess Android/Desktop retry bursts quiet instead of feeding immediate tcp-reset retries. Use `SYNFIX_ACTION=reject` only when you intentionally want fast reset feedback. Installers persist SYNFIX and optional TCPMSS iptables state with `netfilter-persistent` so it is restored after reboot.
+The SYN pacing default is `SYNFIX_RATE=30/minute SYNFIX_BURST=1 SYNFIX_ACTION=drop`. This keeps excess Android/Desktop retry bursts quiet instead of feeding immediate tcp-reset retries. Use `SYNFIX_ACTION=reject` only when you intentionally want fast reset feedback. `SYNFIX_ACTION=icmp-host-unreachable` immediately rejects excess attempts without encouraging the same TCP-reset retry loop; it can be paired with a cautiously higher rate such as `54/minute` when filtered Android/Desktop routes need faster primary and media connections. Installers persist SYNFIX and optional TCPMSS iptables state with `netfilter-persistent` so it is restored after reboot.
 
 Legacy `TCPMSS=88` ClientHello fragmentation is disabled by default for PQ-capable Caddy masking setups. Re-enable it only as an explicit fallback with `ENABLE_TCPMSS=true`.
 

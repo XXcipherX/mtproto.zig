@@ -10,7 +10,7 @@
 #   ENABLE_SYNFIX=true   # install inbound SYN pacing rules for filtered routes
 #   SYNFIX_RATE=30/minute
 #   SYNFIX_BURST=1
-#   SYNFIX_ACTION=drop   # drop (default) or reject (tcp-reset) for over-limit SYNs
+#   SYNFIX_ACTION=drop   # drop (default), reject (tcp-reset), or icmp-host-unreachable
 #
 # The script is idempotent:
 #   - On first run: installs Zig, builds proxy, generates config, sets up systemd + DPI bypass.
