@@ -722,7 +722,7 @@ port = 443
 public_ip = "proxy.example.com"             # Same domain as tls_domain for self-domain masking links
 # middle_proxy_nat_ip = "203.0.113.10"      # Optional IPv4 override for MiddleProxy NAT/AES derivation
 backlog = 4096                             # TCP listen queue size
-middleproxy_buffer_kb = 2048               # ME C2S/S2C buffers grow on demand up to this cap; runtime caps effective value at 16384 KiB
+middleproxy_buffer_kb = 2048               # ME C2S/S2C buffers grow on demand up to this cap; runtime caps effective value at 3840 KiB
 max_connections = 512                      # Safe default for small (1 vCPU / ~1 GB) VPS
 idle_timeout_sec = 120
 # idle_timeout_jitter_pct = 15             # Per-connection idle timeout jitter in percent; 0 disables
@@ -782,7 +782,7 @@ alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eli
 | `[server]` | `client_silence_fast_after_idle_sec` | `30` | Minimum quiet relay period before the fast iOS wedge path is eligible (parser lower bound 5). Has no effect while `client_silence_fast_close_sec=0` |
 | `[server]` | `handshake_timeout_sec` | `15` | Timeout for completing handshake after first byte (parser lower bound 5) |
 | `[server]` | `dc_connect_timeout_sec` | `10` | Per-endpoint TCP connect ceiling for Telegram DC and MiddleProxy candidates. Every attempt is also capped by its share of the remaining global handshake budget, including the final MiddleProxy candidate and reserved direct fallback. `0` disables only the configured ceiling; global budget sharing remains active |
-| `[server]` | `middleproxy_buffer_kb` | `2048` | MiddleProxy per-direction buffer cap in KiB. Active ME connections start with 16 KiB C2S/S2C buffers and grow on demand up to `min(middleproxy_buffer_kb, 16384)` KiB; each event loop also keeps lazy shared scratch buffers. Default 2048 leaves headroom for 1 MiB media parts; values below 1024 may still cause `MiddleProxyBufferOverflow` on media-heavy traffic (Stories, video messages). Parser lower bound is 64 KiB |
+| `[server]` | `middleproxy_buffer_kb` | `2048` | MiddleProxy per-direction buffer cap in KiB. Active ME connections start with 16 KiB C2S/S2C buffers and grow on demand up to `min(middleproxy_buffer_kb, 3840)` KiB; each event loop also keeps lazy shared scratch buffers. The effective cap leaves 256 KiB for MP/TLS framing inside the 4 MiB relay-queue limit. Default 2048 leaves headroom for 1 MiB media parts; values below 1024 may still cause `MiddleProxyBufferOverflow` on media-heavy traffic (Stories, video messages). Parser lower bound is 64 KiB |
 | `[server]` | `tag` | _(none)_ | Optional 32 hex-char promotion tag from [@MTProxybot](https://t.me/MTProxybot) |
 | `[server]` | `log_level` | `"info"` | Runtime log verbosity: `debug` (all DC routing, relay, close details), `info` (default — connection stats, warnings), `warn`, `err`. Change without recompilation; takes effect on restart |
 | `[server]` | `rate_limit_per_subnet` | `30` | Max new connections per second per /24 (IPv4) or /48 (IPv6) subnet. Blocks scanner/DPI-probe flood. Set `0` to disable |
@@ -816,7 +816,7 @@ alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eli
 
 > **Operational note** &nbsp; On startup, `max_connections` is automatically clamped to an effective-memory estimate derived from host RAM and the lowest readable limit in the process's cgroup hierarchy. The estimate charges both per-connection relay queues and their shared retained-page pool at the runtime page size, in addition to any MiddleProxy buffers. Set `unsafe_override_limits = true` to disable this. Admission control also pauses `accept()` at 90% capacity, resumes at 80%, and limits concurrent unauthenticated sockets per source subnet.
 
-> **Operational note** &nbsp; The RAM-safety estimate intentionally budgets MiddleProxy at full configured per-direction cap even though active C2S/S2C buffers grow lazily from 16 KiB. Configured `middleproxy_buffer_kb` values above 16384 are accepted but the effective runtime cap is 16 MiB per direction and startup logs a warning.
+> **Operational note** &nbsp; The RAM-safety estimate intentionally budgets MiddleProxy at full configured per-direction cap even though active C2S/S2C buffers grow lazily from 16 KiB. Configured `middleproxy_buffer_kb` values above 3840 are accepted but the effective runtime cap is 3840 KiB per direction, leaving 256 KiB of framing headroom inside the 4 MiB relay queue; startup logs a warning when the configured value is capped.
 
 > **Operational note** &nbsp; The proxy limits new connections to 30/sec per /24 subnet by default (`rate_limit_per_subnet`). Native IPv6 keys retain all 48 prefix bits, while IPv4-mapped IPv6 shares the native IPv4 `/24` key. This blocks ТСПУ scanners and DPI replay probes without affecting legitimate Telegram clients.
 

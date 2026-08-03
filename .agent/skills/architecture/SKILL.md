@@ -64,7 +64,7 @@ Important behavior:
 - `[access.direct_users]` / `[access.admins]` bypass MiddleProxy entirely, including media paths.
 - `datacenter_override` is test-only and disables MiddleProxy snapshot/updater routing.
 - `server.middle_proxy_nat_ip` can pin the IPv4 used for MiddleProxy NAT/AES derivation when AWG/public-IP detection would choose the wrong address.
-- `middleproxy_buffer_kb` is a per-direction cap. Each MiddleProxy context starts with 16 KiB C2S/S2C buffers and grows on demand up to `min(middleproxy_buffer_kb, 16384)` KiB; event-loop scratch buffers are lazy and reused.
+- `middleproxy_buffer_kb` is a per-direction cap. Each MiddleProxy context starts with 16 KiB C2S/S2C buffers and grows on demand up to `min(middleproxy_buffer_kb, 3840)` KiB; event-loop scratch buffers are lazy and reused. The effective cap reserves 256 KiB for MP/TLS framing before the 4 MiB relay-queue limit.
 - MiddleProxy handshake/read failures and upstream fatal hangups can fall back to direct when the connect plan has a direct fallback address.
 - Tunnel deployment supports `direct`, `preserve`, and `middleproxy` modes.
 
@@ -96,9 +96,9 @@ Startup computes a safety estimate from the effective process memory limit:
 tls_working_bytes = ~6 KiB
 queue_per_conn_bytes = 2 * (ceil(4 MiB / block_payload) + 1) * runtime_page_size
 queue_shared_bytes   = 1024 * runtime_page_size
-effective_mp_cap = min(middleproxy_buffer_kb * 1024, 16 MiB)
+effective_mp_cap = min(middleproxy_buffer_kb * 1024, 3840 KiB)
 middleproxy_per_conn_bytes = effective_mp_cap * 2 (if ME enabled)
-middleproxy_shared_bytes   = (effective_mp_cap + 256) + effective_mp_cap (if ME enabled)
+middleproxy_shared_bytes   = (effective_mp_cap + 256 KiB) + effective_mp_cap (if ME enabled)
 overhead_bytes    = ~2 KiB
 per_conn_bytes    = tls_working_bytes + queue_per_conn_bytes + middleproxy_per_conn_bytes + overhead_bytes
 
@@ -136,7 +136,7 @@ If `max_connections` exceeds the memory-safe estimate, startup auto-clamps it be
 - FakeTLS validation keeps the 32-byte Session ID contract with `src/protocol/tls.zig` templates.
 - Pipelined appdata after the 64-byte MTProto nonce is preserved across direct and MiddleProxy startup.
 - Direct/MiddleProxy fallback logic still preserves media and non-media expectations.
-- MiddleProxy buffer changes preserve 16 KiB initial allocation, on-demand growth, and the 16 MiB effective cap.
+- MiddleProxy buffer changes preserve 16 KiB initial allocation, on-demand growth, and the 3840 KiB effective cap derived from the 4 MiB relay queue minus framing headroom.
 - Timeout behavior remains controlled by config timers.
 - CI remains green across `zig fmt --check`, Debug tests, ReleaseSafe tests, daemon smoke with positive and bad-secret paths, ReleaseFast builds, cross-builds, ShellCheck, Python syntax checks, Docker build smoke, bench, and soak.
 - Deploy docs remain aligned with current tunnel/direct-mode behavior.

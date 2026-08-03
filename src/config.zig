@@ -102,8 +102,17 @@ pub const Config = struct {
     /// Test-only hook to redirect upstream connections locally
     datacenter_override: ?net.Address = null,
 
-    pub const middle_proxy_c2s_scratch_headroom: usize = 256;
-    pub const middle_proxy_stream_buffer_cap_bytes: usize = 1 << 24;
+    /// Both relay directions ultimately feed a MessageQueue with this cap.
+    /// Keep the value here so MiddleProxy framing and proxy backpressure share
+    /// one source of truth without introducing an import cycle.
+    pub const relay_queue_max_pending_bytes: usize = 4 * 1024 * 1024;
+    /// Reserve space for MiddleProxy wrapping, TLS record headers, and secure
+    /// transport padding before a complete payload reaches the relay queue.
+    pub const middle_proxy_relay_queue_headroom_bytes: usize = 256 * 1024;
+    pub const middle_proxy_c2s_scratch_headroom: usize =
+        middle_proxy_relay_queue_headroom_bytes;
+    pub const middle_proxy_stream_buffer_cap_bytes: usize =
+        relay_queue_max_pending_bytes - middle_proxy_relay_queue_headroom_bytes;
 
     pub fn middleProxyConfiguredBufferBytes(self: *const Config) usize {
         return @as(usize, self.middleproxy_buffer_kb) * 1024;
@@ -770,6 +779,15 @@ test "parse config - middleproxy buffer runtime cap" {
 
     try std.testing.expectEqual(@as(u32, 32768), cfg.middleproxy_buffer_kb);
     try std.testing.expectEqual(Config.middle_proxy_stream_buffer_cap_bytes, cfg.middleProxyBufferBytes());
+    try std.testing.expectEqual(
+        @as(usize, 3840 * 1024),
+        Config.middle_proxy_stream_buffer_cap_bytes,
+    );
+    try std.testing.expectEqual(
+        Config.relay_queue_max_pending_bytes,
+        Config.middle_proxy_stream_buffer_cap_bytes +
+            Config.middle_proxy_relay_queue_headroom_bytes,
+    );
 }
 
 test "parse config - log_level debug" {

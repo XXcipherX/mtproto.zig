@@ -610,7 +610,7 @@ pub const MiddleProxyContext = struct {
                 continue;
             }
 
-            if (frame_len < 12 or frame_len > (1 << 24)) {
+            if (frame_len < 12 or frame_len > self.buffer_limit) {
                 // AES-CBC decryption is stateful across records, so dropping the current
                 // window without rewinding the chaining IV cannot produce a safe resync.
                 // Fail closed instead of continuing with corrupted stream state.
@@ -1411,6 +1411,41 @@ test "decapsulate s2c rejects invalid frame length instead of resyncing" {
 
     var out_buf: [64]u8 = undefined;
     try std.testing.expectError(error.BadMiddleProxyFrameLen, ctx.decapsulateS2C(wire[0..], out_buf[0..]));
+}
+
+test "decapsulate s2c rejects a frame above the configured stream cap" {
+    const allocator = std.testing.allocator;
+
+    const key = [_]u8{0} ** 32;
+    const iv = [_]u8{0} ** 16;
+    const buffer_limit: usize = 64 * 1024;
+
+    var ctx = try MiddleProxyContext.initWithBuffer(
+        allocator,
+        crypto.AesCbc.init(&key, &iv),
+        crypto.AesCbc.init(&key, &iv),
+        [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 },
+        -2,
+        net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
+        net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
+        .intermediate,
+        null,
+        buffer_limit,
+    );
+    defer ctx.deinit();
+
+    var plain = [_]u8{0} ** 16;
+    std.mem.writeInt(u32, plain[0..4], @intCast(buffer_limit + 16), .little);
+
+    var enc = crypto.AesCbc.init(&key, &iv);
+    var wire = plain;
+    try enc.encryptInPlace(wire[0..]);
+
+    var out_buf: [64]u8 = undefined;
+    try std.testing.expectError(
+        error.BadMiddleProxyFrameLen,
+        ctx.decapsulateS2C(wire[0..], out_buf[0..]),
+    );
 }
 
 test "encapsulate c2s supports payloads larger than 64KiB" {

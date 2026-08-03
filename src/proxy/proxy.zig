@@ -531,7 +531,7 @@ const MessageBlockPool = struct {
 };
 
 const MessageQueue = struct {
-    const max_pending_bytes: usize = 4 * 1024 * 1024;
+    const max_pending_bytes: usize = Config.relay_queue_max_pending_bytes;
 
     allocator: std.mem.Allocator,
     pool: ?*MessageBlockPool = null,

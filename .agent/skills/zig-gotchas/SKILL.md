@@ -61,9 +61,9 @@ Do not reintroduce thread-per-connection or blocking relay loops.
 - MiddleProxy handshake stages have a 5-second deadline; protocol/read stalls cool the endpoint, request refresh, and use direct fallback when available.
 - Direct fallback can happen for both regular and media traffic when MiddleProxy candidates are missing or ME transport fails.
 - MiddleProxy connect and stage deadlines must reserve part of the still-live global handshake budget for direct fallback. Never start fallback after that global deadline has already expired.
-- `middleproxy_buffer_kb` is a per-direction cap, not an eager allocation. Each MiddleProxy context starts with 16 KiB C2S/S2C buffers and grows on demand up to `min(middleproxy_buffer_kb, 16384)` KiB.
+- `middleproxy_buffer_kb` is a per-direction cap, not an eager allocation. Each MiddleProxy context starts with 16 KiB C2S/S2C buffers and grows on demand up to `min(middleproxy_buffer_kb, 3840)` KiB. That cap is the 4 MiB relay-queue limit minus 256 KiB reserved for MP/TLS framing; do not raise it independently.
 - Abridged `RPC_PROXY_ANS` data must be 4-byte aligned before its word-count header is encoded; reject an unaligned upstream payload instead of truncating the byte length.
-- The event loop keeps lazy reusable C2S/S2C scratch buffers. C2S scratch is `effective_cap + 256`; S2C scratch is `effective_cap`.
+- The event loop keeps lazy reusable C2S/S2C scratch buffers. C2S scratch is `effective_cap + 256 KiB`; S2C scratch is `effective_cap`.
 - The startup capacity clamp charges two full relay queues plus one conservative prefix block per direction at the runtime `page_allocator` page size, as well as the capped shared queue pool and full effective MiddleProxy cap per direction. It is intentionally more conservative than the idle memory footprint.
 - `force_media_middle_proxy` defaults to true, so media traffic keeps preferring ME unless explicitly disabled.
 - `middle_proxy_nat_ip` can override the IPv4 embedded into MiddleProxy NAT/AES derivation when AWG/public-IP detection is not the address you want.
