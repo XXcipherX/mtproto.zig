@@ -59,6 +59,7 @@ Do not reintroduce thread-per-connection or blocking relay loops.
 - Candidate rotation and direct fallback behavior are part of normal operation.
 - MiddleProxy handshake stages have a 5-second deadline; protocol/read stalls cool the endpoint, request refresh, and use direct fallback when available.
 - Direct fallback can happen for both regular and media traffic when MiddleProxy candidates are missing or ME transport fails.
+- MiddleProxy connect and stage deadlines must reserve part of the still-live global handshake budget for direct fallback. Never start fallback after that global deadline has already expired.
 - `middleproxy_buffer_kb` is a per-direction cap, not an eager allocation. Each MiddleProxy context starts with 16 KiB C2S/S2C buffers and grows on demand up to `min(middleproxy_buffer_kb, 16384)` KiB.
 - The event loop keeps lazy reusable C2S/S2C scratch buffers. C2S scratch is `effective_cap + 256`; S2C scratch is `effective_cap`.
 - The startup capacity clamp intentionally budgets the full effective MiddleProxy cap per direction, so it is more conservative than the idle memory footprint.

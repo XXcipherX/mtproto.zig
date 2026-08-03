@@ -74,7 +74,8 @@ port = 443
 # Per-endpoint deadline for the TCP connect to a Telegram DC candidate.
 # This is separate from the global handshake timeout: if one candidate is
 # black-holed, the proxy can abandon it and try the next candidate in time.
-# 0 disables this per-endpoint guard.
+# 0 disables this configured ceiling; the remaining global handshake budget
+# is still shared across candidates and reserved direct fallback.
 # dc_connect_timeout_sec = 10
 
 # MiddleProxy per-direction stream buffer cap in KiB.

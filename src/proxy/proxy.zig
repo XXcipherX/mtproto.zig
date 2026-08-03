@@ -3555,12 +3555,14 @@ const EventLoop = struct {
 
     fn upstreamConnectDeadlineMs(self: *EventLoop, slot: *const ConnectionSlot, started_at_ms: i64) i64 {
         const configured_timeout_ms = secondsToMs(self.state.config.dc_connect_timeout_sec);
-        if (configured_timeout_ms <= 0) return 0;
 
-        const candidate_count = if (slot.upstream_candidates) |candidates| blk: {
+        var candidate_count = if (slot.upstream_candidates) |candidates| blk: {
             const next_index = @min(@as(usize, @intCast(slot.upstream_candidate_next)), candidates.len);
             break :blk candidates.len - next_index + 1;
         } else 1;
+        if (slot.use_middle_proxy and !slot.direct_fallback_used and slot.direct_fallback_addr != null) {
+            candidate_count += 1;
+        }
         const attempt_timeout_ms = budgetedConnectTimeoutMs(
             configured_timeout_ms,
             slot.first_byte_at_ms,
@@ -3568,6 +3570,7 @@ const EventLoop = struct {
             started_at_ms,
             candidate_count,
         );
+        if (attempt_timeout_ms <= 0) return 0;
         return started_at_ms + attempt_timeout_ms;
     }
 
@@ -4486,10 +4489,24 @@ const EventLoop = struct {
         slot.mp_step = step;
         slot.mp_step_deadline_ms = switch (step) {
             .none, .done => 0,
-            else => compat.monotonicMilliTimestamp() + @min(
-                secondsToMs(self.state.config.handshake_timeout_sec),
-                middle_proxy_stage_timeout_ms,
-            ),
+            else => blk: {
+                const now_ms = compat.monotonicMilliTimestamp();
+                const configured_stage_ms = @min(
+                    secondsToMs(self.state.config.handshake_timeout_sec),
+                    middle_proxy_stage_timeout_ms,
+                );
+                const reserve_direct_fallback = slot.use_middle_proxy and
+                    !slot.direct_fallback_used and
+                    slot.direct_fallback_addr != null;
+                const stage_timeout_ms = budgetedMiddleProxyStageTimeoutMs(
+                    configured_stage_ms,
+                    slot.first_byte_at_ms,
+                    secondsToMs(self.state.config.handshake_timeout_sec),
+                    now_ms,
+                    reserve_direct_fallback,
+                );
+                break :blk now_ms + stage_timeout_ms;
+            },
         };
     }
 
@@ -4861,7 +4878,6 @@ const EventLoop = struct {
                 self.state.stats_hs_timeout +|= 1;
                 if (slot.phase == .middle_proxy_handshake and slot.mp_step.awaitingMiddleProxy()) {
                     self.state.requestMiddleProxyRefresh();
-                    if (self.fallbackFromMiddleProxyToDirect(slot)) return;
                 }
                 self.closeSlot(slot, "handshake timeout");
                 return;
@@ -5496,17 +5512,32 @@ fn budgetedConnectTimeoutMs(
     started_at_ms: i64,
     candidate_count: usize,
 ) i64 {
-    if (configured_timeout_ms <= 0 or first_byte_at_ms <= 0 or candidate_count <= 1) {
-        return configured_timeout_ms;
-    }
+    if (first_byte_at_ms <= 0) return configured_timeout_ms;
 
     const handshake_deadline_ms = first_byte_at_ms + handshake_timeout_ms;
     const remaining_handshake_ms = @max(@as(i64, 1), handshake_deadline_ms - started_at_ms);
+    const attempts = @max(@as(usize, 1), candidate_count);
     const fair_share_ms = @max(
         @as(i64, 1),
-        @divTrunc(remaining_handshake_ms, @as(i64, @intCast(candidate_count))),
+        @divTrunc(remaining_handshake_ms, @as(i64, @intCast(attempts))),
     );
+    if (configured_timeout_ms <= 0) return fair_share_ms;
     return @min(configured_timeout_ms, fair_share_ms);
+}
+
+fn budgetedMiddleProxyStageTimeoutMs(
+    configured_stage_timeout_ms: i64,
+    first_byte_at_ms: i64,
+    handshake_timeout_ms: i64,
+    started_at_ms: i64,
+    reserve_direct_fallback: bool,
+) i64 {
+    if (!reserve_direct_fallback or first_byte_at_ms <= 0) return configured_stage_timeout_ms;
+
+    const handshake_deadline_ms = first_byte_at_ms + handshake_timeout_ms;
+    const remaining_handshake_ms = @max(@as(i64, 1), handshake_deadline_ms - started_at_ms);
+    const stage_share_ms = @max(@as(i64, 1), @divTrunc(remaining_handshake_ms, 2));
+    return @min(configured_stage_timeout_ms, stage_share_ms);
 }
 
 fn idleTimeoutSeed(slot: *const ConnectionSlot) u64 {
@@ -6697,8 +6728,23 @@ test "connect timeout shares handshake budget across candidates" {
         budgetedConnectTimeoutMs(10_000, 1_000, 15_000, 2_000, 1),
     );
     try std.testing.expectEqual(
-        @as(i64, 0),
+        @as(i64, 7000),
         budgetedConnectTimeoutMs(0, 1_000, 15_000, 2_000, 2),
+    );
+    try std.testing.expectEqual(
+        @as(i64, 5000),
+        budgetedConnectTimeoutMs(10_000, 1_000, 15_000, 11_000, 1),
+    );
+}
+
+test "middle proxy stage reserves remaining handshake budget for direct fallback" {
+    try std.testing.expectEqual(
+        @as(i64, 1000),
+        budgetedMiddleProxyStageTimeoutMs(5_000, 1_000, 5_000, 4_000, true),
+    );
+    try std.testing.expectEqual(
+        @as(i64, 5_000),
+        budgetedMiddleProxyStageTimeoutMs(5_000, 1_000, 5_000, 4_000, false),
     );
 }
 

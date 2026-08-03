@@ -730,7 +730,7 @@ idle_timeout_sec = 120
 # client_silence_fast_close_sec = 0        # Fast close after resumed generic relay traffic; 0 = off
 # client_silence_fast_after_idle_sec = 30  # Quiet relay period required by the fast path
 handshake_timeout_sec = 15
-# dc_connect_timeout_sec = 10              # Per-DC TCP connect deadline; 0 disables per-endpoint failover timing
+# dc_connect_timeout_sec = 10              # Per-DC TCP connect ceiling; 0 still shares the global budget across candidates
 tag = "1234567890abcdef1234567890abcdef"   # Optional: promotion tag from @MTProxybot
 log_level = "info"                         # Runtime log level: debug, info, warn, err
 rate_limit_per_subnet = 30                # Max new connections/sec per /24 subnet (0 = disabled)
@@ -781,7 +781,7 @@ alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eli
 | `[server]` | `client_silence_fast_close_sec` | `0` | Optional fast close for the same unanswered-reply pattern when an established generic relay has just resumed after `client_silence_fast_after_idle_sec` of silence. Any client payload cancels the candidate, and a fresh reconnect is not immediately eligible, preventing reconnect loops. `0` disables it; `2` is the recommended iOS value |
 | `[server]` | `client_silence_fast_after_idle_sec` | `30` | Minimum quiet relay period before the fast iOS wedge path is eligible (parser lower bound 5). Has no effect while `client_silence_fast_close_sec=0` |
 | `[server]` | `handshake_timeout_sec` | `15` | Timeout for completing handshake after first byte (parser lower bound 5) |
-| `[server]` | `dc_connect_timeout_sec` | `10` | Per-endpoint TCP connect deadline for Telegram DC and MiddleProxy candidates. With multiple candidates, each attempt is capped by an equal share of the remaining global handshake budget, so a black-holed IP cannot consume the next candidate's time. Set `0` to disable |
+| `[server]` | `dc_connect_timeout_sec` | `10` | Per-endpoint TCP connect ceiling for Telegram DC and MiddleProxy candidates. Every attempt is also capped by its share of the remaining global handshake budget, including the final MiddleProxy candidate and reserved direct fallback. `0` disables only the configured ceiling; global budget sharing remains active |
 | `[server]` | `middleproxy_buffer_kb` | `2048` | MiddleProxy per-direction buffer cap in KiB. Active ME connections start with 16 KiB C2S/S2C buffers and grow on demand up to `min(middleproxy_buffer_kb, 16384)` KiB; each event loop also keeps lazy shared scratch buffers. Default 2048 leaves headroom for 1 MiB media parts; values below 1024 may still cause `MiddleProxyBufferOverflow` on media-heavy traffic (Stories, video messages). Parser lower bound is 64 KiB |
 | `[server]` | `tag` | _(none)_ | Optional 32 hex-char promotion tag from [@MTProxybot](https://t.me/MTProxybot) |
 | `[server]` | `log_level` | `"info"` | Runtime log verbosity: `debug` (all DC routing, relay, close details), `info` (default — connection stats, warnings), `warn`, `err`. Change without recompilation; takes effect on restart |

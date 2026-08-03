@@ -44,7 +44,8 @@ pub const Config = struct {
     /// Handshake read timeout after first byte arrives
     handshake_timeout_sec: u32 = 15,
     /// Per-endpoint TCP connect deadline for Telegram DC candidates.
-    /// 0 disables it and relies only on the global handshake timeout.
+    /// Zero disables this configured ceiling; the remaining global handshake
+    /// budget is still divided across candidates and direct fallback.
     dc_connect_timeout_sec: u32 = 10,
     tag: ?[16]u8 = null,
     /// FakeTLS SNI / fronting domain. Since the June-2026 TSPU rollout, the
