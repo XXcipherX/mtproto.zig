@@ -143,15 +143,57 @@ fn fetchUrlBytesWithIo(
     options: FetchOptions,
     io: std.Io,
 ) ![]u8 {
-    const uri = try std.Uri.parse(url);
     var client: std.http.Client = .{
         .allocator = allocator,
         .io = io,
     };
     defer client.deinit();
 
+    var current_url = try allocator.dupe(u8, url);
+    defer allocator.free(current_url);
+    var redirects_followed: u8 = 0;
+
+    while (true) {
+        const step = try fetchUrlStep(
+            allocator,
+            &client,
+            current_url,
+            options.max_response_bytes,
+        );
+        switch (step) {
+            .body => |body| return body,
+            .redirect => |next_url| {
+                if (redirects_followed >= options.max_redirects) {
+                    allocator.free(next_url);
+                    return error.TooManyHttpRedirects;
+                }
+                redirects_followed += 1;
+                allocator.free(current_url);
+                current_url = next_url;
+            },
+        }
+    }
+}
+
+const FetchStep = union(enum) {
+    body: []u8,
+    redirect: []u8,
+};
+
+fn fetchUrlStep(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    url: []const u8,
+    max_response_bytes: usize,
+) !FetchStep {
+    var uri = try std.Uri.parse(url);
+    if (!std.ascii.eqlIgnoreCase(uri.scheme, "https")) return error.InsecureHttpUrl;
+    uri.scheme = "https";
+
     var req = try client.request(.GET, uri, .{
-        .redirect_behavior = @enumFromInt(options.max_redirects),
+        // Redirects must be inspected before another connection is opened:
+        // Zig's automatic path also accepts plain HTTP targets.
+        .redirect_behavior = .unhandled,
         .keep_alive = false,
         .headers = .{
             .accept_encoding = .{ .override = "identity" },
@@ -161,13 +203,38 @@ fn fetchUrlBytesWithIo(
 
     try req.sendBodiless();
 
-    var redirect_buf: [8 * 1024]u8 = undefined;
-    var response = try req.receiveHead(&redirect_buf);
+    var unused_redirect_buf: [0]u8 = .{};
+    var response = try req.receiveHead(&unused_redirect_buf);
+    if (response.head.status.class() == .redirect and
+        response.head.status != .not_modified)
+    {
+        const location = response.head.location orelse return error.HttpRedirectLocationMissing;
+        return .{ .redirect = try resolveHttpsRedirect(allocator, uri, location) };
+    }
     if (response.head.status.class() != .success) return error.HttpRequestFailed;
 
     var transfer_buf: [4 * 1024]u8 = undefined;
     const reader = response.reader(&transfer_buf);
-    return reader.allocRemaining(allocator, .limited(options.max_response_bytes));
+    return .{ .body = try reader.allocRemaining(allocator, .limited(max_response_bytes)) };
+}
+
+fn resolveHttpsRedirect(
+    allocator: std.mem.Allocator,
+    base_uri: std.Uri,
+    location: []const u8,
+) ![]u8 {
+    var redirect_buf: [8 * 1024]u8 = undefined;
+    if (location.len > redirect_buf.len) return error.HttpRedirectLocationOversize;
+    @memcpy(redirect_buf[0..location.len], location);
+
+    var remaining: []u8 = redirect_buf[0..];
+    var uri = base_uri.resolveInPlace(location.len, &remaining) catch |err| switch (err) {
+        error.NoSpaceLeft => return error.HttpRedirectLocationOversize,
+        else => return error.HttpRedirectLocationInvalid,
+    };
+    if (!std.ascii.eqlIgnoreCase(uri.scheme, "https")) return error.InsecureHttpRedirect;
+    uri.scheme = "https";
+    return std.fmt.allocPrint(allocator, "{f}", .{std.Uri.fmt(&uri, .all)});
 }
 
 fn runCurlFetch(
@@ -229,4 +296,32 @@ fn runCurlFetch(
     }
 
     return result.stdout;
+}
+
+test "redirect resolver rejects HTTPS downgrade before the next request" {
+    const base = try std.Uri.parse("https://example.com/path/index");
+    try std.testing.expectError(
+        error.InsecureHttpRedirect,
+        resolveHttpsRedirect(std.testing.allocator, base, "http://example.com/plain"),
+    );
+}
+
+test "redirect resolver preserves HTTPS for relative and network paths" {
+    const base = try std.Uri.parse("https://example.com/path/index");
+
+    const relative = try resolveHttpsRedirect(std.testing.allocator, base, "../next");
+    defer std.testing.allocator.free(relative);
+    try std.testing.expectEqualStrings("https://example.com/next", relative);
+
+    const network = try resolveHttpsRedirect(std.testing.allocator, base, "//cdn.example.com/file");
+    defer std.testing.allocator.free(network);
+    try std.testing.expectEqualStrings("https://cdn.example.com/file", network);
+
+    const uppercase = try std.Uri.parse("HTTPS://example.com/start");
+    const same_scheme = try resolveHttpsRedirect(std.testing.allocator, uppercase, "/next");
+    defer std.testing.allocator.free(same_scheme);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(
+        (try std.Uri.parse(same_scheme)).scheme,
+        "https",
+    ));
 }

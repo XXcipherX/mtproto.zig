@@ -24,6 +24,7 @@ Do not reintroduce thread-per-connection or blocking relay loops.
 - Keep hot-path logging minimal (`debug` only where needed, avoid noisy per-packet logs).
 - Do not force global `.log_level = .debug` in production builds.
 - Startup output redacts user secrets and connection links by default. `--show-secrets` is an explicit private-terminal opt-in; never add secrets back to normal service logs.
+- HTTP discovery handles redirects explicitly and validates the resolved URI as HTTPS before opening the next request; never restore automatic `std.http` redirects, which also accept HTTP targets.
 
 ## Allocator and Concurrency
 
