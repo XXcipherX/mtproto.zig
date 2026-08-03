@@ -22,7 +22,7 @@ Production MTProto proxy implemented in Zig with FakeTLS entry, obfuscated MTPro
 - Connections are represented by pooled `ConnectionSlot` state objects.
 - Epoll payloads encode slot index, generation, and client/upstream role directly in `epoll_event.data.u64`; dispatch has no fd hash lookup, and generation checks reject stale events after slot/fd reuse.
 - Connection deadlines live in an indexed min-heap with one entry per active slot. A monotonic `timerfd` is armed to the earliest slot, accept-backoff, or stats deadline, eliminating the historical full-slot timer scan.
-- Outbound data uses `MessageQueue` block classes (64/512/2048 byte storage) from one event-loop-wide block pool, bounded `writev` flushing, and a 4 MiB pending-byte cap per direction queue. Read/drain/write loops have explicit byte and operation budgets per dispatch.
+- Outbound data uses intrusive `MessageQueue` blocks whose allocation occupies one page, served by one capped event-loop-wide free list. Appends pack the current tail before acquiring another block; bounded `writev` flushing and a 4 MiB pending-byte cap apply per direction queue. Read/drain/write loops have explicit byte and operation budgets per dispatch.
 - A joinable background updater starts after the listener when MiddleProxy or masking discovery is needed. It refreshes MiddleProxy metadata, detects the NAT IPv4, re-resolves all masking candidates hourly, probes endpoints in cancellable batches of four, can wake early after stalled MiddleProxy handshakes, and is stopped cooperatively on `ProxyState.deinit`.
 - MiddleProxy handshakes copy only the selected route candidates and a secret version/NAT value, release handshake-only storage at relay start, and parse each C2S frame header once. Current and immediately previous secrets live centrally under the metadata lock, so selector/KDF inputs stay consistent without a per-handshake secret copy. Runtime CBC state is direction-specific; high-frequency protocol randomness comes from a per-thread ChaCha20 DRBG reseeded from the OS CSPRNG.
 
@@ -94,20 +94,22 @@ Startup computes a safety estimate from the effective process memory limit:
 
 ```text
 tls_working_bytes = ~6 KiB
+queue_per_conn_bytes = 2 * (ceil(4 MiB / block_payload) + 1) * runtime_page_size
+queue_shared_bytes   = 1024 * runtime_page_size
 effective_mp_cap = min(middleproxy_buffer_kb * 1024, 16 MiB)
 middleproxy_per_conn_bytes = effective_mp_cap * 2 (if ME enabled)
 middleproxy_shared_bytes   = (effective_mp_cap + 256) + effective_mp_cap (if ME enabled)
 overhead_bytes    = ~2 KiB
-per_conn_bytes    = tls_working_bytes + middleproxy_per_conn_bytes + overhead_bytes
+per_conn_bytes    = tls_working_bytes + queue_per_conn_bytes + middleproxy_per_conn_bytes + overhead_bytes
 
 effective_memory = min(host RAM, all visible limits in the active cgroup v2/v1 hierarchy)
 usable_bytes  = effective_memory * 70%
 reserve_bytes = max(256 MiB, effective_memory * 10%)
-budget_bytes  = max(0, usable_bytes - reserve_bytes - middleproxy_shared_bytes)
+budget_bytes  = max(0, usable_bytes - reserve_bytes - queue_shared_bytes - middleproxy_shared_bytes)
 safe_connections = budget_bytes / per_conn_bytes
 ```
 
-Runtime allocation is lazier than this estimate: MiddleProxy per-connection stream buffers start at 16 KiB per direction and grow only when traffic requires it. The capacity estimate intentionally budgets the full effective cap so the startup clamp is conservative under worst-case media traffic.
+Runtime allocation is lazier than this estimate: relay queue pages appear only under backpressure, and MiddleProxy per-connection stream buffers start at 16 KiB per direction and grow only when traffic requires it. The queue term uses the runtime page size because production uses `page_allocator`; the extra block per direction covers a retained consumed prefix while the queue refills to its byte cap. The capacity estimate intentionally budgets these worst cases so the startup clamp remains conservative under backpressure and media traffic.
 
 The cgroup detector resolves the process membership through `/proc/self/cgroup` and `/proc/self/mountinfo`, then takes the lowest readable leaf or ancestor limit. In cgroup v2 a numeric `0` is a real hard limit; only `max` means unlimited. Conventional `/sys/fs/cgroup` paths remain a fallback when procfs mount metadata is unavailable.
 

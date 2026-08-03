@@ -479,11 +479,21 @@ fn percentOfMemory(value: u64, percent: u8) u64 {
 }
 
 fn estimateCapacity(cfg: *const config.Config, total_ram_bytes: u64) CapacityEstimate {
+    return estimateCapacityWithPageSize(cfg, total_ram_bytes, std.heap.pageSize());
+}
+
+fn estimateCapacityWithPageSize(
+    cfg: *const config.Config,
+    total_ram_bytes: u64,
+    runtime_page_size: usize,
+) CapacityEstimate {
     // Approximate per-connection user-space working set in the epoll model:
     // - preallocated slot state and small relay buffers
+    // - two worst-case relay queues at their physical page-allocation cost
     // - optional middle-proxy stream buffers (budgeted as 2 per-connection caps)
     // - allocator/socket bookkeeping cushion
     const tls_working_bytes: u64 = @intCast(6 * 1024);
+    const queue_memory = proxy.queueMemoryBudget(runtime_page_size);
     const uses_middle_proxy = cfg.usesAnyMiddleProxy();
     const middleproxy_per_conn_bytes: u64 = if (uses_middle_proxy)
         @intCast(cfg.middleProxyBufferBytes() * 2)
@@ -496,7 +506,11 @@ fn estimateCapacity(cfg: *const config.Config, total_ram_bytes: u64) CapacityEst
     else
         0;
     const overhead_bytes: u64 = 2 * 1024;
-    const per_conn_bytes = tls_working_bytes + middleproxy_per_conn_bytes + overhead_bytes;
+    const per_conn_bytes =
+        tls_working_bytes +
+        queue_memory.per_connection_bytes +
+        middleproxy_per_conn_bytes +
+        overhead_bytes;
 
     // Keep safety headroom for kernel TCP memory, page cache, and baseline process state.
     const usable_bytes = percentOfMemory(total_ram_bytes, 70);
@@ -504,7 +518,10 @@ fn estimateCapacity(cfg: *const config.Config, total_ram_bytes: u64) CapacityEst
         @as(u64, 256 * 1024 * 1024),
         percentOfMemory(total_ram_bytes, 10),
     );
-    const fixed_overhead_bytes = reserve_bytes + middleproxy_shared_bytes;
+    const fixed_overhead_bytes =
+        reserve_bytes +
+        queue_memory.shared_pool_bytes +
+        middleproxy_shared_bytes;
     const budget_bytes = if (usable_bytes > fixed_overhead_bytes) usable_bytes - fixed_overhead_bytes else 0;
 
     const raw_cap = if (per_conn_bytes > 0) budget_bytes / per_conn_bytes else 0;
@@ -848,6 +865,47 @@ test "capacity estimate accounts for media-only middle proxy overhead" {
 
     try std.testing.expect(media_est.per_conn_bytes > direct_est.per_conn_bytes);
     try std.testing.expect(media_est.safe_connections < direct_est.safe_connections);
+}
+
+test "capacity estimate budgets physical relay queue pages" {
+    var cfg = config.Config{
+        .users = std.StringHashMap([16]u8).init(std.testing.allocator),
+        .direct_users = std.StringHashMap(void).init(std.testing.allocator),
+        .use_middle_proxy = false,
+        .force_media_middle_proxy = false,
+    };
+    defer cfg.deinit(std.testing.allocator);
+
+    const total_ram_bytes: u64 = 2 * 1024 * 1024 * 1024;
+    const runtime_page_size = std.heap.page_size_min;
+    const queue_memory = proxy.queueMemoryBudget(runtime_page_size);
+    const est = estimateCapacityWithPageSize(&cfg, total_ram_bytes, runtime_page_size);
+
+    try std.testing.expectEqual(
+        queue_memory.per_connection_bytes + 8 * 1024,
+        est.per_conn_bytes,
+    );
+
+    const usable_bytes = percentOfMemory(total_ram_bytes, 70);
+    const reserve_bytes = @max(
+        @as(u64, 256 * 1024 * 1024),
+        percentOfMemory(total_ram_bytes, 10),
+    );
+    const expected_budget =
+        usable_bytes - reserve_bytes - queue_memory.shared_pool_bytes;
+    try std.testing.expectEqual(
+        @as(u32, @intCast(expected_budget / est.per_conn_bytes)),
+        est.safe_connections,
+    );
+
+    const larger_runtime_page_size = runtime_page_size * 2;
+    const larger_est = estimateCapacityWithPageSize(
+        &cfg,
+        total_ram_bytes,
+        larger_runtime_page_size,
+    );
+    try std.testing.expect(larger_est.per_conn_bytes > est.per_conn_bytes);
+    try std.testing.expect(larger_est.safe_connections < est.safe_connections);
 }
 
 test "capacity estimate handles the largest finite cgroup v2 limit" {

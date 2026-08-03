@@ -12,7 +12,7 @@ This file tracks practical pitfalls and current runtime constraints for `mtproto
 - Relay core is Linux `epoll` event loop, single-threaded on hot path.
 - The large `EventLoop` container and its fixed subnet tables are heap-allocated and initialized in place; returning it by value can overflow the Debug daemon stack. Connection pools allocate slot indexes and a deadline-heap entry per active slot, while `ConnectionSlot` objects are heap-created on demand. Epoll payloads carry index/generation/role directly; do not reintroduce an fd hash map.
 - Non-blocking writes are queue-based (`MessageQueue`) and flushed with `writev`.
-- `MessageQueue` has classed storage blocks from one event-loop-wide pool and a 4 MiB pending-byte cap; queue overflow is a close-worthy backpressure signal.
+- `MessageQueue` has intrusive page-sized storage blocks from one capped event-loop-wide pool and a 4 MiB pending-byte cap; queue overflow is a close-worthy backpressure signal.
 - Runtime discovery runs in a joinable updater thread after the listener is ready when MiddleProxy or masking resolution is active; shutdown is cooperative and endpoint probes run in cancellable batches of at most four sockets.
 
 Do not reintroduce thread-per-connection or blocking relay loops.
@@ -46,7 +46,7 @@ Do not reintroduce thread-per-connection or blocking relay loops.
 
 ## Queueing and Partial Write Model
 
-- Outbound data is queued in block classes (tiny/small/standard) served by the shared `MessageBlockPool`.
+- Outbound data is queued in intrusive page-sized blocks served by the shared `MessageBlockPool`; append into the current tail before acquiring a new page.
 - Recycled/destroyed queue blocks are securely wiped. If appending an acquired block pointer fails, return it to the shared pool (or destroy it) before propagating OOM.
 - Flush path uses scatter-gather `writev` with explicit queue consumption.
 - Backpressure is represented by pending queue state and epoll `OUT` interest toggles.
@@ -64,7 +64,7 @@ Do not reintroduce thread-per-connection or blocking relay loops.
 - `middleproxy_buffer_kb` is a per-direction cap, not an eager allocation. Each MiddleProxy context starts with 16 KiB C2S/S2C buffers and grows on demand up to `min(middleproxy_buffer_kb, 16384)` KiB.
 - Abridged `RPC_PROXY_ANS` data must be 4-byte aligned before its word-count header is encoded; reject an unaligned upstream payload instead of truncating the byte length.
 - The event loop keeps lazy reusable C2S/S2C scratch buffers. C2S scratch is `effective_cap + 256`; S2C scratch is `effective_cap`.
-- The startup capacity clamp intentionally budgets the full effective MiddleProxy cap per direction, so it is more conservative than the idle memory footprint.
+- The startup capacity clamp charges two full relay queues plus one conservative prefix block per direction at the runtime `page_allocator` page size, as well as the capped shared queue pool and full effective MiddleProxy cap per direction. It is intentionally more conservative than the idle memory footprint.
 - `force_media_middle_proxy` defaults to true, so media traffic keeps preferring ME unless explicitly disabled.
 - `middle_proxy_nat_ip` can override the IPv4 embedded into MiddleProxy NAT/AES derivation when AWG/public-IP detection is not the address you want.
 - A connection snapshots the MiddleProxy secret version and NAT IPv4 together with its endpoint plan. The current and immediately previous secrets remain centrally available under the metadata lock, so rotation cannot split key-selector and KDF inputs mid-handshake without copying the secret into every slot.

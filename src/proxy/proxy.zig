@@ -440,35 +440,20 @@ const SubnetRateLimit = struct {
     }
 };
 
-const MsgBlockClass = enum(u2) {
-    tiny = 0,
-    small = 1,
-    standard = 2,
-};
-
-const tiny_block_size: usize = 64;
-const small_block_size: usize = 512;
-const standard_block_size: usize = 2048;
+const msg_block_header_size: usize = @sizeOf(?*anyopaque) + @sizeOf(usize);
+const msg_block_payload_size: usize = std.heap.page_size_min - msg_block_header_size;
 
 const MsgBlock = struct {
-    class: MsgBlockClass,
-    len: usize,
+    next: ?*@This() = null,
+    len: usize = 0,
+    data: [msg_block_payload_size]u8 = undefined,
 };
 
-const TinyMsgBlock = struct {
-    header: MsgBlock = .{ .class = .tiny, .len = 0 },
-    data: [tiny_block_size]u8 = undefined,
-};
-
-const SmallMsgBlock = struct {
-    header: MsgBlock = .{ .class = .small, .len = 0 },
-    data: [small_block_size]u8 = undefined,
-};
-
-const StandardMsgBlock = struct {
-    header: MsgBlock = .{ .class = .standard, .len = 0 },
-    data: [standard_block_size]u8 = undefined,
-};
+comptime {
+    if (@sizeOf(MsgBlock) != std.heap.page_size_min) {
+        @compileError("MsgBlock must occupy exactly one minimum target page");
+    }
+}
 
 const max_scatter_parts: usize = 64;
 
@@ -481,133 +466,67 @@ fn hasGracefulEpollRdhup(events: u32) bool {
         (events & (linux.EPOLL.ERR | linux.EPOLL.HUP)) == 0;
 }
 
-fn classCapacity(class: MsgBlockClass) usize {
-    return switch (class) {
-        .tiny => tiny_block_size,
-        .small => small_block_size,
-        .standard => standard_block_size,
-    };
-}
-
-fn chooseClass(size: usize) MsgBlockClass {
-    if (size <= tiny_block_size) return .tiny;
-    if (size <= small_block_size) return .small;
-    return .standard;
-}
-
 fn blockStorage(blk: *MsgBlock) []u8 {
-    return switch (blk.class) {
-        .tiny => blk: {
-            const tiny: *TinyMsgBlock = @fieldParentPtr("header", blk);
-            break :blk tiny.data[0..];
-        },
-        .small => blk: {
-            const small: *SmallMsgBlock = @fieldParentPtr("header", blk);
-            break :blk small.data[0..];
-        },
-        .standard => blk: {
-            const standard: *StandardMsgBlock = @fieldParentPtr("header", blk);
-            break :blk standard.data[0..];
-        },
-    };
+    return blk.data[0..];
 }
 
 fn blockStorageConst(blk: *const MsgBlock) []const u8 {
-    return switch (blk.class) {
-        .tiny => blk: {
-            const tiny: *const TinyMsgBlock = @fieldParentPtr("header", blk);
-            break :blk tiny.data[0..];
-        },
-        .small => blk: {
-            const small: *const SmallMsgBlock = @fieldParentPtr("header", blk);
-            break :blk small.data[0..];
-        },
-        .standard => blk: {
-            const standard: *const StandardMsgBlock = @fieldParentPtr("header", blk);
-            break :blk standard.data[0..];
-        },
-    };
+    return blk.data[0..];
 }
 
-fn allocateMsgBlock(allocator: std.mem.Allocator, class: MsgBlockClass) !*MsgBlock {
-    return switch (class) {
-        .tiny => blk: {
-            const tiny = try allocator.create(TinyMsgBlock);
-            tiny.* = .{};
-            break :blk &tiny.header;
-        },
-        .small => blk: {
-            const small = try allocator.create(SmallMsgBlock);
-            small.* = .{};
-            break :blk &small.header;
-        },
-        .standard => blk: {
-            const standard = try allocator.create(StandardMsgBlock);
-            standard.* = .{};
-            break :blk &standard.header;
-        },
-    };
+fn allocateMsgBlock(allocator: std.mem.Allocator) !*MsgBlock {
+    const blk = try allocator.create(MsgBlock);
+    blk.* = .{};
+    return blk;
+}
+
+fn wipeMsgBlock(blk: *MsgBlock) void {
+    std.crypto.secureZero(u8, blockStorage(blk));
+    blk.len = 0;
 }
 
 fn destroyMsgBlock(allocator: std.mem.Allocator, blk: *MsgBlock) void {
-    std.crypto.secureZero(u8, blockStorage(blk));
-    switch (blk.class) {
-        .tiny => allocator.destroy(@as(*TinyMsgBlock, @fieldParentPtr("header", blk))),
-        .small => allocator.destroy(@as(*SmallMsgBlock, @fieldParentPtr("header", blk))),
-        .standard => allocator.destroy(@as(*StandardMsgBlock, @fieldParentPtr("header", blk))),
-    }
+    wipeMsgBlock(blk);
+    blk.next = null;
+    allocator.destroy(blk);
 }
 
 const MessageBlockPool = struct {
-    const max_free_tiny_blocks: usize = 1024;
-    const max_free_small_blocks: usize = 1024;
-    const max_free_standard_blocks: usize = 1024;
+    const max_free_blocks: usize = 1024;
 
     allocator: std.mem.Allocator,
-    tiny_free: std.ArrayList(*MsgBlock) = .empty,
-    small_free: std.ArrayList(*MsgBlock) = .empty,
-    std_free: std.ArrayList(*MsgBlock) = .empty,
+    free_head: ?*MsgBlock = null,
+    free_count: usize = 0,
 
     fn deinit(self: *MessageBlockPool) void {
-        for (self.tiny_free.items) |blk| destroyMsgBlock(self.allocator, blk);
-        for (self.small_free.items) |blk| destroyMsgBlock(self.allocator, blk);
-        for (self.std_free.items) |blk| destroyMsgBlock(self.allocator, blk);
-        self.tiny_free.deinit(self.allocator);
-        self.small_free.deinit(self.allocator);
-        self.std_free.deinit(self.allocator);
+        var current = self.free_head;
+        while (current) |blk| {
+            const next = blk.next;
+            destroyMsgBlock(self.allocator, blk);
+            current = next;
+        }
+        self.free_head = null;
+        self.free_count = 0;
     }
 
-    fn acquire(self: *MessageBlockPool, class: MsgBlockClass) !*MsgBlock {
-        const list = self.freeList(class);
-        if (list.items.len > 0) return list.pop().?;
-        return allocateMsgBlock(self.allocator, class);
+    fn acquire(self: *MessageBlockPool) !*MsgBlock {
+        const blk = self.free_head orelse return allocateMsgBlock(self.allocator);
+        self.free_head = blk.next;
+        self.free_count -= 1;
+        blk.next = null;
+        blk.len = 0;
+        return blk;
     }
 
     fn recycle(self: *MessageBlockPool, blk: *MsgBlock) void {
-        std.crypto.secureZero(u8, blockStorage(blk));
-        blk.len = 0;
-        const list = self.freeList(blk.class);
-        if (list.items.len >= freeListLimit(blk.class)) {
+        if (self.free_count >= max_free_blocks) {
             destroyMsgBlock(self.allocator, blk);
             return;
         }
-        list.append(self.allocator, blk) catch destroyMsgBlock(self.allocator, blk);
-    }
-
-    fn freeList(self: *MessageBlockPool, class: MsgBlockClass) *std.ArrayList(*MsgBlock) {
-        return switch (class) {
-            .tiny => &self.tiny_free,
-            .small => &self.small_free,
-            .standard => &self.std_free,
-        };
-    }
-
-    fn freeListLimit(class: MsgBlockClass) usize {
-        return switch (class) {
-            .tiny => max_free_tiny_blocks,
-            .small => max_free_small_blocks,
-            .standard => max_free_standard_blocks,
-        };
+        wipeMsgBlock(blk);
+        blk.next = self.free_head;
+        self.free_head = blk;
+        self.free_count += 1;
     }
 };
 
@@ -616,22 +535,24 @@ const MessageQueue = struct {
 
     allocator: std.mem.Allocator,
     pool: ?*MessageBlockPool = null,
-    blocks: std.ArrayList(*MsgBlock) = .empty,
-    head_idx: usize = 0,
+    head: ?*MsgBlock = null,
+    tail: ?*MsgBlock = null,
     offset: usize = 0,
     total_len: usize = 0,
 
     fn deinit(self: *MessageQueue) void {
         self.clear();
-        self.blocks.deinit(self.allocator);
     }
 
     fn clear(self: *MessageQueue) void {
-        for (self.blocks.items[self.head_idx..]) |blk| {
+        var current = self.head;
+        while (current) |blk| {
+            const next = blk.next;
             self.recycleBlock(blk);
+            current = next;
         }
-        self.blocks.clearRetainingCapacity();
-        self.head_idx = 0;
+        self.head = null;
+        self.tail = null;
         self.offset = 0;
         self.total_len = 0;
     }
@@ -645,19 +566,33 @@ const MessageQueue = struct {
         try self.ensureCanAppend(data.len);
 
         var off: usize = 0;
-        while (off < data.len) {
-            const rem = data.len - off;
-            const class = chooseClass(rem);
-            const cap = classCapacity(class);
-            const take = @min(rem, cap);
+        if (self.tail) |tail| {
+            const available = blockStorage(tail).len - tail.len;
+            const take = @min(data.len, available);
+            if (take > 0) {
+                @memcpy(
+                    blockStorage(tail)[tail.len .. tail.len + take],
+                    data[0..take],
+                );
+                tail.len += take;
+                self.total_len += take;
+                off = take;
+            }
+        }
 
-            var blk = try self.acquireBlock(class);
+        while (off < data.len) {
+            const take = @min(data.len - off, msg_block_payload_size);
+            const blk = try self.acquireBlock();
             blk.len = take;
+            blk.next = null;
             @memcpy(blockStorage(blk)[0..take], data[off .. off + take]);
-            self.blocks.append(self.allocator, blk) catch |err| {
-                self.recycleBlock(blk);
-                return err;
-            };
+
+            if (self.tail) |tail| {
+                tail.next = blk;
+            } else {
+                self.head = blk;
+            }
+            self.tail = blk;
             self.total_len += take;
             off += take;
         }
@@ -670,16 +605,18 @@ const MessageQueue = struct {
     }
 
     fn prepareIovecs(self: *const MessageQueue, out: []posix.iovec_const, max_bytes: usize) usize {
-        if (self.head_idx >= self.blocks.items.len or max_bytes == 0) return 0;
+        if (self.head == null or max_bytes == 0) return 0;
 
         var count: usize = 0;
         var prepared: usize = 0;
         var local_off = self.offset;
-        for (self.blocks.items[self.head_idx..]) |blk| {
+        var current = self.head;
+        while (current) |blk| {
             if (count >= out.len or prepared >= max_bytes) break;
 
             if (local_off >= blk.len) {
                 local_off -= blk.len;
+                current = blk.next;
                 continue;
             }
 
@@ -689,6 +626,7 @@ const MessageQueue = struct {
             count += 1;
             prepared += take;
             local_off = 0;
+            current = blk.next;
         }
         return count;
     }
@@ -699,8 +637,8 @@ const MessageQueue = struct {
         var remaining = @min(bytes, self.total_len);
         self.total_len -= remaining;
 
-        while (remaining > 0 and self.head_idx < self.blocks.items.len) {
-            const blk = self.blocks.items[self.head_idx];
+        while (remaining > 0) {
+            const blk = self.head orelse unreachable;
             const blk_left = blk.len - self.offset;
 
             if (remaining < blk_left) {
@@ -711,28 +649,21 @@ const MessageQueue = struct {
 
             remaining -= blk_left;
             self.offset = 0;
-            self.head_idx += 1;
+            self.head = blk.next;
+            if (self.head == null) self.tail = null;
             self.recycleBlock(blk);
         }
 
-        if (self.head_idx > 0 and (self.head_idx >= self.blocks.items.len or self.head_idx >= 64)) {
-            const rem = self.blocks.items.len - self.head_idx;
-            if (rem > 0) {
-                std.mem.copyForwards(*MsgBlock, self.blocks.items[0..rem], self.blocks.items[self.head_idx..]);
-            }
-            self.blocks.shrinkRetainingCapacity(rem);
-            self.head_idx = 0;
-        }
-
         if (self.total_len == 0) {
-            self.head_idx = 0;
+            self.head = null;
+            self.tail = null;
             self.offset = 0;
         }
     }
 
-    fn acquireBlock(self: *MessageQueue, class: MsgBlockClass) !*MsgBlock {
-        if (self.pool) |pool| return pool.acquire(class);
-        return allocateMsgBlock(self.allocator, class);
+    fn acquireBlock(self: *MessageQueue) !*MsgBlock {
+        if (self.pool) |pool| return pool.acquire();
+        return allocateMsgBlock(self.allocator);
     }
 
     fn recycleBlock(self: *MessageQueue, blk: *MsgBlock) void {
@@ -743,6 +674,37 @@ const MessageQueue = struct {
         }
     }
 };
+
+pub const QueueMemoryBudget = struct {
+    per_connection_bytes: u64,
+    shared_pool_bytes: u64,
+};
+
+/// Conservative physical-memory budget for page-allocator-backed relay queues.
+///
+/// Each connection owns two queues. The extra active block per queue covers a
+/// consumed prefix retained in the head block while unread bytes refill the
+/// queue to its byte cap. The event-loop pool is shared across all connections.
+pub fn queueMemoryBudget(runtime_page_size: usize) QueueMemoryBudget {
+    std.debug.assert(std.math.isPowerOfTwo(runtime_page_size));
+    std.debug.assert(runtime_page_size >= std.heap.page_size_min);
+
+    const full_queue_blocks =
+        (MessageQueue.max_pending_bytes + msg_block_payload_size - 1) /
+        msg_block_payload_size;
+    const active_blocks_per_queue = full_queue_blocks + 1;
+    const per_connection_wide =
+        @as(u128, active_blocks_per_queue) * 2 * @as(u128, runtime_page_size);
+    const shared_pool_wide =
+        @as(u128, MessageBlockPool.max_free_blocks) * @as(u128, runtime_page_size);
+    std.debug.assert(per_connection_wide <= std.math.maxInt(u64));
+    std.debug.assert(shared_pool_wide <= std.math.maxInt(u64));
+
+    return .{
+        .per_connection_bytes = @intCast(per_connection_wide),
+        .shared_pool_bytes = @intCast(shared_pool_wide),
+    };
+}
 
 const UpstreamKind = enum {
     none,
@@ -1418,7 +1380,7 @@ const ConnectionSlot = struct {
 
     read_buf: ?[]u8 = null,
 
-    // Non-blocking write queues (slab-like chain buffers)
+    // Non-blocking write queues (intrusive page-backed chains)
     client_queue: MessageQueue = .{ .allocator = std.heap.page_allocator },
     upstream_queue: MessageQueue = .{ .allocator = std.heap.page_allocator },
 
@@ -6608,32 +6570,50 @@ test "message queue consume is stable" {
     try q.consume(5);
     try std.testing.expect(q.isEmpty());
     try std.testing.expectEqual(@as(usize, 0), q.offset);
-    try std.testing.expectEqual(@as(usize, 0), q.head_idx);
+    try std.testing.expect(q.head == null);
+    try std.testing.expect(q.tail == null);
 }
 
-test "message queue uses compact block storage per class" {
-    try std.testing.expect(@sizeOf(TinyMsgBlock) < @sizeOf(StandardMsgBlock));
-    try std.testing.expect(@sizeOf(SmallMsgBlock) < @sizeOf(StandardMsgBlock));
-
+test "message queue uses page-sized blocks and fills the tail first" {
+    try std.testing.expectEqual(std.heap.page_size_min, @sizeOf(MsgBlock));
     var q = MessageQueue{ .allocator = std.testing.allocator };
     defer q.deinit();
 
-    var tiny_payload: [tiny_block_size]u8 = [_]u8{0} ** tiny_block_size;
-    try q.appendCopy(&tiny_payload);
-    try std.testing.expectEqual(MsgBlockClass.tiny, q.blocks.items[0].class);
-    try std.testing.expectEqual(@as(usize, tiny_block_size), blockStorageConst(q.blocks.items[0]).len);
+    try q.appendCopy("abc");
+    const first = q.head.?;
+    try q.appendCopy("defg");
+    try std.testing.expect(q.head.? == first);
+    try std.testing.expect(q.tail.? == first);
+    try std.testing.expect(first.next == null);
+    try std.testing.expectEqual(@as(usize, 7), first.len);
+    try std.testing.expectEqualStrings("abcdefg", blockStorageConst(first)[0..first.len]);
+
     q.clear();
 
-    var small_payload: [small_block_size]u8 = [_]u8{1} ** small_block_size;
-    try q.appendCopy(&small_payload);
-    try std.testing.expectEqual(MsgBlockClass.small, q.blocks.items[0].class);
-    try std.testing.expectEqual(@as(usize, small_block_size), blockStorageConst(q.blocks.items[0]).len);
-    q.clear();
+    var payload: [msg_block_payload_size + 1]u8 = [_]u8{0xA5} ** (msg_block_payload_size + 1);
+    try q.appendCopy(&payload);
+    const page_first = q.head.?;
+    const page_second = page_first.next.?;
+    try std.testing.expectEqual(msg_block_payload_size, page_first.len);
+    try std.testing.expectEqual(@as(usize, 1), page_second.len);
+    try std.testing.expect(q.tail.? == page_second);
+    try std.testing.expect(page_second.next == null);
+}
 
-    var standard_payload: [small_block_size + 1]u8 = [_]u8{2} ** (small_block_size + 1);
-    try q.appendCopy(&standard_payload);
-    try std.testing.expectEqual(MsgBlockClass.standard, q.blocks.items[0].class);
-    try std.testing.expectEqual(@as(usize, standard_block_size), blockStorageConst(q.blocks.items[0]).len);
+test "message queue consumed prefix permits one conservative extra block" {
+    var q = MessageQueue{ .allocator = std.testing.allocator };
+    defer q.deinit();
+
+    var payload: [msg_block_payload_size]u8 = [_]u8{0x5A} ** msg_block_payload_size;
+    try q.appendCopy(&payload);
+    const first = q.head.?;
+    try q.consume(1);
+    try q.appendCopy(&[_]u8{0xA5});
+
+    try std.testing.expectEqual(msg_block_payload_size, q.total_len);
+    try std.testing.expect(q.head.? == first);
+    try std.testing.expect(first.next != null);
+    try std.testing.expect(q.tail.? == first.next.?);
 }
 
 test "message queue rejects pending byte overflow" {
@@ -6645,22 +6625,42 @@ test "message queue rejects pending byte overflow" {
     q.total_len = 0;
 }
 
-test "shared message block pool trims retained standard blocks after traffic spike" {
+test "shared message block pool trims and wipes recycled page blocks" {
     var pool = MessageBlockPool{ .allocator = std.testing.allocator };
     defer pool.deinit();
-    var q = MessageQueue{ .allocator = std.testing.allocator, .pool = &pool };
-    defer q.deinit();
 
-    const payload_len = (MessageBlockPool.max_free_standard_blocks + 8) * standard_block_size;
-    const payload = try std.testing.allocator.alloc(u8, payload_len);
-    defer std.testing.allocator.free(payload);
-    @memset(payload, 0xA5);
+    var blocks: [MessageBlockPool.max_free_blocks + 8]*MsgBlock = undefined;
+    for (&blocks) |*entry| {
+        entry.* = try pool.acquire();
+        @memset(blockStorage(entry.*), 0xA5);
+        entry.*.len = msg_block_payload_size;
+    }
+    for (blocks) |blk| pool.recycle(blk);
 
-    try q.appendCopy(payload);
-    try q.consume(payload.len);
+    try std.testing.expectEqual(MessageBlockPool.max_free_blocks, pool.free_count);
+    const recycled = pool.free_head.?;
+    try std.testing.expectEqual(@as(usize, 0), recycled.len);
+    for (blockStorageConst(recycled)) |byte| {
+        try std.testing.expectEqual(@as(u8, 0), byte);
+    }
+}
 
-    try std.testing.expect(q.isEmpty());
-    try std.testing.expect(pool.std_free.items.len <= MessageBlockPool.max_free_standard_blocks);
+test "queue memory budget covers two queues and the shared pool" {
+    const runtime_page_size = std.heap.page_size_min;
+    const full_queue_blocks =
+        (MessageQueue.max_pending_bytes + msg_block_payload_size - 1) /
+        msg_block_payload_size;
+    const active_blocks_per_queue = full_queue_blocks + 1;
+    const budget = queueMemoryBudget(runtime_page_size);
+
+    try std.testing.expectEqual(
+        @as(u64, @intCast(active_blocks_per_queue * 2 * runtime_page_size)),
+        budget.per_connection_bytes,
+    );
+    try std.testing.expectEqual(
+        @as(u64, @intCast(MessageBlockPool.max_free_blocks * runtime_page_size)),
+        budget.shared_pool_bytes,
+    );
 }
 
 test "epoll hangup helper" {
