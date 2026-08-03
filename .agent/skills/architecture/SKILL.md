@@ -23,7 +23,7 @@ Production MTProto proxy implemented in Zig with FakeTLS entry, obfuscated MTPro
 - Connections are represented by pooled `ConnectionSlot` state objects.
 - Epoll payloads encode slot index, generation, and client/upstream role directly in `epoll_event.data.u64`; dispatch has no fd hash lookup, and generation checks reject stale events after slot/fd reuse.
 - Connection deadlines live in an indexed min-heap with one entry per active slot. A monotonic `timerfd` is armed to the earliest slot, accept-backoff, or stats deadline, eliminating the historical full-slot timer scan.
-- Outbound data uses intrusive `MessageQueue` blocks whose allocation occupies one page, served by one capped event-loop-wide free list. Appends pack the current tail before acquiring another block; bounded `writev` flushing and a 4 MiB pending-byte cap apply per direction queue. Read/drain/write loops have explicit byte and operation budgets per dispatch.
+- Outbound data uses intrusive `MessageQueue` blocks whose allocation occupies one page, served by one capped event-loop-wide free list. Queue pages, retained free-list pages, MiddleProxy stream buffers, and shared scratch are charged to one hard `ManagedBufferAllocator` budget. Appends pack the current tail before acquiring another block; bounded `writev` flushing and a 4 MiB pending-byte cap apply per direction queue. Read/drain/write loops have explicit byte and operation budgets per dispatch.
 - Relay slots track client/upstream read EOF and write shutdown independently. A frame-aligned EOF stops only that source read; after its destination queue drains, `shutdown(SHUT_WR)` propagates FIN without disabling the reverse direction. EOF inside a FakeTLS or MiddleProxy frame fails closed.
 - A joinable background updater starts after the listener when MiddleProxy or masking discovery is needed. It refreshes MiddleProxy metadata, detects the NAT IPv4, re-resolves all masking candidates hourly, probes endpoints in cancellable batches of four, can wake early after stalled MiddleProxy handshakes, and is stopped cooperatively on `ProxyState.deinit`. DNS, built-in HTTPS, and curl fallback operations race an atomic stop watcher inside an owner-thread `std.Io.Select`; every late allocated result is drained before the updater is joined.
 - MiddleProxy handshakes copy only the selected route candidates and a secret version/NAT value, release handshake-only storage at relay start, and parse each C2S frame header once. Current and immediately previous secrets live centrally under the metadata lock, so selector/KDF inputs stay consistent without a per-handshake secret copy. Runtime CBC state is direction-specific; high-frequency protocol randomness comes from a per-thread ChaCha20 DRBG reseeded from the OS CSPRNG.
@@ -96,22 +96,27 @@ Startup computes a safety estimate from the effective process memory limit:
 
 ```text
 tls_working_bytes = ~6 KiB
-queue_per_conn_bytes = 2 * (ceil(4 MiB / block_payload) + 1) * runtime_page_size
-queue_shared_bytes   = 1024 * runtime_page_size
-effective_mp_cap = min(middleproxy_buffer_kb * 1024, 3840 KiB)
-middleproxy_per_conn_bytes = effective_mp_cap * 2 (if ME enabled)
-middleproxy_shared_bytes   = (effective_mp_cap + 256 KiB) + effective_mp_cap (if ME enabled)
-overhead_bytes    = ~2 KiB
-per_conn_bytes    = tls_working_bytes + queue_per_conn_bytes + middleproxy_per_conn_bytes + overhead_bytes
+overhead_bytes = ~2 KiB
+managed_initial_per_conn = 2 * 16 KiB (if any MiddleProxy mode is enabled)
+per_conn_bytes = tls_working_bytes + overhead_bytes + managed_initial_per_conn
 
 effective_memory = min(host RAM, all visible limits in the active cgroup v2/v1 hierarchy)
 usable_bytes  = effective_memory * 70%
 reserve_bytes = max(256 MiB, effective_memory * 10%)
-budget_bytes  = max(0, usable_bytes - reserve_bytes - queue_shared_bytes - middleproxy_shared_bytes)
-safe_connections = budget_bytes / per_conn_bytes
+allocatable_bytes = max(0, usable_bytes - reserve_bytes)
+managed_burst_reserve = allocatable_bytes / 2
+connection_budget = allocatable_bytes - managed_burst_reserve
+safe_connections = connection_budget / per_conn_bytes
+
+unmanaged_per_conn = per_conn_bytes - managed_initial_per_conn
+managed_buffer_limit =
+    min(managed_burst_reserve + max_connections * managed_initial_per_conn,
+        allocatable_bytes - max_connections * unmanaged_per_conn)
 ```
 
-Runtime allocation is lazier than this estimate: relay queue pages appear only under backpressure, and MiddleProxy per-connection stream buffers start at 16 KiB per direction and grow only when traffic requires it. The queue term uses the runtime page size because production uses `page_allocator`; the extra block per direction covers a retained consumed prefix while the queue refills to its byte cap. The capacity estimate intentionally budgets these worst cases so the startup clamp remains conservative under backpressure and media traffic.
+The startup estimate no longer multiplies every connection by two full 4 MiB relay queues and two full MiddleProxy caps. Those are independent protective maxima, not simultaneous guaranteed resident memory. Instead, the event loop routes queue blocks, retained free-list blocks, MiddleProxy C2S/S2C buffers, and shared scratch through `ManagedBufferAllocator`. It tracks requested live bytes, refuses remap so allocate-before-free growth is charged at its transient peak, and keeps recycled queue pages charged until they are actually destroyed. Budget exhaustion follows existing OOM handling: optional shrink retains the existing buffer, while required growth closes the requesting connection or falls back to the direct path where possible. Every denial is reported as `memory_pressure+=...` in periodic stats.
+
+The runtime limit includes the 16 KiB-per-direction MiddleProxy baseline for every configured slot plus the shared burst reserve, but is capped so the unmanaged baseline and managed allocation ceiling cannot exceed `allocatable_bytes` together. When effective memory cannot be detected, the managed pool uses a 64 MiB default. For a 960 MiB limit with media MiddleProxy enabled and `max_connections=256`, the banner reports a ~40 KiB baseline, ~216 MiB shared buffer limit, and a safe cap of ~5324.
 
 The cgroup detector resolves the process membership through `/proc/self/cgroup` and `/proc/self/mountinfo`, then takes the lowest readable leaf or ancestor limit. In cgroup v2 a numeric `0` is a real hard limit; only `max` means unlimited. Conventional `/sys/fs/cgroup` paths remain a fallback when procfs mount metadata is unavailable.
 

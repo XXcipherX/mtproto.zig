@@ -152,7 +152,8 @@ pub const MiddleProxyContext = struct {
     buffer_limit: usize,
 
     pub const default_stream_buffer_size: usize = 128 * 1024;
-    pub const initial_stream_buffer_size: usize = 16 * 1024;
+    pub const initial_stream_buffer_size: usize =
+        config.Config.middle_proxy_initial_stream_buffer_bytes;
     pub const shrink_stream_buffer_threshold: usize = initial_stream_buffer_size * 4;
     pub const max_stream_buffer_size: usize = config.Config.middle_proxy_stream_buffer_cap_bytes;
     pub const min_client_payload_size: usize = 20;

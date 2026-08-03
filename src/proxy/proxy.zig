@@ -42,6 +42,7 @@ const min_nofile_soft: usize = 65535;
 const client_hello_inline_size: usize = 512;
 const mp_handshake_frame_buf_size: usize = 2048;
 const read_buf_size: usize = 4096;
+pub const default_managed_buffer_limit_bytes: u64 = 64 * 1024 * 1024;
 const pre_first_byte_timeout_ms: i64 = 10 * std.time.ms_per_s;
 const middle_proxy_stage_timeout_ms: i64 = 5 * std.time.ms_per_s;
 // Telegram iOS arms a 12-second response watchdog for requests that expect a
@@ -533,6 +534,125 @@ fn destroyMsgBlock(allocator: std.mem.Allocator, blk: *MsgBlock) void {
     blk.next = null;
     allocator.destroy(blk);
 }
+
+/// Exact process-local budget for dynamic relay and MiddleProxy storage.
+///
+/// The epoll loop is single-threaded, so the accounting deliberately avoids
+/// atomics. `remap` is refused: `Allocator.realloc` then allocates the new
+/// region before releasing the old one, which makes transient growth count
+/// against the limit instead of hiding a temporary RSS spike.
+const ManagedBufferAllocator = struct {
+    child: std.mem.Allocator,
+    limit_bytes: usize,
+    used_bytes: usize = 0,
+    peak_bytes: usize = 0,
+    denied_allocations: u64 = 0,
+
+    fn init(child: std.mem.Allocator, limit_bytes: usize) ManagedBufferAllocator {
+        return .{
+            .child = child,
+            .limit_bytes = limit_bytes,
+        };
+    }
+
+    fn allocator(self: *ManagedBufferAllocator) std.mem.Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            },
+        };
+    }
+
+    fn reserve(self: *ManagedBufferAllocator, len: usize) bool {
+        const next = std.math.add(usize, self.used_bytes, len) catch {
+            self.denied_allocations +|= 1;
+            return false;
+        };
+        if (next > self.limit_bytes) {
+            self.denied_allocations +|= 1;
+            return false;
+        }
+        self.used_bytes = next;
+        self.peak_bytes = @max(self.peak_bytes, next);
+        return true;
+    }
+
+    fn release(self: *ManagedBufferAllocator, len: usize) void {
+        std.debug.assert(self.used_bytes >= len);
+        self.used_bytes -= len;
+    }
+
+    fn fromContext(ctx: *anyopaque) *ManagedBufferAllocator {
+        return @ptrCast(@alignCast(ctx));
+    }
+
+    fn alloc(
+        ctx: *anyopaque,
+        len: usize,
+        alignment: std.mem.Alignment,
+        ret_addr: usize,
+    ) ?[*]u8 {
+        const self = fromContext(ctx);
+        if (!self.reserve(len)) return null;
+        return self.child.rawAlloc(len, alignment, ret_addr) orelse {
+            self.release(len);
+            return null;
+        };
+    }
+
+    fn resize(
+        ctx: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ret_addr: usize,
+    ) bool {
+        const self = fromContext(ctx);
+        if (new_len == memory.len) return true;
+
+        if (new_len > memory.len) {
+            const extra = new_len - memory.len;
+            if (!self.reserve(extra)) return false;
+            if (self.child.rawResize(memory, alignment, new_len, ret_addr)) return true;
+            self.release(extra);
+            return false;
+        }
+
+        if (!self.child.rawResize(memory, alignment, new_len, ret_addr)) return false;
+        self.release(memory.len - new_len);
+        return true;
+    }
+
+    fn remap(
+        ctx: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ret_addr: usize,
+    ) ?[*]u8 {
+        _ = ctx;
+        _ = memory;
+        _ = alignment;
+        _ = new_len;
+        _ = ret_addr;
+        return null;
+    }
+
+    fn free(
+        ctx: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        ret_addr: usize,
+    ) void {
+        const self = fromContext(ctx);
+        self.child.rawFree(memory, alignment, ret_addr);
+        self.release(memory.len);
+    }
+};
 
 const MessageBlockPool = struct {
     const max_free_blocks: usize = 1024;
@@ -1807,6 +1927,7 @@ fn slotCandidateCount(slot: *const ConnectionSlot) usize {
 pub const ProxyState = struct {
     allocator: std.mem.Allocator,
     config: Config,
+    managed_buffer_limit_bytes: u64,
     user_secrets: []obfuscation.UserSecret,
     connection_count: u64,
     active_connections: u32,
@@ -1847,6 +1968,18 @@ pub const ProxyState = struct {
     middle_proxy_updater_thread: ?std.Thread,
 
     pub fn init(allocator: std.mem.Allocator, cfg: Config) !ProxyState {
+        return initWithManagedBufferLimit(
+            allocator,
+            cfg,
+            default_managed_buffer_limit_bytes,
+        );
+    }
+
+    pub fn initWithManagedBufferLimit(
+        allocator: std.mem.Allocator,
+        cfg: Config,
+        managed_buffer_limit_bytes: u64,
+    ) !ProxyState {
         var secrets: std.ArrayList(obfuscation.UserSecret) = .empty;
         errdefer {
             for (secrets.items) |*secret| {
@@ -1937,6 +2070,7 @@ pub const ProxyState = struct {
         return .{
             .allocator = allocator,
             .config = cfg,
+            .managed_buffer_limit_bytes = managed_buffer_limit_bytes,
             .user_secrets = user_secrets,
             .connection_count = 0,
             .active_connections = 0,
@@ -2539,6 +2673,7 @@ const EventLoop = struct {
     listen_fd: posix.fd_t,
     shutdown_fd: posix.fd_t,
     pool: ConnectionPool,
+    managed_buffers: ManagedBufferAllocator,
     message_block_pool: MessageBlockPool,
     accept_paused: bool,
     accept_resume_ns: i128,
@@ -2561,6 +2696,7 @@ const EventLoop = struct {
     prev_dropped_hs_budget: u64,
     prev_hs_timeout: u64,
     prev_mp_fallback: u64,
+    prev_buffer_denials: u64,
     mp_c2s_scratch: ?[]u8,
     mp_s2c_scratch: ?[]u8,
     pending_close_fds: std.ArrayList(posix.fd_t),
@@ -2582,7 +2718,15 @@ const EventLoop = struct {
         loop.shutdown_fd = shutdown_fd;
         loop.pool = try ConnectionPool.init(state.allocator, state.config.max_connections);
         errdefer loop.pool.deinit();
-        loop.message_block_pool = .{ .allocator = state.allocator };
+        const managed_buffer_limit: usize = @intCast(@min(
+            state.managed_buffer_limit_bytes,
+            @as(u64, std.math.maxInt(usize)),
+        ));
+        loop.managed_buffers = ManagedBufferAllocator.init(
+            state.allocator,
+            managed_buffer_limit,
+        );
+        loop.message_block_pool = .{ .allocator = loop.managed_buffers.allocator() };
         loop.accept_paused = false;
         loop.accept_resume_ns = 0;
         loop.saturation_paused = false;
@@ -2607,6 +2751,7 @@ const EventLoop = struct {
         loop.prev_dropped_hs_budget = 0;
         loop.prev_hs_timeout = 0;
         loop.prev_mp_fallback = 0;
+        loop.prev_buffer_denials = 0;
         loop.mp_c2s_scratch = null;
         loop.mp_s2c_scratch = null;
         loop.pending_close_fds = .empty;
@@ -2628,14 +2773,16 @@ const EventLoop = struct {
             }
         }
 
-        if (self.mp_c2s_scratch) |buf| secureFree(self.state.allocator, buf);
-        if (self.mp_s2c_scratch) |buf| secureFree(self.state.allocator, buf);
+        const managed_allocator = self.managed_buffers.allocator();
+        if (self.mp_c2s_scratch) |buf| secureFree(managed_allocator, buf);
+        if (self.mp_s2c_scratch) |buf| secureFree(managed_allocator, buf);
 
         self.drainPendingCloses();
         self.pending_close_fds.deinit(self.state.allocator);
 
         self.pool.deinit();
         self.message_block_pool.deinit();
+        std.debug.assert(self.managed_buffers.used_bytes == 0);
         self.deadline_heap.deinit(self.state.allocator);
         closeFd(self.timer_fd);
         closeFd(self.epoll_fd);
@@ -2915,6 +3062,7 @@ const EventLoop = struct {
         const cur_hs = self.state.stats_dropped_hs_budget;
         const cur_hst = self.state.stats_hs_timeout;
         const cur_mpf = self.state.stats_mp_fallback;
+        const cur_buffer_denials = self.managed_buffers.denied_allocations;
 
         const d_cap = cur_cap - self.prev_dropped_cap;
         const d_sat = cur_sat - self.prev_dropped_saturation;
@@ -2922,6 +3070,7 @@ const EventLoop = struct {
         const d_hs = cur_hs - self.prev_dropped_hs_budget;
         const d_hst = cur_hst - self.prev_hs_timeout;
         const d_mpf = cur_mpf - self.prev_mp_fallback;
+        const d_buffer_denials = cur_buffer_denials - self.prev_buffer_denials;
 
         self.prev_dropped_cap = cur_cap;
         self.prev_dropped_saturation = cur_sat;
@@ -2929,10 +3078,12 @@ const EventLoop = struct {
         self.prev_dropped_hs_budget = cur_hs;
         self.prev_hs_timeout = cur_hst;
         self.prev_mp_fallback = cur_mpf;
+        self.prev_buffer_denials = cur_buffer_denials;
 
-        const has_drops = d_cap + d_sat + d_rate + d_hs + d_hst + d_mpf > 0;
+        const has_drops =
+            d_cap + d_sat + d_rate + d_hs + d_hst + d_mpf + d_buffer_denials > 0;
 
-        log.info("conn stats: active={d}/{d} hs_inflight={d} accepted+={d} closed+={d} tracked_fds={d} total={d} paused={}/{}", .{
+        log.info("conn stats: active={d}/{d} hs_inflight={d} accepted+={d} closed+={d} tracked_fds={d} total={d} paused={}/{} managed_buf={d}/{d}KiB peak={d}KiB", .{
             active,
             self.state.config.max_connections,
             hs,
@@ -2942,11 +3093,14 @@ const EventLoop = struct {
             accepted_total,
             self.accept_paused,
             self.saturation_paused,
+            self.managed_buffers.used_bytes / 1024,
+            self.managed_buffers.limit_bytes / 1024,
+            self.managed_buffers.peak_bytes / 1024,
         });
 
         if (has_drops) {
-            log.info("  drops: cap+={d} sat+={d} rate+={d} hs_budget+={d} hs_timeout+={d} mp_fallback+={d}", .{
-                d_cap, d_sat, d_rate, d_hs, d_hst, d_mpf,
+            log.info("  drops: cap+={d} sat+={d} rate+={d} hs_budget+={d} hs_timeout+={d} mp_fallback+={d} memory_pressure+={d}", .{
+                d_cap, d_sat, d_rate, d_hs, d_hst, d_mpf, d_buffer_denials,
             });
         }
 
@@ -4475,7 +4629,7 @@ const EventLoop = struct {
                 crypto.randomBytes(&conn_id);
 
                 slot.middle_ctx = middleproxy.MiddleProxyContext.initWithBuffer(
-                    self.state.allocator,
+                    self.managed_buffers.allocator(),
                     slot.mp_enc.?,
                     slot.mp_dec.?,
                     conn_id,
@@ -5138,8 +5292,9 @@ const EventLoop = struct {
             if (buf.len >= target_capacity) return buf;
         }
 
-        const next = try self.state.allocator.alloc(u8, target_capacity);
-        if (self.mp_c2s_scratch) |prev| secureFree(self.state.allocator, prev);
+        const allocator = self.managed_buffers.allocator();
+        const next = try allocator.alloc(u8, target_capacity);
+        if (self.mp_c2s_scratch) |prev| secureFree(allocator, prev);
         self.mp_c2s_scratch = next;
         return next;
     }
@@ -5150,8 +5305,9 @@ const EventLoop = struct {
             if (buf.len >= target_capacity) return buf;
         }
 
-        const next = try self.state.allocator.alloc(u8, target_capacity);
-        if (self.mp_s2c_scratch) |prev| secureFree(self.state.allocator, prev);
+        const allocator = self.managed_buffers.allocator();
+        const next = try allocator.alloc(u8, target_capacity);
+        if (self.mp_s2c_scratch) |prev| secureFree(allocator, prev);
         self.mp_s2c_scratch = next;
         return next;
     }
@@ -6599,6 +6755,10 @@ test "middle proxy nonce response failures fall back to direct path" {
         .listen_fd = invalid_fd,
         .shutdown_fd = invalid_fd,
         .pool = try ConnectionPool.init(std.testing.allocator, 4),
+        .managed_buffers = ManagedBufferAllocator.init(
+            std.testing.allocator,
+            @intCast(default_managed_buffer_limit_bytes),
+        ),
         .message_block_pool = .{ .allocator = std.testing.allocator },
         .accept_paused = false,
         .accept_resume_ns = 0,
@@ -6616,6 +6776,7 @@ test "middle proxy nonce response failures fall back to direct path" {
         .prev_dropped_hs_budget = 0,
         .prev_hs_timeout = 0,
         .prev_mp_fallback = 0,
+        .prev_buffer_denials = 0,
         .mp_c2s_scratch = null,
         .mp_s2c_scratch = null,
         .pending_close_fds = .empty,
@@ -6940,6 +7101,47 @@ test "shared message block pool trims and wipes recycled page blocks" {
     for (blockStorageConst(recycled)) |byte| {
         try std.testing.expectEqual(@as(u8, 0), byte);
     }
+}
+
+test "managed buffer allocator enforces limit and accounts transient growth" {
+    var budget = ManagedBufferAllocator.init(std.testing.allocator, 128);
+    const allocator = budget.allocator();
+
+    const first = try allocator.alloc(u8, 64);
+    try std.testing.expectEqual(@as(usize, 64), budget.used_bytes);
+    try std.testing.expectEqual(@as(usize, 64), budget.peak_bytes);
+
+    try std.testing.expectError(error.OutOfMemory, allocator.alloc(u8, 65));
+    try std.testing.expectEqual(@as(u64, 1), budget.denied_allocations);
+
+    // The wrapper refuses remap, so realloc must reserve the replacement while
+    // the old allocation is still resident. A failed growth leaves accounting
+    // and ownership of the original allocation unchanged.
+    try std.testing.expectError(error.OutOfMemory, allocator.realloc(first, 96));
+    try std.testing.expectEqual(@as(usize, 64), budget.used_bytes);
+    try std.testing.expectEqual(@as(u64, 2), budget.denied_allocations);
+
+    allocator.free(first);
+    try std.testing.expectEqual(@as(usize, 0), budget.used_bytes);
+}
+
+test "managed buffer budget includes retained message pages" {
+    const page_bytes = @sizeOf(MsgBlock);
+    var budget = ManagedBufferAllocator.init(std.testing.allocator, page_bytes);
+    var pool = MessageBlockPool{ .allocator = budget.allocator() };
+
+    const first = try pool.acquire();
+    try std.testing.expectEqual(page_bytes, budget.used_bytes);
+    try std.testing.expectError(error.OutOfMemory, pool.acquire());
+
+    pool.recycle(first);
+    try std.testing.expectEqual(page_bytes, budget.used_bytes);
+    const reused = try pool.acquire();
+    try std.testing.expect(reused == first);
+    pool.recycle(reused);
+
+    pool.deinit();
+    try std.testing.expectEqual(@as(usize, 0), budget.used_bytes);
 }
 
 test "queue memory budget covers two queues and the shared pool" {
@@ -7422,6 +7624,10 @@ test "handshake budget is charged once after the first client byte" {
         .listen_fd = invalid_fd,
         .shutdown_fd = invalid_fd,
         .pool = try ConnectionPool.init(std.testing.allocator, 1),
+        .managed_buffers = ManagedBufferAllocator.init(
+            std.testing.allocator,
+            @intCast(default_managed_buffer_limit_bytes),
+        ),
         .message_block_pool = .{ .allocator = std.testing.allocator },
         .accept_paused = false,
         .accept_resume_ns = 0,
@@ -7439,6 +7645,7 @@ test "handshake budget is charged once after the first client byte" {
         .prev_dropped_hs_budget = 0,
         .prev_hs_timeout = 0,
         .prev_mp_fallback = 0,
+        .prev_buffer_denials = 0,
         .mp_c2s_scratch = null,
         .mp_s2c_scratch = null,
         .pending_close_fds = .empty,

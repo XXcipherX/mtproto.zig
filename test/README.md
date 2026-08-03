@@ -16,6 +16,8 @@ The capacity probe reports, per target level:
 - `payload_ok` — successful payload submission for selected traffic mode.
 - `established_server_side` — server-side held `ESTABLISHED` sockets.
 - `rss_kb` — process-tree RSS (listener process + children).
+- `conn stats ... managed_buf=<used>/<limit>KiB peak=<peak>KiB` — runtime use of the proxy's shared relay/MiddleProxy buffer budget.
+- `drops: ... memory_pressure+=...` — allocations rejected at that hard budget; optional shrink can retain its old buffer, while required growth sheds the requesting path. Sustained increments identify pressure even when total RSS still includes ample kernel/process headroom.
 - `stable` — level considered stable per probe criteria.
 
 This is a capacity/memory harness, not an end-user Telegram UX benchmark.
@@ -173,6 +175,6 @@ Primary bottlenecks typically are:
 
 1. `max_connections` runtime cap.
 2. Host FD limits (`ulimit -n`, systemd `LimitNOFILE`).
-3. Available RAM.
+3. Available RAM and the `managed_buf` high-water mark; repeated `memory_pressure` drops mean the shared burst budget is saturated.
 
 When pushing higher levels, tune config and probe limits together.

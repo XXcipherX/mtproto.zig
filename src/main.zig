@@ -178,7 +178,10 @@ const ShutdownSignalBridge = struct {
 
 const CapacityEstimate = struct {
     effective_memory_bytes: u64,
+    allocatable_bytes: u64,
     per_conn_bytes: u64,
+    managed_initial_per_conn_bytes: u64,
+    managed_burst_reserve_bytes: u64,
     safe_connections: u32,
 };
 
@@ -558,37 +561,19 @@ fn percentOfMemory(value: u64, percent: u8) u64 {
 }
 
 fn estimateCapacity(cfg: *const config.Config, total_ram_bytes: u64) CapacityEstimate {
-    return estimateCapacityWithPageSize(cfg, total_ram_bytes, std.heap.pageSize());
-}
-
-fn estimateCapacityWithPageSize(
-    cfg: *const config.Config,
-    total_ram_bytes: u64,
-    runtime_page_size: usize,
-) CapacityEstimate {
-    // Approximate per-connection user-space working set in the epoll model:
-    // - preallocated slot state and small relay buffers
-    // - two worst-case relay queues at their physical page-allocation cost
-    // - optional middle-proxy stream buffers (budgeted as 2 per-connection caps)
-    // - allocator/socket bookkeeping cushion
+    // Guaranteed per-connection baseline in the epoll model. Relay queue pages,
+    // MiddleProxy growth, and shared scratch are charged to one runtime-enforced
+    // managed budget instead of multiplying their rare maxima by every slot.
     const tls_working_bytes: u64 = @intCast(6 * 1024);
-    const queue_memory = proxy.queueMemoryBudget(runtime_page_size);
     const uses_middle_proxy = cfg.usesAnyMiddleProxy();
-    const middleproxy_per_conn_bytes: u64 = if (uses_middle_proxy)
-        @intCast(cfg.middleProxyBufferBytes() * 2)
-    else
-        0;
-    // Event loop also keeps shared C2S/S2C scratch for middle-proxy paths.
-    // Media-only middle-proxy mode still needs that shared budget.
-    const middleproxy_shared_bytes: u64 = if (uses_middle_proxy)
-        @intCast(cfg.middleProxySharedScratchBytes())
+    const managed_initial_per_conn_bytes: u64 = if (uses_middle_proxy)
+        @intCast(config.Config.middle_proxy_initial_stream_buffer_bytes * 2)
     else
         0;
     const overhead_bytes: u64 = 2 * 1024;
     const per_conn_bytes =
         tls_working_bytes +
-        queue_memory.per_connection_bytes +
-        middleproxy_per_conn_bytes +
+        managed_initial_per_conn_bytes +
         overhead_bytes;
 
     // Keep safety headroom for kernel TCP memory, page cache, and baseline process state.
@@ -597,20 +582,49 @@ fn estimateCapacityWithPageSize(
         @as(u64, 256 * 1024 * 1024),
         percentOfMemory(total_ram_bytes, 10),
     );
-    const fixed_overhead_bytes =
-        reserve_bytes +
-        queue_memory.shared_pool_bytes +
-        middleproxy_shared_bytes;
-    const budget_bytes = if (usable_bytes > fixed_overhead_bytes) usable_bytes - fixed_overhead_bytes else 0;
+    const allocatable_bytes = if (usable_bytes > reserve_bytes) usable_bytes - reserve_bytes else 0;
 
-    const raw_cap = if (per_conn_bytes > 0) budget_bytes / per_conn_bytes else 0;
+    // Half of the post-reserve budget is a shared hard ceiling for queue pages,
+    // MP stream-buffer capacity, and MP scratch. The other half guarantees the
+    // fixed baseline for every admitted connection.
+    const managed_burst_reserve_bytes = allocatable_bytes / 2;
+    const connection_budget_bytes = allocatable_bytes - managed_burst_reserve_bytes;
+
+    const raw_cap = if (per_conn_bytes > 0) connection_budget_bytes / per_conn_bytes else 0;
     const safe_connections_u64 = @min(raw_cap, @as(u64, std.math.maxInt(u32)));
 
     return .{
         .effective_memory_bytes = total_ram_bytes,
+        .allocatable_bytes = allocatable_bytes,
         .per_conn_bytes = per_conn_bytes,
+        .managed_initial_per_conn_bytes = managed_initial_per_conn_bytes,
+        .managed_burst_reserve_bytes = managed_burst_reserve_bytes,
         .safe_connections = @intCast(safe_connections_u64),
     };
+}
+
+fn managedBufferLimitForConnections(
+    capacity_estimate: ?CapacityEstimate,
+    max_connections: u32,
+) u64 {
+    const est = capacity_estimate orelse return proxy.default_managed_buffer_limit_bytes;
+    if (est.per_conn_bytes < est.managed_initial_per_conn_bytes) return 0;
+    const unmanaged_per_conn_bytes =
+        est.per_conn_bytes - est.managed_initial_per_conn_bytes;
+    const unmanaged_total_wide =
+        @as(u128, unmanaged_per_conn_bytes) * @as(u128, max_connections);
+    if (unmanaged_total_wide >= @as(u128, est.allocatable_bytes)) return 0;
+
+    const max_managed_bytes =
+        est.allocatable_bytes - @as(u64, @intCast(unmanaged_total_wide));
+    const managed_initial_wide =
+        @as(u128, est.managed_initial_per_conn_bytes) * @as(u128, max_connections);
+    const desired_wide =
+        @as(u128, est.managed_burst_reserve_bytes) + managed_initial_wide;
+    return @intCast(@min(
+        desired_wide,
+        @as(u128, max_managed_bytes),
+    ));
 }
 
 fn enforceCapacitySafety(cfg: *config.Config, capacity_estimate: ?CapacityEstimate) !void {
@@ -660,7 +674,7 @@ fn enforceCapacitySafety(cfg: *config.Config, capacity_estimate: ?CapacityEstima
 
     log_main.warn(
         "auto-clamping max_connections from {d} to {d} " ++
-            "(effective memory limit {d} MiB, ~{d} KiB/connection). " ++
+            "(effective memory limit {d} MiB, ~{d} KiB baseline/connection). " ++
             "To disable this safety clamp, set unsafe_override_limits = true in [server].",
         .{
             configured_limit,
@@ -674,7 +688,12 @@ fn enforceCapacitySafety(cfg: *config.Config, capacity_estimate: ?CapacityEstima
 // ============= Startup Banner =============
 
 /// Print a stylish startup banner with config summary and connection links.
-fn printBanner(cfg: config.Config, capacity_estimate: ?CapacityEstimate, show_secrets: bool) void {
+fn printBanner(
+    cfg: config.Config,
+    capacity_estimate: ?CapacityEstimate,
+    managed_buffer_limit_bytes: u64,
+    show_secrets: bool,
+) void {
     var output = std.Io.Writer.Allocating.init(std.heap.page_allocator);
     defer output.deinit();
     stdout_accumulator = &output.writer;
@@ -730,9 +749,12 @@ fn printBanner(cfg: config.Config, capacity_estimate: ?CapacityEstimate, show_se
             "direct mode";
         writeRaw("  " ++ D ++ "───" ++ R ++ " " ++ B ++ cyan ++ "CAPACITY" ++ R ++ " " ++ D ++ "────────────────────────────────────" ++ R ++ "\n");
         writeStdout("      Memory limit " ++ B ++ "{d} MiB" ++ R ++ "\n", .{est.effective_memory_bytes / (1024 * 1024)});
-        writeStdout("      Per conn     ~{d} KiB ({s})\n", .{
+        writeStdout("      Baseline     ~{d} KiB/connection ({s})\n", .{
             est.per_conn_bytes / 1024,
             capacity_mode,
+        });
+        writeStdout("      Buffer pool  ~{d} MiB shared hard limit\n", .{
+            managed_buffer_limit_bytes / (1024 * 1024),
         });
         writeStdout("      Safe cap     " ++ B ++ "~{d}" ++ R ++ " connections\n", .{est.safe_connections});
         if (cfg.max_connections > est.safe_connections) {
@@ -859,15 +881,26 @@ pub fn main(init: std.process.Init) !void {
         null;
 
     try enforceCapacitySafety(&cfg, capacity_estimate);
+    const managed_buffer_limit_bytes =
+        managedBufferLimitForConnections(capacity_estimate, cfg.max_connections);
 
     // Print the startup banner without blocking on external discovery.
-    printBanner(cfg, capacity_estimate, show_secrets);
+    printBanner(
+        cfg,
+        capacity_estimate,
+        managed_buffer_limit_bytes,
+        show_secrets,
+    );
 
     // Emit config warnings (e.g. buffer too small, memory concerns)
     cfg.emitWarnings();
 
     // Create shared state (DI — no globals)
-    var state = try proxy.ProxyState.init(allocator, cfg);
+    var state = try proxy.ProxyState.initWithManagedBufferLimit(
+        allocator,
+        cfg,
+        managed_buffer_limit_bytes,
+    );
     defer state.deinit();
 
     // Run the proxy
@@ -900,7 +933,10 @@ test "capacity safety clamp enforces safe cap when override disabled" {
 
     const est = CapacityEstimate{
         .effective_memory_bytes = 2 * 1024 * 1024 * 1024,
+        .allocatable_bytes = 1200 * 1024 * 1024,
         .per_conn_bytes = 2 * 1024 * 1024,
+        .managed_initial_per_conn_bytes = 0,
+        .managed_burst_reserve_bytes = 256 * 1024 * 1024,
         .safe_connections = 585,
     };
 
@@ -919,7 +955,10 @@ test "capacity safety clamp keeps configured limit when override enabled" {
 
     const est = CapacityEstimate{
         .effective_memory_bytes = 2 * 1024 * 1024 * 1024,
+        .allocatable_bytes = 1200 * 1024 * 1024,
         .per_conn_bytes = 2 * 1024 * 1024,
+        .managed_initial_per_conn_bytes = 0,
+        .managed_burst_reserve_bytes = 256 * 1024 * 1024,
         .safe_connections = 585,
     };
 
@@ -954,45 +993,63 @@ test "capacity estimate accounts for media-only middle proxy overhead" {
     try std.testing.expect(media_est.safe_connections < direct_est.safe_connections);
 }
 
-test "capacity estimate budgets physical relay queue pages" {
-    var cfg = config.Config{
+test "capacity estimate reserves one shared managed buffer pool" {
+    var direct_cfg = config.Config{
         .users = std.StringHashMap([16]u8).init(std.testing.allocator),
         .direct_users = std.StringHashMap(void).init(std.testing.allocator),
         .use_middle_proxy = false,
         .force_media_middle_proxy = false,
     };
-    defer cfg.deinit(std.testing.allocator);
+    defer direct_cfg.deinit(std.testing.allocator);
 
-    const total_ram_bytes: u64 = 2 * 1024 * 1024 * 1024;
-    const runtime_page_size = std.heap.page_size_min;
-    const queue_memory = proxy.queueMemoryBudget(runtime_page_size);
-    const est = estimateCapacityWithPageSize(&cfg, total_ram_bytes, runtime_page_size);
+    var media_cfg = config.Config{
+        .users = std.StringHashMap([16]u8).init(std.testing.allocator),
+        .direct_users = std.StringHashMap(void).init(std.testing.allocator),
+        .use_middle_proxy = false,
+        .force_media_middle_proxy = true,
+    };
+    defer media_cfg.deinit(std.testing.allocator);
+
+    const total_ram_bytes: u64 = 960 * 1024 * 1024;
+    const direct_est = estimateCapacity(&direct_cfg, total_ram_bytes);
+    const media_est = estimateCapacity(&media_cfg, total_ram_bytes);
+
+    try std.testing.expectEqual(@as(u64, 416 * 1024 * 1024), direct_est.allocatable_bytes);
+    try std.testing.expectEqual(@as(u64, 208 * 1024 * 1024), direct_est.managed_burst_reserve_bytes);
+    try std.testing.expectEqual(@as(u64, 8 * 1024), direct_est.per_conn_bytes);
+    try std.testing.expectEqual(@as(u32, 26_624), direct_est.safe_connections);
 
     try std.testing.expectEqual(
-        queue_memory.per_connection_bytes + 8 * 1024,
-        est.per_conn_bytes,
+        @as(u64, 2 * config.Config.middle_proxy_initial_stream_buffer_bytes),
+        media_est.managed_initial_per_conn_bytes,
     );
-
-    const usable_bytes = percentOfMemory(total_ram_bytes, 70);
-    const reserve_bytes = @max(
-        @as(u64, 256 * 1024 * 1024),
-        percentOfMemory(total_ram_bytes, 10),
-    );
-    const expected_budget =
-        usable_bytes - reserve_bytes - queue_memory.shared_pool_bytes;
+    try std.testing.expectEqual(@as(u64, 40 * 1024), media_est.per_conn_bytes);
+    try std.testing.expectEqual(@as(u32, 5_324), media_est.safe_connections);
     try std.testing.expectEqual(
-        @as(u32, @intCast(expected_budget / est.per_conn_bytes)),
-        est.safe_connections,
+        @as(u64, 216 * 1024 * 1024),
+        managedBufferLimitForConnections(media_est, 256),
     );
 
-    const larger_runtime_page_size = runtime_page_size * 2;
-    const larger_est = estimateCapacityWithPageSize(
-        &cfg,
-        total_ram_bytes,
-        larger_runtime_page_size,
+    const unmanaged_per_conn =
+        media_est.per_conn_bytes - media_est.managed_initial_per_conn_bytes;
+    const safe_limit =
+        managedBufferLimitForConnections(media_est, media_est.safe_connections);
+    try std.testing.expect(
+        safe_limit +
+            @as(u64, media_est.safe_connections) * unmanaged_per_conn <=
+            media_est.allocatable_bytes,
     );
-    try std.testing.expect(larger_est.per_conn_bytes > est.per_conn_bytes);
-    try std.testing.expect(larger_est.safe_connections < est.safe_connections);
+
+    const overridden_connections = media_est.safe_connections + 1;
+    try std.testing.expectEqual(
+        media_est.allocatable_bytes -
+            @as(u64, overridden_connections) * unmanaged_per_conn,
+        managedBufferLimitForConnections(media_est, overridden_connections),
+    );
+    try std.testing.expectEqual(
+        proxy.default_managed_buffer_limit_bytes,
+        managedBufferLimitForConnections(null, 256),
+    );
 }
 
 test "capacity estimate handles the largest finite cgroup v2 limit" {
@@ -1075,7 +1132,10 @@ test "capacity safety refuses a budget below the supported minimum" {
 
     const est = CapacityEstimate{
         .effective_memory_bytes = 128 * 1024 * 1024,
+        .allocatable_bytes = 0,
         .per_conn_bytes = 8 * 1024,
+        .managed_initial_per_conn_bytes = 0,
+        .managed_burst_reserve_bytes = 0,
         .safe_connections = 0,
     };
     try std.testing.expectError(error.InsufficientMemoryBudget, enforceCapacitySafety(&cfg, est));

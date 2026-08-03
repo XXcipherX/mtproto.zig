@@ -111,6 +111,7 @@ pub const Config = struct {
     pub const middle_proxy_relay_queue_headroom_bytes: usize = 256 * 1024;
     pub const middle_proxy_c2s_scratch_headroom: usize =
         middle_proxy_relay_queue_headroom_bytes;
+    pub const middle_proxy_initial_stream_buffer_bytes: usize = 16 * 1024;
     pub const middle_proxy_stream_buffer_cap_bytes: usize =
         relay_queue_max_pending_bytes - middle_proxy_relay_queue_headroom_bytes;
 
@@ -166,17 +167,6 @@ pub const Config = struct {
                 },
             );
         }
-        if (self.usesAnyMiddleProxy() and self.max_connections > 2000) {
-            const log = std.log.scoped(.config);
-            const mem_per_conn_mb = (self.middleProxyBufferBytes() * 2) / (1024 * 1024);
-            const shared_mb = self.middleProxySharedScratchBytes() / (1024 * 1024);
-            log.warn(
-                "max_connections={d} with middleproxy_buffer_kb={d} should still plan for " ++
-                    "up to {d} MB + {d} MB shared RAM at full capacity. Ensure your VPS has sufficient memory.",
-                .{ self.max_connections, self.middleproxy_buffer_kb, mem_per_conn_mb * self.max_connections, shared_mb },
-            );
-        }
-
         if (self.direct_users.count() > 0) {
             const log = std.log.scoped(.config);
             var direct_users = self.direct_users;
