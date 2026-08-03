@@ -38,25 +38,30 @@ pub const ObfuscationParams = struct {
 
         // Encrypt direction: reversed prekey+IV
         var enc_prekey_iv: [constants.prekey_len + constants.iv_len]u8 = undefined;
+        defer std.crypto.secureZero(u8, &enc_prekey_iv);
         for (0..dec_prekey_iv.len) |i| {
             enc_prekey_iv[i] = dec_prekey_iv[dec_prekey_iv.len - 1 - i];
         }
         const enc_prekey = enc_prekey_iv[0..constants.prekey_len];
         const enc_iv_bytes: *const [constants.iv_len]u8 = enc_prekey_iv[constants.prekey_len..][0..constants.iv_len];
 
-        for (secrets) |entry| {
+        for (secrets) |*entry| {
             // Derive decrypt key: SHA256(prekey || secret)
             var dec_key_input: [constants.prekey_len + 16]u8 = undefined;
+            defer std.crypto.secureZero(u8, &dec_key_input);
             @memcpy(dec_key_input[0..constants.prekey_len], dec_prekey);
             @memcpy(dec_key_input[constants.prekey_len..], &entry.secret);
-            const decrypt_key = crypto.sha256(&dec_key_input);
+            var decrypt_key = crypto.sha256(&dec_key_input);
+            defer std.crypto.secureZero(u8, &decrypt_key);
 
-            const decrypt_iv = std.mem.readInt(u128, dec_iv_bytes, .big);
+            var decrypt_iv = std.mem.readInt(u128, dec_iv_bytes, .big);
+            defer std.crypto.secureZero(u8, std.mem.asBytes(&decrypt_iv));
 
             // Decrypt the handshake to check proto tag
             var decryptor = crypto.AesCtr.init(&decrypt_key, decrypt_iv);
             defer decryptor.wipe();
             var decrypted: [constants.handshake_len]u8 = undefined;
+            defer std.crypto.secureZero(u8, &decrypted);
             @memcpy(&decrypted, handshake);
             decryptor.apply(&decrypted);
 
@@ -69,10 +74,13 @@ pub const ObfuscationParams = struct {
 
             // Derive encrypt key
             var enc_key_input: [constants.prekey_len + 16]u8 = undefined;
+            defer std.crypto.secureZero(u8, &enc_key_input);
             @memcpy(enc_key_input[0..constants.prekey_len], enc_prekey);
             @memcpy(enc_key_input[constants.prekey_len..], &entry.secret);
-            const encrypt_key = crypto.sha256(&enc_key_input);
-            const encrypt_iv = std.mem.readInt(u128, enc_iv_bytes, .big);
+            var encrypt_key = crypto.sha256(&enc_key_input);
+            defer std.crypto.secureZero(u8, &encrypt_key);
+            var encrypt_iv = std.mem.readInt(u128, enc_iv_bytes, .big);
+            defer std.crypto.secureZero(u8, std.mem.asBytes(&encrypt_iv));
 
             return .{
                 .params = .{
@@ -102,10 +110,10 @@ pub const ObfuscationParams = struct {
 
     /// Securely wipe key material.
     pub fn wipe(self: *ObfuscationParams) void {
-        @memset(&self.decrypt_key, 0);
-        self.decrypt_iv = 0;
-        @memset(&self.encrypt_key, 0);
-        self.encrypt_iv = 0;
+        std.crypto.secureZero(u8, &self.decrypt_key);
+        std.crypto.secureZero(u8, std.mem.asBytes(&self.decrypt_iv));
+        std.crypto.secureZero(u8, &self.encrypt_key);
+        std.crypto.secureZero(u8, std.mem.asBytes(&self.encrypt_iv));
     }
 };
 
@@ -141,6 +149,7 @@ pub fn isValidNonce(nonce: *const [constants.handshake_len]u8) bool {
 pub fn generateNonce() [constants.handshake_len]u8 {
     while (true) {
         var nonce: [constants.handshake_len]u8 = undefined;
+        defer std.crypto.secureZero(u8, &nonce);
         crypto.randomBytes(&nonce);
         if (isValidNonce(&nonce)) return nonce;
     }
@@ -159,6 +168,7 @@ pub fn prepareTgNonce(
     if (enc_key_iv) |key_iv| {
         // Reverse the key+IV into the nonce
         var reversed: [constants.key_len + constants.iv_len]u8 = undefined;
+        defer std.crypto.secureZero(u8, &reversed);
         for (0..key_iv.len) |i| {
             reversed[i] = key_iv[key_iv.len - 1 - i];
         }

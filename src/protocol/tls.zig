@@ -27,6 +27,16 @@ pub const TlsValidation = struct {
     timestamp: u32,
     /// The 16-byte user secret that matched (needed for ServerHello HMAC)
     secret: [16]u8,
+
+    /// Wipe copied authentication material without overwriting the borrowed
+    /// username pointer with an invalid pointer representation.
+    pub fn wipe(self: *TlsValidation) void {
+        std.crypto.secureZero(u8, &self.session_id);
+        std.crypto.secureZero(u8, &self.digest);
+        std.crypto.secureZero(u8, &self.canonical_hmac);
+        std.crypto.secureZero(u8, &self.secret);
+        std.crypto.secureZero(u8, std.mem.asBytes(&self.timestamp));
+    }
 };
 
 const ParsedClientHello = struct {
@@ -172,7 +182,8 @@ pub fn validateTlsHandshake(
     const parsed = parseClientHello(handshake) orelse return null;
     if (parsed.digest.ptr != handshake[constants.tls_digest_pos..].ptr) return null;
     if (parsed.session_id.len != 32) return null;
-    const digest: [constants.tls_digest_len]u8 = parsed.digest[0..constants.tls_digest_len].*;
+    var digest: [constants.tls_digest_len]u8 = parsed.digest[0..constants.tls_digest_len].*;
+    defer std.crypto.secureZero(u8, &digest);
 
     const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
     const zero_digest = [_]u8{0} ** constants.tls_digest_len;
@@ -182,7 +193,7 @@ pub fn validateTlsHandshake(
     else
         0;
 
-    for (secrets) |entry| {
+    for (secrets) |*entry| {
         var hmac = HmacSha256.init(&entry.secret);
         defer std.crypto.secureZero(u8, std.mem.asBytes(&hmac));
         hmac.update(handshake[0..constants.tls_digest_pos]);

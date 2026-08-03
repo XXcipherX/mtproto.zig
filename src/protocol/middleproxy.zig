@@ -111,10 +111,12 @@ pub fn getAesKeyAndIv(
     defer std.crypto.secureZero(u8, &sha1_all);
 
     var key: [32]u8 = undefined;
+    defer std.crypto.secureZero(u8, &key);
     @memcpy(key[0..12], md5_all[0..12]);
     @memcpy(key[12..32], sha1_all[0..20]);
 
-    const iv = crypto.md5(s[2..]);
+    var iv = crypto.md5(s[2..]);
+    defer std.crypto.secureZero(u8, &iv);
 
     return .{ key, iv };
 }
@@ -532,7 +534,7 @@ pub const MiddleProxyContext = struct {
         @memcpy(out_buf[out_len .. out_len + 20], &self.our_ip_port);
         out_len += 20;
 
-        if (self.ad_tag) |ad_tag| {
+        if (self.ad_tag) |*ad_tag| {
             const extra_size: u32 = 24;
             std.mem.writeInt(u32, out_buf[out_len..][0..4], extra_size, .little);
             out_len += 4;
@@ -544,7 +546,7 @@ pub const MiddleProxyContext = struct {
             out_buf[out_len] = 16;
             out_len += 1;
 
-            @memcpy(out_buf[out_len .. out_len + 16], &ad_tag);
+            @memcpy(out_buf[out_len .. out_len + 16], ad_tag);
             out_len += 16;
 
             const aligner = [_]u8{ 0x00, 0x00, 0x00 };

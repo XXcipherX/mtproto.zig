@@ -3189,21 +3189,20 @@ const EventLoop = struct {
             return;
         }
 
-        const validation = tls.validateTlsHandshake(
+        var validation = tls.validateTlsHandshake(
             self.state.allocator,
             client_hello,
             self.state.user_secrets,
             false,
         ) catch null;
+        defer if (validation) |*value| value.wipe();
 
-        if (validation == null) {
+        const v = if (validation) |*value| value else {
             self.startMasking(slot, client_hello) catch {
                 self.closeSlot(slot, "tls validation failed");
             };
             return;
-        }
-
-        const v = validation.?;
+        };
         if (self.state.replay_cache.checkAndInsert(&v.canonical_hmac)) {
             self.startMasking(slot, client_hello) catch {
                 self.closeSlot(slot, "replay detected, masking failed");
@@ -3389,14 +3388,19 @@ const EventLoop = struct {
     }
 
     fn finishClientHandshake(self: *EventLoop, slot: *ConnectionSlot) void {
-        const known_secret = [_]obfuscation.UserSecret{.{
+        var known_secret = [_]obfuscation.UserSecret{.{
             .name = slot.validation_user[0..slot.validation_user_len],
             .secret = slot.validation_secret,
         }};
-        const result = obfuscation.ObfuscationParams.fromHandshake(&slot.handshake_buf, &known_secret) orelse {
+        defer std.crypto.secureZero(u8, &known_secret[0].secret);
+        var result = obfuscation.ObfuscationParams.fromHandshake(&slot.handshake_buf, &known_secret) orelse {
             self.closeSlot(slot, "bad mtproto obfuscation handshake");
             return;
         };
+        defer result.params.wipe();
+        std.crypto.secureZero(u8, &slot.validation_secret);
+        std.crypto.secureZero(u8, &slot.handshake_buf);
+        slot.handshake_pos = 0;
 
         slot.obf_params = result.params;
         slot.proto_tag = result.params.proto_tag;
@@ -3756,7 +3760,7 @@ const EventLoop = struct {
     }
 
     fn sendDcNonce(self: *EventLoop, slot: *ConnectionSlot) void {
-        const params = slot.obf_params orelse {
+        const params = if (slot.obf_params) |*value| value else {
             self.closeSlot(slot, "missing obfuscation params");
             return;
         };
@@ -3781,7 +3785,8 @@ const EventLoop = struct {
         defer std.crypto.secureZero(u8, &tg_enc_key);
         var tg_enc_iv_bytes: [constants.iv_len]u8 = tg_enc_key_iv[constants.key_len..][0..constants.iv_len].*;
         defer std.crypto.secureZero(u8, &tg_enc_iv_bytes);
-        const tg_enc_iv = std.mem.readInt(u128, &tg_enc_iv_bytes, .big);
+        var tg_enc_iv = std.mem.readInt(u128, &tg_enc_iv_bytes, .big);
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&tg_enc_iv));
 
         var tg_dec_key_iv: [constants.key_len + constants.iv_len]u8 = undefined;
         defer std.crypto.secureZero(u8, &tg_dec_key_iv);
@@ -3790,7 +3795,8 @@ const EventLoop = struct {
         }
         var tg_dec_key: [constants.key_len]u8 = tg_dec_key_iv[0..constants.key_len].*;
         defer std.crypto.secureZero(u8, &tg_dec_key);
-        const tg_dec_iv = std.mem.readInt(u128, tg_dec_key_iv[constants.key_len..][0..constants.iv_len], .big);
+        var tg_dec_iv = std.mem.readInt(u128, tg_dec_key_iv[constants.key_len..][0..constants.iv_len], .big);
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&tg_dec_iv));
 
         var tg_encryptor = crypto.AesCtr.init(&tg_enc_key, tg_enc_iv);
         defer tg_encryptor.wipe();
@@ -3811,7 +3817,7 @@ const EventLoop = struct {
         }
 
         // Promotion tag (optional), only for primary DC1..5
-        if (self.state.config.tag) |tag| {
+        if (self.state.config.tag) |*tag| {
             const dc_abs: usize = slot.dc_abs;
             if (dc_abs >= 1 and dc_abs <= constants.tg_datacenters_v4.len and dc_abs != 203) {
                 var promote_buf: [32]u8 = undefined;
@@ -3822,7 +3828,7 @@ const EventLoop = struct {
                 var rpc_payload: [20]u8 = undefined;
                 defer std.crypto.secureZero(u8, &rpc_payload);
                 std.mem.writeInt(u32, rpc_payload[0..4], rpc_id, .little);
-                @memcpy(rpc_payload[4..20], &tag);
+                @memcpy(rpc_payload[4..20], tag);
 
                 switch (params.proto_tag) {
                     .abridged => {
@@ -4092,9 +4098,11 @@ const EventLoop = struct {
         slot.mp_timestamp = ts;
 
         var crypto_ts: [4]u8 = undefined;
+        defer std.crypto.secureZero(u8, &crypto_ts);
         std.mem.writeInt(u32, &crypto_ts, ts, .little);
 
         var msg: [32]u8 = undefined;
+        defer std.crypto.secureZero(u8, &msg);
         @memcpy(msg[0..4], &middleproxy.rpc_nonce_req);
         @memset(msg[4..8], 0);
         self.state.middle_proxy_lock.lockShared();
@@ -4395,7 +4403,7 @@ const EventLoop = struct {
         }
         if (slot.direct_fallback_addr == null or slot.direct_fallback_used) return false;
 
-        _ = slot.obf_params orelse return false;
+        if (slot.obf_params == null) return false;
         slot.direct_fallback_used = true;
         self.state.stats_mp_fallback +|= 1;
         slot.use_middle_proxy = false;
@@ -4475,6 +4483,7 @@ const EventLoop = struct {
     fn mpWriteFrame(self: *EventLoop, slot: *ConnectionSlot, payload: []const u8, encrypted: bool) !void {
         _ = self;
         var plain: [mp_handshake_frame_buf_size]u8 = undefined;
+        defer std.crypto.secureZero(u8, &plain);
         const total_len: usize = payload.len + 12;
         if (total_len > plain.len) return error.BadMiddleProxyFrameSize;
 

@@ -98,6 +98,7 @@ Do not reintroduce thread-per-connection or blocking relay loops.
 
 - Pass allocators explicitly and free deterministically.
 - Securely wipe secret-bearing and plaintext buffers before allocator release, including Config user-secret values, queue blocks, MiddleProxy stream/scratch buffers, nonce/KDF state, and cipher contexts.
+- Avoid value captures and optional-unwrapping copies for secret-bearing records. Use pointer captures where ownership permits, clear named handshake/KDF/hash/cipher temporaries with `std.crypto.secureZero`, and wipe only the sensitive fields of structs that also contain enums or pointers.
 - Use error unions and avoid swallowing critical errors on control-path boundaries.
 - Keep tests close to protocol primitives and relay helpers.
 - For substantial behavior changes, update `README.md` and relevant `.agent` docs in the same change.

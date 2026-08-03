@@ -38,7 +38,8 @@ pub const AesCtr = struct {
         if (key.len != 32) return error.InvalidKeyLength;
         if (iv.len != 16) return error.InvalidIvLength;
         const k: *const [32]u8 = key[0..32];
-        const iv_val = std.mem.readInt(u128, iv[0..16], .big);
+        var iv_val = std.mem.readInt(u128, iv[0..16], .big);
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&iv_val));
         return init(k, iv_val);
     }
 
@@ -46,25 +47,31 @@ pub const AesCtr = struct {
     pub fn apply(self: *AesCtr, data: []u8) void {
         const wide_blocks = 4;
         const wide_bytes = 16 * wide_blocks;
+        var wide_counters: [wide_bytes]u8 = undefined;
+        defer std.crypto.secureZero(u8, &wide_counters);
+        var wide_keystream: [wide_bytes]u8 = undefined;
+        defer std.crypto.secureZero(u8, &wide_keystream);
+        var ctr_bytes: [16]u8 = undefined;
+        defer std.crypto.secureZero(u8, &ctr_bytes);
+        var block_keystream: [16]u8 = undefined;
+        defer std.crypto.secureZero(u8, &block_keystream);
         var i: usize = 0;
 
         while (i < data.len) {
             if (self.buffer_pos >= 16 and data.len - i >= wide_bytes) {
-                var counters: [wide_bytes]u8 = undefined;
-                var keystream: [wide_bytes]u8 = undefined;
                 for (0..wide_blocks) |block_index| {
                     std.mem.writeInt(
                         u128,
-                        counters[block_index * 16 ..][0..16],
+                        wide_counters[block_index * 16 ..][0..16],
                         self.ctr +% @as(u128, block_index),
                         .big,
                     );
                 }
-                self.enc_ctx.encryptWide(wide_blocks, &keystream, &counters);
+                self.enc_ctx.encryptWide(wide_blocks, &wide_keystream, &wide_counters);
                 for (0..wide_blocks) |block_index| {
                     xorBlockInPlace(
                         data[i + block_index * 16 ..][0..16],
-                        keystream[block_index * 16 ..][0..16],
+                        wide_keystream[block_index * 16 ..][0..16],
                     );
                 }
                 self.ctr +%= wide_blocks;
@@ -73,11 +80,9 @@ pub const AesCtr = struct {
             }
 
             if (self.buffer_pos >= 16 and data.len - i >= 16) {
-                var ctr_bytes: [16]u8 = undefined;
-                var keystream: [16]u8 = undefined;
                 std.mem.writeInt(u128, &ctr_bytes, self.ctr, .big);
-                self.enc_ctx.encrypt(&keystream, &ctr_bytes);
-                xorBlockInPlace(data[i..][0..16], &keystream);
+                self.enc_ctx.encrypt(&block_keystream, &ctr_bytes);
+                xorBlockInPlace(data[i..][0..16], &block_keystream);
                 self.ctr +%= 1;
                 i += 16;
                 continue;
@@ -85,7 +90,6 @@ pub const AesCtr = struct {
 
             if (self.buffer_pos >= 16) {
                 // Generate new keystream block
-                var ctr_bytes: [16]u8 = undefined;
                 std.mem.writeInt(u128, &ctr_bytes, self.ctr, .big);
                 self.enc_ctx.encrypt(&self.buffer, &ctr_bytes);
                 self.ctr +%= 1;
@@ -116,7 +120,7 @@ pub const AesCtr = struct {
     /// Securely wipe key material.
     pub fn wipe(self: *AesCtr) void {
         std.crypto.secureZero(u8, &self.buffer);
-        self.ctr = 0;
+        std.crypto.secureZero(u8, std.mem.asBytes(&self.ctr));
         // Wipe expanded key schedule
         std.crypto.secureZero(u8, std.mem.asBytes(&self.enc_ctx));
     }
@@ -284,6 +288,7 @@ pub const AesCbc = struct {
 /// SHA-256
 pub fn sha256(data: []const u8) [32]u8 {
     var h = std.crypto.hash.sha2.Sha256.init(.{});
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&h));
     h.update(data);
     return h.finalResult();
 }
@@ -291,14 +296,19 @@ pub fn sha256(data: []const u8) [32]u8 {
 /// SHA-256 HMAC
 pub fn sha256Hmac(key: []const u8, data: []const u8) [32]u8 {
     const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+    var hmac = HmacSha256.init(key);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&hmac));
+    hmac.update(data);
     var mac: [32]u8 = undefined;
-    HmacSha256.create(&mac, data, key);
+    defer std.crypto.secureZero(u8, &mac);
+    hmac.final(&mac);
     return mac;
 }
 
 /// SHA-1 — protocol-required by Telegram Middle Proxy KDF.
 pub fn sha1(data: []const u8) [20]u8 {
     var h = std.crypto.hash.Sha1.init(.{});
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&h));
     h.update(data);
     return h.finalResult();
 }
@@ -306,8 +316,10 @@ pub fn sha1(data: []const u8) [20]u8 {
 /// MD5 — protocol-required by Telegram Middle Proxy KDF.
 pub fn md5(data: []const u8) [16]u8 {
     var h = std.crypto.hash.Md5.init(.{});
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&h));
     h.update(data);
     var out: [16]u8 = undefined;
+    defer std.crypto.secureZero(u8, &out);
     h.final(&out);
     return out;
 }
