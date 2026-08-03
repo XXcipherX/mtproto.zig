@@ -100,7 +100,7 @@ middleproxy_shared_bytes   = (effective_mp_cap + 256) + effective_mp_cap (if ME 
 overhead_bytes    = ~2 KiB
 per_conn_bytes    = tls_working_bytes + middleproxy_per_conn_bytes + overhead_bytes
 
-effective_memory = min(host RAM, cgroup v2/v1 memory limit when present)
+effective_memory = min(host RAM, all visible limits in the active cgroup v2/v1 hierarchy)
 usable_bytes  = effective_memory * 70%
 reserve_bytes = max(256 MiB, effective_memory * 10%)
 budget_bytes  = max(0, usable_bytes - reserve_bytes - middleproxy_shared_bytes)
@@ -108,6 +108,8 @@ safe_connections = budget_bytes / per_conn_bytes
 ```
 
 Runtime allocation is lazier than this estimate: MiddleProxy per-connection stream buffers start at 16 KiB per direction and grow only when traffic requires it. The capacity estimate intentionally budgets the full effective cap so the startup clamp is conservative under worst-case media traffic.
+
+The cgroup detector resolves the process membership through `/proc/self/cgroup` and `/proc/self/mountinfo`, then takes the lowest readable leaf or ancestor limit. In cgroup v2 a numeric `0` is a real hard limit; only `max` means unlimited. Conventional `/sys/fs/cgroup` paths remain a fallback when procfs mount metadata is unavailable.
 
 If `max_connections` exceeds the memory-safe estimate, startup auto-clamps it before the proxy starts unless `[server].unsafe_override_limits = true`. If the estimate is below the supported minimum of 32 slots, safe mode fails startup instead of forcing 32. With the override enabled, startup keeps the configured value and logs a warning. If neither host nor cgroup memory can be read on Linux, startup logs that the clamp was skipped.
 

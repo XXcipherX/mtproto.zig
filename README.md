@@ -480,7 +480,7 @@ EOF
 
 ### &nbsp; Capacity & RAM Monitoring
 
-On startup, the proxy uses the lower of host RAM and the active cgroup v2/v1 memory limit and prints a **CAPACITY** banner. If `max_connections` is above the safe estimate, it auto-clamps unless `unsafe_override_limits = true`; if the safe budget cannot support the minimum 32 slots, startup fails instead of forcing an unsafe minimum.
+On startup, the proxy uses the lower of host RAM and every visible limit from the process's active cgroup v2/v1 hierarchy, including parent groups and non-standard mount points, and prints a **CAPACITY** banner. If `max_connections` is above the safe estimate, it auto-clamps unless `unsafe_override_limits = true`; if the safe budget cannot support the minimum 32 slots, startup fails instead of forcing an unsafe minimum.
 
 User secrets and `tg://`/`t.me` links are redacted from the daemon banner by default so they do not enter journald or container logs. To reveal them intentionally in a private terminal, run `mtproto-proxy [config.toml] --show-secrets`.
 
@@ -774,7 +774,7 @@ alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eli
 | `[server]` | `public_ip` | _(none)_ | IP/domain shown in startup links. Set it explicitly when using `--show-secrets`; external discovery is intentionally not allowed to delay listener startup. For self-domain masking, use the same domain as `tls_domain`. Tunnel deploy scripts preserve an existing domain instead of replacing it with the tunnel exit IP |
 | `[server]` | `middle_proxy_nat_ip` | _(auto-detect)_ | Optional IPv4 override used in MiddleProxy NAT/AES derivation. Useful when `public_ip` is a hostname or when tunnel egress/detection would choose the wrong IPv4 |
 | `[server]` | `backlog` | `4096` | TCP listen queue size (for high-traffic loads) |
-| `[server]` | `max_connections` | `512` | Concurrent connection cap (small-VPS tuned default, parser lower bound 32). On Linux, startup first auto-clamps this to the effective-memory estimate (host/cgroup) unless `unsafe_override_limits=true`; the proxy then clamps again if `RLIMIT_NOFILE` can support at least 32 slots, otherwise startup fails safely |
+| `[server]` | `max_connections` | `512` | Concurrent connection cap (small-VPS tuned default, parser lower bound 32). On Linux, startup first auto-clamps this to the lower of host RAM and the lowest visible leaf/parent cgroup limit unless `unsafe_override_limits=true`; the proxy then clamps again if `RLIMIT_NOFILE` can support at least 32 slots, otherwise startup fails safely |
 | `[server]` | `idle_timeout_sec` | `120` | Established relay idle timeout in seconds (parser lower bound 5). Pre-first-byte admission uses a separate fixed 10-second deadline |
 | `[server]` | `idle_timeout_jitter_pct` | `15` | Per-connection random jitter applied once when the slot is admitted to `idle_timeout_sec` (`±N%`, clamped to `0..100`). The effective timeout is then reused for every deadline update, floored to at least 5 seconds and at least half the base timeout. Set `0` to disable |
 | `[server]` | `client_silence_close_sec` | `0` | Conservative iOS MtProtoKit wedge fallback for proven generic DC relays. Eligibility requires at least 30 seconds in the relay phase and a delivered server reply followed by further client traffic, so startup exchanges on fresh reconnects cannot arm a close loop. A later server payload is considered a reply only when it arrives within the client's 12-second response window, and the timer starts after the userspace client queue drains. Media relays are excluded. `0` disables it; `15` is the recommended fallback |
@@ -814,7 +814,7 @@ alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eli
 
 > **Operational note** &nbsp; If `accept()` hits `EMFILE`/`ENFILE`, the listener temporarily disables `EPOLLIN`, waits 500ms, and retries. In periodic `conn stats`, the first `paused=` flag reflects this fd-quota backoff.
 
-> **Operational note** &nbsp; On startup, `max_connections` is automatically clamped to an effective-memory estimate derived from host RAM and cgroup limits. Set `unsafe_override_limits = true` to disable this. Admission control also pauses `accept()` at 90% capacity, resumes at 80%, and limits concurrent unauthenticated sockets per source subnet.
+> **Operational note** &nbsp; On startup, `max_connections` is automatically clamped to an effective-memory estimate derived from host RAM and the lowest readable limit in the process's cgroup hierarchy. Set `unsafe_override_limits = true` to disable this. Admission control also pauses `accept()` at 90% capacity, resumes at 80%, and limits concurrent unauthenticated sockets per source subnet.
 
 > **Operational note** &nbsp; The RAM-safety estimate intentionally budgets MiddleProxy at full configured per-direction cap even though active C2S/S2C buffers grow lazily from 16 KiB. Configured `middleproxy_buffer_kb` values above 16384 are accepted but the effective runtime cap is 16 MiB per direction and startup logs a warning.
 
@@ -851,7 +851,7 @@ ssh root@<VPS_IP> 'cat /proc/$(pgrep -f mtproto-proxy)/limits | grep "open files
 
 Interpretation:
 
-- `auto-clamping max_connections ...` means startup reduced configured capacity to the host/cgroup effective-memory estimate. `max_connections clamped ... due to RLIMIT_NOFILE` means runtime reduced it again to fit the process fd limit.
+- `auto-clamping max_connections ...` means startup reduced configured capacity to the host/cgroup-hierarchy effective-memory estimate. `max_connections clamped ... due to RLIMIT_NOFILE` means runtime reduced it again to fit the process fd limit.
 - `fd quota reached ... pausing accepts for 500ms` means the listener hit `EMFILE`/`ENFILE` and intentionally backed off instead of busy-looping.
 - `conn stats ... paused=<fd_pause>/<saturation_pause>` exposes two pause reasons: fd-quota backoff first, saturation hysteresis second.
 - `drops: ... rate+=...` means the per-subnet rate limiter rejected excess new connections.

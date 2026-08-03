@@ -124,7 +124,7 @@ ssh root@<SERVER_IP> 'cd /root/mtproto.zig && zig build && python3 test/daemon_s
 
 Interpretation helpers:
 
-- `auto-clamping max_connections ...` means the startup effective-memory clamp (host RAM plus cgroup limit) reduced the configured cap. `max_connections clamped ... due to RLIMIT_NOFILE` means the later fd-budget clamp reduced it again.
+- `auto-clamping max_connections ...` means the startup effective-memory clamp (the lower of host RAM and the lowest readable leaf/parent cgroup limit) reduced the configured cap. `max_connections clamped ... due to RLIMIT_NOFILE` means the later fd-budget clamp reduced it again.
 - `fd quota reached ...` means the listener paused accepts; expect the first `paused=` flag to flip to `true` in nearby `conn stats` lines until the retry window clears.
 - `hs_budget+=...` means connection churn is exhausting either the global handshake budget or a source subnet's unauthenticated concurrency allowance before established relays become the bottleneck.
 - `mp_fallback+=...` means users are still being served, but MiddleProxy path quality is degraded enough to trigger direct fallback.
