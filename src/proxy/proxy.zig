@@ -3099,7 +3099,7 @@ const EventLoop = struct {
         });
 
         if (has_drops) {
-            log.info("  drops: cap+={d} sat+={d} rate+={d} hs_budget+={d} hs_timeout+={d} mp_fallback+={d} memory_pressure+={d}", .{
+            log.info("drops: cap+={d} sat+={d} rate+={d} hs_budget+={d} hs_timeout+={d} mp_fallback+={d} memory_pressure+={d}", .{
                 d_cap, d_sat, d_rate, d_hs, d_hst, d_mpf, d_buffer_denials,
             });
         }
@@ -3107,7 +3107,7 @@ const EventLoop = struct {
         if (self.wedge_candidates_since_log + self.wedge_cancelled_since_log +
             self.wedge_fast_closes_since_log + self.wedge_fallback_closes_since_log > 0)
         {
-            log.info("  ios_wedge: candidates+={d} cancelled+={d} fast_close+={d} fallback_close+={d}", .{
+            log.info("ios_wedge: candidates+={d} cancelled+={d} fast_close+={d} fallback_close+={d}", .{
                 self.wedge_candidates_since_log,
                 self.wedge_cancelled_since_log,
                 self.wedge_fast_closes_since_log,

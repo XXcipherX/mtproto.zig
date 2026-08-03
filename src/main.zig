@@ -32,6 +32,28 @@ pub const std_options = std.Options{
     .logFn = lockFreeLog,
 };
 
+// Left-align the standard Zig level name to the longest built-in label. This
+// keeps the level, scope, and message columns aligned without padding after
+// the scope.
+const log_level_field_width: usize = "warning".len;
+
+fn formatLogPrefix(
+    comptime message_level: std.log.Level,
+    comptime scope: @EnumLiteral(),
+    out: []u8,
+) []u8 {
+    const level_txt = comptime message_level.asText();
+    const suffix_txt = comptime if (scope == .default) ":" else " (" ++ @tagName(scope) ++ "):";
+    const prefix_len = log_level_field_width + suffix_txt.len;
+
+    std.debug.assert(out.len >= prefix_len + 1);
+    @memcpy(out[0..level_txt.len], level_txt);
+    @memset(out[level_txt.len..log_level_field_width], ' ');
+    @memcpy(out[log_level_field_width..prefix_len], suffix_txt);
+    out[prefix_len] = ' ';
+    return out[0 .. prefix_len + 1];
+}
+
 fn lockFreeLog(
     comptime message_level: std.log.Level,
     comptime scope: @EnumLiteral(),
@@ -41,11 +63,10 @@ fn lockFreeLog(
     // Runtime filter: skip messages below configured level
     if (@intFromEnum(message_level) > @intFromEnum(runtime_log_level)) return;
 
-    const level_txt = comptime message_level.asText();
-    const prefix2 = comptime if (scope == .default) ": " else "(" ++ @tagName(scope) ++ "): ";
     var buf: [4096]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, level_txt ++ prefix2 ++ format ++ "\n", args) catch return;
-    compat.writeStderr(msg);
+    const prefix = formatLogPrefix(message_level, scope, &buf);
+    const body = std.fmt.bufPrint(buf[prefix.len..], format ++ "\n", args) catch return;
+    compat.writeStderr(buf[0 .. prefix.len + body.len]);
 }
 
 const log = std.log.scoped(.mtproto);
