@@ -12,7 +12,7 @@ Production MTProto proxy implemented in Zig with FakeTLS entry, obfuscated MTPro
 - Language: Zig 0.16.0
 - Networking: Linux sockets + `epoll` via a local Zig 0.16 `net_compat` facade
 - Cryptography: `std.crypto` primitives (SHA256/HMAC/AES-CTR/AES-CBC) plus project protocol layers
-- HTTP metadata fetch: `src/http_fetch.zig` wraps `std.http` with bounded response sizes and whole-request timeout behavior
+- HTTP metadata fetch: `src/http_fetch.zig` wraps `std.http` with bounded response sizes, whole-request timeout behavior, redirect-by-redirect resolver preflight, and owner-thread cancellation
 - Build: `build.zig` + `Makefile`
 - Deployment: Linux VPS + systemd (`deploy/mtproto-proxy.service`), with optional tunnel setup from `deploy/setup_tunnel.sh`
 
@@ -23,7 +23,7 @@ Production MTProto proxy implemented in Zig with FakeTLS entry, obfuscated MTPro
 - Epoll payloads encode slot index, generation, and client/upstream role directly in `epoll_event.data.u64`; dispatch has no fd hash lookup, and generation checks reject stale events after slot/fd reuse.
 - Connection deadlines live in an indexed min-heap with one entry per active slot. A monotonic `timerfd` is armed to the earliest slot, accept-backoff, or stats deadline, eliminating the historical full-slot timer scan.
 - Outbound data uses intrusive `MessageQueue` blocks whose allocation occupies one page, served by one capped event-loop-wide free list. Appends pack the current tail before acquiring another block; bounded `writev` flushing and a 4 MiB pending-byte cap apply per direction queue. Read/drain/write loops have explicit byte and operation budgets per dispatch.
-- A joinable background updater starts after the listener when MiddleProxy or masking discovery is needed. It refreshes MiddleProxy metadata, detects the NAT IPv4, re-resolves all masking candidates hourly, probes endpoints in cancellable batches of four, can wake early after stalled MiddleProxy handshakes, and is stopped cooperatively on `ProxyState.deinit`.
+- A joinable background updater starts after the listener when MiddleProxy or masking discovery is needed. It refreshes MiddleProxy metadata, detects the NAT IPv4, re-resolves all masking candidates hourly, probes endpoints in cancellable batches of four, can wake early after stalled MiddleProxy handshakes, and is stopped cooperatively on `ProxyState.deinit`. DNS, built-in HTTPS, and curl fallback operations race an atomic stop watcher inside an owner-thread `std.Io.Select`; every late allocated result is drained before the updater is joined.
 - MiddleProxy handshakes copy only the selected route candidates and a secret version/NAT value, release handshake-only storage at relay start, and parse each C2S frame header once. Current and immediately previous secrets live centrally under the metadata lock, so selector/KDF inputs stay consistent without a per-handshake secret copy. Runtime CBC state is direction-specific; high-frequency protocol randomness comes from a per-thread ChaCha20 DRBG reseeded from the OS CSPRNG.
 
 Code anchors:

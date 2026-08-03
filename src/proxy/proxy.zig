@@ -2188,7 +2188,10 @@ pub const ProxyState = struct {
 
     fn middleProxyUpdaterMain(self: *ProxyState) void {
         if (self.config.usesAnyMiddleProxy()) {
-            self.ensureMiddleProxyNatIp();
+            self.ensureMiddleProxyNatIp() catch |err| {
+                if (err == error.UpdateCancelled or self.middle_proxy_updater_stop.load(.acquire)) return;
+                log.warn("Initial middle-proxy NAT IP discovery failed: {any}", .{err});
+            };
             // Serve immediately with bundled fallback endpoints. Fetching metadata
             // in this worker keeps a censored or slow core.telegram.org from
             // delaying accepts after a proxy restart.
@@ -2201,7 +2204,10 @@ pub const ProxyState = struct {
 
         while (self.waitMiddleProxyUpdatePeriod()) {
             if (self.config.usesAnyMiddleProxy()) {
-                self.ensureMiddleProxyNatIp();
+                self.ensureMiddleProxyNatIp() catch |err| {
+                    if (err == error.UpdateCancelled or self.middle_proxy_updater_stop.load(.acquire)) return;
+                    log.warn("Middle-proxy NAT IP discovery failed: {any}", .{err});
+                };
                 self.refreshMiddleProxyInfo() catch |err| {
                     if (err == error.UpdateCancelled or self.middle_proxy_updater_stop.load(.acquire)) return;
                     log.warn("Middle-proxy refresh failed: {any}", .{err});
@@ -2211,19 +2217,30 @@ pub const ProxyState = struct {
         }
     }
 
-    fn ensureMiddleProxyNatIp(self: *ProxyState) void {
+    fn ensureMiddleProxyNatIp(self: *ProxyState) !void {
         self.middle_proxy_lock.lock();
         const already_known = self.middle_proxy_nat_ip4 != null;
         self.middle_proxy_lock.unlock();
         if (already_known or self.middle_proxy_updater_stop.load(.acquire)) return;
 
-        var detected = detectAwgEndpointIpv4(self.allocator);
+        var detected = try detectAwgEndpointIpv4(
+            self.allocator,
+            &self.middle_proxy_updater_stop,
+        );
         if (detected == null and !self.middle_proxy_updater_stop.load(.acquire)) {
-            detected = detectPublicIpv4(self.allocator);
+            detected = try detectPublicIpv4(
+                self.allocator,
+                &self.middle_proxy_updater_stop,
+            );
         }
         const ip = detected orelse return;
+        if (self.middle_proxy_updater_stop.load(.acquire)) return error.UpdateCancelled;
 
         self.middle_proxy_lock.lock();
+        if (self.middle_proxy_updater_stop.load(.acquire)) {
+            self.middle_proxy_lock.unlock();
+            return error.UpdateCancelled;
+        }
         if (self.middle_proxy_nat_ip4 == null) self.middle_proxy_nat_ip4 = ip;
         self.middle_proxy_lock.unlock();
 
@@ -2235,12 +2252,21 @@ pub const ProxyState = struct {
         const target = self.mask_target orelse return;
         if (self.middle_proxy_updater_stop.load(.acquire)) return;
 
-        const list = net.getAddressList(self.allocator, target, self.config.mask_port) catch |err| {
+        const list = net.getAddressListCancelable(
+            self.allocator,
+            target,
+            self.config.mask_port,
+            &self.middle_proxy_updater_stop,
+        ) catch |err| {
             if (!self.middle_proxy_updater_stop.load(.acquire)) {
                 log.warn("Failed to resolve mask target '{s}:{d}': {any}", .{ target, self.config.mask_port, err });
             }
             return;
         };
+        if (self.middle_proxy_updater_stop.load(.acquire)) {
+            list.deinit();
+            return;
+        }
         if (list.addrs.len == 0) {
             list.deinit();
             return;
@@ -2248,6 +2274,11 @@ pub const ProxyState = struct {
         prioritizeIpv4Addresses(list.addrs);
 
         self.middle_proxy_lock.lock();
+        if (self.middle_proxy_updater_stop.load(.acquire)) {
+            self.middle_proxy_lock.unlock();
+            list.deinit();
+            return;
+        }
         const old_addrs = self.mask_addrs;
         self.mask_addrs = list.addrs;
         self.middle_proxy_lock.unlock();
@@ -2263,7 +2294,10 @@ pub const ProxyState = struct {
             const bytes = http_fetch.fetchUrlBytes(
                 self.allocator,
                 url,
-                .{ .max_response_bytes = 1 * 1024 * 1024 },
+                .{
+                    .max_response_bytes = 1 * 1024 * 1024,
+                    .stop = &self.middle_proxy_updater_stop,
+                },
             ) catch |err| {
                 if (err == error.HttpRequestTimedOut and attempt == 0) {
                     log.info("Middle-proxy {s} request timed out; retrying once in 1s", .{label});
@@ -5659,8 +5693,22 @@ fn parseEndpointHost(endpoint: []const u8) ?[]const u8 {
     return trimmed;
 }
 
-fn resolveHostnameIpv4(allocator: std.mem.Allocator, host: []const u8) ?[4]u8 {
-    var list = net.getAddressList(allocator, host, 443) catch return null;
+fn resolveHostnameIpv4(
+    allocator: std.mem.Allocator,
+    host: []const u8,
+    stop: ?*const std.atomic.Value(bool),
+) !?[4]u8 {
+    if (stop) |stop_flag| {
+        if (stop_flag.load(.acquire)) return error.UpdateCancelled;
+    }
+
+    var list = if (stop) |stop_flag|
+        net.getAddressListCancelable(allocator, host, 443, stop_flag) catch |err| {
+            if (err == error.UpdateCancelled) return err;
+            return null;
+        }
+    else
+        net.getAddressList(allocator, host, 443) catch return null;
     defer list.deinit();
 
     for (list.addrs) |addr| {
@@ -5674,11 +5722,19 @@ fn resolveHostnameIpv4(allocator: std.mem.Allocator, host: []const u8) ?[4]u8 {
     return null;
 }
 
-fn parseAwgEndpointIpv4FromConfig(allocator: std.mem.Allocator, content: []const u8) ?[4]u8 {
+fn parseAwgEndpointIpv4FromConfig(
+    allocator: std.mem.Allocator,
+    content: []const u8,
+    stop: ?*const std.atomic.Value(bool),
+) !?[4]u8 {
     var in_peer = false;
     var lines = std.mem.splitScalar(u8, content, '\n');
 
     while (lines.next()) |raw_line| {
+        if (stop) |stop_flag| {
+            if (stop_flag.load(.acquire)) return error.UpdateCancelled;
+        }
+
         const line_no_cr = std.mem.trimEnd(u8, raw_line, "\r");
         const line = std.mem.trim(u8, line_no_cr, &[_]u8{ ' ', '\t' });
         if (line.len == 0 or line[0] == '#' or line[0] == ';') continue;
@@ -5700,13 +5756,16 @@ fn parseAwgEndpointIpv4FromConfig(allocator: std.mem.Allocator, content: []const
         const host = parseEndpointHost(value) orelse continue;
 
         if (parseIpv4Literal(host)) |ip| return ip;
-        if (resolveHostnameIpv4(allocator, host)) |resolved_ip| return resolved_ip;
+        if (try resolveHostnameIpv4(allocator, host, stop)) |resolved_ip| return resolved_ip;
     }
 
     return null;
 }
 
-fn detectAwgEndpointIpv4(allocator: std.mem.Allocator) ?[4]u8 {
+fn detectAwgEndpointIpv4(
+    allocator: std.mem.Allocator,
+    stop: ?*const std.atomic.Value(bool),
+) !?[4]u8 {
     if (builtin.os.tag != .linux) return null;
 
     const paths = [_][]const u8{
@@ -5716,16 +5775,23 @@ fn detectAwgEndpointIpv4(allocator: std.mem.Allocator) ?[4]u8 {
     };
 
     for (paths) |path| {
+        if (stop) |stop_flag| {
+            if (stop_flag.load(.acquire)) return error.UpdateCancelled;
+        }
+
         const content = compat.readFileAbsoluteAlloc(allocator, path, 64 * 1024) catch continue;
         defer allocator.free(content);
 
-        if (parseAwgEndpointIpv4FromConfig(allocator, content)) |ip| return ip;
+        if (try parseAwgEndpointIpv4FromConfig(allocator, content, stop)) |ip| return ip;
     }
 
     return null;
 }
 
-fn detectPublicIpv4(allocator: std.mem.Allocator) ?[4]u8 {
+fn detectPublicIpv4(
+    allocator: std.mem.Allocator,
+    stop: ?*const std.atomic.Value(bool),
+) !?[4]u8 {
     const services = [_][]const u8{
         "https://api.ipify.org",
         "https://ifconfig.me",
@@ -5736,8 +5802,14 @@ fn detectPublicIpv4(allocator: std.mem.Allocator) ?[4]u8 {
         const stdout = http_fetch.fetchUrlBytes(
             allocator,
             url,
-            .{ .max_response_bytes = 64 * 1024 },
-        ) catch continue;
+            .{
+                .max_response_bytes = 64 * 1024,
+                .stop = stop,
+            },
+        ) catch |err| {
+            if (err == error.UpdateCancelled) return err;
+            continue;
+        };
         const trimmed = std.mem.trim(u8, stdout, &[_]u8{ ' ', '\t', '\r', '\n' });
         const parsed = parseIpv4Literal(trimmed);
         allocator.free(stdout);
@@ -6854,7 +6926,11 @@ test "parse awg endpoint ipv4 from config" {
         \\Endpoint = 179.43.141.146:41182
     ;
 
-    const parsed = parseAwgEndpointIpv4FromConfig(std.testing.allocator, content) orelse return error.TestExpectedEqual;
+    const parsed = (try parseAwgEndpointIpv4FromConfig(
+        std.testing.allocator,
+        content,
+        null,
+    )) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual([4]u8{ 179, 43, 141, 146 }, parsed);
 }
 

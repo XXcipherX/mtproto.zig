@@ -1,5 +1,6 @@
 const std = @import("std");
 const compat = @import("compat.zig");
+const net = @import("net_compat.zig");
 
 const log = std.log.scoped(.http_fetch);
 
@@ -9,83 +10,80 @@ pub const FetchOptions = struct {
     max_response_bytes: usize,
     timeout_sec: u32 = default_timeout_sec,
     max_redirects: u8 = 3,
+    stop: ?*const std.atomic.Value(bool) = null,
 };
 
-const FetchEvent = enum {
-    fetch,
-    timeout,
-};
-
-const FetchTask = struct {
-    allocator: std.mem.Allocator,
-    url: []const u8,
-    options: FetchOptions,
-    io: std.Io,
-    queue: *std.Io.Queue(FetchEvent),
+const FetchEvent = union(enum) {
+    fetch: anyerror![]u8,
+    timeout: anyerror!void,
+    stop: anyerror!void,
 };
 
 pub fn fetchUrlBytes(allocator: std.mem.Allocator, url: []const u8, options: FetchOptions) ![]u8 {
+    if (options.stop) |stop| {
+        if (stop.load(.acquire)) return error.UpdateCancelled;
+    }
+
     var threaded_io = compat.initThreadedIo();
     defer threaded_io.deinit();
-
     const io = threaded_io.io();
-    if (options.timeout_sec == 0) return fetchUrlBytesWithFallback(allocator, url, options, io);
 
     const worker_allocator = std.heap.page_allocator;
     const url_copy = try worker_allocator.dupe(u8, url);
     defer worker_allocator.free(url_copy);
 
-    var event_storage: [2]FetchEvent = undefined;
-    var event_queue: std.Io.Queue(FetchEvent) = .init(&event_storage);
-
-    var fetch_future = try io.concurrent(fetchUrlBytesSignaled, .{FetchTask{
-        .allocator = worker_allocator,
-        .url = url_copy,
-        .options = options,
-        .io = io,
-        .queue = &event_queue,
-    }});
-    var timeout_future = io.concurrent(fetchTimeoutSignaled, .{
+    var event_storage: [3]FetchEvent = undefined;
+    var select = std.Io.Select(FetchEvent).init(io, &event_storage);
+    try select.concurrent(.fetch, fetchUrlBytesWithFallback, .{
+        worker_allocator,
+        url_copy,
+        options,
         io,
-        options.timeout_sec,
-        &event_queue,
-    }) catch |err| {
-        discardFetchResult(fetch_future.cancel(io));
-        return err;
-    };
+    });
+    if (options.timeout_sec != 0) {
+        select.concurrent(.timeout, fetchTimeout, .{
+            io,
+            options.timeout_sec,
+        }) catch |err| {
+            drainFetchSelect(&select);
+            return err;
+        };
+    }
+    if (options.stop) |stop| {
+        select.concurrent(.stop, waitForFetchStop, .{ io, stop }) catch |err| {
+            drainFetchSelect(&select);
+            return err;
+        };
+    }
 
-    const selected = event_queue.getOneUncancelable(io) catch |err| {
-        discardFetchResult(fetch_future.cancel(io));
-        timeout_future.cancel(io) catch {};
+    const selected = select.await() catch |err| {
+        drainFetchSelect(&select);
         return err;
     };
+    defer drainFetchSelect(&select);
 
     switch (selected) {
-        .fetch => {
-            const result = fetch_future.await(io);
-            timeout_future.cancel(io) catch {};
+        .fetch => |result| {
+            if (options.stop) |stop| {
+                if (stop.load(.acquire)) {
+                    discardFetchResult(result);
+                    return error.UpdateCancelled;
+                }
+            }
             return finishFetchResult(allocator, result);
         },
-        .timeout => {
-            timeout_future.await(io) catch |err| {
-                discardFetchResult(fetch_future.cancel(io));
-                return err;
-            };
-            discardFetchResult(fetch_future.cancel(io));
+        .timeout => |result| {
+            try result;
+            if (options.stop) |stop| {
+                if (stop.load(.acquire)) return error.UpdateCancelled;
+            }
             return error.HttpRequestTimedOut;
         },
+        .stop => |result| {
+            try result;
+            return error.UpdateCancelled;
+        },
     }
-}
-
-fn fetchUrlBytesSignaled(task: FetchTask) ![]u8 {
-    const result = fetchUrlBytesWithFallback(
-        task.allocator,
-        task.url,
-        task.options,
-        task.io,
-    );
-    task.queue.putOneUncancelable(task.io, .fetch) catch {};
-    return result;
 }
 
 fn fetchUrlBytesWithFallback(
@@ -95,22 +93,17 @@ fn fetchUrlBytesWithFallback(
     io: std.Io,
 ) ![]u8 {
     return fetchUrlBytesWithIo(allocator, url, options, io) catch |err| {
-        if (std.mem.eql(u8, @errorName(err), "ResolvConfParseFailed")) {
-            log.warn("std.http resolver failed for {s} with ResolvConfParseFailed; retrying via curl", .{url});
+        if (std.mem.eql(u8, @errorName(err), "ResolvConfParseFailed") or
+            std.mem.eql(u8, @errorName(err), "UnsafeResolverConfiguration"))
+        {
+            log.warn("std.http resolver rejected the system configuration for {s}: {s}; retrying via curl", .{
+                url,
+                @errorName(err),
+            });
             return runCurlFetch(allocator, url, options, io);
         }
         return err;
     };
-}
-
-fn fetchTimeoutSignaled(
-    io: std.Io,
-    timeout_sec: u32,
-    queue: *std.Io.Queue(FetchEvent),
-) !void {
-    const result = fetchTimeout(io, timeout_sec);
-    queue.putOneUncancelable(io, .timeout) catch {};
-    return result;
 }
 
 fn finishFetchResult(allocator: std.mem.Allocator, result: anyerror![]u8) ![]u8 {
@@ -120,6 +113,13 @@ fn finishFetchResult(allocator: std.mem.Allocator, result: anyerror![]u8) ![]u8 
     } else |err| {
         return err;
     }
+}
+
+fn drainFetchSelect(select: *std.Io.Select(FetchEvent)) void {
+    while (select.cancel()) |event| switch (event) {
+        .fetch => |result| discardFetchResult(result),
+        .timeout, .stop => |result| result catch {},
+    };
 }
 
 fn discardFetchResult(result: anyerror![]u8) void {
@@ -135,6 +135,16 @@ fn fetchTimeout(io: std.Io, timeout_sec: u32) !void {
         .{ .nanoseconds = @intCast(timeout_ns) },
         .awake,
     );
+}
+
+fn waitForFetchStop(io: std.Io, stop: *const std.atomic.Value(bool)) !void {
+    while (!stop.load(.acquire)) {
+        try std.Io.sleep(
+            io,
+            .{ .nanoseconds = 100 * std.time.ns_per_ms },
+            .awake,
+        );
+    }
 }
 
 fn fetchUrlBytesWithIo(
@@ -190,6 +200,10 @@ fn fetchUrlStep(
     if (!std.ascii.eqlIgnoreCase(uri.scheme, "https")) return error.InsecureHttpUrl;
     uri.scheme = "https";
 
+    var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
+    const host = try uri.getHost(&host_buf);
+    try net.validateSystemResolverForHost(allocator, client.io, host.bytes);
+
     var req = try client.request(.GET, uri, .{
         // Redirects must be inspected before another connection is opened:
         // Zig's automatic path also accepts plain HTTP targets.
@@ -215,7 +229,16 @@ fn fetchUrlStep(
 
     var transfer_buf: [4 * 1024]u8 = undefined;
     const reader = response.reader(&transfer_buf);
-    return .{ .body = try reader.allocRemaining(allocator, .limited(max_response_bytes)) };
+    const body = reader.allocRemaining(
+        allocator,
+        .limited(max_response_bytes),
+    ) catch |err| switch (err) {
+        // The generic reader erases transport errors; preserve Canceled so a
+        // Select cancellation is acknowledged by the fetch task.
+        error.ReadFailed => return response.bodyErr() orelse error.ReadFailed,
+        else => |e| return e,
+    };
+    return .{ .body = body };
 }
 
 fn resolveHttpsRedirect(

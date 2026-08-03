@@ -13,7 +13,9 @@ This file tracks practical pitfalls and current runtime constraints for `mtproto
 - The large `EventLoop` container and its fixed subnet tables are heap-allocated and initialized in place; returning it by value can overflow the Debug daemon stack. Connection pools allocate slot indexes and a deadline-heap entry per active slot, while `ConnectionSlot` objects are heap-created on demand. Epoll payloads carry index/generation/role directly; do not reintroduce an fd hash map.
 - Non-blocking writes are queue-based (`MessageQueue`) and flushed with `writev`.
 - `MessageQueue` has intrusive page-sized storage blocks from one capped event-loop-wide pool and a 4 MiB pending-byte cap; queue overflow is a close-worthy backpressure signal.
-- Runtime discovery runs in a joinable updater thread after the listener is ready when MiddleProxy or masking resolution is active; shutdown is cooperative and endpoint probes run in cancellable batches of at most four sockets.
+- Runtime discovery runs in a joinable updater thread after the listener is ready when MiddleProxy or masking resolution is active; shutdown is cooperative, DNS/HTTPS/curl tasks are canceled in their owning thread, and endpoint probes run in cancellable batches of at most four sockets.
+- Zig 0.16 `Io.Future.cancel` and `Io.Group.cancel` are not thread-safe, while `Io.Select.cancel` is explicitly thread-safe. Runtime discovery nevertheless keeps cancellation with the Select owner because its tasks borrow scope-local buffers and arguments; `Select.cancel()` must be drained until `null` so late successful tasks cannot leak allocated results.
+- Before Zig 0.16's resolver reads `/etc/resolv.conf`, enforce nonzero final `attempts`, its 255-byte search buffer, its 512-byte line bound, and the 253-byte DNS wire-name limit for the base host plus any applied search suffix.
 
 Do not reintroduce thread-per-connection or blocking relay loops.
 

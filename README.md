@@ -59,7 +59,7 @@ Connection-capacity methodology and command profiles: `test/README.md`.
 ## Runtime Model
 
 - Client relay is handled by a single-threaded Linux `epoll` event loop. `epoll_event.data.u64` carries the slot index, generation, and fd role, so dispatch does not need an fd hash lookup and stale events cannot attach to a reused slot.
-- External discovery never delays the listening socket: MiddleProxy metadata/NAT detection and hostname-based masking resolution run in a joinable background worker. Metadata and masking candidates refresh hourly, reachability probes run in cancellable batches of at most four sockets, and stalled MiddleProxy handshakes can request an early refresh.
+- External discovery never delays the listening socket: MiddleProxy metadata/NAT detection and hostname-based masking resolution run in a joinable background worker. Metadata and masking candidates refresh hourly, reachability probes run in cancellable batches of at most four sockets, in-flight DNS/HTTPS/curl work is canceled cooperatively during shutdown, and stalled MiddleProxy handshakes can request an early refresh.
 - FakeTLS validation expects Telegram-style 32-byte ClientHello Session IDs and copies the Session ID into the synthetic ServerHello.
 - Handshake and relay lifetimes are controlled by monotonic `timerfd` deadlines in an indexed min-heap (`handshake_timeout_sec`, `idle_timeout_sec`), not by periodic slot scans or `SO_RCVTIMEO`; a silent connection gets at most 10 seconds to send its first byte.
 - Unauthenticated sockets share a per-/24 or per-/48 concurrent allowance (`clamp(max_connections / 8, 16, 128)`). The global handshake-inflight budget is charged after the first byte and released after authentication.
@@ -187,7 +187,7 @@ For a fresh self-domain install, pass `MASK_DOMAIN` as shown below or enter the 
 
 ## Docker image
 
-The repository includes a **multi-stage Dockerfile**: Zig is bootstrapped from the official tarball inside the build stage; the runtime image is Debian **bookworm-slim** with `curl` and CA certs. The proxy binary performs background HTTPS public-IPv4 detection for MiddleProxy NAT derivation and refreshes Telegram metadata itself, so CA certs are required; `curl` is kept for container-side diagnostics and as a fallback when the Zig resolver rejects a malformed `/etc/resolv.conf`. Both the built-in client and that fallback follow only a bounded number of HTTPS-to-HTTPS redirects; a redirect to plain HTTP is rejected before the next request. The process runs as **root** inside the container (simple bind to port 443). The image ships `config.toml.example` as `/etc/mtproto-proxy/config.toml` for a quick start; mount your own file for real secrets and settings.
+The repository includes a **multi-stage Dockerfile**: Zig is bootstrapped from the official tarball inside the build stage; the runtime image is Debian **bookworm-slim** with `curl` and CA certs. The proxy binary performs background HTTPS public-IPv4 detection for MiddleProxy NAT derivation and refreshes Telegram metadata itself, so CA certs are required; `curl` is kept for container-side diagnostics and as a fallback when a bounded preflight rejects `/etc/resolv.conf` before Zig 0.16 can reach its unsafe `attempts:0`, oversized search, or overlong DNS-name paths. Both the built-in client and that fallback follow only a bounded number of HTTPS-to-HTTPS redirects; a redirect to plain HTTP is rejected before the next request. The process runs as **root** inside the container (simple bind to port 443). The image ships `config.toml.example` as `/etc/mtproto-proxy/config.toml` for a quick start; mount your own file for real secrets and settings.
 
 ### Build
 
@@ -831,7 +831,7 @@ alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eli
 
 > **Note** &nbsp; The parser supports inline `#` / `;` comments after values and treats duplicate owned string/user/direct-user entries as last-write-wins without leaking previous allocations.
 
-> **Note** &nbsp; MiddleProxy settings (regular DC1..5 endpoints + media-path endpoints + shared secret), NAT discovery, and masking DNS resolution run after the listener is ready. Metadata and all masking candidates refresh hourly, with reactive early refresh after stalled MiddleProxy handshakes and bundled MiddleProxy defaults as fallback.
+> **Note** &nbsp; MiddleProxy settings (regular DC1..5 endpoints + media-path endpoints + shared secret), NAT discovery, and masking DNS resolution run after the listener is ready. Metadata and all masking candidates refresh hourly, with reactive early refresh after stalled MiddleProxy handshakes and bundled MiddleProxy defaults as fallback. Shutdown cancels active resolver, HTTPS, and curl tasks before joining the updater; an unsafe resolver configuration leaves the previous masking candidates intact and is retried on the next refresh.
 
 ## &nbsp; Troubleshooting ("Updating...")
 
