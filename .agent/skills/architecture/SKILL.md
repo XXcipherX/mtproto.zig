@@ -117,7 +117,7 @@ If `max_connections` exceeds the memory-safe estimate, startup auto-clamps it be
 
 - FakeTLS ServerHello template with runtime digest patching.
 - FakeTLS uses one strict ClientHello framing parser for authentication, SNI, cipher, and PQ key-share reads. It accepts only 32-byte Session IDs, stores the Session ID by value, and securely releases the full ClientHello as soon as the synthetic ServerHello is built.
-- Anti-replay cache compares the full canonical HMAC digest and never evicts a live entry inside the one-hour window. A saturated probe window fails closed.
+- Anti-replay cache compares the full canonical HMAC digest, retains entries for the maximum FakeTLS timestamp-validity horizon, and replaces the oldest entry in a saturated bounded probe window so cache pressure cannot masquerade as a proven replay.
 - MTProto obfuscation rejects reserved nonces before decrypting protocol tags.
 - Unknown MTProto DC indices are rejected before endpoint planning; modulo fallback is not part of the connection path.
 - Masking target selection for unauthenticated clients: `mask_port=443` resolves every address for `tls_domain:443` in the background, prefers IPv4, and fails over across candidates; non-443 `mask_port` connects to a local address on that port (`127.0.0.1` in the init namespace, `10.200.200.1` inside the tunnel netns). Hostname candidates are re-resolved hourly.

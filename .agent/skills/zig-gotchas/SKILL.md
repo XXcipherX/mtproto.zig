@@ -70,7 +70,7 @@ Do not reintroduce thread-per-connection or blocking relay loops.
 
 ## Protocol Validation Notes
 
-- Replay detection compares the full canonical HMAC digest, even when the hash-table key collides; live entries must not be evicted before the one-hour replay window expires.
+- Replay detection compares the full canonical HMAC digest even when the hash-table key collides. Its retention horizon must cover every still-valid FakeTLS timestamp, while saturation must never be reported as a proven replay.
 - `prepareTgNonce` accepts exactly a 48-byte key+IV pointer, MiddleProxy KDF rejects inputs that exceed its fixed transcript buffer, and unknown DC indices are rejected before routing.
 - Reserved MTProto obfuscation nonces are rejected before protocol-tag decryption.
 - Direct-user bypass only applies when the name exists in `[access.users]`; unknown names in `[access.direct_users]` warn and are ignored.

@@ -1153,7 +1153,11 @@ const DynamicRecordSizer = struct {
 const ReplayCache = struct {
     const BUCKETS = 8192;
     const MAX_PROBES = 8;
-    const stale_after_s: i64 = 60 * 60;
+    // A validated FakeTLS timestamp can remain acceptable for at most the
+    // distance between the lower and upper skew bounds. Retaining entries
+    // longer only increases cache pressure after the handshake is already
+    // guaranteed to fail timestamp validation.
+    const stale_after_s: i64 = constants.time_skew_max - constants.time_skew_min;
 
     const Entry = struct {
         used: bool = false,
@@ -1192,6 +1196,8 @@ const ReplayCache = struct {
         const start = self.indexFor(key);
 
         var first_stale_idx: ?usize = null;
+        var oldest_idx: usize = start;
+        var oldest_seen_s: i64 = std.math.maxInt(i64);
         var probe: usize = 0;
         while (probe < MAX_PROBES) : (probe += 1) {
             const idx = (start + probe) & (BUCKETS - 1);
@@ -1210,9 +1216,16 @@ const ReplayCache = struct {
             if (now_s - e.last_seen_s > stale_after_s and first_stale_idx == null) {
                 first_stale_idx = idx;
             }
+            if (e.last_seen_s < oldest_seen_s) {
+                oldest_seen_s = e.last_seen_s;
+                oldest_idx = idx;
+            }
         }
 
-        const victim_idx = first_stale_idx orelse return true;
+        // Cache pressure is not proof of replay. Reuse the oldest entry in the
+        // bounded probe window rather than rejecting a fresh authenticated
+        // handshake as a replay.
+        const victim_idx = first_stale_idx orelse oldest_idx;
         self.entries[victim_idx] = .{ .used = true, .key = key, .digest = digest.*, .last_seen_s = now_s };
         return false;
     }
@@ -6944,7 +6957,7 @@ test "replay cache compares full digest on key collision" {
     try std.testing.expect(cache.checkAndInsert(&digest_b));
 }
 
-test "replay cache never evicts a live probe window" {
+test "replay cache replaces oldest live entry without reporting false replay" {
     var cache = ReplayCache.init();
     const digest = [_]u8{0x5a} ** 32;
     const start = cache.indexFor(ReplayCache.digestKey(&digest));
@@ -6959,17 +6972,19 @@ test "replay cache never evicts a live probe window" {
             .used = true,
             .key = @as(u64, @intCast(probe + 1)),
             .digest = occupied_digest,
-            .last_seen_s = now_s,
+            .last_seen_s = now_s - @as(i64, @intCast(probe)),
         };
     }
 
-    // A saturated live window fails closed instead of weakening replay protection.
-    try std.testing.expect(cache.checkAndInsert(&digest));
+    try std.testing.expect(!cache.checkAndInsert(&digest));
     probe = 0;
-    while (probe < ReplayCache.MAX_PROBES) : (probe += 1) {
+    while (probe + 1 < ReplayCache.MAX_PROBES) : (probe += 1) {
         const idx = (start + probe) & (ReplayCache.BUCKETS - 1);
         try std.testing.expectEqual(@as(u64, @intCast(probe + 1)), cache.entries[idx].key);
     }
+    const replaced_idx = (start + ReplayCache.MAX_PROBES - 1) & (ReplayCache.BUCKETS - 1);
+    try std.testing.expectEqual(ReplayCache.digestKey(&digest), cache.entries[replaced_idx].key);
+    try std.testing.expect(cache.checkAndInsert(&digest));
 }
 
 test "handshakeInProgress - phases" {
