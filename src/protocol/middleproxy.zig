@@ -682,7 +682,10 @@ pub const MiddleProxyContext = struct {
 
                 switch (self.proto_tag) {
                     .abridged => {
-                        const len_div_4: usize = (conn_data.len + pad_len) / 4;
+                        // Abridged length is encoded in 32-bit words. Never
+                        // truncate a malformed byte length from the upstream.
+                        if ((conn_data.len & 3) != 0) return error.BadMiddleProxyPayload;
+                        const len_div_4: usize = conn_data.len / 4;
                         if (len_div_4 < 127) {
                             header_buf[0] = @intCast(len_div_4);
                             header_len = 1;
@@ -1285,6 +1288,47 @@ test "decapsulate s2c rejects checksum mismatch without resyncing" {
 
     var out_buf: [128]u8 = undefined;
     try std.testing.expectError(error.BadMiddleProxyChecksum, ctx.decapsulateS2C(wire[0..], out_buf[0..]));
+}
+
+test "decapsulate s2c rejects unaligned abridged proxy payload" {
+    const allocator = std.testing.allocator;
+
+    const key = [_]u8{0} ** 32;
+    const iv = [_]u8{0} ** 16;
+
+    var ctx = try MiddleProxyContext.init(
+        allocator,
+        crypto.AesCbc.init(&key, &iv),
+        crypto.AesCbc.init(&key, &iv),
+        [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 },
+        -2,
+        net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
+        net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
+        .abridged,
+        null,
+    );
+    defer ctx.deinit();
+
+    var plain: [48]u8 = [_]u8{0} ** 48;
+    const conn_data_len: usize = 5;
+    const total_len: usize = 8 + 16 + conn_data_len + 4;
+    std.mem.writeInt(u32, plain[0..4], @intCast(total_len), .little);
+    std.mem.writeInt(i32, plain[4..8], 0, .little);
+    @memcpy(plain[8..12], &rpc_proxy_ans);
+    std.mem.writeInt(u32, plain[12..16], Flag.abridged, .little);
+    @memcpy(plain[16..24], &ctx.conn_id);
+    @memset(plain[24 .. 24 + conn_data_len], 0x5a);
+    const checksum = crc32(plain[0 .. total_len - 4]);
+    std.mem.writeInt(u32, plain[total_len - 4 .. total_len], checksum, .little);
+
+    var enc = crypto.AesCbc.init(&key, &iv);
+    try enc.encryptInPlace(plain[0..]);
+
+    var out_buf: [128]u8 = undefined;
+    try std.testing.expectError(
+        error.BadMiddleProxyPayload,
+        ctx.decapsulateS2C(plain[0..], out_buf[0..]),
+    );
 }
 
 test "middle proxy sequence counters wrap without panicking" {
