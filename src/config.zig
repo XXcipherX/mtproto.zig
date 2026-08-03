@@ -226,18 +226,17 @@ pub const Config = struct {
         field.* = try allocator.dupe(u8, value);
     }
 
-    fn warnInvalidValue(key: []const u8, value: []const u8, expected: []const u8) void {
+    fn warnInvalidValue(key: []const u8, _: []const u8, expected: []const u8) void {
         const log = std.log.scoped(.config);
-        log.warn("invalid config value for {s}: '{s}' (expected {s}); keeping previous/default", .{
+        log.warn("invalid config value for {s} (expected {s}); keeping previous/default", .{
             key,
-            value,
             expected,
         });
     }
 
-    fn failConfigLine(err: anyerror, line_number: usize, line: []const u8) anyerror {
+    fn failConfigLine(err: anyerror, line_number: usize, _: []const u8) anyerror {
         const log = std.log.scoped(.config);
-        log.warn("invalid config at line {d}: {s}", .{ line_number, line });
+        log.warn("invalid config at line {d}: {s}", .{ line_number, @errorName(err) });
         return err;
     }
 

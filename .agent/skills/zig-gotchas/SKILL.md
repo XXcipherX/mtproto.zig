@@ -78,6 +78,7 @@ Do not reintroduce thread-per-connection or blocking relay loops.
 - Direct-user bypass only applies when the name exists in `[access.users]`; unknown names in `[access.direct_users]` warn and are ignored.
 - Duplicate user/direct-user/config string entries are last-write-wins. Direct users accept `false`/`0`/`no` to remove a previous duplicate entry.
 - Unknown proxy sections/keys and malformed config lines are fatal parse errors. `[monitor].host` and `[monitor].port` are the intentional externally consumed exception.
+- Config diagnostics may name a key, line number, and parse error, but must never echo raw values or source lines because malformed input can still contain user secrets.
 
 ## Timeout and Lifetime Notes
 

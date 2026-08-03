@@ -810,7 +810,7 @@ alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eli
 
 > **Operational note** &nbsp; The FakeTLS path uses one strict ClientHello parser for validation, SNI, cipher selection, and PQ key-share detection. It rejects inconsistent nested lengths and non-32-byte Session IDs; current Telegram MTProto-over-TLS clients use a 32-byte Session ID, which the proxy echoes in its TLS-like ServerHello template.
 
-> **Operational note** &nbsp; The parser rejects unknown sections, unknown proxy keys, keys outside a section, and malformed non-comment lines. `[monitor].host` and `[monitor].port` remain accepted for the separate dashboard service. Socket ports must be in `1..65535`, and `backlog` must fit Linux's signed listen backlog range; invalid numeric values keep their safe defaults with a warning. Config load failures exit non-zero.
+> **Operational note** &nbsp; The parser rejects unknown sections, unknown proxy keys, keys outside a section, and malformed non-comment lines. `[monitor].host` and `[monitor].port` remain accepted for the separate dashboard service. Socket ports must be in `1..65535`, and `backlog` must fit Linux's signed listen backlog range; invalid numeric values keep their safe defaults with a warning. Diagnostics identify the key or line number and reason but never echo raw config values or lines, which may contain credentials. Config load failures exit non-zero.
 
 > **Operational note** &nbsp; If `accept()` hits `EMFILE`/`ENFILE`, the listener temporarily disables `EPOLLIN`, waits 500ms, and retries. In periodic `conn stats`, the first `paused=` flag reflects this fd-quota backoff.
 
