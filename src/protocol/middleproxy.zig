@@ -309,6 +309,14 @@ pub const MiddleProxyContext = struct {
         self.s2c_buf = next;
     }
 
+    pub fn c2sAtFrameBoundary(self: *const MiddleProxyContext) bool {
+        return self.c2s_len == 0;
+    }
+
+    pub fn s2cAtFrameBoundary(self: *const MiddleProxyContext) bool {
+        return self.s2c_len == 0 and self.s2c_decrypted_len == 0;
+    }
+
     fn shrinkC2sIfIdle(self: *MiddleProxyContext) void {
         if (self.c2s_len != 0) return;
         if (self.c2s_buf.len <= shrink_stream_buffer_threshold) return;
@@ -949,12 +957,18 @@ test "required c2s scratch capacity accounts for buffered partial frame" {
     ctx.c2s_buf[0] = @intCast(MiddleProxyContext.min_client_payload_size);
     ctx.c2s_buf[1] = 0;
     ctx.c2s_len = 2;
+    try std.testing.expect(!ctx.c2sAtFrameBoundary());
 
     var tail = [_]u8{0} ** (2 + MiddleProxyContext.min_client_payload_size);
     @memset(tail[2..], 0xef);
     const required = try ctx.requiredC2sScratchCapacity(tail[0..]);
+    const out_buf = try allocator.alloc(u8, required);
+    defer allocator.free(out_buf);
+    const out = try ctx.encapsulateC2S(&tail, out_buf);
 
     try std.testing.expect(required >= ctx.c2sFrameEncryptedLen(MiddleProxyContext.min_client_payload_size));
+    try std.testing.expect(out.len > 0);
+    try std.testing.expect(ctx.c2sAtFrameBoundary());
 }
 
 test "secure c2s strips encrypted padded-intermediate padding" {
@@ -1599,14 +1613,20 @@ test "middle proxy context grows s2c buffer on demand within configured cap" {
     var enc = crypto.AesCbc.init(&key, &iv);
     try enc.encryptInPlace(plain);
 
-    const required = try ctx.requiredS2cScratchCapacity(plain);
+    var first_out: [16]u8 = undefined;
+    const first = try ctx.decapsulateS2C(plain[0..16], &first_out);
+    try std.testing.expectEqual(@as(usize, 0), first.len);
+    try std.testing.expect(!ctx.s2cAtFrameBoundary());
+
+    const required = try ctx.requiredS2cScratchCapacity(plain[16..]);
     const out_buf = try allocator.alloc(u8, required);
     defer allocator.free(out_buf);
 
-    const out = try ctx.decapsulateS2C(plain, out_buf);
+    const out = try ctx.decapsulateS2C(plain[16..], out_buf);
     try std.testing.expectEqual(@as(usize, 4 + conn_data_len), out.len);
     try std.testing.expectEqual(@as(usize, 0), ctx.s2c_len);
     try std.testing.expectEqual(@as(usize, 0), ctx.s2c_decrypted_len);
+    try std.testing.expect(ctx.s2cAtFrameBoundary());
     try std.testing.expectEqual(MiddleProxyContext.initial_stream_buffer_size, ctx.s2c_buf.len);
 }
 

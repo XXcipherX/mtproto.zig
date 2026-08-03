@@ -63,7 +63,7 @@ Connection-capacity methodology and command profiles: `test/README.md`.
 - FakeTLS validation expects Telegram-style 32-byte ClientHello Session IDs and copies the Session ID into the synthetic ServerHello.
 - Handshake and relay lifetimes are controlled by monotonic `timerfd` deadlines in an indexed min-heap (`handshake_timeout_sec`, `idle_timeout_sec`), not by periodic slot scans or `SO_RCVTIMEO`; a silent connection gets at most 10 seconds to send its first byte.
 - Unauthenticated sockets share a per-/24 or per-/48 concurrent allowance (`clamp(max_connections / 8, 16, 128)`). The global handshake-inflight budget is charged after the first byte and released after authentication.
-- Graceful `EPOLLRDHUP` is drained to EOF before the source fd is detached, preserving data queued immediately before a peer half-closes.
+- Graceful `EPOLLRDHUP` is treated as a read-side hint and drained to actual EOF. Client and upstream read/write halves remain independent: queued data is flushed before `shutdown(SHUT_WR)` propagates FIN, while the reverse relay direction stays active.
 - Failed non-blocking upstream connects are reclaimed immediately on fatal hangup events; the relay loop should not spin on dead upstream sockets.
 - The timerfd wakes only for the earliest connection/admission deadline or the 10-second aggregated `conn stats` report; timer maintenance does not scan the slot pool.
 - Client payload bytes pipelined after the 64-byte MTProto obfuscation nonce are buffered and forwarded once the upstream path is ready.

@@ -43,6 +43,7 @@ Do not reintroduce thread-per-connection or blocking relay loops.
 - IPv6 subnet keys preserve all 48 prefix bits; IPv4-mapped IPv6 intentionally shares the corresponding native IPv4 `/24` key.
 - `SIGPIPE` is ignored process-wide before socket relay starts; write paths must continue handling `EPIPE` as a normal connection failure.
 - There is no active `SO_RCVTIMEO`-based relay timeout path in current code.
+- `EPOLLRDHUP` is only a hint to drain until `read()==0`; do not detach that fd while its write half is still carrying the reverse relay. Track both directions separately, flush the destination queue before `shutdown(SHUT_WR)`, and accept graceful EOF only at FakeTLS/MiddleProxy frame boundaries.
 - FakeTLS validation requires a 32-byte ClientHello Session ID. Authentication, SNI, TLS 1.3 cipher, and PQ key-share detection share one strict outer parser, so do not introduce a second path with different nested-length rules. The Session ID is stored by value and echoed into the fixed Nginx-like ServerHello template; the complete ClientHello is securely zeroed/freed immediately after response construction.
 - Extra TLS appdata bytes after the 64-byte MTProto obfuscation nonce are buffered as `pipelined_data` and flushed after the DC/MiddleProxy path is ready.
 
