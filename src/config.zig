@@ -28,7 +28,9 @@ pub const Config = struct {
     /// Hard cap for concurrently handled client connections
     /// Default tuned for 1 vCPU / 1 GB VPS profile.
     max_connections: u32 = 512,
-    /// Pre-handshake idle timeout: wait for first client byte
+    /// Established relay idle timeout.
+    /// The first client byte is independently capped at 10 seconds; lower
+    /// configured values lower that admission deadline.
     idle_timeout_sec: u32 = 120,
     /// Per-connection idle timeout jitter in percent; 0 disables.
     idle_timeout_jitter_pct: u8 = 15,

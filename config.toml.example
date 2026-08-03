@@ -42,8 +42,10 @@ port = 443
 # unsafe_override_limits=true.
 # max_connections = 512
 
-# Seconds to wait for the first byte from a new client before dropping.
-# Default is 120; raise if your client mix keeps many pre-warmed idle sockets.
+# Established relay idle timeout in seconds.
+# The first client byte is independently capped at 10 seconds; configured
+# values below 10 seconds lower that admission deadline.
+# Default is 120; raise if your client mix keeps established relays idle longer.
 # idle_timeout_sec = 120
 
 # Per-connection random jitter for idle_timeout_sec, in percent.
