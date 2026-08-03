@@ -19,6 +19,7 @@ Production MTProto proxy implemented in Zig with FakeTLS entry, obfuscated MTPro
 ## Runtime Model
 
 - Relay path is a single-threaded Linux `epoll` event loop. The large `EventLoop` container (including fixed admission tables) is allocated once on the heap and initialized in place so Debug builds do not reserve multi-megabyte stack frames.
+- `SIGINT` and `SIGTERM` use a minimal `sigaction` handler that writes to a non-blocking `eventfd` registered in epoll. Shutdown work never runs in signal context: the event loop exits first, closes active slots, then the listener closes before the discovery updater is canceled and joined.
 - Connections are represented by pooled `ConnectionSlot` state objects.
 - Epoll payloads encode slot index, generation, and client/upstream role directly in `epoll_event.data.u64`; dispatch has no fd hash lookup, and generation checks reject stale events after slot/fd reuse.
 - Connection deadlines live in an indexed min-heap with one entry per active slot. A monotonic `timerfd` is armed to the earliest slot, accept-backoff, or stats deadline, eliminating the historical full-slot timer scan.

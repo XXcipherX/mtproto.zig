@@ -6,6 +6,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
+const linux = std.os.linux;
 const constants = @import("protocol/constants.zig");
 const crypto = @import("crypto/crypto.zig");
 const compat = @import("compat.zig");
@@ -96,6 +97,84 @@ fn ignoreSigpipe() void {
     };
     posix.sigaction(.PIPE, &action, null);
 }
+
+const invalid_shutdown_event_fd: posix.fd_t = -1;
+var shutdown_event_fd = std.atomic.Value(posix.fd_t).init(invalid_shutdown_event_fd);
+
+fn shutdownSignalMask() posix.sigset_t {
+    var mask = posix.sigemptyset();
+    posix.sigaddset(&mask, .INT);
+    posix.sigaddset(&mask, .TERM);
+    return mask;
+}
+
+fn shutdownSignalHandler(_: posix.SIG) callconv(.c) void {
+    const fd = shutdown_event_fd.load(.acquire);
+    if (fd == invalid_shutdown_event_fd) return;
+
+    const increment: u64 = 1;
+    _ = linux.write(fd, @ptrCast(&increment), @sizeOf(u64));
+}
+
+const ShutdownSignalBridge = struct {
+    fd: posix.fd_t,
+    old_int_action: posix.Sigaction,
+    old_term_action: posix.Sigaction,
+    previous_mask: posix.sigset_t,
+
+    fn init() !ShutdownSignalBridge {
+        if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
+
+        const signal_mask = shutdownSignalMask();
+        var previous_mask: posix.sigset_t = undefined;
+        posix.sigprocmask(posix.SIG.BLOCK, &signal_mask, &previous_mask);
+        errdefer posix.sigprocmask(posix.SIG.SETMASK, &previous_mask, null);
+
+        const rc = linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
+        const fd: posix.fd_t = switch (posix.errno(rc)) {
+            .SUCCESS => @intCast(rc),
+            .MFILE => return error.ProcessFdQuotaExceeded,
+            .NFILE => return error.SystemFdQuotaExceeded,
+            .NOMEM => return error.SystemResources,
+            else => |err| return posix.unexpectedErrno(err),
+        };
+        errdefer _ = linux.close(fd);
+
+        shutdown_event_fd.store(fd, .release);
+        errdefer shutdown_event_fd.store(invalid_shutdown_event_fd, .release);
+
+        const action = posix.Sigaction{
+            .handler = .{ .handler = shutdownSignalHandler },
+            .mask = signal_mask,
+            .flags = 0,
+        };
+        var old_int_action: posix.Sigaction = undefined;
+        var old_term_action: posix.Sigaction = undefined;
+        posix.sigaction(.INT, &action, &old_int_action);
+        posix.sigaction(.TERM, &action, &old_term_action);
+
+        posix.sigprocmask(posix.SIG.UNBLOCK, &signal_mask, null);
+        return .{
+            .fd = fd,
+            .old_int_action = old_int_action,
+            .old_term_action = old_term_action,
+            .previous_mask = previous_mask,
+        };
+    }
+
+    fn deinit(self: *ShutdownSignalBridge) void {
+        const signal_mask = shutdownSignalMask();
+        posix.sigprocmask(posix.SIG.BLOCK, &signal_mask, null);
+
+        posix.sigaction(.INT, &self.old_int_action, null);
+        posix.sigaction(.TERM, &self.old_term_action, null);
+        shutdown_event_fd.store(invalid_shutdown_event_fd, .release);
+        _ = linux.close(self.fd);
+
+        posix.sigprocmask(posix.SIG.SETMASK, &self.previous_mask, null);
+        self.fd = invalid_shutdown_event_fd;
+    }
+};
 
 const CapacityEstimate = struct {
     effective_memory_bytes: u64,
@@ -732,6 +811,8 @@ pub fn main(init: std.process.Init) !void {
     // (1000+ simultaneous connections all doing TLS validation allocations).
     const allocator = std.heap.page_allocator;
     ignoreSigpipe();
+    var shutdown_signals = try ShutdownSignalBridge.init();
+    defer shutdown_signals.deinit();
 
     // Parse config path and explicit secret-display opt-in.
     var args = try init.minimal.args.iterateAllocator(allocator);
@@ -790,7 +871,7 @@ pub fn main(init: std.process.Init) !void {
     defer state.deinit();
 
     // Run the proxy
-    try state.run();
+    try state.run(shutdown_signals.fd);
 }
 
 test {
@@ -800,6 +881,12 @@ test {
     _ = tls;
     _ = config;
     _ = proxy;
+}
+
+test "shutdown signal mask covers SIGINT and SIGTERM" {
+    const mask = shutdownSignalMask();
+    try std.testing.expect(posix.sigismember(&mask, .INT));
+    try std.testing.expect(posix.sigismember(&mask, .TERM));
 }
 
 test "capacity safety clamp enforces safe cap when override disabled" {

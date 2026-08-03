@@ -63,6 +63,7 @@ const invalid_fd: posix.fd_t = switch (builtin.os.tag) {
 
 const epoll_listener_token: u64 = 0;
 const epoll_timer_token: u64 = 1;
+const epoll_shutdown_token: u64 = 2;
 const max_slot_generation: u32 = 0x7fff_ffff;
 
 const SlotFdRole = enum(u1) {
@@ -1988,8 +1989,13 @@ pub const ProxyState = struct {
         freeUserSecrets(self.allocator, self.user_secrets);
     }
 
-    pub fn run(self: *ProxyState) !void {
+    pub fn run(self: *ProxyState, shutdown_fd: posix.fd_t) !void {
         if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
+
+        var middle_proxy_updater_started = false;
+        defer {
+            if (middle_proxy_updater_started) self.stopMiddleProxyUpdater();
+        }
 
         const address = net.Address.initIp6(
             .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
@@ -2019,11 +2025,6 @@ pub const ProxyState = struct {
             log.info("Listening on [::]:{d} (epoll, single-thread)", .{self.config.port});
         } else {
             log.info("Listening on 0.0.0.0:{d} (epoll, single-thread)", .{self.config.port});
-        }
-
-        var middle_proxy_updater_started = false;
-        defer {
-            if (middle_proxy_updater_started) self.stopMiddleProxyUpdater();
         }
 
         if (self.config.datacenter_override == null and
@@ -2059,7 +2060,7 @@ pub const ProxyState = struct {
         const effective_needed_fds = requiredFdsForConnections(self.config.max_connections);
         checkNofileLimit(@max(effective_needed_fds, min_nofile_soft), self.config.max_connections);
 
-        const loop = try EventLoop.init(self, server.stream.handle);
+        const loop = try EventLoop.init(self, server.stream.handle, shutdown_fd);
         defer {
             loop.deinit();
             self.allocator.destroy(loop);
@@ -2536,6 +2537,7 @@ const EventLoop = struct {
     epoll_fd: posix.fd_t,
     timer_fd: posix.fd_t,
     listen_fd: posix.fd_t,
+    shutdown_fd: posix.fd_t,
     pool: ConnectionPool,
     message_block_pool: MessageBlockPool,
     accept_paused: bool,
@@ -2564,7 +2566,7 @@ const EventLoop = struct {
     pending_close_fds: std.ArrayList(posix.fd_t),
     tracked_fds: u32,
 
-    fn init(state: *ProxyState, listen_fd: posix.fd_t) !*EventLoop {
+    fn init(state: *ProxyState, listen_fd: posix.fd_t, shutdown_fd: posix.fd_t) !*EventLoop {
         const epoll_fd = try epollCreate();
         errdefer closeFd(epoll_fd);
         const timer_fd = try createTimerFd();
@@ -2577,6 +2579,7 @@ const EventLoop = struct {
         loop.epoll_fd = epoll_fd;
         loop.timer_fd = timer_fd;
         loop.listen_fd = listen_fd;
+        loop.shutdown_fd = shutdown_fd;
         loop.pool = try ConnectionPool.init(state.allocator, state.config.max_connections);
         errdefer loop.pool.deinit();
         loop.message_block_pool = .{ .allocator = state.allocator };
@@ -2611,6 +2614,7 @@ const EventLoop = struct {
 
         try loop.addControlFd(listen_fd, epoll_listener_token, true, false, false);
         try loop.addControlFd(timer_fd, epoll_timer_token, true, false, false);
+        try loop.addControlFd(shutdown_fd, epoll_shutdown_token, true, false, false);
         try loop.rearmTimer();
         return loop;
     }
@@ -2663,8 +2667,17 @@ const EventLoop = struct {
 
             const n: usize = @intCast(rc);
             for (events[0..n]) |ev| {
+                if (ev.data.u64 != epoll_shutdown_token) continue;
+                if (try self.consumeShutdownSignal()) {
+                    log.info("SIGINT/SIGTERM received; shutting down", .{});
+                    return;
+                }
+            }
+
+            for (events[0..n]) |ev| {
                 const token = ev.data.u64;
                 const ev_flags = ev.events;
+                if (token == epoll_shutdown_token) continue;
                 if (token == epoll_listener_token) {
                     self.acceptNewConnections() catch |err| {
                         log.err("accept loop error: {any}", .{err});
@@ -2705,6 +2718,18 @@ const EventLoop = struct {
             }
             try self.rearmTimer();
         }
+    }
+
+    fn consumeShutdownSignal(self: *EventLoop) !bool {
+        var count: u64 = 0;
+        const bytes = std.mem.asBytes(&count);
+        const n = posix.read(self.shutdown_fd, bytes) catch |err| switch (err) {
+            error.WouldBlock => return false,
+            else => |e| return e,
+        };
+        if (n == 0) return error.ShutdownEventFdClosed;
+        if (n != bytes.len) return error.ShortShutdownEventRead;
+        return count != 0;
     }
 
     fn processSlotEvent(self: *EventLoop, slot: *ConnectionSlot, fd: posix.fd_t, events: u32) void {
@@ -6572,6 +6597,7 @@ test "middle proxy nonce response failures fall back to direct path" {
         .epoll_fd = epoll_fd,
         .timer_fd = timer_fd,
         .listen_fd = invalid_fd,
+        .shutdown_fd = invalid_fd,
         .pool = try ConnectionPool.init(std.testing.allocator, 4),
         .message_block_pool = .{ .allocator = std.testing.allocator },
         .accept_paused = false,
@@ -6999,6 +7025,7 @@ test "epoll slot tokens preserve registration generation and fd role" {
     try std.testing.expectEqual(@as(u32, 1), nextSlotGeneration(max_slot_generation));
     try std.testing.expect(decodeSlotEventToken(epoll_listener_token) == null);
     try std.testing.expect(decodeSlotEventToken(epoll_timer_token) == null);
+    try std.testing.expect(decodeSlotEventToken(epoll_shutdown_token) == null);
 }
 
 test "fatal hangup close policy distinguishes client/upstream while connecting" {
@@ -7393,6 +7420,7 @@ test "handshake budget is charged once after the first client byte" {
         .epoll_fd = invalid_fd,
         .timer_fd = invalid_fd,
         .listen_fd = invalid_fd,
+        .shutdown_fd = invalid_fd,
         .pool = try ConnectionPool.init(std.testing.allocator, 1),
         .message_block_pool = .{ .allocator = std.testing.allocator },
         .accept_paused = false,

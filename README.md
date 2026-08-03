@@ -59,6 +59,7 @@ Connection-capacity methodology and command profiles: `test/README.md`.
 ## Runtime Model
 
 - Client relay is handled by a single-threaded Linux `epoll` event loop. `epoll_event.data.u64` carries the slot index, generation, and fd role, so dispatch does not need an fd hash lookup and stale events cannot attach to a reused slot.
+- `SIGINT` and `SIGTERM` are bridged into that event loop through a non-blocking `eventfd`; the async signal handler performs only the raw notification write. The loop stops accepting before it closes active slots, the listener, and the joinable discovery worker in ownership order.
 - External discovery never delays the listening socket: MiddleProxy metadata/NAT detection and hostname-based masking resolution run in a joinable background worker. Metadata and masking candidates refresh hourly, reachability probes run in cancellable batches of at most four sockets, in-flight DNS/HTTPS/curl work is canceled cooperatively during shutdown, and stalled MiddleProxy handshakes can request an early refresh.
 - FakeTLS validation expects Telegram-style 32-byte ClientHello Session IDs and copies the Session ID into the synthetic ServerHello.
 - Handshake and relay lifetimes are controlled by monotonic `timerfd` deadlines in an indexed min-heap (`handshake_timeout_sec`, `idle_timeout_sec`), not by periodic slot scans or `SO_RCVTIMEO`; a silent connection gets at most 10 seconds to send its first byte.
