@@ -16,7 +16,7 @@ The capacity probe reports, per target level:
 - `payload_ok` — successful payload submission for selected traffic mode.
 - `established_server_side` — server-side held `ESTABLISHED` sockets.
 - `rss_kb` — process-tree RSS (listener process + children).
-- `conn stats ... managed_buf=<used>/<limit>KiB peak=<peak>KiB` — runtime use of the proxy's shared relay/MiddleProxy buffer budget.
+- `conn stats ... managed_buf=<used>/<limit>KiB peak=<peak>KiB` — runtime use of the proxy's shared relay/MiddleProxy buffer budget, not whole-process RSS or kernel socket memory.
 - `drops: ... memory_pressure+=...` — allocations rejected at that hard budget; optional shrink can retain its old buffer, while required growth sheds the requesting path. Sustained increments identify pressure even when total RSS still includes ample kernel/process headroom.
 - `stable` — level considered stable per probe criteria.
 

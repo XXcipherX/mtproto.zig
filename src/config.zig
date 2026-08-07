@@ -96,7 +96,8 @@ pub const Config = struct {
     /// Limits scanner/flood/DPI-probe impact. Generous for legitimate Telegram clients
     /// which open 3-6 connections at startup and hold them.
     rate_limit_per_subnet: u8 = 30,
-    /// When true, disables auto-clamping of max_connections to the RAM-safe estimate.
+    /// When true, disables auto-clamping of max_connections to the baseline RAM
+    /// admission ceiling.
     /// Use only if you know your host has enough memory for the configured limits.
     unsafe_override_limits: bool = false,
     /// Test-only hook to redirect upstream connections locally

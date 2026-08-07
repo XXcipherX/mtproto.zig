@@ -92,7 +92,7 @@ There is no active `SO_RCVTIMEO`-driven relay timeout model in current code.
 
 ## Capacity Model (as implemented)
 
-Startup computes a safety estimate from the effective process memory limit:
+Startup computes a baseline RAM admission ceiling from the effective process memory limit:
 
 ```text
 tls_working_bytes = ~6 KiB
@@ -114,13 +114,13 @@ managed_buffer_limit =
         allocatable_bytes - max_connections * unmanaged_per_conn)
 ```
 
-The startup estimate no longer multiplies every connection by two full 4 MiB relay queues and two full MiddleProxy caps. Those are independent protective maxima, not simultaneous guaranteed resident memory. Instead, the event loop routes queue blocks, retained free-list blocks, MiddleProxy C2S/S2C buffers, and shared scratch through `ManagedBufferAllocator`. It tracks requested live bytes, refuses remap so allocate-before-free growth is charged at its transient peak, and keeps recycled queue pages charged until they are actually destroyed. Budget exhaustion follows existing OOM handling: optional shrink retains the existing buffer, while required growth closes the requesting connection or falls back to the direct path where possible. Every denial is reported as `memory_pressure+=...` in periodic stats.
+The startup ceiling no longer multiplies every connection by two full 4 MiB relay queues and two full MiddleProxy caps. Those are independent protective maxima, not simultaneous guaranteed resident memory. The ceiling therefore guarantees baseline admission under the enforced shared budget; it is not a simultaneous full-buffer throughput claim. The event loop routes queue blocks, retained free-list blocks, MiddleProxy C2S/S2C buffers, and shared scratch through `ManagedBufferAllocator`. It tracks requested live bytes, refuses remap so allocate-before-free growth is charged at its transient peak, and keeps recycled queue pages charged until they are actually destroyed. Budget exhaustion follows existing OOM handling: optional shrink retains the existing buffer, while required growth closes the requesting connection or falls back to the direct path where possible. Every denial is reported as `memory_pressure+=...` in periodic stats.
 
-The runtime limit includes the 16 KiB-per-direction MiddleProxy baseline for every configured slot plus the shared burst reserve, but is capped so the unmanaged baseline and managed allocation ceiling cannot exceed `allocatable_bytes` together. When effective memory cannot be detected, the managed pool uses a 64 MiB default. For a 960 MiB limit with media MiddleProxy enabled and `max_connections=256`, the banner reports a ~40 KiB baseline, ~216 MiB shared buffer limit, and a safe cap of ~5324.
+The runtime limit includes the 16 KiB-per-direction MiddleProxy baseline for every configured slot plus the shared burst reserve, but is capped so the unmanaged baseline and managed allocation ceiling cannot exceed `allocatable_bytes` together. When effective memory cannot be detected, the managed pool uses a 64 MiB default. For a 960 MiB limit with media MiddleProxy enabled and `max_connections=256`, the banner reports a ~40 KiB baseline, ~216 MiB shared dynamic-pool limit, a baseline RAM ceiling of ~5324, the separately configured cap, and the 90%/80% admission hysteresis.
 
 The cgroup detector resolves the process membership through `/proc/self/cgroup` and `/proc/self/mountinfo`, then takes the lowest readable leaf or ancestor limit. In cgroup v2 a numeric `0` is a real hard limit; only `max` means unlimited. Conventional `/sys/fs/cgroup` paths remain a fallback when procfs mount metadata is unavailable.
 
-If `max_connections` exceeds the memory-safe estimate, startup auto-clamps it before the proxy starts unless `[server].unsafe_override_limits = true`. If the estimate is below the supported minimum of 32 slots, safe mode fails startup instead of forcing 32. With the override enabled, startup keeps the configured value and logs a warning. If neither host nor cgroup memory can be read on Linux, startup logs that the clamp was skipped.
+If `max_connections` exceeds the baseline RAM ceiling, startup auto-clamps it before the proxy starts unless `[server].unsafe_override_limits = true`. If the ceiling is below the supported minimum of 32 slots, safe mode fails startup instead of forcing 32. With the override enabled, startup keeps the configured value and logs a warning; the shared dynamic-pool hard limit remains active. If neither host nor cgroup memory can be read on Linux, startup logs that the RAM admission clamp was skipped.
 
 `ProxyState.run` then applies a second, independent `RLIMIT_NOFILE` clamp before creating the event loop when the process soft fd limit cannot cover the effective connection cap. If the fd budget cannot support the minimum 32 slots (576 descriptors including overhead), startup fails instead of advertising an impossible capacity.
 

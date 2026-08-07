@@ -653,7 +653,7 @@ fn enforceCapacitySafety(cfg: *config.Config, capacity_estimate: ?CapacityEstima
         if (builtin.os.tag == .linux and !cfg.unsafe_override_limits) {
             const log_main = std.log.scoped(.config);
             log_main.warn(
-                "could not detect total RAM; skipping max_connections safety clamp. " ++
+                "could not detect total RAM; skipping max_connections RAM admission clamp. " ++
                     "set a conservative [server].max_connections to avoid OOM.",
                 .{},
             );
@@ -665,14 +665,14 @@ fn enforceCapacitySafety(cfg: *config.Config, capacity_estimate: ?CapacityEstima
         const log_main = std.log.scoped(.config);
         if (cfg.unsafe_override_limits) {
             log_main.warn(
-                "effective memory budget supports only {d} connections; " ++
+                "baseline RAM ceiling is only {d} connections; " ++
                     "unsafe_override_limits=true, keeping configured limit {d}",
                 .{ est.safe_connections, cfg.max_connections },
             );
             return;
         }
         log_main.warn(
-            "effective memory budget supports only {d} connections, below the minimum safe capacity of 32",
+            "baseline RAM ceiling is {d} connections, below the minimum supported capacity of 32",
             .{est.safe_connections},
         );
         return error.InsufficientMemoryBudget;
@@ -683,7 +683,7 @@ fn enforceCapacitySafety(cfg: *config.Config, capacity_estimate: ?CapacityEstima
     const log_main = std.log.scoped(.config);
     if (cfg.unsafe_override_limits) {
         log_main.warn(
-            "max_connections={d} is above RAM-safe estimate ({d}); " ++
+            "max_connections={d} exceeds baseline RAM ceiling ({d}); " ++
                 "unsafe_override_limits=true, keeping configured limit.",
             .{ cfg.max_connections, est.safe_connections },
         );
@@ -694,9 +694,9 @@ fn enforceCapacitySafety(cfg: *config.Config, capacity_estimate: ?CapacityEstima
     cfg.max_connections = est.safe_connections;
 
     log_main.warn(
-        "auto-clamping max_connections from {d} to {d} " ++
+        "auto-clamping max_connections from {d} to baseline RAM ceiling {d} " ++
             "(effective memory limit {d} MiB, ~{d} KiB baseline/connection). " ++
-            "To disable this safety clamp, set unsafe_override_limits = true in [server].",
+            "To disable this RAM admission clamp, set unsafe_override_limits = true in [server].",
         .{
             configured_limit,
             est.safe_connections,
@@ -774,12 +774,14 @@ fn printBanner(
             est.per_conn_bytes / 1024,
             capacity_mode,
         });
-        writeStdout("      Buffer pool  ~{d} MiB shared hard limit\n", .{
+        writeStdout("      Dynamic pool ~{d} MiB shared hard limit\n", .{
             managed_buffer_limit_bytes / (1024 * 1024),
         });
-        writeStdout("      Safe cap     " ++ B ++ "~{d}" ++ R ++ " connections\n", .{est.safe_connections});
+        writeStdout("      RAM ceiling  " ++ B ++ "~{d}" ++ R ++ " baseline connections\n", .{est.safe_connections});
+        writeStdout("      Configured   " ++ B ++ "{d}" ++ R ++ " connections\n", .{cfg.max_connections});
+        writeRaw("      Admission    pauses at 90%, resumes at 80%\n");
         if (cfg.max_connections > est.safe_connections) {
-            writeStdout("      " ++ yellow ++ "max_connections={d} is above safe estimate" ++ R ++ "\n", .{cfg.max_connections});
+            writeStdout("      " ++ yellow ++ "configured limit exceeds baseline RAM ceiling" ++ R ++ "\n", .{});
         }
         writeRaw("\n");
     }

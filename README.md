@@ -482,7 +482,7 @@ EOF
 
 ### &nbsp; Capacity & RAM Monitoring
 
-On startup, the proxy uses the lower of host RAM and every visible limit from the process's active cgroup v2/v1 hierarchy, including parent groups and non-standard mount points, and prints a **CAPACITY** banner. The estimate reserves fixed headroom, splits the remaining allowance between guaranteed connection baselines and a shared dynamically allocated buffer pool, and enforces that pool as a hard runtime limit. If `max_connections` is above the safe estimate, it auto-clamps unless `unsafe_override_limits = true`; if the safe budget cannot support the minimum 32 slots, startup fails instead of forcing an unsafe minimum.
+On startup, the proxy uses the lower of host RAM and every visible limit from the process's active cgroup v2/v1 hierarchy, including parent groups and non-standard mount points, and prints a **CAPACITY** banner. The estimate reserves fixed headroom, splits the remaining allowance between guaranteed connection baselines and a shared dynamically allocated buffer pool, and enforces that pool as a hard runtime limit. The displayed **RAM ceiling** is a baseline admission ceiling, not a promise that every admitted connection can simultaneously grow all MiddleProxy buffers and relay queues to their independent maxima. The banner reports the separately configured connection limit and the 90%/80% admission hysteresis. If `max_connections` exceeds the RAM ceiling, it auto-clamps unless `unsafe_override_limits = true`; if the ceiling cannot support the minimum 32 slots, startup fails instead of forcing an unsafe minimum.
 
 User secrets and `tg://`/`t.me` links are redacted from the daemon banner by default so they do not enter journald or container logs. To reveal them intentionally in a private terminal, run `mtproto-proxy [config.toml] --show-secrets`.
 
@@ -776,7 +776,7 @@ alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eli
 | `[server]` | `public_ip` | _(none)_ | IP/domain shown in startup links. Set it explicitly when using `--show-secrets`; external discovery is intentionally not allowed to delay listener startup. For self-domain masking, use the same domain as `tls_domain`. Tunnel deploy scripts preserve an existing domain instead of replacing it with the tunnel exit IP |
 | `[server]` | `middle_proxy_nat_ip` | _(auto-detect)_ | Optional IPv4 override used in MiddleProxy NAT/AES derivation. Useful when `public_ip` is a hostname or when tunnel egress/detection would choose the wrong IPv4 |
 | `[server]` | `backlog` | `4096` | TCP listen queue size (for high-traffic loads) |
-| `[server]` | `max_connections` | `512` | Concurrent connection cap (small-VPS tuned default, parser lower bound 32). On Linux, startup first auto-clamps this to the lower of host RAM and the lowest visible leaf/parent cgroup limit unless `unsafe_override_limits=true`; the proxy then clamps again if `RLIMIT_NOFILE` can support at least 32 slots, otherwise startup fails safely |
+| `[server]` | `max_connections` | `512` | Configured concurrent connection cap (small-VPS tuned default, parser lower bound 32), distinct from the banner's baseline RAM ceiling. On Linux, startup first auto-clamps this to that effective-memory ceiling unless `unsafe_override_limits=true`; the proxy then clamps again if `RLIMIT_NOFILE` can support at least 32 slots, otherwise startup fails safely |
 | `[server]` | `idle_timeout_sec` | `120` | Established relay idle timeout in seconds (parser lower bound 5). Pre-first-byte admission uses a separate fixed 10-second deadline |
 | `[server]` | `idle_timeout_jitter_pct` | `15` | Per-connection random jitter applied once when the slot is admitted to `idle_timeout_sec` (`±N%`, clamped to `0..100`). The effective timeout is then reused for every deadline update, floored to at least 5 seconds and at least half the base timeout. Set `0` to disable |
 | `[server]` | `client_silence_close_sec` | `0` | Conservative iOS MtProtoKit wedge fallback for proven generic DC relays. Eligibility requires at least 30 seconds in the relay phase and a delivered server reply followed by further client traffic, so startup exchanges on fresh reconnects cannot arm a close loop. A later server payload is considered a reply only when it arrives within the client's 12-second response window, and the timer starts after the userspace client queue drains. Media relays are excluded. `0` disables it; `15` is the recommended fallback |
@@ -788,7 +788,7 @@ alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eli
 | `[server]` | `tag` | _(none)_ | Optional 32 hex-char promotion tag from [@MTProxybot](https://t.me/MTProxybot) |
 | `[server]` | `log_level` | `"info"` | Runtime log verbosity: `debug` (all DC routing, relay, close details), `info` (default — connection stats, warnings), `warn`, `err`. Change without recompilation; takes effect on restart |
 | `[server]` | `rate_limit_per_subnet` | `30` | Max new connections per second per /24 (IPv4) or /48 (IPv6) subnet. Blocks scanner/DPI-probe flood. Set `0` to disable |
-| `[server]` | `unsafe_override_limits` | `false` | Disable auto-clamping of `max_connections` to the effective-memory estimate. Use only when the container/service limit as well as host RAM are sufficient |
+| `[server]` | `unsafe_override_limits` | `false` | Disable auto-clamping of `max_connections` to the baseline RAM admission ceiling. The shared dynamic-buffer hard limit remains enforced. Use only when the container/service limit as well as host RAM are sufficient |
 | `[monitor]` | `host` | `"127.0.0.1"` | Bind address for the optional monitoring dashboard HTTP server. This section is read by `proxy-monitor`, not by the proxy binary. Set to `"0.0.0.0"` to expose on all interfaces (warning: no built-in auth) |
 | `[monitor]` | `port` | `61208` | TCP port for the optional monitoring dashboard HTTP server |
 | `[censorship]` | `tls_domain` | `"google.com"` | FakeTLS SNI domain. With `mask_port=443`, unauthenticated clients are forwarded to this domain directly. For self-domain masking, set it to your own domain and point its DNS A record to the VPS. Since June 2026, the real masking endpoint should negotiate X25519MLKEM768 (`0x11ec`) in one round; classical-x25519-only domains can be a passive marker |
@@ -847,15 +847,15 @@ This proxy uses a Linux `epoll` event loop (single-thread relay path). Timeouts 
 Before chasing client/network hypotheses, inspect the new low-noise runtime signals:
 
 ```bash
-ssh root@<VPS_IP> 'journalctl -u mtproto-proxy --since "30 min ago" --no-pager | grep -E "conn stats|drops:|auto-clamping max_connections|RAM-safe estimate|skipping max_connections safety clamp|max_connections clamped|fd quota reached|failed to resume accepts|connection saturation|saturation eased"'
+ssh root@<VPS_IP> 'journalctl -u mtproto-proxy --since "30 min ago" --no-pager | grep -E "conn stats|drops:|auto-clamping max_connections|baseline RAM ceiling|RAM admission clamp|max_connections clamped|fd quota reached|failed to resume accepts|connection saturation|saturation eased"'
 ssh root@<VPS_IP> 'cat /proc/$(pgrep -f mtproto-proxy)/limits | grep "open files"'
 ```
 
 Interpretation:
 
-- `auto-clamping max_connections ...` means startup reduced configured capacity to the host/cgroup-hierarchy effective-memory estimate. `max_connections clamped ... due to RLIMIT_NOFILE` means runtime reduced it again to fit the process fd limit.
+- `RAM ceiling` in the startup banner is the baseline admission ceiling derived from effective memory; `Configured` is the requested runtime cap before any later `RLIMIT_NOFILE` clamp. `auto-clamping max_connections ...` means startup reduced that configured cap to the RAM ceiling. `max_connections clamped ... due to RLIMIT_NOFILE` means runtime reduced it again to fit the process fd limit.
 - `fd quota reached ... pausing accepts for 500ms` means the listener hit `EMFILE`/`ENFILE` and intentionally backed off instead of busy-looping.
-- `conn stats ... paused=<fd_pause>/<saturation_pause> managed_buf=<used>/<limit>KiB peak=<peak>KiB` exposes both pause reasons and current/peak use of the shared dynamic-buffer budget.
+- `conn stats ... paused=<fd_pause>/<saturation_pause> managed_buf=<used>/<limit>KiB peak=<peak>KiB` exposes both pause reasons and current/peak use of the shared dynamic-buffer budget. `managed_buf` is not whole-process RSS and excludes kernel socket memory and non-managed process allocations.
 - `drops: ... rate+=...` means the per-subnet rate limiter rejected excess new connections.
 - `drops: ... hs_budget+=...` means either the global handshake-inflight budget or the per-subnet unauthenticated-socket allowance rejected a new handshake.
 - `drops: ... mp_fallback+=...` means the MiddleProxy path degraded and the proxy recovered by reconnecting directly to the same DC.

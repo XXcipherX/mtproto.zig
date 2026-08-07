@@ -29,7 +29,7 @@ ssh root@<SERVER_IP> 'cat /proc/$(pgrep -f mtproto-proxy)/limits | grep "open fi
 ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy --since "1 hour ago" --no-pager'
 
 # Runtime capacity / fd-pressure signals
-ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy --since "1 hour ago" --no-pager | grep -E "conn stats|drops:|auto-clamping max_connections|RAM-safe estimate|skipping max_connections safety clamp|max_connections clamped|fd quota reached|failed to resume accepts|connection saturation|saturation eased"'
+ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy --since "1 hour ago" --no-pager | grep -E "conn stats|drops:|auto-clamping max_connections|baseline RAM ceiling|RAM admission clamp|max_connections clamped|fd quota reached|failed to resume accepts|connection saturation|saturation eased"'
 
 # Connect-path and fallback signals
 ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy --since "1 hour ago" --no-pager | grep -E "middle-proxy exhausted|middle-proxy handshake failed|media path connect failed|epoll hup/err"'
@@ -124,9 +124,9 @@ ssh root@<SERVER_IP> 'cd /root/mtproto.zig && zig build && python3 test/daemon_s
 
 Interpretation helpers:
 
-- `auto-clamping max_connections ...` means the startup effective-memory clamp (the lower of host RAM and the lowest readable leaf/parent cgroup limit) reduced the configured cap. `max_connections clamped ... due to RLIMIT_NOFILE` means the later fd-budget clamp reduced it again.
+- `RAM ceiling` is the startup baseline-admission ceiling, not simultaneous full-buffer capacity. `Configured` is the requested connection cap before any later fd clamp. `auto-clamping max_connections ...` means the effective-memory clamp reduced that configured cap to the RAM ceiling. `max_connections clamped ... due to RLIMIT_NOFILE` means the later fd-budget clamp reduced it again.
 - `fd quota reached ...` means the listener paused accepts; expect the first `paused=` flag to flip to `true` in nearby `conn stats` lines until the retry window clears.
-- `managed_buf=<used>/<limit>KiB peak=<peak>KiB` in `conn stats` reports the current, hard-limit, and process-lifetime peak for relay/MiddleProxy dynamic storage.
+- `managed_buf=<used>/<limit>KiB peak=<peak>KiB` in `conn stats` reports the current, hard-limit, and process-lifetime peak for relay/MiddleProxy dynamic storage. It is not whole-process RSS and excludes kernel socket memory and non-managed allocations.
 - `memory_pressure+=...` means this hard buffer limit rejected allocations; an optional shrink may keep its existing allocation, while required growth sheds only the requesting path. Repeated increments indicate that the configured connection/traffic target exceeds the available burst budget.
 - `hs_budget+=...` means connection churn is exhausting either the global handshake budget or a source subnet's unauthenticated concurrency allowance before established relays become the bottleneck.
 - `mp_fallback+=...` means users are still being served, but MiddleProxy path quality is degraded enough to trigger direct fallback.
