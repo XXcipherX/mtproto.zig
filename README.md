@@ -318,6 +318,17 @@ sudo systemctl restart mtproto-proxy
 docker compose --env-file .env -f compose.yml logs -f
 ```
 
+To print the connection links again without starting a second proxy listener:
+
+```bash
+docker exec -it mtproto-proxy \
+  /usr/local/bin/mtproto-proxy \
+  /etc/mtproto-proxy/config.toml \
+  --print-links
+```
+
+The one-shot process reads the container's mounted config, writes the secret links only to the current terminal, and exits while the main proxy process keeps running.
+
 ## &nbsp; Deploy to Server
 
 ### One-line install (Ubuntu/Debian)
@@ -484,7 +495,7 @@ EOF
 
 On startup, the proxy uses the lower of host RAM and every visible limit from the process's active cgroup v2/v1 hierarchy, including parent groups and non-standard mount points, and prints a **CAPACITY** banner. The estimate reserves fixed headroom, splits the remaining allowance between guaranteed connection baselines and a shared dynamically allocated buffer pool, and enforces that pool as a hard runtime limit. The displayed **RAM ceiling** is a baseline admission ceiling, not a promise that every admitted connection can simultaneously grow all MiddleProxy buffers and relay queues to their independent maxima. The banner reports the separately configured connection limit and the 90%/80% admission hysteresis. If `max_connections` exceeds the RAM ceiling, it auto-clamps unless `unsafe_override_limits = true`; if the ceiling cannot support the minimum 32 slots, startup fails instead of forcing an unsafe minimum.
 
-User secrets and `tg://`/`t.me` links are redacted from the daemon banner by default so they do not enter journald or container logs. To reveal them intentionally in a private terminal, run `mtproto-proxy [config.toml] --show-secrets`.
+User secrets and `tg://`/`t.me` links are redacted from the daemon banner by default so they do not enter journald or container logs. Use the one-shot `--print-links` mode in a private terminal to load the config, print the links, and exit before opening the listener. The existing `--show-secrets` flag remains available for an intentional foreground daemon run with secrets included in its startup banner.
 
 **4. Install the systemd service**
 
@@ -517,13 +528,26 @@ sudo systemctl start mtproto-proxy
 
 **7. Generate connection link**
 
-The proxy prints links on startup. Check them with:
+For a source/systemd installation:
 
 ```bash
-journalctl -u mtproto-proxy | head -30
+sudo /opt/mtproto-proxy/mtproto-proxy \
+  /opt/mtproto-proxy/config.toml \
+  --print-links
 ```
 
-Or build it manually:
+For a running Docker Compose installation:
+
+```bash
+docker exec -it mtproto-proxy \
+  /usr/local/bin/mtproto-proxy \
+  /etc/mtproto-proxy/config.toml \
+  --print-links
+```
+
+This command does not start a second listener, so it can run while the service is active. It prints the access secrets only to the current terminal and exits. Keep the terminal and its scrollback private.
+
+You can also build a link manually:
 
 ```
 tg://proxy?server=<DOMAIN_OR_IP>&port=443&secret=ee<SECRET><HEX_DOMAIN>
@@ -773,7 +797,7 @@ alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eli
 | `[general]` | `force_media_middle_proxy` | `true` | Keep media-path traffic (`dc=203` / negative `dc_idx`) on MiddleProxy when ME endpoints are available, even if regular DC traffic stays direct |
 | `[general]` | `ad_tag` | _(none)_ | Telemt-compatible alias for promotion tag; ignored if `[server].tag` is set |
 | `[server]` | `port` | `443` | TCP port to listen on |
-| `[server]` | `public_ip` | _(none)_ | IP/domain shown in startup links. Set it explicitly when using `--show-secrets`; external discovery is intentionally not allowed to delay listener startup. For self-domain masking, use the same domain as `tls_domain`. Tunnel deploy scripts preserve an existing domain instead of replacing it with the tunnel exit IP |
+| `[server]` | `public_ip` | _(none)_ | IP/domain used in generated links. Set it explicitly when using `--print-links` or `--show-secrets`; external discovery is intentionally unavailable in the one-shot path and is not allowed to delay listener startup. For self-domain masking, use the same domain as `tls_domain`. Tunnel deploy scripts preserve an existing domain instead of replacing it with the tunnel exit IP |
 | `[server]` | `middle_proxy_nat_ip` | _(auto-detect)_ | Optional IPv4 override used in MiddleProxy NAT/AES derivation. Useful when `public_ip` is a hostname or when tunnel egress/detection would choose the wrong IPv4 |
 | `[server]` | `backlog` | `4096` | TCP listen queue size (for high-traffic loads) |
 | `[server]` | `max_connections` | `512` | Configured concurrent connection cap (small-VPS tuned default, parser lower bound 32), distinct from the banner's baseline RAM ceiling. On Linux, startup first auto-clamps this to that effective-memory ceiling unless `unsafe_override_limits=true`; the proxy then clamps again if `RLIMIT_NOFILE` can support at least 32 slots, otherwise startup fails safely |

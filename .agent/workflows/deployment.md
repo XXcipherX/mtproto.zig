@@ -152,7 +152,7 @@ The tracked `deploy/compose.yml` is a minimal proxy-only example. `deploy/instal
 
 - Default and tunnel-patched units run as `mtproto:mtproto`, use `Restart=always` with `RestartSec=3`, and ship with `LimitNOFILE=131582` plus `TasksMax=65535`.
 - Startup first auto-clamps `max_connections` to an effective-memory estimate using the lower of host RAM and every visible limit in the process's cgroup v2/v1 hierarchy (leaf plus parents, including non-standard mount points) unless `unsafe_override_limits=true`; it fails safe if fewer than 32 slots fit. `ProxyState.run` then clamps again if `RLIMIT_NOFILE` can cover at least 32 slots, otherwise it also fails startup safely.
-- The daemon banner redacts user secrets and proxy links. Use `--show-secrets` only for an intentional foreground run in a private terminal.
+- The daemon banner redacts user secrets and proxy links. Prefer the one-shot `--print-links` mode: it loads the config, prints links in the current private terminal, and exits before initializing signals or opening the listener. In a running Compose install, execute `/usr/local/bin/mtproto-proxy /etc/mtproto-proxy/config.toml --print-links` inside the `mtproto-proxy` container. `--show-secrets` remains an explicit opt-in for a full foreground daemon run.
 - Runtime relay model is still single-thread `epoll` in proxy core.
 - Default unit keeps `ReadOnlyPaths=/opt/mtproto-proxy` and only `CAP_NET_BIND_SERVICE`.
 - Tunnel-patched unit keeps the hardening settings, adds `CAP_NET_ADMIN` + `CAP_SYS_ADMIN`, and uses `ExecStartPre=/usr/local/bin/setup_netns.sh` to recreate the namespace on every restart.

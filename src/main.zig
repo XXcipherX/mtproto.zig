@@ -708,7 +708,72 @@ fn enforceCapacitySafety(cfg: *config.Config, capacity_estimate: ?CapacityEstima
 
 // ============= Startup Banner =============
 
-/// Print a stylish startup banner with config summary and connection links.
+fn writeConnectionLinkEntries(cfg: config.Config) void {
+    const R = "\x1b[0m";
+    const B = "\x1b[1m";
+    const D = "\x1b[2m";
+    const cyan = "\x1b[36m";
+    const green = "\x1b[32m";
+    const magenta = "\x1b[35m";
+    const red = "\x1b[31m";
+
+    // Public discovery used by MiddleProxy runs is intentionally not available
+    // while rendering links, so they require an explicitly configured address.
+    const has_ip = cfg.public_ip != null;
+    const server_ip = cfg.public_ip orelse "<SERVER_IP>";
+    if (!has_ip) {
+        writeRaw("      " ++ red ++ "⚠  public_ip is not configured; replace <SERVER_IP> manually." ++ R ++ "\n");
+    }
+
+    var users = cfg.users;
+    var it = users.iterator();
+    while (it.next()) |entry| {
+        writeStdout("      " ++ B ++ magenta ++ "{s}" ++ R ++ "\n", .{entry.key_ptr.*});
+
+        writeStdout("      " ++ cyan ++ "tg://" ++ R ++ "proxy?server={s}&port={d}&secret=", .{ server_ip, cfg.port });
+        writeRaw(green ++ "ee");
+        for (entry.value_ptr.*) |byte| {
+            writeHexByte(byte);
+        }
+        for (cfg.tls_domain) |byte| {
+            writeHexByte(byte);
+        }
+        writeRaw(R ++ "\n");
+
+        writeStdout("      " ++ D ++ "t.me/proxy?server={s}&port={d}&secret=ee", .{ server_ip, cfg.port });
+        for (entry.value_ptr.*) |byte| {
+            writeHexByte(byte);
+        }
+        for (cfg.tls_domain) |byte| {
+            writeHexByte(byte);
+        }
+        writeRaw(R ++ "\n");
+    }
+}
+
+/// Print connection links and return without starting the proxy.
+fn printConnectionLinks(cfg: config.Config) void {
+    var output = std.Io.Writer.Allocating.init(std.heap.page_allocator);
+    defer output.deinit();
+    stdout_accumulator = &output.writer;
+    defer stdout_accumulator = null;
+
+    const R = "\x1b[0m";
+    const B = "\x1b[1m";
+    const D = "\x1b[2m";
+    const cyan = "\x1b[36m";
+    const yellow = "\x1b[33m";
+
+    writeRaw("\n  " ++ D ++ "───" ++ R ++ " " ++ B ++ cyan ++ "CONNECTION LINKS" ++ R ++ " " ++ D ++ "────────────────────────────" ++ R ++ "\n");
+    writeConnectionLinkEntries(cfg);
+    writeRaw("\n  " ++ D ++ "──────────────────────────────────────────────────" ++ R ++ "\n");
+    writeRaw("  " ++ yellow ++ "Links contain access secrets; keep this terminal private." ++ R ++ "\n\n");
+
+    stdout_accumulator = null;
+    compat.writeStdout(output.written());
+}
+
+/// Print a stylish startup banner with config summary.
 fn printBanner(
     cfg: config.Config,
     capacity_estimate: ?CapacityEstimate,
@@ -726,9 +791,7 @@ fn printBanner(
     const cyan = "\x1b[36m";
     const green = "\x1b[32m";
     const yellow = "\x1b[33m";
-    const magenta = "\x1b[35m";
     const white = "\x1b[97m";
-    const red = "\x1b[31m";
 
     // Public discovery used by MiddleProxy runs after the listener is ready.
     // Connection links therefore use only an explicitly configured address.
@@ -808,38 +871,9 @@ fn printBanner(
     writeRaw("  " ++ D ++ "───" ++ R ++ " " ++ B ++ cyan ++ "LINKS" ++ R ++ " " ++ D ++ "──────────────────────────────────────" ++ R ++ "\n");
     if (!show_secrets) {
         writeRaw("      Secrets and connection links are hidden by default.\n");
-        writeRaw("      Use --show-secrets only in a private terminal.\n");
-    } else if (!has_ip) {
-        writeRaw("      " ++ red ++ "⚠  Could not detect IP. Replace <SERVER_IP> manually." ++ R ++ "\n");
-    }
-
-    if (show_secrets) {
-        var users_for_links = cfg.users;
-        var it2 = users_for_links.iterator();
-        while (it2.next()) |entry| {
-            writeStdout("      " ++ B ++ magenta ++ "{s}" ++ R ++ "\n", .{entry.key_ptr.*});
-
-            // tg:// deep link
-            writeStdout("      " ++ cyan ++ "tg://" ++ R ++ "proxy?server={s}&port={d}&secret=", .{ server_ip, cfg.port });
-            writeRaw(green ++ "ee");
-            for (entry.value_ptr.*) |byte| {
-                writeHexByte(byte);
-            }
-            for (cfg.tls_domain) |byte| {
-                writeHexByte(byte);
-            }
-            writeRaw(R ++ "\n");
-
-            // t.me link
-            writeStdout("      " ++ D ++ "t.me/proxy?server={s}&port={d}&secret=ee", .{ server_ip, cfg.port });
-            for (entry.value_ptr.*) |byte| {
-                writeHexByte(byte);
-            }
-            for (cfg.tls_domain) |byte| {
-                writeHexByte(byte);
-            }
-            writeRaw(R ++ "\n");
-        }
+        writeRaw("      Use --print-links only in a private terminal.\n");
+    } else {
+        writeConnectionLinkEntries(cfg);
     }
 
     // Footer
@@ -856,24 +890,25 @@ pub fn main(init: std.process.Init) !void {
     // (1000+ simultaneous connections all doing TLS validation allocations).
     const allocator = std.heap.page_allocator;
     ignoreSigpipe();
-    var shutdown_signals = try ShutdownSignalBridge.init();
-    defer shutdown_signals.deinit();
 
-    // Parse config path and explicit secret-display opt-in.
+    // Parse config path and explicit secret-display modes.
     var args = try init.minimal.args.iterateAllocator(allocator);
     defer args.deinit();
     _ = args.next(); // skip program name
     var config_path: []const u8 = "config.toml";
     var config_path_set = false;
     var show_secrets = false;
+    var print_links = false;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--show-secrets")) {
             show_secrets = true;
+        } else if (std.mem.eql(u8, arg, "--print-links")) {
+            print_links = true;
         } else if (!config_path_set) {
             config_path = arg;
             config_path_set = true;
         } else {
-            writeStderr("\n  Usage: mtproto-proxy [config.toml] [--show-secrets]\n\n", .{});
+            writeStderr("\n  Usage: mtproto-proxy [config.toml] [--show-secrets | --print-links]\n\n", .{});
             return error.InvalidArguments;
         }
     }
@@ -881,13 +916,21 @@ pub fn main(init: std.process.Init) !void {
     // Parse config
     var cfg = config.Config.loadFromFile(allocator, config_path) catch |err| {
         writeStderr("\x1b[1m\x1b[31m  ✗ Failed to load config '{s}': {}\x1b[0m\n", .{ config_path, err });
-        writeStderr("\n  Usage: mtproto-proxy [config.toml] [--show-secrets]\n\n", .{});
+        writeStderr("\n  Usage: mtproto-proxy [config.toml] [--show-secrets | --print-links]\n\n", .{});
         return err;
     };
     defer cfg.deinit(allocator);
 
     // Apply runtime log level from config
     runtime_log_level = cfg.log_level;
+
+    if (print_links) {
+        printConnectionLinks(cfg);
+        return;
+    }
+
+    var shutdown_signals = try ShutdownSignalBridge.init();
+    defer shutdown_signals.deinit();
 
     if (!std.crypto.core.aes.has_hardware_support and (builtin.cpu.arch == .x86_64 or builtin.cpu.arch == .aarch64)) {
         const log_main = std.log.scoped(.config);

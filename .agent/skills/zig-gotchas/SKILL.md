@@ -27,7 +27,7 @@ Do not reintroduce thread-per-connection or blocking relay loops.
 - Left-align standard log level names to Zig's longest built-in label (`warning`), then print ` (scope):` and exactly one separator space. This aligns the left edge, scope, and message columns for every level within any scope without enumerating or constraining scope names; keep message text free of manual leading padding.
 - Keep hot-path logging minimal (`debug` only where needed, avoid noisy per-packet logs).
 - Do not force global `.log_level = .debug` in production builds.
-- Startup output redacts user secrets and connection links by default. `--show-secrets` is an explicit private-terminal opt-in; never add secrets back to normal service logs.
+- Startup output redacts user secrets and connection links by default. Prefer `--print-links`, whose one-shot path must return after config parsing and before daemon signal/listener initialization; it is safe to invoke inside a running container. `--show-secrets` is only an explicit opt-in for a full foreground daemon run. Never add secrets back to normal service logs.
 - HTTP discovery handles redirects explicitly and validates the resolved URI as HTTPS before opening the next request; never restore automatic `std.http` redirects, which also accept HTTP targets.
 
 ## Allocator and Concurrency
