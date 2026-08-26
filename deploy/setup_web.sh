@@ -290,10 +290,26 @@ https://${WEB_DOMAIN}:${WEB_TLS_PORT} {
     tls /etc/caddy/web/cert/fullchain.pem /etc/caddy/web/cert/privkey.pem {
         curves x25519mlkem768 x25519
     }
-    reverse_proxy 127.0.0.1:${WEB_PORT} {
-        header_up X-Forwarded-For {remote_host}
-        flush_interval -1
-        stream_close_delay 5m
+    @web_bridge_page {
+        path /
+        query bridge=*
+    }
+    @web_bridge_socket {
+        path /api/v1/socket
+        query b=*
+    }
+    route {
+        reverse_proxy @web_bridge_page 127.0.0.1:${WEB_PORT} {
+            header_up X-Forwarded-For {remote_host}
+            flush_interval -1
+            stream_close_delay 5m
+        }
+        reverse_proxy @web_bridge_socket 127.0.0.1:${WEB_PORT} {
+            header_up X-Forwarded-For {remote_host}
+            flush_interval -1
+            stream_close_delay 5m
+        }
+        respond 404
     }
 }
 EOF
@@ -307,10 +323,26 @@ https://${WEB_DOMAIN}:${WEB_TLS_PORT} {
     tls /etc/caddy/web/cert/fullchain.pem /etc/caddy/web/cert/privkey.pem {
         curves x25519mlkem768 x25519
     }
-    reverse_proxy 127.0.0.1:${WEB_PORT} {
-        header_up X-Forwarded-For {remote_host}
-        flush_interval -1
-        stream_close_delay 5m
+    @web_bridge_page {
+        path /
+        query bridge=*
+    }
+    @web_bridge_socket {
+        path /api/v1/socket
+        query b=*
+    }
+    route {
+        reverse_proxy @web_bridge_page 127.0.0.1:${WEB_PORT} {
+            header_up X-Forwarded-For {remote_host}
+            flush_interval -1
+            stream_close_delay 5m
+        }
+        reverse_proxy @web_bridge_socket 127.0.0.1:${WEB_PORT} {
+            header_up X-Forwarded-For {remote_host}
+            flush_interval -1
+            stream_close_delay 5m
+        }
+        respond 404
     }
 }
 EOF

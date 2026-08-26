@@ -314,8 +314,6 @@ pub const Relay = struct {
     /// Pre-rendered responses; the bridge page carries no per-user bytes.
     bridge_page: []u8,
     bridge_headers: []u8,
-    cover_headers: []u8,
-    notfound_headers: []u8,
 
     epoll_fd: posix.fd_t,
     listen_fd: posix.fd_t,
@@ -364,16 +362,6 @@ pub const Relay = struct {
             "Cache-Control: no-store\r\n", .{opts.domain});
         errdefer allocator.free(bridge_headers);
 
-        const cover_headers = try allocator.dupe(u8, "Content-Type: text/html; charset=utf-8\r\n" ++
-            "X-Content-Type-Options: nosniff\r\n" ++
-            "Cache-Control: public, max-age=300\r\n");
-        errdefer allocator.free(cover_headers);
-
-        const notfound_headers = try allocator.dupe(u8, "Content-Type: text/html; charset=utf-8\r\n" ++
-            "X-Content-Type-Options: nosniff\r\n" ++
-            "Cache-Control: no-store\r\n");
-        errdefer allocator.free(notfound_headers);
-
         const epoll_fd = try socket_utils.epollCreate();
         errdefer closeFd(epoll_fd);
 
@@ -394,8 +382,6 @@ pub const Relay = struct {
             .caps = caps,
             .bridge_page = bridge_page,
             .bridge_headers = bridge_headers,
-            .cover_headers = cover_headers,
-            .notfound_headers = notfound_headers,
             .epoll_fd = epoll_fd,
             .listen_fd = listen_fd,
             .signal_fd = signal_fd,
@@ -433,8 +419,6 @@ pub const Relay = struct {
         self.allocator.free(self.caps);
         self.allocator.free(self.bridge_page);
         self.allocator.free(self.bridge_headers);
-        self.allocator.free(self.cover_headers);
-        self.allocator.free(self.notfound_headers);
     }
 
     pub fn run(self: *Relay) !void {
@@ -808,8 +792,7 @@ pub const Relay = struct {
             if (user) |name| {
                 self.upgrade(conn, request, name);
             } else {
-                // No valid capability: behave exactly like any other unknown path.
-                self.respondPage(conn, "404 Not Found", self.notfound_headers, page.cover_body, keep, request.method == .head);
+                self.respondEmpty(conn, "404 Not Found", keep);
             }
             return;
         }
@@ -818,11 +801,11 @@ pub const Relay = struct {
             if (user != null) {
                 self.respondPage(conn, "200 OK", self.bridge_headers, self.bridge_page, keep, request.method == .head);
             } else {
-                self.respondPage(conn, "200 OK", self.cover_headers, page.cover_body, keep, request.method == .head);
+                self.respondEmpty(conn, "404 Not Found", keep);
             }
             return;
         }
-        self.respondPage(conn, "404 Not Found", self.notfound_headers, page.cover_body, keep, request.method == .head);
+        self.respondEmpty(conn, "404 Not Found", keep);
     }
 
     /// Constant-time match of a presented capability against every configured user.
@@ -875,7 +858,11 @@ pub const Relay = struct {
     }
 
     fn respondStatus(self: *Relay, conn: *Conn, status: []const u8) void {
-        self.respondPage(conn, status, self.notfound_headers, page.cover_body, false, false);
+        self.respondEmpty(conn, status, false);
+    }
+
+    fn respondEmpty(self: *Relay, conn: *Conn, status: []const u8, keep_alive: bool) void {
+        self.respondPage(conn, status, "", "", keep_alive, false);
     }
 
     // ── WebSocket upgrade ─────────────────────────────────────────────────────
@@ -899,7 +886,7 @@ pub const Relay = struct {
             const want = std.fmt.bufPrint(&expected, "https://{s}", .{self.opts.domain}) catch "";
             if (!std.mem.eql(u8, origin, want)) {
                 log.debug("rejecting websocket upgrade with unexpected origin", .{});
-                self.respondPage(conn, "404 Not Found", self.notfound_headers, page.cover_body, false, false);
+                self.respondEmpty(conn, "404 Not Found", false);
                 return;
             }
         }

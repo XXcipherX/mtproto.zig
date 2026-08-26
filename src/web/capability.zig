@@ -19,8 +19,8 @@
 //!     MTProto stream. That gives per-user accounting and lets a disabled user be
 //!     refused at the HTTP layer.
 //!  2. A visitor who cannot present a capability derived from a real secret never sees
-//!     the bridge page at all — they get the ordinary cover site. An active prober
-//!     without a valid user secret cannot distinguish this host from a plain website.
+//!     the bridge page at all — they get the same empty 404 as the ordinary MTProto
+//!     masking hostname.
 //!
 //! Reference: tdesktop `Telegram/SourceFiles/mtproto/mtproto_proxy_data.cpp`
 //! (`ComputeWebProxyBridgeCapability`, `NormalizeWebProxyHost`, `LastLabelIsNumeric`).

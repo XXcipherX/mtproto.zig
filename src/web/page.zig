@@ -1,13 +1,10 @@
-//! The two pages the relay serves: an ordinary cover site, and the bridge.
+//! The capability-gated bridge page served to Telegram Desktop.
 //!
-//! ## Why they look identical
-//!
-//! Telegram Desktop only ever navigates to `https://<host>/?bridge=<capability>`, and
-//! that capability is `HMAC-SHA256(user secret)` — so a visitor who cannot present one
-//! derived from a configured user secret never receives the bridge at all. Both
-//! responses therefore render the *same* visible page; the bridge response merely adds
-//! an inline script. An active prober without a valid secret sees a plain website, and
-//! a curious human who opens the bridge link sees the same plain website too.
+//! Telegram Desktop navigates to `https://<host>/?bridge=<capability>`. A visitor who
+//! cannot present a capability derived from a configured user secret receives the same
+//! bodyless 404 as the ordinary MTProto masking domain, so no public cover page or
+//! generic placeholder is exposed. The authenticated bridge itself is deliberately
+//! visually empty; only its inline transport script matters to the hidden WebView.
 //!
 //! ## What the bridge script may use
 //!
@@ -36,32 +33,14 @@
 
 const std = @import("std");
 
-/// Visible markup, shared by both responses. Deliberately unremarkable: a domain that
-/// serves a small static placeholder is the least interesting thing on the internet.
-pub const cover_body =
+/// Minimal, visually empty shell for the authenticated bridge script.
+const bridge_head =
     \\<!doctype html>
     \\<html lang="en"><head>
     \\<meta charset="utf-8">
-    \\<meta name="viewport" content="width=device-width,initial-scale=1">
     \\<meta name="robots" content="noindex,nofollow">
-    \\<title>Static Host</title>
-    \\<style>
-    \\:root{color-scheme:light dark}
-    \\body{margin:0;min-height:100vh;display:grid;place-items:center;
-    \\font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
-    \\background:#fbfbfc;color:#1c1e21}
-    \\main{width:min(32rem,calc(100% - 3rem));padding:2rem;text-align:center}
-    \\h1{margin:0 0 .5rem;font-size:1.25rem;font-weight:600;letter-spacing:-.01em}
-    \\p{margin:0;color:#6b7280;font-size:.9375rem}
-    \\@media (prefers-color-scheme:dark){body{background:#0f1115;color:#e7e9ee}p{color:#9aa1ad}}
-    \\</style>
     \\</head><body>
-    \\<main><h1>Nothing to see here</h1><p>This host serves static content only.</p></main>
-    \\</body></html>
 ;
-
-/// Everything before the injected `<script>` block — `cover_body` minus its trailing tags.
-const cover_head = cover_body[0 .. cover_body.len - "\n</body></html>".len];
 
 const script_head =
     \\
@@ -225,7 +204,7 @@ const script_body =
 pub fn renderBridge(allocator: std.mem.Allocator, ws_path: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
-    try out.appendSlice(allocator, cover_head);
+    try out.appendSlice(allocator, bridge_head);
     try out.appendSlice(allocator, script_head);
     try appendJsString(allocator, &out, ws_path);
     try out.appendSlice(allocator, script_body);
@@ -255,10 +234,10 @@ fn appendJsString(allocator: std.mem.Allocator, out: *std.ArrayList(u8), value: 
 
 // ── tests ─────────────────────────────────────────────────────────────────────
 
-test "cover head is the cover body without its closing tags" {
-    try std.testing.expect(std.mem.startsWith(u8, cover_body, cover_head));
-    try std.testing.expect(std.mem.endsWith(u8, cover_body, "</body></html>"));
-    try std.testing.expect(!std.mem.containsAtLeast(u8, cover_head, 1, "</body>"));
+test "bridge shell contains no visible cover template" {
+    try std.testing.expect(std.mem.endsWith(u8, bridge_head, "<body>"));
+    try std.testing.expect(!std.mem.containsAtLeast(u8, bridge_head, 1, "<main>"));
+    try std.testing.expect(!std.mem.containsAtLeast(u8, bridge_head, 1, "Static Host"));
 }
 
 test "bridge page embeds the websocket path and closes its tags" {

@@ -56,7 +56,7 @@ Code anchors:
 
 1. Telegram Desktop opens a browser HTTPS carrier to `[web].domain` on public `:443`; ordinary FakeTLS clients continue to use the same listener with `censorship.tls_domain`.
 2. The proxy recognizes the WEB SNI and relays the untouched TLS connection to `[web].mask_backend`, prefixing PROXY v2 with the kernel-reported browser address.
-3. The existing Caddy service terminates TLS, serves the capability-gated bridge page, and reverse-proxies the same-origin WebSocket to the loopback WEB relay.
+3. The existing Caddy service terminates TLS and returns a bodyless 404 for ordinary WEB-host requests. Only the capability-bearing bridge and WebSocket routes are sent to the loopback relay; invalid capabilities also receive an empty 404.
 4. The relay authenticates the bridge capability derived from the configured user secret and multiplexes logical streams with the Telegram Desktop WEB frame protocol.
 5. Every logical stream connects back to `[web].backend`, prefixes PROXY v2 with the browser address, and carries the client's `dd` direct-obfuscated MTProto stream into the normal DC/MiddleProxy routing path.
 

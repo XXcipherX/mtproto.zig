@@ -1,8 +1,8 @@
 //! Minimal HTTP/1.1 request parsing for the WEB proxy relay.
 //!
-//! The relay is a small public website: it serves a cover page, one bridge page, and a
-//! WebSocket upgrade. It never proxies HTTP, never reads a request body, and only ever
-//! answers `GET`/`HEAD`. That makes the safe subset tiny — and lets us reject the whole
+//! The relay serves one capability-gated bridge page and its WebSocket upgrade; every
+//! unauthenticated HTTP route is a bodyless 404. It never proxies HTTP, never reads a
+//! request body, and only ever answers `GET`/`HEAD`. That makes the safe subset tiny — and lets us reject the whole
 //! class of smuggling tricks (bodies, `Transfer-Encoding`, duplicate `Content-Length`)
 //! outright instead of implementing them correctly.
 //!
@@ -76,8 +76,8 @@ pub const Request = struct {
     }
 
     /// Whether the connection may be reused after this response. HTTP/1.1 defaults to
-    /// keep-alive and HTTP/1.0 to close; the relay honours both so its cover site
-    /// behaves like an ordinary server rather than a one-shot responder.
+    /// keep-alive and HTTP/1.0 to close; the relay honours both for bridge and empty
+    /// masking responses.
     pub fn keepAlive(self: *const Request) bool {
         if (self.headerHasToken("connection", "close")) return false;
         if (self.http_1_0) return self.headerHasToken("connection", "keep-alive");
@@ -269,7 +269,7 @@ test "an upgrade missing version 13 is not an upgrade" {
 
 test "an empty body declaration is accepted, the way a static host would" {
     // Refusing this is a one-request, secret-less way to tell the relay apart from any
-    // ordinary website, which is exactly what the cover page exists to prevent.
+    // ordinary web server, including the Caddy 404 masking endpoint in front of it.
     const req = try parse("GET / HTTP/1.1\r\nHost: h\r\nContent-Length: 0\r\n\r\n");
     try std.testing.expectEqualStrings("/", req.path());
     try std.testing.expectEqual(@as(usize, 2), req.headers_len);

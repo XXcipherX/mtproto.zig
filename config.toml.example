@@ -131,6 +131,7 @@ port = 443
 # Public DNS name in tg://webproxy links. Use a second DNS-only A record that
 # points to this VPS. It MUST differ from censorship.tls_domain, because the two
 # names select different Caddy paths behind the same public :443 listener.
+# Requests without a valid bridge capability receive an empty 404 response.
 # domain = "web.example.com"
 
 # Plain HTTP/WebSocket relay listener behind Caddy. Keep this local.

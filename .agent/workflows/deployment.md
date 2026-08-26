@@ -73,7 +73,7 @@ curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/in
   | sudo env ENABLE_WEB=true WEB_DOMAIN=web.example.com bash
 ```
 
-This preserves `config.toml` and user secrets, adds the `mtproto-web-relay` profile service, and extends the existing `mtproto-mask-caddy` container. Source/systemd installations use `sudo /opt/mtproto-proxy/setup_web.sh web.example.com`. In tunnel-netns mode, rerunning `setup_tunnel.sh` refreshes the WEB backend/listener addresses automatically.
+This preserves `config.toml` and user secrets, adds the `mtproto-web-relay` profile service, and extends the existing `mtproto-mask-caddy` container. Ordinary requests to both the WEB and MTProto masking hostnames receive the same bodyless Caddy 404; only capability-bearing WEB bridge/carrier routes reach the relay. Source/systemd installations use `sudo /opt/mtproto-proxy/setup_web.sh web.example.com`. In tunnel-netns mode, rerunning `setup_tunnel.sh` refreshes the WEB backend/listener addresses automatically.
 
 To disable only WEB while preserving ordinary MTProto and Caddy masking:
 
