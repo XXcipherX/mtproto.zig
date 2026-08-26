@@ -48,8 +48,8 @@ Code anchors:
 5. Proxy derives MTProto crypto params and chooses upstream strategy:
 - Direct DC path.
 - MiddleProxy path (`use_middle_proxy=true` and endpoint available).
-- Media path (`dc=203` or negative index) prefers MiddleProxy endpoint when available.
-6. If MiddleProxy connect/handshake fails, proxy can reconnect directly to the same DC fallback endpoint.
+- Media path (`dc=203` or negative index) prefers MiddleProxy endpoint when available; DC203 has no real direct endpoint.
+6. If MiddleProxy connect/handshake fails, proxy can reconnect directly when the selected DC has a real fallback endpoint. DC203 never uses a raw direct fallback.
 7. Bidirectional relay starts (`relaying` phase).
 
 ## WEB Proxy Flow (Telegram Desktop 7.1+)
@@ -72,10 +72,10 @@ Trust is fixed from the kernel-reported peer at `accept()`: only loopback plus e
 
 Important behavior:
 
-- If a MiddleProxy endpoint is unavailable, direct path is allowed by the current connect-plan logic to avoid dropping valid users.
-- Each MiddleProxy handshake stage has a 5-second deadline. A stalled or malformed endpoint is cooled for 60 seconds, triggers reactive refresh, and falls back directly when possible.
+- If a MiddleProxy endpoint is unavailable, direct path is allowed by the current connect-plan logic when that DC has a real direct endpoint; DC203 is excluded.
+- Each MiddleProxy handshake stage has a 5-second deadline. A stalled or malformed endpoint is cooled for 60 seconds, triggers reactive refresh, and falls back directly when possible, except for DC203.
 - `force_media_middle_proxy=true` is the default, so `direct` only affects regular DC traffic; media path still prefers MiddleProxy when available unless that knob is disabled.
-- `[access.direct_users]` / `[access.admins]` bypass MiddleProxy entirely, including media paths.
+- `[access.direct_users]` / `[access.admins]` bypass MiddleProxy for regular and media paths with real direct endpoints. DC203 still uses MiddleProxy when its route is available.
 - `datacenter_override` is test-only and disables MiddleProxy snapshot/updater routing.
 - `server.middle_proxy_nat_ip` can pin the IPv4 used for MiddleProxy NAT/AES derivation when AWG/public-IP detection would choose the wrong address.
 - `middleproxy_buffer_kb` is a per-direction cap. Each MiddleProxy context starts with 16 KiB C2S/S2C buffers and grows on demand up to `min(middleproxy_buffer_kb, 3840)` KiB; event-loop scratch buffers are lazy and reused. The effective cap reserves 256 KiB for MP/TLS framing before the 4 MiB relay-queue limit.

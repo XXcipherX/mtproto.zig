@@ -93,7 +93,8 @@ pub const Config = struct {
     /// True when tls_domain was duplicated by the parser and must be freed.
     tls_domain_owned: bool = false,
     users: std.StringHashMap([16]u8),
-    /// Users that always bypass MiddleProxy and connect to DC directly.
+    /// Users that bypass MiddleProxy when the requested DC has a direct endpoint.
+    /// CDN DC 203 still requires MiddleProxy when its route is available.
     /// Section: [access.direct_users] (alias: [access.admins])
     direct_users: std.StringHashMap(void),
     /// Whether to mask bad clients (forward to tls_domain)

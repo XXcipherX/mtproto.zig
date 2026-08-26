@@ -222,7 +222,8 @@ user1 = "00112233445566778899aabbccddeeff"
 user2 = "ffeeddccbbaa99887766554433221100"
 
 [access.direct_users]
-# Optional: users that always bypass MiddleProxy (direct DC path).
+# Optional: users that bypass MiddleProxy when a real direct DC path exists.
+# CDN DC 203 still uses MiddleProxy because it has no direct endpoint.
 # Useful for admin/service accounts that should always use fast mode.
 # Names here must match keys from [access.users].
 # Value must be true/1/yes to enable.

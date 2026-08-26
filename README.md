@@ -42,7 +42,7 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 | **WEB Proxy** | Browser HTTPS Carrier | Runs Telegram Desktop 7.1+ WEB links in parallel with ordinary MTProto, using the existing Caddy instance for real TLS/WebSocket termination |
 | **PQ FakeTLS** | DPI Evasion | Echoes `X25519MLKEM768` (`0x11ec`) ServerHello key_share for modern Desktop/Android ClientHellos |
 | **Fast Mode** | Direct-Path S2C Offload | Reduces CPU usage by delegating S2C AES work to Telegram DCs on direct paths (non-MiddleProxy) |
-| **MiddleProxy** | Telemt-Compatible ME | Optional ME transport for DC1..5 (`use_middle_proxy`); retries TCP candidates, applies a 5-second per-stage handshake deadline, cools failed endpoints for 60 seconds, and falls back directly when ME stalls |
+| **MiddleProxy** | Telemt-Compatible ME | Optional ME transport for DC1..5 (`use_middle_proxy`); retries TCP candidates, applies a 5-second per-stage handshake deadline, cools failed endpoints for 60 seconds, and falls back directly when a real DC endpoint exists (never for CDN DC203) |
 | **Auto Refresh** | Runtime Discovery | Periodically updates regular/media MiddleProxy metadata and re-resolves all masking DNS candidates without delaying listener startup |
 | **Promotion** | Tag Support | Optional promotion tag for sponsored proxy channel registration |
 | **IPv6 Hopping** | DPI Evasion | Rotates IPv6 from a routed /64 and updates Cloudflare AAAA records; installers schedule a hop every 5 minutes, while `--auto` provides foreground ban-detection mode |
@@ -872,7 +872,7 @@ alice = "00112233445566778899aabbccddeeff"
 bob   = "ffeeddccbbaa99887766554433221100"
 
 [access.direct_users]
-alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eligible
+alice = true   # direct where possible; CDN DC203 still requires MiddleProxy
 # bob = true   # optional
 ```
 
@@ -881,7 +881,7 @@ alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eli
 
 | Section | Key | Default | Description |
 |---------|-----|---------|-------------|
-| `[general]` | `use_middle_proxy` | `false` | Telemt-compatible ME mode for regular DC1..5. Media-path requests still prefer ME endpoints when available; direct fallback can be used if ME endpoints are unavailable |
+| `[general]` | `use_middle_proxy` | `false` | Telemt-compatible ME mode for regular DC1..5. Media-path requests still prefer ME endpoints when available; direct fallback can be used only when the requested DC has a real direct endpoint |
 | `[general]` | `force_media_middle_proxy` | `true` | Keep media-path traffic (`dc=203` / negative `dc_idx`) on MiddleProxy when ME endpoints are available, even if regular DC traffic stays direct |
 | `[general]` | `ad_tag` | _(none)_ | Telemt-compatible alias for promotion tag; ignored if `[server].tag` is set |
 | `[server]` | `port` | `443` | TCP port to listen on |
@@ -928,7 +928,7 @@ alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eli
 | `[censorship]` | `drs` | `false` | Dynamic Record Sizing: ramp TLS records from 1369→16384 bytes after warmup (mimics Chrome/Firefox) |
 | `[censorship]` | `fast_mode` | `false` | **Recommended** for direct-path traffic. Delegates S2C AES encryption to Telegram DC and reduces proxy CPU/RAM pressure |
 | `[access.users]` | `<name>` | -- | 32 hex-char secret (16 bytes) per user |
-| `[access.direct_users]` | `<name> = true` | _(none)_ | Optional per-user MiddleProxy bypass. `<name>` must match a user from `[access.users]`; such users always connect directly to Telegram DCs (including media paths). Values `false`/`0`/`no` remove a previous duplicate entry. Alias section: `[access.admins]` |
+| `[access.direct_users]` | `<name> = true` | _(none)_ | Optional per-user MiddleProxy bypass. `<name>` must match a user from `[access.users]`; the bypass covers regular and media paths with real direct endpoints, but CDN DC203 still uses its required MiddleProxy when available. Values `false`/`0`/`no` remove a previous duplicate entry. Alias section: `[access.admins]` |
 
 </details>
 
@@ -1043,7 +1043,7 @@ If only media-heavy sessions fail on non-premium clients, check MiddleProxy logs
 sudo journalctl -u mtproto-proxy --since "15 min ago" | grep -E "dc=203|Middle-proxy"
 ```
 
-On startup the proxy now refreshes DC203 metadata from Telegram automatically. If your server cannot reach `core.telegram.org`, it falls back to bundled defaults.
+On startup the proxy refreshes DC203 metadata from Telegram automatically. If your server cannot reach `core.telegram.org`, it falls back to bundled defaults. DC203 has no real direct endpoint, so its MiddleProxy route never falls back to a raw direct stream.
 
 ## &nbsp; License
 

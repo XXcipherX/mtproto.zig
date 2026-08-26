@@ -6709,19 +6709,26 @@ fn buildDcConnectPlan(
         return plan;
     }
 
-    if (bypass_middle_proxy) {
+    var middle_candidates: []const net.Address = &.{};
+    if (snapshot) |snap| {
+        middle_candidates = snap.selectedCandidates();
+    }
+    const middle_addr = if (middle_candidates.len > 0) middle_candidates[0] else null;
+    // DC 203 has no direct datacenter endpoint. Its constants-table address is
+    // itself a MiddleProxy (the proxy_for 203 entry), so sending a raw obfuscated
+    // client stream there succeeds at TCP connect but never produces a reply.
+    // A direct user may bypass MiddleProxy for real DC endpoints, but not for
+    // DC 203 when its required MiddleProxy route is available.
+    const cdn_dc = dc_abs == 203;
+    const has_cdn_middle_proxy = cdn_dc and middle_addr != null;
+
+    if (bypass_middle_proxy and !has_cdn_middle_proxy) {
         plan.candidates[0] = directDcAddressV4(dc_abs);
         plan.count = 1;
         plan.use_middle_proxy = false;
         plan.direct_fallback = null;
         return plan;
     }
-
-    var middle_candidates: []const net.Address = &.{};
-    if (snapshot) |snap| {
-        middle_candidates = snap.selectedCandidates();
-    }
-    const middle_addr = if (middle_candidates.len > 0) middle_candidates[0] else null;
 
     const force_media_middle_proxy = cfg.force_media_middle_proxy and plan.is_media_path and middle_addr != null;
     plan.use_middle_proxy = if (force_media_middle_proxy)
@@ -6754,10 +6761,10 @@ fn buildDcConnectPlan(
         return plan;
     }
 
-    // If middle-proxy connect/handshake fails, retry the same DC via direct mode.
-    // This keeps media paths functional in environments where middle-proxy transport
-    // itself is degraded (for example due to strict NAT behavior in upstream tunnels).
-    plan.direct_fallback = directDcAddressV4(dc_abs);
+    // If middle-proxy connect/handshake fails, retry a real DC endpoint directly.
+    // DC 203 is the exception: its so-called direct address is another MiddleProxy,
+    // and retrying a raw client stream there would only create a silent black hole.
+    plan.direct_fallback = if (cdn_dc) null else directDcAddressV4(dc_abs);
     return plan;
 }
 
@@ -7279,7 +7286,7 @@ test "middle proxy updater stop joins sleeping thread" {
     try std.testing.expect(state.middle_proxy_updater_thread == null);
 }
 
-test "direct users bypass middle-proxy routing" {
+test "direct users bypass middle-proxy routing except CDN DC 203" {
     const cfg_text =
         \\[general]
         \\use_middle_proxy = true
@@ -7326,14 +7333,22 @@ test "direct users bypass middle-proxy routing" {
     const regular_media = buildDcConnectPlan(&cfg, 203, -203, &media_203_snapshot, false);
     try std.testing.expect(regular_media.use_middle_proxy);
     try std.testing.expect(regular_media.candidates[0].eql(mp_dc203));
+    try std.testing.expect(regular_media.direct_fallback == null);
 
     const regular_media_dc5 = buildDcConnectPlan(&cfg, 5, -5, &media_dc5_snapshot, false);
     try std.testing.expectEqual(@as(usize, 2), regular_media_dc5.count);
     try std.testing.expect(regular_media_dc5.candidates[1].eql(mp_media_dc5_secondary));
 
     const admin_media = buildDcConnectPlan(&cfg, 203, -203, &media_203_snapshot, true);
-    try std.testing.expect(!admin_media.use_middle_proxy);
-    try std.testing.expect(admin_media.candidates[0].eql(constants.getDcAddressV4(203)));
+    try std.testing.expect(admin_media.use_middle_proxy);
+    try std.testing.expect(admin_media.candidates[0].eql(mp_dc203));
+    try std.testing.expect(admin_media.direct_fallback == null);
+
+    // Preserve the previous last-resort behavior if no DC 203 MiddleProxy route
+    // is known at all; there is no usable alternative to put in the plan.
+    const admin_media_no_mp = buildDcConnectPlan(&cfg, 203, -203, null, true);
+    try std.testing.expect(!admin_media_no_mp.use_middle_proxy);
+    try std.testing.expect(admin_media_no_mp.candidates[0].eql(constants.getDcAddressV4(203)));
 }
 
 test "unknown datacenter indices produce no connect plan" {

@@ -83,7 +83,7 @@ Do not reintroduce thread-per-connection or blocking relay loops.
 - Replay detection compares the full canonical HMAC digest even when the hash-table key collides. Its retention horizon must cover every still-valid FakeTLS timestamp, while saturation must never be reported as a proven replay.
 - `prepareTgNonce` accepts exactly a 48-byte key+IV pointer, MiddleProxy KDF rejects inputs that exceed its fixed transcript buffer, and unknown DC indices are rejected before routing.
 - Reserved MTProto obfuscation nonces are rejected before protocol-tag decryption.
-- Direct-user bypass only applies when the name exists in `[access.users]`; unknown names in `[access.direct_users]` warn and are ignored.
+- Direct-user bypass only applies when the name exists in `[access.users]`; unknown names in `[access.direct_users]` warn and are ignored. DC203 is exempt from the bypass when its MiddleProxy route is available because its constants-table address is not a direct DC endpoint.
 - Duplicate user/direct-user/config string entries are last-write-wins. Direct users accept `false`/`0`/`no` to remove a previous duplicate entry.
 - Unknown proxy sections/keys and malformed config lines are fatal parse errors. `[monitor].host` and `[monitor].port` are the intentional externally consumed exception.
 - Config diagnostics may name a key, line number, and parse error, but must never echo raw values or source lines because malformed input can still contain user secrets.
