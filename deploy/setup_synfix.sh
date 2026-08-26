@@ -6,9 +6,11 @@
 # connection. Android/Desktop clients can open multiple parallel TLS attempts;
 # on filtered routes that pattern is enough for DPI to stall the following
 # ClientHello/FakeTLS flow. The rule set lets iOS-like SYN fingerprints bypass
-# the slow lane and paces all other clients per source IP. Excess attempts are
-# dropped silently by default so Telegram does not amplify noisy retry bursts
-# with immediate tcp-reset feedback.
+# the slow lane and paces all other clients per source IP. Loopback is excluded:
+# the WEB relay opens one local TCP connection per logical stream, and those
+# internal connections must never share an external-client pacing bucket.
+# Excess attempts are dropped silently by default so Telegram does not amplify
+# noisy retry bursts with immediate tcp-reset feedback.
 #
 # Usage:
 #   sudo bash deploy/setup_synfix.sh
@@ -108,10 +110,15 @@ esac
 remove_rules() {
     if command -v iptables >/dev/null 2>&1; then
         while iptables -D INPUT -p tcp --dport "$PORT" --syn -j "$CHAIN" 2>/dev/null; do :; done
-        iptables -t mangle -D PREROUTING \
+        while iptables -D INPUT ! -i lo -p tcp --dport "$PORT" --syn -j "$CHAIN" 2>/dev/null; do :; done
+        while iptables -t mangle -D PREROUTING \
             -p tcp --dport "$PORT" --syn \
             -m u32 --u32 "$IOS_U32" \
-            -j MARK --set-mark "$IOS_MARK" 2>/dev/null || true
+            -j MARK --set-mark "$IOS_MARK" 2>/dev/null; do :; done
+        while iptables -t mangle -D PREROUTING \
+            ! -i lo -p tcp --dport "$PORT" --syn \
+            -m u32 --u32 "$IOS_U32" \
+            -j MARK --set-mark "$IOS_MARK" 2>/dev/null; do :; done
         iptables -F "$CHAIN" 2>/dev/null || true
         iptables -X "$CHAIN" 2>/dev/null || true
     fi
@@ -141,7 +148,7 @@ remove_rules
 iptables -N "$CHAIN"
 
 iptables -t mangle -A PREROUTING \
-    -p tcp --dport "$PORT" --syn \
+    ! -i lo -p tcp --dport "$PORT" --syn \
     -m u32 --u32 "$IOS_U32" \
     -j MARK --set-mark "$IOS_MARK"
 
@@ -181,7 +188,7 @@ esac
 
 iptables -A "$CHAIN" -j RETURN
 
-iptables -I INPUT 1 -p tcp --dport "$PORT" --syn -j "$CHAIN"
+iptables -I INPUT 1 ! -i lo -p tcp --dport "$PORT" --syn -j "$CHAIN"
 persist_rules
 
 ok "MTProto SYN fix applied"
@@ -191,4 +198,5 @@ echo -e "  ${DIM}Port:${RESET}       ${PORT}"
 echo -e "  ${DIM}iOS mark:${RESET}   ${IOS_MARK}"
 echo -e "  ${DIM}Other rate:${RESET} ${SYNFIX_RATE}, burst ${SYNFIX_BURST}"
 echo -e "  ${DIM}Action:${RESET}     ${SYNFIX_ACTION}"
+echo -e "  ${DIM}Loopback:${RESET}   excluded (WEB relay streams bypass pacing)"
 echo ""

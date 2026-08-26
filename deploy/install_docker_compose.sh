@@ -467,16 +467,20 @@ apply_firewall_and_tcpmss() {
     fi
 
     # TCPMSS clamping is a legacy fallback. With PQ-capable Caddy masking it is
-    # disabled by default because tiny MSS can hurt media throughput.
+    # disabled by default because tiny MSS can hurt media throughput. Sweep both
+    # rule spellings so an update removes the old loopback-inclusive form.
     if command -v iptables >/dev/null 2>&1; then
         local tcpmss_v4_removed=false
         while iptables -t mangle -D OUTPUT -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88 2>/dev/null; do
             tcpmss_v4_removed=true
         done
+        while iptables -t mangle -D OUTPUT ! -o lo -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88 2>/dev/null; do
+            tcpmss_v4_removed=true
+        done
         if is_true "$ENABLE_TCPMSS"; then
-            iptables -t mangle -A OUTPUT -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88
+            iptables -t mangle -A OUTPUT ! -o lo -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88
             TCPMSS_OK=true
-            ok "TCPMSS=88 clamping applied to IPv4"
+            ok "TCPMSS=88 clamping applied to external IPv4 traffic (loopback excluded)"
         elif $tcpmss_v4_removed; then
             ok "Removed legacy IPv4 TCPMSS=88 clamping"
         else
@@ -492,10 +496,13 @@ apply_firewall_and_tcpmss() {
         while ip6tables -t mangle -D OUTPUT -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88 2>/dev/null; do
             tcpmss_v6_removed=true
         done
+        while ip6tables -t mangle -D OUTPUT ! -o lo -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88 2>/dev/null; do
+            tcpmss_v6_removed=true
+        done
         if is_true "$ENABLE_TCPMSS"; then
-            if ip6tables -t mangle -A OUTPUT -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88 2>/dev/null; then
+            if ip6tables -t mangle -A OUTPUT ! -o lo -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88 2>/dev/null; then
                 TCPMSS_OK=true
-                ok "TCPMSS=88 clamping applied to IPv6"
+                ok "TCPMSS=88 clamping applied to external IPv6 traffic (loopback excluded)"
             else
                 info "IPv6 TCPMSS skipped"
             fi

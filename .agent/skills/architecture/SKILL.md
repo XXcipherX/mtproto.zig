@@ -145,7 +145,7 @@ If `max_connections` exceeds the baseline RAM ceiling, startup auto-clamps it be
 - Unknown MTProto DC indices are rejected before endpoint planning; modulo fallback is not part of the connection path.
 - Masking target selection for unauthenticated clients: `mask_port=443` resolves every address for `tls_domain:443` in the background, prefers IPv4, and fails over across candidates; non-443 `mask_port` connects to a local address on that port (`127.0.0.1` in the init namespace, `10.200.200.1` inside the tunnel netns). Hostname candidates are re-resolved hourly.
 - Config parsing is strict for proxy-owned sections/keys and malformed lines; `[monitor].host`/`port` remain accepted for the external dashboard. Config load errors propagate as a non-zero process exit.
-- TCPMSS clamping and optional zapret/nfqws integration via deploy scripts.
+- TCPMSS clamping, SYN pacing, and zapret/nfqws integration are external-path mitigations; deploy rules exclude loopback so WEB relay streams never enter pacing, tiny-MSS, or NFQUEUE processing.
 - Split-TLS desync (`desync=true`) as split write of fake ServerHello.
 - Self-domain masking setup (`setup_masking.sh`) configures Caddy 2.10+ on `127.0.0.1:8443` and, in tunnel netns mode, `10.200.200.1:8443`; non-proxy requests receive 404. Optional WEB setup extends that same Caddy instance with an internal PROXY-protocol listener on `8444` and a loopback relay on `8081`. Source installs use `mtproto-mask-caddy.service`; Docker Compose installs use the `mtproto-mask-caddy` service/container.
 

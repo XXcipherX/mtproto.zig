@@ -147,7 +147,7 @@ curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/in
 Current installer behavior also:
 
 - refreshes self-domain Caddy 404 masking (`setup_masking.sh`) and the masking health timer when available;
-- attempts optional `zapret` / `nfqws` setup;
+- attempts optional `zapret` / `nfqws` setup; SYNFIX, NFQUEUE, and TCPMSS rules exclude loopback so local WEB relay streams remain untouched;
 - refreshes optional `proxy-monitor` files on disk and restarts that service if it is already active.
 - prints a connection link only when it can find a valid 32-hex secret in `[access.users]`.
 

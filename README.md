@@ -46,8 +46,8 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 | **Auto Refresh** | Runtime Discovery | Periodically updates regular/media MiddleProxy metadata and re-resolves all masking DNS candidates without delaying listener startup |
 | **Promotion** | Tag Support | Optional promotion tag for sponsored proxy channel registration |
 | **IPv6 Hopping** | DPI Evasion | Rotates IPv6 from a routed /64 and updates Cloudflare AAAA records; installers schedule a hop every 5 minutes, while `--auto` provides foreground ban-detection mode |
-| **Optional TCPMSS=88** | Legacy DPI fallback | Disabled by default; can force tiny ClientHello fragmentation when explicitly enabled |
-| **TCP Desync** | DPI Evasion | Integrated `zapret` (`nfqws`) OS-level desynchronization (fake packets + TTL spoofing); NFQUEUE queue-bypass preserves traffic while `nfqws` restarts |
+| **Optional TCPMSS=88** | Legacy DPI fallback | Disabled by default; can force tiny ClientHello fragmentation on external traffic when explicitly enabled; loopback is always excluded |
+| **TCP Desync** | DPI Evasion | Integrated `zapret` (`nfqws`) OS-level desynchronization (fake packets + TTL spoofing); NFQUEUE queue-bypass preserves traffic while `nfqws` restarts, and loopback never enters the queue |
 | **Split-TLS** | DPI Evasion | Splits fake `ServerHello` write into `1 byte + short pause + rest` to desynchronize passive DPI |
 | **Zero-RTT** | DPI Evasion | Local self-domain Caddy 404 masking (`127.0.0.1:8443`, with tunnel netns auto-routing and PQ TLS groups) to defeat active probing timing analysis |
 | **0 deps** | Stdlib Only | No third-party Zig packages (proxy core uses Zig standard library only) |
@@ -302,8 +302,8 @@ Useful environment variables:
 | `ENABLE_MASKING` | `true` | Install Caddy/certbot masking and set `mask = true`; Docker installs run Caddy in Compose |
 | `ENABLE_WEB` | `false` | Enable the Telegram Desktop WEB relay alongside ordinary MTProto; an existing enabled WEB setup is preserved when this variable is omitted |
 | `WEB_DOMAIN` | _(required with `ENABLE_WEB=true`)_ | Separate public DNS hostname used by `tg://webproxy` links; it must differ from `TLS_DOMAIN` |
-| `ENABLE_TCPMSS` | `false` | Enable legacy `TCPMSS=88` ClientHello fragmentation fallback; disabled by default with PQ-capable Caddy masking |
-| `ENABLE_SYNFIX` | `false` | Install inbound SYN pacing rules for Android/Desktop routes that need it |
+| `ENABLE_TCPMSS` | `false` | Enable legacy `TCPMSS=88` ClientHello fragmentation fallback for external traffic; disabled by default with PQ-capable Caddy masking |
+| `ENABLE_SYNFIX` | `false` | Install inbound SYN pacing rules for external Android/Desktop routes that need it; loopback is excluded |
 | `SYNFIX_RATE` | `30/minute` | Per-source SYN rate for non-iOS-like fingerprints |
 | `SYNFIX_BURST` | `1` | Per-source SYN burst for non-iOS-like fingerprints |
 | `SYNFIX_ACTION` | `drop` | Over-limit SYN action: `drop` is quiet, `reject` sends TCP reset, `icmp-host-unreachable` fails the attempt immediately without an RST |
@@ -345,7 +345,7 @@ Telegram Desktop WEB ─▶ mtproto-proxy :443 ─▶ Caddy :8444
                                                                   └─ MTProto streams ─▶ mtproto-proxy :443 ─▶ Telegram
 ```
 
-The deployment uses the existing `mtproto-mask-caddy` instance only. Caddy's built-in PROXY-protocol listener wrapper preserves the real browser address across the proxy-to-Caddy hop; the relay then prefixes every backend MTProto stream with PROXY v2. No additional public port is opened: Caddy `8444` and relay `8081` remain local.
+The deployment uses the existing `mtproto-mask-caddy` instance only. Caddy's built-in PROXY-protocol listener wrapper preserves the real browser address across the proxy-to-Caddy hop; the relay then prefixes every backend MTProto stream with PROXY v2. No additional public port is opened: Caddy `8444` and relay `8081` remain local. Host SYN pacing, NFQUEUE desync, and optional TCPMSS rules explicitly exclude loopback, so internal WEB streams never consume external-client limits or DPI processing.
 
 Requirements:
 
@@ -428,9 +428,9 @@ curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/in
   | sudo env ENABLE_SYNFIX=true bash
 ```
 
-The SYN pacing default is `SYNFIX_RATE=30/minute SYNFIX_BURST=1 SYNFIX_ACTION=drop`. This keeps excess Android/Desktop retry bursts quiet instead of feeding immediate tcp-reset retries. Use `SYNFIX_ACTION=reject` only when you intentionally want fast reset feedback. `SYNFIX_ACTION=icmp-host-unreachable` immediately rejects excess attempts without encouraging the same TCP-reset retry loop; it can be paired with a cautiously higher rate such as `54/minute` when filtered Android/Desktop routes need faster primary and media connections. Installers persist SYNFIX and optional TCPMSS iptables state with `netfilter-persistent` so it is restored after reboot.
+The SYN pacing default is `SYNFIX_RATE=30/minute SYNFIX_BURST=1 SYNFIX_ACTION=drop`. This keeps excess Android/Desktop retry bursts quiet instead of feeding immediate tcp-reset retries. Use `SYNFIX_ACTION=reject` only when you intentionally want fast reset feedback. `SYNFIX_ACTION=icmp-host-unreachable` immediately rejects excess attempts without encouraging the same TCP-reset retry loop; it can be paired with a cautiously higher rate such as `54/minute` when filtered Android/Desktop routes need faster primary and media connections. The INPUT jump excludes `lo`, so WEB relay backend connections never share the `127.0.0.1` hashlimit bucket. Installers persist SYNFIX and optional TCPMSS iptables state with `netfilter-persistent` so it is restored after reboot.
 
-Legacy `TCPMSS=88` ClientHello fragmentation is disabled by default for PQ-capable Caddy masking setups. Re-enable it only as an explicit fallback with `ENABLE_TCPMSS=true`.
+Legacy `TCPMSS=88` ClientHello fragmentation is disabled by default for PQ-capable Caddy masking setups. Re-enable it only as an explicit fallback with `ENABLE_TCPMSS=true`. TCPMSS and nfqws rules use `! -o lo`; rerunning either installer removes the older loopback-inclusive spelling before applying the corrected rule.
 
 ### Self-Domain 404 Masking
 
