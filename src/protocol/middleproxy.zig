@@ -680,9 +680,15 @@ pub const MiddleProxyContext = struct {
                 const conn_data = payload[16..];
 
                 var pad_len: usize = 0;
-                var pad_buf: [15]u8 = undefined;
-                if (self.proto_tag == .secure) {
-                    pad_len = crypto.randomRange(usize, 16);
+                var pad_buf: [3]u8 = undefined;
+                // Padded intermediate carries no padding length: the receiver recovers the
+                // payload by truncating the declared length down to a multiple of 4, just
+                // as the c2s path above does. MTProto bodies are already 4-aligned, so only
+                // 0..3 bytes survive that round trip. Wider padding leaves random garbage
+                // attached to the message and makes the client reject its encrypted hash.
+                // Do not add padding to an unexpectedly unaligned body.
+                if (self.proto_tag == .secure and conn_data.len % 4 == 0) {
+                    pad_len = crypto.randomRange(usize, pad_buf.len + 1);
                     if (pad_len > 0) {
                         crypto.randomBytes(pad_buf[0..pad_len]);
                     }
@@ -1211,6 +1217,65 @@ test "decapsulate s2c skips noop padding words" {
     const out = try ctx.decapsulateS2C(wire[0..], out_buf[0..]);
     try std.testing.expectEqual(@as(usize, 4), out.len);
     try std.testing.expectEqualSlices(u8, &confirm, out);
+}
+
+test "secure s2c padding survives padded-intermediate truncate-to-4" {
+    // Padded intermediate carries no padding-length field. A peer keeps only the
+    // declared-length prefix that is divisible by four, so every generated padding
+    // length must leave the original aligned MTProto body intact.
+    const allocator = std.testing.allocator;
+    const key = [_]u8{0} ** 32;
+    const iv = [_]u8{0} ** 16;
+    const conn_data = [_]u8{ 0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04 };
+
+    var round: usize = 0;
+    while (round < 200) : (round += 1) {
+        var ctx = try MiddleProxyContext.init(
+            allocator,
+            crypto.AesCbc.init(&key, &iv),
+            crypto.AesCbc.init(&key, &iv),
+            [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 },
+            -2,
+            net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
+            net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
+            .secure,
+            null,
+        );
+        defer ctx.deinit();
+
+        // len(4) + seq(4) + [type(4) + flags(4) + conn_id(8) + data] + crc(4),
+        // followed by NO-OP words up to the AES block boundary.
+        const total_len: u32 = @intCast(4 + 4 + 16 + conn_data.len + 4);
+        var plain: [48]u8 = undefined;
+        std.mem.writeInt(u32, plain[0..4], total_len, .little);
+        std.mem.writeInt(i32, plain[4..8], 0, .little);
+        @memcpy(plain[8..12], &rpc_proxy_ans);
+        std.mem.writeInt(u32, plain[12..16], 0, .little);
+        @memcpy(plain[16..24], &ctx.conn_id);
+        @memcpy(plain[24 .. 24 + conn_data.len], &conn_data);
+        const crc_at = 24 + conn_data.len;
+        std.mem.writeInt(u32, plain[crc_at..][0..4], crc32(plain[0..crc_at]), .little);
+        var tail = crc_at + 4;
+        while (tail < plain.len) : (tail += 4) {
+            std.mem.writeInt(u32, plain[tail..][0..4], 4, .little);
+        }
+
+        var enc = crypto.AesCbc.init(&key, &iv);
+        var wire = plain;
+        try enc.encryptInPlace(wire[0..]);
+
+        var out_buf: [128]u8 = undefined;
+        const out = try ctx.decapsulateS2C(wire[0..], out_buf[0..]);
+        const declared: usize = @intCast(std.mem.readInt(u32, out[0..4], .little));
+        try std.testing.expectEqual(4 + declared, out.len);
+
+        const pad_len = declared - conn_data.len;
+        try std.testing.expect(pad_len <= 3);
+
+        const recovered = declared - (declared % 4);
+        try std.testing.expectEqual(conn_data.len, recovered);
+        try std.testing.expectEqualSlices(u8, &conn_data, out[4 .. 4 + recovered]);
+    }
 }
 
 test "decapsulate s2c validates seq" {
