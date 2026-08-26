@@ -437,6 +437,16 @@ else
     fail "Proxy failed to restart. Check: journalctl -u $SERVICE_NAME --no-pager -n 50"
 fi
 
+# An existing WEB deployment is a separate process using the same binary. Restart
+# it after replacing that binary so source updates cannot leave the old relay mapped.
+if systemctl list-unit-files --type=service --no-legend 2>/dev/null | grep -q '^mtproto-web-relay\.service[[:space:]]'; then
+    if systemctl restart mtproto-web-relay.service && systemctl is-active --quiet mtproto-web-relay.service; then
+        ok "WEB relay restarted"
+    else
+        warn "WEB relay restart failed; check: journalctl -u mtproto-web-relay --no-pager -n 50"
+    fi
+fi
+
 if [[ -x "$INSTALL_DIR/setup_mask_monitor.sh" ]]; then
     info "Applying masking monitor setup..."
     if bash "$INSTALL_DIR/setup_mask_monitor.sh" --quiet; then
@@ -503,6 +513,8 @@ PUBLIC_IP="${PUBLIC_IP:-$(curl -4 -s --max-time 5 https://ifconfig.me 2>/dev/nul
 PORT="$(get_server_port "$INSTALL_DIR/config.toml")"
 PORT="${PORT:-443}"
 TLS_DOMAIN="$(get_config_value "$INSTALL_DIR/config.toml" "censorship" "tls_domain" "$TLS_DOMAIN")"
+WEB_ENABLED="$(get_config_value "$INSTALL_DIR/config.toml" "web" "enabled" "false")"
+WEB_DOMAIN="$(get_config_value "$INSTALL_DIR/config.toml" "web" "domain" "")"
 
 # Build ee-secret: ee + hex(secret) + hex(tls_domain)
 DOMAIN_HEX=$(echo -n "$TLS_DOMAIN" | xxd -p | tr -d '\n')
@@ -532,6 +544,12 @@ if [[ -n "$EE_SECRET" ]]; then
 echo -e "  ${CYAN}tg://proxy?server=${PUBLIC_IP}&port=${PORT}&secret=${GREEN}${EE_SECRET}${RESET}"
 echo ""
 echo -e "  ${DIM}t.me/proxy?server=${PUBLIC_IP}&port=${PORT}&secret=${EE_SECRET}${RESET}"
+if is_true "$WEB_ENABLED" && [[ -n "$WEB_DOMAIN" ]]; then
+echo ""
+echo -e "  ${BOLD}WEB connection link:${RESET}"
+echo -e "  ${CYAN}tg://webproxy?server=${WEB_DOMAIN}&secret=${GREEN}dd${SECRET}${RESET}"
+echo -e "  ${DIM}t.me/webproxy?server=${WEB_DOMAIN}&secret=dd${SECRET}${RESET}"
+fi
 else
 echo -e "  ${RED}Unable to build link:${RESET} no valid 32-hex secret found in [access.users]"
 fi

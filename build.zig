@@ -57,6 +57,14 @@ pub fn build(b: *std.Build) void {
     const soak_step = b.step("soak", "Run multithreaded soak stress test");
     soak_step.dependOn(&run_soak_cmd.step);
 
+    // The WEB bridge is JavaScript executed inside Telegram Desktop's hidden WebView,
+    // so Zig unit tests cannot exercise its client-facing contract. CI drives the
+    // rendered page through a small Node harness; developer machines without Node skip
+    // this optional target cleanly.
+    const web_bridge_cmd = b.addSystemCommand(&.{ "python3", "test/web-bridge/run.py" });
+    const web_bridge_step = b.step("web-bridge", "Run WEB proxy bridge-page contract tests");
+    web_bridge_step.dependOn(&web_bridge_cmd.step);
+
     // Tests
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),

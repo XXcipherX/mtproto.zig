@@ -22,13 +22,16 @@ jobs:
         run: zig fmt --check build.zig src
 
       - name: Check Python harness syntax
-        run: python3 -m py_compile test/*.py
+        run: python3 -m py_compile test/*.py test/web-bridge/*.py
 
       - name: ShellCheck deploy scripts
         run: shellcheck --severity=error deploy/*.sh deploy/monitor/*.sh
 
       - name: Run tests
         run: zig build test
+
+      - name: Run WEB proxy bridge-page contract tests
+        run: zig build web-bridge
 
       - name: Run ReleaseSafe tests
         run: zig build -Doptimize=ReleaseSafe test

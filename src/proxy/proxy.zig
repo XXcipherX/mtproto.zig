@@ -17,6 +17,7 @@ const obfuscation = @import("../protocol/obfuscation.zig");
 const middleproxy = @import("../protocol/middleproxy.zig");
 const tls = @import("../protocol/tls.zig");
 const Config = @import("../config.zig").Config;
+const web_support = @import("web_support.zig");
 
 const log = std.log.scoped(.proxy);
 
@@ -471,6 +472,10 @@ fn hasGracefulEpollRdhup(events: u32) bool {
 fn clientRelayAtFrameBoundary(slot: *const ConnectionSlot) bool {
     if (slot.phase == .mask_relaying) return true;
     if (slot.phase != .relaying) return false;
+    if (slot.client_transport == .direct_obfuscated) {
+        if (slot.middle_ctx) |*mp| return mp.c2sAtFrameBoundary();
+        return true;
+    }
     if (slot.relay_tls_hdr_pos != 0 or
         slot.relay_tls_body_len != 0 or
         slot.relay_tls_body_pos != 0)
@@ -875,9 +880,16 @@ const UpstreamKind = enum {
     mask,
 };
 
+const ClientTransport = enum {
+    fake_tls,
+    direct_obfuscated,
+};
+
 const ConnectionPhase = enum {
     idle,
+    reading_web_prefix,
     reading_tls_header,
+    reading_direct_obfuscated_handshake,
     reading_client_hello_body,
     writing_server_hello_first,
     desync_wait,
@@ -1447,6 +1459,10 @@ const ConnectionSlot = struct {
     upstream_fd: posix.fd_t = invalid_fd,
     upstream_kind: UpstreamKind = .none,
     peer_addr: net.Address = undefined,
+    /// Fixed from the kernel-reported address at accept time. A PROXY header may
+    /// replace `peer_addr`, but can never grant relay trust.
+    trusted_peer: bool = false,
+    client_transport: ClientTransport = .fake_tls,
 
     phase: ConnectionPhase = .idle,
     active_reserved: bool = false,
@@ -1479,6 +1495,10 @@ const ConnectionSlot = struct {
     tls_body_len: u16 = 0,
     tls_body_pos: u16 = 0,
     tls_record_type: u8 = 0,
+
+    // Optional binary PROXY-v2 prefix from the trusted WEB relay.
+    web_prefix_buf: [256]u8 = undefined,
+    web_prefix_pos: u16 = 0,
 
     client_hello_inline: [client_hello_inline_size]u8 = undefined,
     client_hello_heap: ?[]u8 = null,
@@ -1549,6 +1569,11 @@ const ConnectionSlot = struct {
 
     // Masking: bytes already read from client before deciding to mask
     mask_prebuffer: ?[]u8 = null,
+    mask_addr_override: ?net.Address = null,
+    mask_send_proxy_header: bool = false,
+    /// Long-lived HTTPS/WebSocket carrier for the configured WEB domain. Unlike
+    /// probe-cover relays it must not be cut off by mask_relay_max_secs.
+    web_carrier: bool = false,
 
     // Non-blocking MiddleProxy handshake state
     mp_step: MiddleProxyHandshakeStep = .none,
@@ -1595,7 +1620,9 @@ const ConnectionSlot = struct {
 
     fn handshakeInProgress(self: *const ConnectionSlot) bool {
         return switch (self.phase) {
+            .reading_web_prefix,
             .reading_tls_header,
+            .reading_direct_obfuscated_handshake,
             .reading_client_hello_body,
             .writing_server_hello_first,
             .desync_wait,
@@ -1924,6 +1951,18 @@ fn slotCandidateCount(slot: *const ConnectionSlot) usize {
     return 0;
 }
 
+fn parseWebHostPort(allocator: std.mem.Allocator, spec: []const u8) ?net.Address {
+    const colon = std.mem.lastIndexOfScalar(u8, spec, ':') orelse return null;
+    const host = std.mem.trim(u8, spec[0..colon], "[] ");
+    if (host.len == 0) return null;
+    const port = std.fmt.parseInt(u16, spec[colon + 1 ..], 10) catch return null;
+    if (port == 0) return null;
+    const list = net.getAddressList(allocator, host, port) catch return null;
+    defer list.deinit();
+    if (list.addrs.len == 0) return null;
+    return list.addrs[0];
+}
+
 pub const ProxyState = struct {
     allocator: std.mem.Allocator,
     config: Config,
@@ -1934,6 +1973,8 @@ pub const ProxyState = struct {
     handshakes_inflight: u32,
     mask_target: ?[]const u8,
     mask_addrs: []net.Address,
+    trusted_web_peers: web_support.TrustedPeers,
+    web_mask_addr: ?net.Address,
     replay_cache: ReplayCache,
     tls_server_hello_template: []u8,
 
@@ -2039,6 +2080,23 @@ pub const ProxyState = struct {
             }
         }
 
+        const relay_sources = try web_support.parseSources(allocator, cfg.web.relay_sources);
+        errdefer if (relay_sources.len > 0) allocator.free(relay_sources);
+        const trusted_web_peers = web_support.TrustedPeers{
+            .enabled = cfg.web.enabled,
+            .extra = relay_sources,
+        };
+        var web_mask_addr: ?net.Address = null;
+        if (cfg.web.enabled) {
+            if (cfg.web.mask_backend) |spec| {
+                web_mask_addr = parseWebHostPort(allocator, spec);
+                if (web_mask_addr == null) {
+                    log.warn("[web].mask_backend '{s}' is invalid or cannot be resolved", .{spec});
+                }
+            }
+            log.info("WEB relay trust enabled for loopback and {d} configured source(s)", .{relay_sources.len});
+        }
+
         var default_middle_proxy_secret = [_]u8{0} ** 256;
         @memcpy(default_middle_proxy_secret[0..middleproxy.proxy_secret.len], middleproxy.proxy_secret[0..]);
 
@@ -2077,6 +2135,8 @@ pub const ProxyState = struct {
             .handshakes_inflight = 0,
             .mask_target = mask_target,
             .mask_addrs = resolved_addrs,
+            .trusted_web_peers = trusted_web_peers,
+            .web_mask_addr = web_mask_addr,
             .replay_cache = ReplayCache.init(),
             .tls_server_hello_template = tls_template,
             .stats_dropped_cap = 0,
@@ -2120,6 +2180,7 @@ pub const ProxyState = struct {
         self.middle_proxy_lock.unlock();
         self.allocator.free(self.tls_server_hello_template);
         if (self.mask_addrs.len > 0) self.allocator.free(self.mask_addrs);
+        if (self.trusted_web_peers.extra.len > 0) self.allocator.free(self.trusted_web_peers.extra);
         freeUserSecrets(self.allocator, self.user_secrets);
     }
 
@@ -2984,8 +3045,10 @@ const EventLoop = struct {
             };
             accepted_this_round += 1;
 
+            const trusted_web_peer = self.state.trusted_web_peers.contains(client_addr);
+
             // Per-/24 subnet rate limit (before we allocate any slot)
-            if (!self.subnet_limiter.check(client_addr, self.state.config.rate_limit_per_subnet)) {
+            if (!trusted_web_peer and !self.subnet_limiter.check(client_addr, self.state.config.rate_limit_per_subnet)) {
                 self.state.stats_dropped_rate_limit +|= 1;
                 closeFd(cfd);
                 continue;
@@ -3008,24 +3071,28 @@ const EventLoop = struct {
             slot.client_queue.pool = &self.message_block_pool;
             slot.upstream_queue.pool = &self.message_block_pool;
 
-            const subnet_key = SubnetRateLimit.subnetKey(client_addr);
-            if (!self.subnet_handshakes.reserve(subnet_key, subnetHandshakeLimit(max))) {
-                self.state.active_connections -= 1;
-                self.state.stats_dropped_hs_budget +|= 1;
-                self.pool.release(slot);
-                closeFd(cfd);
-                continue;
+            const subnet_key = if (trusted_web_peer) 0 else SubnetRateLimit.subnetKey(client_addr);
+            if (!trusted_web_peer) {
+                if (!self.subnet_handshakes.reserve(subnet_key, subnetHandshakeLimit(max))) {
+                    self.state.active_connections -= 1;
+                    self.state.stats_dropped_hs_budget +|= 1;
+                    self.pool.release(slot);
+                    closeFd(cfd);
+                    continue;
+                }
             }
 
             slot.active_reserved = true;
             slot.hs_counted = false;
             slot.subnet_key = subnet_key;
-            slot.subnet_hs_counted = true;
+            slot.subnet_hs_counted = !trusted_web_peer;
             slot.conn_id = self.state.connection_count;
             self.state.connection_count +|= 1;
             slot.client_fd = cfd;
             slot.peer_addr = client_addr;
-            slot.phase = .reading_tls_header;
+            slot.trusted_peer = trusted_web_peer;
+            slot.client_transport = .fake_tls;
+            slot.phase = if (trusted_web_peer) .reading_web_prefix else .reading_tls_header;
             slot.created_at_ms = compat.monotonicMilliTimestamp();
             slot.last_activity_ms = slot.created_at_ms;
             slot.idle_timeout_ms = jitteredIdleTimeoutMs(
@@ -3210,7 +3277,9 @@ const EventLoop = struct {
         slot.last_activity_ms = compat.monotonicMilliTimestamp();
 
         switch (slot.phase) {
+            .reading_web_prefix => self.readWebPrefix(slot),
             .reading_tls_header => self.readTlsHeader(slot),
+            .reading_direct_obfuscated_handshake => self.readDirectObfuscatedHandshake(slot),
             .reading_client_hello_body => self.readClientHelloBody(slot),
             .reading_mtproto_tls_header, .reading_mtproto_tls_body => self.readMtprotoHandshake(slot),
             .relaying => self.relayClientToUpstream(slot),
@@ -3367,6 +3436,94 @@ const EventLoop = struct {
         slot.subnet_key = 0;
     }
 
+    fn readWebPrefix(self: *EventLoop, slot: *ConnectionSlot) void {
+        while (true) {
+            if (slot.web_prefix_pos > 0) {
+                const prefix = slot.web_prefix_buf[0..slot.web_prefix_pos];
+                switch (web_support.parseProxyV2(prefix)) {
+                    .invalid => {
+                        // A PROXY header is optional for a trusted local peer. A normal
+                        // TLS connection is decided after the five-byte record header;
+                        // a dd nonce that happens to begin with 0x0d must retain every
+                        // byte already consumed while we ruled out the v2 signature.
+                        if (prefix[0] != 0x0d) {
+                            slot.tls_hdr_buf[0] = prefix[0];
+                            slot.tls_hdr_pos = 1;
+                            slot.web_prefix_pos = 0;
+                            slot.phase = .reading_tls_header;
+                            self.readTlsHeader(slot);
+                            return;
+                        }
+                        if (prefix.len > slot.handshake_buf.len) {
+                            self.closeSlot(slot, "invalid WEB relay PROXY header");
+                            return;
+                        }
+                        slot.client_transport = .direct_obfuscated;
+                        @memcpy(slot.handshake_buf[0..prefix.len], prefix);
+                        slot.handshake_pos = @intCast(prefix.len);
+                        slot.web_prefix_pos = 0;
+                        slot.phase = .reading_direct_obfuscated_handshake;
+                        self.readDirectObfuscatedHandshake(slot);
+                        return;
+                    },
+                    .ok => |result| {
+                        if (result.src) |real_client| {
+                            slot.peer_addr = real_client;
+                            if (!self.subnet_limiter.check(real_client, self.state.config.rate_limit_per_subnet)) {
+                                self.state.stats_dropped_rate_limit +|= 1;
+                                self.closeSlot(slot, "WEB client subnet rate limit");
+                                return;
+                            }
+                            const subnet_key = SubnetRateLimit.subnetKey(real_client);
+                            if (!self.subnet_handshakes.reserve(subnet_key, subnetHandshakeLimit(self.state.config.max_connections))) {
+                                self.state.stats_dropped_hs_budget +|= 1;
+                                self.closeSlot(slot, "WEB client subnet handshake limit");
+                                return;
+                            }
+                            slot.subnet_key = subnet_key;
+                            slot.subnet_hs_counted = true;
+                        }
+                        slot.web_prefix_pos = 0;
+                        slot.phase = .reading_tls_header;
+                        self.readTlsHeader(slot);
+                        return;
+                    },
+                    .incomplete => {},
+                }
+            }
+
+            const have: usize = slot.web_prefix_pos;
+            const target: usize = if (have < 16)
+                have + 1
+            else
+                16 + @as(usize, std.mem.readInt(u16, slot.web_prefix_buf[14..16], .big));
+
+            if (target > slot.web_prefix_buf.len) {
+                self.closeSlot(slot, "WEB relay PROXY header too long");
+                return;
+            }
+            if (have < target) {
+                const n = readSlotFd(slot, slot.client_fd, slot.web_prefix_buf[have..target]) catch |err| {
+                    if (err == error.WouldBlock) return;
+                    self.closeSlot(slot, "WEB relay prefix read error");
+                    return;
+                };
+                if (n == 0) {
+                    self.closeSlot(slot, "WEB relay prefix eof");
+                    return;
+                }
+                slot.web_prefix_pos += @intCast(n);
+                if (slot.first_byte_at_ms == 0) slot.first_byte_at_ms = compat.monotonicMilliTimestamp();
+                if (!slot.hs_counted and !self.reserveHandshakeBudget(slot)) {
+                    self.closeSlot(slot, "handshake budget exhausted");
+                    return;
+                }
+                slot.last_activity_ms = compat.monotonicMilliTimestamp();
+                continue;
+            }
+        }
+    }
+
     fn readTlsHeader(self: *EventLoop, slot: *ConnectionSlot) void {
         while (slot.tls_hdr_pos < tls_header_len) {
             const n = readSlotFd(slot, slot.client_fd, slot.tls_hdr_buf[slot.tls_hdr_pos..]) catch |err| {
@@ -3378,8 +3535,8 @@ const EventLoop = struct {
                 self.closeSlot(slot, "client eof before tls header");
                 return;
             }
-            if (slot.first_byte_at_ms == 0) {
-                slot.first_byte_at_ms = compat.monotonicMilliTimestamp();
+            if (slot.first_byte_at_ms == 0) slot.first_byte_at_ms = compat.monotonicMilliTimestamp();
+            if (!slot.hs_counted) {
                 if (!self.reserveHandshakeBudget(slot)) {
                     self.closeSlot(slot, "handshake budget exhausted");
                     return;
@@ -3390,6 +3547,14 @@ const EventLoop = struct {
         }
 
         if (!tls.isTlsHandshake(slot.tls_hdr_buf[0..])) {
+            if (slot.trusted_peer) {
+                slot.client_transport = .direct_obfuscated;
+                @memcpy(slot.handshake_buf[0..tls_header_len], slot.tls_hdr_buf[0..]);
+                slot.handshake_pos = tls_header_len;
+                slot.phase = .reading_direct_obfuscated_handshake;
+                self.readDirectObfuscatedHandshake(slot);
+                return;
+            }
             self.startMasking(slot, slot.tls_hdr_buf[0..]) catch {
                 self.closeSlot(slot, "non-tls masked failed");
             };
@@ -3417,6 +3582,36 @@ const EventLoop = struct {
         slot.tls_body_len = @intCast(record_len);
         slot.tls_body_pos = 0;
         slot.phase = .reading_client_hello_body;
+    }
+
+    fn readDirectObfuscatedHandshake(self: *EventLoop, slot: *ConnectionSlot) void {
+        while (slot.handshake_pos < constants.handshake_len) {
+            const n = readSlotFd(slot, slot.client_fd, slot.handshake_buf[slot.handshake_pos..]) catch |err| {
+                if (err == error.WouldBlock) return;
+                self.closeSlot(slot, "direct obfuscated handshake read error");
+                return;
+            };
+            if (n == 0) {
+                self.closeSlot(slot, "direct obfuscated handshake eof");
+                return;
+            }
+            slot.handshake_pos += @intCast(n);
+            slot.last_activity_ms = compat.monotonicMilliTimestamp();
+        }
+
+        var result = obfuscation.ObfuscationParams.fromHandshake(&slot.handshake_buf, self.state.user_secrets) orelse {
+            self.closeSlot(slot, "invalid direct obfuscated handshake");
+            return;
+        };
+        defer result.params.wipe();
+
+        const user_len = @min(result.user.len, slot.validation_user.len);
+        slot.validation_user_len = @intCast(user_len);
+        @memcpy(slot.validation_user[0..user_len], result.user[0..user_len]);
+        slot.validation_force_direct = self.state.config.userBypassesMiddleProxy(result.user);
+        std.crypto.secureZero(u8, &slot.handshake_buf);
+        slot.handshake_pos = 0;
+        self.finishParsedClientHandshake(slot, result);
     }
 
     fn readClientHelloBody(self: *EventLoop, slot: *ConnectionSlot) void {
@@ -3450,6 +3645,15 @@ const EventLoop = struct {
 
         const sni = maybe_sni.?;
         if (!std.ascii.eqlIgnoreCase(sni, self.state.config.tls_domain)) {
+            if (self.state.web_mask_addr) |web_addr| {
+                if (self.state.config.web.domain) |web_domain| {
+                    if (std.ascii.eqlIgnoreCase(sni, web_domain)) {
+                        slot.mask_addr_override = web_addr;
+                        slot.mask_send_proxy_header = true;
+                        slot.web_carrier = true;
+                    }
+                }
+            }
             self.startMasking(slot, client_hello) catch {
                 self.closeSlot(slot, "tls sni mismatch");
             };
@@ -3669,6 +3873,10 @@ const EventLoop = struct {
         std.crypto.secureZero(u8, &slot.handshake_buf);
         slot.handshake_pos = 0;
 
+        self.finishParsedClientHandshake(slot, result);
+    }
+
+    fn finishParsedClientHandshake(self: *EventLoop, slot: *ConnectionSlot, result: anytype) void {
         slot.obf_params = result.params;
         slot.proto_tag = result.params.proto_tag;
         slot.dc_idx = result.params.dc_idx;
@@ -3759,22 +3967,39 @@ const EventLoop = struct {
 
     fn startMasking(self: *EventLoop, slot: *ConnectionSlot, buffered: []const u8) !void {
         if (!self.state.config.mask) return error.MaskingDisabled;
-        self.state.middle_proxy_lock.lock();
-        const candidates = self.state.allocator.dupe(net.Address, self.state.mask_addrs) catch |err| {
+        const override = slot.mask_addr_override;
+        slot.mask_addr_override = null;
+        const candidates = if (override) |addr| blk: {
+            const one = try self.state.allocator.alloc(net.Address, 1);
+            one[0] = addr;
+            break :blk one;
+        } else blk: {
+            self.state.middle_proxy_lock.lock();
+            const copy = self.state.allocator.dupe(net.Address, self.state.mask_addrs) catch |err| {
+                self.state.middle_proxy_lock.unlock();
+                return err;
+            };
             self.state.middle_proxy_lock.unlock();
-            return err;
+            break :blk copy;
         };
-        self.state.middle_proxy_lock.unlock();
         if (candidates.len == 0) {
             self.state.allocator.free(candidates);
             return error.NoMaskAddress;
         }
 
-        const pre = self.state.allocator.alloc(u8, buffered.len) catch |err| {
+        var proxy_header_buf: [64]u8 = undefined;
+        const proxy_header: []const u8 = if (slot.mask_send_proxy_header)
+            web_support.buildProxyV2(&proxy_header_buf, slot.peer_addr, candidates[0])
+        else
+            "";
+        slot.mask_send_proxy_header = false;
+
+        const pre = self.state.allocator.alloc(u8, proxy_header.len + buffered.len) catch |err| {
             self.state.allocator.free(candidates);
             return err;
         };
-        @memcpy(pre, buffered);
+        @memcpy(pre[0..proxy_header.len], proxy_header);
+        @memcpy(pre[proxy_header.len..], buffered);
         slot.mask_prebuffer = pre;
 
         slot.upstream_candidates = candidates;
@@ -4242,6 +4467,10 @@ const EventLoop = struct {
 
     fn relayClientToUpstream(self: *EventLoop, slot: *ConnectionSlot) void {
         if (slot.hasUpstreamPending()) return;
+        if (slot.client_transport == .direct_obfuscated) {
+            self.relayObfuscatedClientToUpstream(slot);
+            return;
+        }
 
         const c2s_before = slot.c2s_bytes;
         const progress = relayClientToUpstreamStep(self, slot) catch |err| {
@@ -4269,6 +4498,10 @@ const EventLoop = struct {
 
     fn relayUpstreamToClient(self: *EventLoop, slot: *ConnectionSlot) void {
         if (slot.hasClientPending()) return;
+        if (slot.client_transport == .direct_obfuscated) {
+            self.relayObfuscatedUpstreamToClient(slot);
+            return;
+        }
 
         const s2c_before = slot.s2c_bytes;
         const progress = relayUpstreamToClientStep(self, slot) catch |err| {
@@ -4309,6 +4542,114 @@ const EventLoop = struct {
                 self.noteServerRelayPayload(slot, slot.last_activity_ms);
             }
         }
+    }
+
+    fn relayObfuscatedClientToUpstream(self: *EventLoop, slot: *ConnectionSlot) void {
+        const read_buf = ensureReadBuf(slot, self.state.allocator) catch {
+            self.closeSlot(slot, "direct obfuscated c2s buffer allocation failed");
+            return;
+        };
+        const n = readSlotFd(slot, slot.client_fd, read_buf) catch |err| {
+            if (err == error.WouldBlock) return;
+            self.closeSlot(slot, "direct obfuscated c2s read error");
+            return;
+        };
+        if (n == 0) {
+            self.noteRelayReadEof(slot, .client);
+            return;
+        }
+
+        const payload = read_buf[0..n];
+        if (slot.client_decryptor) |*decryptor| decryptor.apply(payload);
+
+        if (slot.middle_ctx) |*mp| {
+            const required = mp.requiredC2sScratchCapacity(payload) catch {
+                self.closeSlot(slot, "direct obfuscated middleproxy scratch sizing failed");
+                return;
+            };
+            const scratch = self.ensureMpC2sScratch(required) catch {
+                self.closeSlot(slot, "direct obfuscated middleproxy scratch allocation failed");
+                return;
+            };
+            const framed = mp.encapsulateC2S(payload, scratch) catch {
+                self.closeSlot(slot, "direct obfuscated middleproxy c2s failed");
+                return;
+            };
+            if (framed.len > 0) {
+                _ = queueUpstream(slot, framed) catch {
+                    self.closeSlot(slot, "direct obfuscated c2s queue failed");
+                    return;
+                };
+            }
+        } else if (slot.tg_encryptor) |*encryptor| {
+            encryptor.apply(payload);
+            _ = queueUpstream(slot, payload) catch {
+                self.closeSlot(slot, "direct obfuscated c2s queue failed");
+                return;
+            };
+        } else {
+            self.closeSlot(slot, "direct obfuscated c2s crypto state missing");
+            return;
+        }
+
+        slot.c2s_bytes += payload.len;
+        slot.last_activity_ms = compat.monotonicMilliTimestamp();
+        self.noteClientRelayPayload(slot, slot.last_activity_ms);
+    }
+
+    fn relayObfuscatedUpstreamToClient(self: *EventLoop, slot: *ConnectionSlot) void {
+        const read_buf = ensureReadBuf(slot, self.state.allocator) catch {
+            self.closeSlot(slot, "direct obfuscated s2c buffer allocation failed");
+            return;
+        };
+        const n = readSlotFd(slot, slot.upstream_fd, read_buf) catch |err| {
+            if (err == error.WouldBlock) return;
+            self.closeSlot(slot, "direct obfuscated s2c read error");
+            return;
+        };
+        if (n == 0) {
+            self.noteRelayReadEof(slot, .upstream);
+            return;
+        }
+
+        const raw = read_buf[0..n];
+        if (slot.middle_ctx) |*mp| {
+            const required = mp.requiredS2cScratchCapacity(raw) catch {
+                self.closeSlot(slot, "direct obfuscated middleproxy scratch sizing failed");
+                return;
+            };
+            const scratch = self.ensureMpS2cScratch(required) catch {
+                self.closeSlot(slot, "direct obfuscated middleproxy scratch allocation failed");
+                return;
+            };
+            const payload = mp.decapsulateS2C(raw, scratch) catch {
+                self.closeSlot(slot, "direct obfuscated middleproxy s2c failed");
+                return;
+            };
+            if (payload.len == 0) {
+                slot.last_activity_ms = compat.monotonicMilliTimestamp();
+                return;
+            }
+            if (slot.client_encryptor) |*encryptor| encryptor.apply(payload);
+            _ = queueClient(slot, payload) catch {
+                self.closeSlot(slot, "direct obfuscated s2c queue failed");
+                return;
+            };
+            slot.s2c_bytes += payload.len;
+        } else {
+            if (!slot.use_fast_mode) {
+                if (slot.tg_decryptor) |*decryptor| decryptor.apply(raw);
+                if (slot.client_encryptor) |*encryptor| encryptor.apply(raw);
+            }
+            _ = queueClient(slot, raw) catch {
+                self.closeSlot(slot, "direct obfuscated s2c queue failed");
+                return;
+            };
+            slot.s2c_bytes += raw.len;
+        }
+
+        slot.last_activity_ms = compat.monotonicMilliTimestamp();
+        self.noteServerRelayPayload(slot, slot.last_activity_ms);
     }
 
     fn relayRawClientToUpstream(self: *EventLoop, slot: *ConnectionSlot) void {
@@ -4955,7 +5296,7 @@ const EventLoop = struct {
             deadline = earlierDeadline(deadline, deadlineMsToNs(handshake_deadline_ms));
         } else if (slot.phase == .relaying or slot.phase == .mask_relaying) {
             deadline = earlierDeadline(deadline, deadlineMsToNs(slot.last_activity_ms + slot.idle_timeout_ms));
-            if (slot.phase == .mask_relaying and self.state.config.mask_relay_max_secs > 0) {
+            if (slot.phase == .mask_relaying and !slot.web_carrier and self.state.config.mask_relay_max_secs > 0) {
                 deadline = earlierDeadline(
                     deadline,
                     deadlineMsToNs(slot.created_at_ms + secondsToMs(self.state.config.mask_relay_max_secs)),
@@ -5134,7 +5475,7 @@ const EventLoop = struct {
                 return;
             }
         } else if (slot.phase == .relaying or slot.phase == .mask_relaying) {
-            if (slot.phase == .mask_relaying and self.state.config.mask_relay_max_secs > 0 and
+            if (slot.phase == .mask_relaying and !slot.web_carrier and self.state.config.mask_relay_max_secs > 0 and
                 now_ms - slot.created_at_ms >= secondsToMs(self.state.config.mask_relay_max_secs))
             {
                 self.closeSlot(slot, "mask relay max lifetime");
@@ -5198,7 +5539,9 @@ const EventLoop = struct {
         var want_upstream_rdhup = !isInvalidFd(slot.upstream_fd);
 
         switch (slot.phase) {
+            .reading_web_prefix,
             .reading_tls_header,
+            .reading_direct_obfuscated_handshake,
             .reading_client_hello_body,
             .reading_mtproto_tls_header,
             .reading_mtproto_tls_body,
@@ -5394,6 +5737,21 @@ const EventLoop = struct {
         if ((from_client and slot.hasUpstreamPending()) or
             (from_upstream and slot.hasClientPending()))
         {
+            return;
+        }
+
+        // The ordinary relay-step helpers below parse FakeTLS records. WEB backend
+        // streams carry the client's direct-obfuscated transport instead, so their
+        // final RDHUP read must stay on the same crypto/framing path as a normal IN
+        // event. Level-triggered RDHUP will notify us again after any queued output
+        // drains and read interest is restored, until read() returns zero and the
+        // regular half-close machinery records EOF.
+        if (slot.phase == .relaying and slot.client_transport == .direct_obfuscated) {
+            if (from_client) {
+                self.relayObfuscatedClientToUpstream(slot);
+            } else {
+                self.relayObfuscatedUpstreamToClient(slot);
+            }
             return;
         }
 
@@ -7577,7 +7935,9 @@ test "handshakeInProgress - phases" {
     var slot: ConnectionSlot = undefined;
 
     const hs_phases = [_]ConnectionPhase{
+        .reading_web_prefix,
         .reading_tls_header,
+        .reading_direct_obfuscated_handshake,
         .reading_client_hello_body,
         .writing_server_hello_first,
         .desync_wait,

@@ -39,6 +39,7 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 | **Multi-user** | Access Control | Independent secret-based authentication per user |
 | **Anti-replay** | Timestamp + Digest Cache | Rejects replayed handshakes outside ±2 min window AND detects ТСПУ Revisor active probes |
 | **Masking** | Connection Cloaking | Forwards unauthenticated clients either to `tls_domain:443` or, for self-domain installs, to a local Caddy 404 backend |
+| **WEB Proxy** | Browser HTTPS Carrier | Runs Telegram Desktop 7.1+ WEB links in parallel with ordinary MTProto, using the existing Caddy instance for real TLS/WebSocket termination |
 | **PQ FakeTLS** | DPI Evasion | Echoes `X25519MLKEM768` (`0x11ec`) ServerHello key_share for modern Desktop/Android ClientHellos |
 | **Fast Mode** | Direct-Path S2C Offload | Reduces CPU usage by delegating S2C AES work to Telegram DCs on direct paths (non-MiddleProxy) |
 | **MiddleProxy** | Telemt-Compatible ME | Optional ME transport for DC1..5 (`use_middle_proxy`); retries TCP candidates, applies a 5-second per-stage handshake deadline, cools failed endpoints for 60 seconds, and falls back directly when ME stalls |
@@ -68,6 +69,7 @@ Connection-capacity methodology and command profiles: `test/README.md`.
 - Failed non-blocking upstream connects are reclaimed immediately on fatal hangup events; the relay loop should not spin on dead upstream sockets.
 - The timerfd wakes only for the earliest connection/admission deadline or the 10-second aggregated `conn stats` report; timer maintenance does not scan the slot pool.
 - Client payload bytes pipelined after the 64-byte MTProto obfuscation nonce are buffered and forwarded once the upstream path is ready.
+- WEB mode runs as a separate `mtproto-proxy web-relay` process. Caddy terminates the browser TLS/WebSocket carrier, while the public `:443` data plane continues to serve ordinary FakeTLS links and admits direct-obfuscated WEB streams only from trusted relay source addresses.
 - Outbound client/upstream writes use intrusive page-sized block queues backed by one event-loop free list and one shared hard buffer-memory budget, bounded `writev` dispatches, and a 4 MiB pending-byte cap per queue. Tail packing avoids one page allocation per small write, recycled pages are wiped, and per-event byte/operation budgets prevent one ready fd from monopolizing the loop.
 - MiddleProxy per-direction C2S/S2C buffers start at 16 KiB and grow on demand up to the effective `middleproxy_buffer_kb` cap; shared event-loop scratch buffers are allocated lazily and reused. Queue pages, retained free-list pages, stream buffers, scratch, and transient growth are all charged to the same runtime budget. C2S headers are parsed once during encapsulation, and completed handshakes release route candidates, validation state, and ME handshake buffers immediately.
 - MiddleProxy route snapshots contain only candidates for the selected DC/path plus a versioned secret reference and NAT address. The current and immediately previous secrets are retained centrally, so concurrent rotations do not copy a 256-byte secret into every handshake or split selector/KDF inputs.
@@ -298,6 +300,8 @@ Useful environment variables:
 | `SECRET` | random | 32-hex user secret; generated once when config is absent |
 | `USE_MIDDLE_PROXY` | `true` | Initial `use_middle_proxy` value |
 | `ENABLE_MASKING` | `true` | Install Caddy/certbot masking and set `mask = true`; Docker installs run Caddy in Compose |
+| `ENABLE_WEB` | `false` | Enable the Telegram Desktop WEB relay alongside ordinary MTProto; an existing enabled WEB setup is preserved when this variable is omitted |
+| `WEB_DOMAIN` | _(required with `ENABLE_WEB=true`)_ | Separate public DNS hostname used by `tg://webproxy` links; it must differ from `TLS_DOMAIN` |
 | `ENABLE_TCPMSS` | `false` | Enable legacy `TCPMSS=88` ClientHello fragmentation fallback; disabled by default with PQ-capable Caddy masking |
 | `ENABLE_SYNFIX` | `false` | Install inbound SYN pacing rules for Android/Desktop routes that need it |
 | `SYNFIX_RATE` | `30/minute` | Per-source SYN rate for non-iOS-like fingerprints |
@@ -307,9 +311,9 @@ Useful environment variables:
 | `CADDY_IMAGE` | `caddy:2.10-alpine` | Caddy image used by the Docker Compose installer |
 | `GHCR_USER` / `GHCR_TOKEN` | _(empty)_ | Optional login for private GHCR packages |
 
-The installer requires Docker Compose v2 (`docker compose`) and installs Docker Engine + the Compose plugin via Docker's convenience script if either Docker or the plugin is missing. When `IMAGE` is not set, compatible x86_64 hosts automatically pull the `latest-amd64-v3` image; if that tag is unavailable, the installer falls back to generic `latest`. The proxy and Caddy Compose services use `network_mode: host`, so the proxy binds public `:443` and Caddy binds local masking/ACME ports directly on the VPS. Re-run the installer to pull and restart with newer images, or update manually:
+The installer requires Docker Compose v2 (`docker compose`) and installs Docker Engine + the Compose plugin via Docker's convenience script if either Docker or the plugin is missing. When `IMAGE` is not set, compatible x86_64 hosts automatically pull the `latest-amd64-v3` image; if that tag is unavailable, the installer falls back to generic `latest`. The proxy, WEB relay, and Caddy Compose services use `network_mode: host`; the proxy owns public `:443`, Caddy owns public ACME `:80` plus local masking/WEB listeners, and the relay stays on loopback. Re-run the installer to pull and restart with newer images, or update manually:
 
-The tracked `deploy/compose.yml` is only a minimal proxy-service example. The installer generates a richer `/opt/mtproto-proxy/compose.yml` containing Caddy, resource limits, and install-specific settings; do not treat the tracked example as the installer's exact output.
+The tracked `deploy/compose.yml` is only a minimal proxy plus optional WEB-relay example. The installer generates a richer `/opt/mtproto-proxy/compose.yml` containing Caddy, resource limits, and install-specific settings; do not treat the tracked example as the installer's exact output.
 
 ```bash
 cd /opt/mtproto-proxy
@@ -328,6 +332,70 @@ docker exec -it mtproto-proxy \
 ```
 
 The one-shot process reads the container's mounted config, writes the secret links only to the current terminal, and exits while the main proxy process keeps running.
+
+## WEB proxy (Telegram Desktop 7.1+)
+
+WEB mode is an additional transport, not a replacement for the ordinary proxy. Existing `tg://proxy` FakeTLS clients continue to use public TCP `443`; Telegram Desktop can additionally use a `tg://webproxy` link whose traffic is carried by a real browser HTTPS/WebSocket session.
+
+```text
+ordinary client ───────────────────────────────▶ mtproto-proxy :443 ─▶ Telegram
+
+Telegram Desktop WEB ─▶ mtproto-proxy :443 ─▶ Caddy :8444
+                                               └─ WebSocket ─▶ web-relay :8081
+                                                                  └─ MTProto streams ─▶ mtproto-proxy :443 ─▶ Telegram
+```
+
+The deployment uses the existing `mtproto-mask-caddy` instance only. Caddy's built-in PROXY-protocol listener wrapper preserves the real browser address across the proxy-to-Caddy hop; the relay then prefixes every backend MTProto stream with PROXY v2. No additional public port is opened: Caddy `8444` and relay `8081` remain local.
+
+Requirements:
+
+1. Create a second DNS-only `A` record such as `web.example.com -> <VPS_IP>`.
+2. Keep it distinct from `[censorship].tls_domain` (for example `proxy.example.com`). The two SNI names select different local Caddy paths on the same public `:443` listener.
+3. Keep public TCP `80` reachable while Certbot issues or renews the WEB certificate.
+4. Keep Caddy masking enabled; the WEB setup extends that same Caddy configuration.
+
+For an existing Docker Compose installation made by this repository's installer, run:
+
+```bash
+curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/install_docker_compose.sh \
+  | sudo env ENABLE_WEB=true WEB_DOMAIN=web.example.com bash
+```
+
+The installer preserves the existing proxy config and user secrets, updates the image and Compose definition, adds `mtproto-web-relay`, extends `mtproto-mask-caddy`, obtains the certificate, and restarts the affected containers. On a fresh Docker install, add `TLS_DOMAIN=proxy.example.com` to the same command.
+
+For an updated source/systemd installation:
+
+```bash
+sudo /opt/mtproto-proxy/setup_web.sh web.example.com
+```
+
+Inspect all three processes with:
+
+```bash
+cd /opt/mtproto-proxy
+docker compose --env-file .env -f compose.yml logs -f \
+  mtproto-proxy mtproto-web-relay mtproto-mask-caddy
+```
+
+Print both ordinary and WEB links without starting another listener:
+
+```bash
+docker exec -it mtproto-proxy \
+  /usr/local/bin/mtproto-proxy \
+  /etc/mtproto-proxy/config.toml \
+  --print-links
+```
+
+WEB links use the same 16-byte `[access.users]` secret encoded as `dd<secret>`; FakeTLS links keep their existing `ee<secret><hex-domain>` encoding. The public proxy still rejects direct-obfuscated traffic from untrusted Internet peers: only loopback and explicit `[web].relay_sources` may carry WEB streams into that path.
+
+Capacity is deliberately separate from the relay's queue-memory limit. One WEB desktop session can occupy one front/masking connection plus up to `max_streams` backend proxy connections. The Caddy installer defaults to `max_sessions=8` and `max_streams=32`, a worst-case 264 proxy slots, which fits the default `max_connections=512`; increase these values together only after accounting for ordinary clients and relay memory.
+
+To remove WEB mode while leaving ordinary MTProto and Caddy masking intact:
+
+```bash
+sudo env MTPROTO_DOCKER_INSTALL=1 \
+  bash /opt/mtproto-proxy/setup_web.sh --remove
+```
 
 ## &nbsp; Deploy to Server
 
@@ -709,6 +777,8 @@ ssh root@<VPS_IP> 'bash /opt/mtproto-proxy/setup_tunnel.sh /tmp/awg.conf middlep
 
 > **Note** &nbsp; For local masking (`mask_port = 8443`) in tunnel netns mode, masking is now auto-routed to host-side Caddy (`10.200.200.1:8443`) by deploy scripts/runtime — no extra config key is required.
 
+> **Note** &nbsp; If WEB mode is already enabled, `setup_tunnel.sh` also refreshes its Caddy listener and relay backend automatically (`10.200.200.1:8444` → `10.200.200.2:443`). Ordinary MTProto and WEB links remain active together.
+
 > **Note** &nbsp; Deploy scripts also install a self-healing masking monitor (`mtproto-mask-health.timer`) that checks local masking endpoint reachability every minute and restarts `mtproto-mask-caddy`/`mtproto-proxy` on failures.
 
 > **Note** &nbsp; To check tunnel status: `ssh root@<VPS_IP> 'ip netns exec tg_proxy_ns awg show'`
@@ -767,11 +837,29 @@ rate_limit_per_subnet = 30                # Max new connections/sec per /24 subn
 # host = "127.0.0.1"                       # Bind address for dashboard. Use "0.0.0.0" to expose externally
 # port = 61208                             # TCP port for the dashboard
 
+[web]
+# Optional Telegram Desktop 7.1+ WEB transport. setup_web.sh writes these
+# values and extends the existing Caddy instance; ordinary MTProto remains on.
+# enabled = true
+# domain = "web.example.com"               # Must differ from censorship.tls_domain
+# listen = "127.0.0.1"                     # Plain HTTP/WebSocket relay, local only
+# port = 8081
+# backend = "127.0.0.1:443"                # Use 10.200.200.2:443 in tunnel-netns mode
+# mask_backend = "127.0.0.1:8444"          # Caddy listener with PROXY v2 support
+# ws_path = "/api/v1/socket"
+# trust_forwarded_for = true
+# client_ip_header = "x-forwarded-for"
+# check_origin = true
+# max_sessions = 8
+# max_streams = 32
+# max_buffer_mb = 128
+# relay_sources = []                       # Extra trusted relay IP literals; loopback is implicit
+
 [censorship]
 tls_domain = "proxy.example.com"
 mask = true
 mask_port = 8443
-# mask_relay_max_secs = 0                  # Max lifetime for masked Caddy relays; 0 disables
+# mask_relay_max_secs = 0                  # Probe-cover lifetime; WEB carriers are exempt
 desync = true
 # desync_split_delay_ms = 3                # Base delay between first ServerHello byte and the rest
 # desync_split_jitter_ms = 2               # Random extra delay, 0..N ms, added to the base
@@ -815,10 +903,24 @@ alice = true   # "alice" from [access.users]: always direct, keeps fast_mode eli
 | `[server]` | `unsafe_override_limits` | `false` | Disable auto-clamping of `max_connections` to the baseline RAM admission ceiling. The shared dynamic-buffer hard limit remains enforced. Use only when the container/service limit as well as host RAM are sufficient |
 | `[monitor]` | `host` | `"127.0.0.1"` | Bind address for the optional monitoring dashboard HTTP server. This section is read by `proxy-monitor`, not by the proxy binary. Set to `"0.0.0.0"` to expose on all interfaces (warning: no built-in auth) |
 | `[monitor]` | `port` | `61208` | TCP port for the optional monitoring dashboard HTTP server |
+| `[web]` | `enabled` | `false` | Enable the separate Telegram Desktop WEB relay process and the trusted relay path in the data plane |
+| `[web]` | `domain` | _(none)_ | Public ASCII DNS hostname placed in `tg://webproxy` links. It must differ from `censorship.tls_domain`; changing it invalidates existing WEB capabilities/links |
+| `[web]` | `listen` / `host` | `"127.0.0.1"` | Plain HTTP/WebSocket relay bind address behind Caddy. Keep it on loopback for the bundled deployment |
+| `[web]` | `port` | `8081` | Local relay listener port |
+| `[web]` | `backend` | `127.0.0.1:<server.port>` | MTProto data-plane endpoint opened for each logical WEB stream. Tunnel-netns installs use `10.200.200.2:443` |
+| `[web]` | `mask_backend` | _(none)_ | Local Caddy TLS listener that accepts PROXY v2 for WEB-domain SNI, normally `127.0.0.1:8444` or `10.200.200.1:8444` from the tunnel namespace |
+| `[web]` | `ws_path` | `"/api/v1/socket"` | Same-origin WebSocket endpoint embedded in the bridge page |
+| `[web]` | `trust_forwarded_for` | `true` | Read the real browser address from the configured forwarded header; the right-most entry is used |
+| `[web]` | `client_ip_header` | `"x-forwarded-for"` | Header Caddy uses to pass the real browser address to the relay |
+| `[web]` | `check_origin` | `true` | Require the WebSocket `Origin` to equal `https://<web.domain>` |
+| `[web]` | `max_sessions` | `8` | Concurrent WEB desktop sessions; the default is sized for the repository's 512-slot small-VPS profile |
+| `[web]` | `max_streams` | `32` | Logical MTProto streams per WEB session; each consumes one data-plane connection |
+| `[web]` | `max_buffer_mb` | `128` | Aggregate hard ceiling for queued WEB-relay data |
+| `[web]` | `relay_sources` | `[]` | Extra IP literals trusted to send PROXY-prefixed direct-obfuscated WEB streams; loopback is implicit while WEB is enabled |
 | `[censorship]` | `tls_domain` | `"google.com"` | FakeTLS SNI domain. With `mask_port=443`, unauthenticated clients are forwarded to this domain directly. For self-domain masking, set it to your own domain and point its DNS A record to the VPS. Since June 2026, the real masking endpoint should negotiate X25519MLKEM768 (`0x11ec`) in one round; classical-x25519-only domains can be a passive marker |
 | `[censorship]` | `mask` | `true` | Forward unauthenticated connections to the configured masking target to defeat active probing |
 | `[censorship]` | `mask_port` | `443` | Masking target port. `443` connects to `tls_domain:443`; non-443 values connect to a local address on that port (`127.0.0.1:<mask_port>`, or `10.200.200.1:<mask_port>` inside tunnel netns), so that port must be served by Caddy or another local backend. Use `8443` for self-domain Caddy so public `443` remains owned by `mtproto-proxy` |
-| `[censorship]` | `mask_relay_max_secs` | `0` | Maximum lifetime for masking relay connections to the configured backend. Limits active probes that keep the Caddy 404 connection open; `0` disables the cap |
+| `[censorship]` | `mask_relay_max_secs` | `0` | Maximum lifetime for ordinary masking/probe connections to the configured backend. WEB-domain HTTPS/WebSocket carriers are exempt; `0` disables the cap for every masking relay |
 | `[censorship]` | `desync` | `true` | Split fake `ServerHello` into `1 byte + short pause + rest` to desynchronize passive DPI |
 | `[censorship]` | `desync_split_delay_ms` | `3` | Base delay between the first fake `ServerHello` byte and the remaining bytes |
 | `[censorship]` | `desync_split_jitter_ms` | `2` | Random extra delay in milliseconds added to `desync_split_delay_ms` (`0..N` per connection) |

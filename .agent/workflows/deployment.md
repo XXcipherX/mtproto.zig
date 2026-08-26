@@ -11,6 +11,7 @@ This workflow documents current build and deploy paths as implemented in `Makefi
 - Zig 0.16.0 for local builds
 - SSH access to VPS
 - systemd on target host
+- Caddy 2.10+ masking enabled when the optional WEB carrier is deployed
 - Ubuntu 24.04 + root access for blocked-region tunnel mode
 - AmneziaWG client config (`.conf`) when using tunnel deploys
 
@@ -60,6 +61,25 @@ zig build -Doptimize=ReleaseFast soak -- --seconds=10
 The default install graph contains only `mtproto-proxy`. Use `zig build install-bench` only when the standalone `mtproto-bench` binary is required; `bench` and `soak` build it explicitly without coupling `run` to the global install step.
 
 The daemon smoke launches a real localhost proxy, verifies a valid FakeTLS handshake, and checks that the same SNI with a bad secret does not receive a valid FakeTLS response. CI uses a shorter soak for pull requests and a longer soak on pushes.
+
+## WEB Proxy Deployment
+
+WEB mode is additive: ordinary `tg://proxy` FakeTLS traffic remains on public `:443`, while a second DNS-only hostname selects the browser carrier and the existing Caddy service. The WEB hostname must differ from `censorship.tls_domain`, public TCP `80` must remain reachable for HTTP-01, and no extra public data port is required.
+
+For an existing Docker Compose installation created by this repository, update the installer and enable WEB in one idempotent pass:
+
+```bash
+curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/install_docker_compose.sh \
+  | sudo env ENABLE_WEB=true WEB_DOMAIN=web.example.com bash
+```
+
+This preserves `config.toml` and user secrets, adds the `mtproto-web-relay` profile service, and extends the existing `mtproto-mask-caddy` container. Source/systemd installations use `sudo /opt/mtproto-proxy/setup_web.sh web.example.com`. In tunnel-netns mode, rerunning `setup_tunnel.sh` refreshes the WEB backend/listener addresses automatically.
+
+To disable only WEB while preserving ordinary MTProto and Caddy masking:
+
+```bash
+sudo env MTPROTO_DOCKER_INSTALL=1 bash /opt/mtproto-proxy/setup_web.sh --remove
+```
 
 ## `make deploy` (current behavior)
 
@@ -140,6 +160,7 @@ Self-domain masking notes:
 - Public `:80` must be reachable for Let's Encrypt HTTP-01 unless the operator provisions certificates manually.
 - `setup_masking.sh` requires Caddy 2.10+ for `x25519mlkem768`, uses public `:80` for ACME HTTP-01, and configures all non-ACME HTTP/HTTPS requests to return 404.
 - `setup_masking.sh` installs a Let's Encrypt renewal hook that reloads the host Caddy service or recreates the Compose Caddy service after certificate renewal.
+- `setup_web.sh` obtains a separate certificate for `[web].domain`, validates the combined Caddy configuration before replacement, and installs a renewal hook for the WEB certificate.
 - `MASK_ALLOW_SELF_SIGNED=1` is available only as a dev/test fallback; the default flow fails closed when Let's Encrypt cannot issue a certificate.
 - `MASK_SET_PUBLIC_IP=0` skips rewriting `[server].public_ip`; otherwise `setup_masking.sh` sets it to the masking domain.
 - Cloudflare records for the proxy domain must be DNS-only, not proxied.

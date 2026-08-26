@@ -15,6 +15,7 @@
 #   SECRET=<32 hex chars>
 #   USE_MIDDLE_PROXY=true|false
 #   ENABLE_MASKING=true|false
+#   ENABLE_WEB=true|false WEB_DOMAIN=web.example.com
 #   ENABLE_TCPMSS=true|false
 #   ENABLE_SYNFIX=true|false
 #   SYNFIX_RATE=30/minute
@@ -35,6 +36,9 @@ AUTO_IMAGE_CPU_VARIANT="${AUTO_IMAGE_CPU_VARIANT:-true}"
 PORT="${PORT:-443}"
 USE_MIDDLE_PROXY="${USE_MIDDLE_PROXY:-true}"
 ENABLE_MASKING="${ENABLE_MASKING:-true}"
+if [[ -v ENABLE_WEB ]]; then ENABLE_WEB_EXPLICIT=true; else ENABLE_WEB_EXPLICIT=false; fi
+ENABLE_WEB="${ENABLE_WEB:-false}"
+WEB_DOMAIN="${WEB_DOMAIN:-}"
 ENABLE_TCPMSS="${ENABLE_TCPMSS:-false}"
 ENABLE_SYNFIX="${ENABLE_SYNFIX:-false}"
 SYNFIX_RATE="${SYNFIX_RATE:-30/minute}"
@@ -234,7 +238,7 @@ install_packages() {
 fetch_helper_scripts() {
     info "Fetching deployment helper scripts..."
     local file
-    for file in setup_masking.sh setup_nfqws.sh setup_synfix.sh setup_mask_monitor.sh ipv6-hop.sh update_dns.sh; do
+    for file in setup_masking.sh setup_web.sh setup_nfqws.sh setup_synfix.sh setup_mask_monitor.sh ipv6-hop.sh update_dns.sh; do
         curl -fsSL "${REPO_RAW_URL}/deploy/${file}" -o "${INSTALL_DIR}/${file}" \
             || fail "Failed to download deploy/${file}"
         chmod 0755 "${INSTALL_DIR}/${file}"
@@ -278,6 +282,7 @@ EOF
       - ./Caddyfile.mask:/etc/caddy/Caddyfile:ro
       - ${MASK_ACME_ROOT:-/var/www/certbot}:${MASK_ACME_ROOT:-/var/www/certbot}:ro
       - ${INSTALL_DIR:-/opt/mtproto-proxy}/caddy/ssl:${INSTALL_DIR:-/opt/mtproto-proxy}/caddy/ssl:ro
+      - ./caddy/web:/etc/caddy/web:ro
       - ./caddy/data:/data
       - ./caddy/config:/config
     logging:
@@ -288,12 +293,38 @@ EOF
 EOF
     fi
 
+    cat >> "$COMPOSE_FILE" <<'EOF'
+
+  mtproto-web-relay:
+    profiles: ["web"]
+    image: ${MTPROTO_IMAGE:-ghcr.io/xxcipherx/mtproto.zig:latest}
+    container_name: mtproto-web-relay
+    restart: unless-stopped
+    network_mode: host
+    command: ["web-relay", "/etc/mtproto-proxy/config.toml"]
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    volumes:
+      - ./config.toml:/etc/mtproto-proxy/config.toml:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+EOF
+
     cat > "$ENV_FILE" <<EOF
 INSTALL_DIR=${INSTALL_DIR}
 MTPROTO_IMAGE=${IMAGE}
 CADDY_IMAGE=${CADDY_IMAGE}
 MASK_ACME_ROOT=${MASK_ACME_ROOT}
 EOF
+    if is_true "$ENABLE_WEB"; then
+        printf 'COMPOSE_PROFILES=web\n' >> "$ENV_FILE"
+    fi
 }
 
 write_compose_service() {
@@ -541,6 +572,33 @@ setup_masking_and_desync() {
     fi
 }
 
+restore_existing_web_settings() {
+    $ENABLE_WEB_EXPLICIT && return
+    if is_true "$(get_config_value "$CONFIG_FILE" "web" "enabled" "false")"; then
+        ENABLE_WEB=true
+        WEB_DOMAIN="$(get_config_value "$CONFIG_FILE" "web" "domain" "$WEB_DOMAIN")"
+        info "Preserving the existing WEB proxy configuration for ${WEB_DOMAIN}"
+    fi
+}
+
+setup_web_proxy() {
+    if ! is_true "$ENABLE_WEB"; then
+        if $ENABLE_WEB_EXPLICIT && is_true "$(get_config_value "$CONFIG_FILE" "web" "enabled" "false")"; then
+            info "Disabling the existing WEB proxy because ENABLE_WEB=false was requested..."
+            MTPROTO_DOCKER_INSTALL=1 INSTALL_DIR="$INSTALL_DIR" COMPOSE_FILE="$COMPOSE_FILE" ENV_FILE="$ENV_FILE" \
+                bash "${INSTALL_DIR}/setup_web.sh" --remove < /dev/null
+            return
+        fi
+        info "WEB proxy disabled (set ENABLE_WEB=true WEB_DOMAIN=web.example.com to enable)"
+        return
+    fi
+    [[ -n "$WEB_DOMAIN" ]] || fail "ENABLE_WEB=true requires WEB_DOMAIN=web.example.com"
+    is_true "$ENABLE_MASKING" || fail "WEB proxy requires ENABLE_MASKING=true for ACME and SNI routing"
+    info "Setting up Telegram WEB proxy on ${WEB_DOMAIN}..."
+    MTPROTO_DOCKER_INSTALL=1 INSTALL_DIR="$INSTALL_DIR" COMPOSE_FILE="$COMPOSE_FILE" ENV_FILE="$ENV_FILE" \
+        WEB_DOMAIN="$WEB_DOMAIN" bash "${INSTALL_DIR}/setup_web.sh" "$WEB_DOMAIN" < /dev/null
+}
+
 validate_masking() {
     local attempt
     local masking_valid=false
@@ -596,6 +654,12 @@ print_summary() {
         echo -e "  ${CYAN}tg://proxy?server=${PUBLIC_IP}&port=${PORT}&secret=${GREEN}${link_secret}${RESET}"
         echo ""
         echo -e "  ${DIM}t.me/proxy?server=${PUBLIC_IP}&port=${PORT}&secret=${link_secret}${RESET}"
+        if is_true "$ENABLE_WEB" && [[ -n "$WEB_DOMAIN" ]]; then
+            echo ""
+            echo -e "  ${BOLD}WEB connection link:${RESET}"
+            echo -e "  ${CYAN}tg://webproxy?server=${WEB_DOMAIN}&secret=${GREEN}dd${SECRET}${RESET}"
+            echo -e "  ${DIM}t.me/webproxy?server=${WEB_DOMAIN}&secret=dd${SECRET}${RESET}"
+        fi
     else
         warn "Unable to build link: no valid 32-hex secret found in [access.users]"
     fi
@@ -637,6 +701,7 @@ mkdir -p "$INSTALL_DIR"
 install_packages
 fetch_helper_scripts
 write_config_if_missing
+restore_existing_web_settings
 write_compose_file
 stop_legacy_service
 write_compose_service
@@ -659,6 +724,7 @@ fi
 apply_firewall_and_tcpmss
 setup_ipv6_hopping
 setup_masking_and_desync
+setup_web_proxy
 
 info "Starting/reloading mtproto-proxy Docker Compose service"
 if start_or_reload_compose_service; then

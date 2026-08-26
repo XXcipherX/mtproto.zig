@@ -10,6 +10,40 @@ const compat = @import("compat.zig");
 pub const Config = struct {
     pub const UserSecret = struct { name: []const u8, secret: [16]u8 };
 
+    /// `[web]` config shared by the ordinary MTProxy data plane and the separate
+    /// `web-relay` process. Telegram's WEB proxy still authenticates with the same
+    /// `[access.users]` secrets; this section only configures its HTTPS carrier.
+    pub const Web = struct {
+        enabled: bool = false,
+        domain: ?[]const u8 = null,
+        host: ?[]const u8 = null,
+        port: u16 = 8081,
+        backend: ?[]const u8 = null,
+        mask_backend: ?[]const u8 = null,
+        ws_path: ?[]const u8 = null,
+        trust_forwarded_for: bool = true,
+        client_ip_header: ?[]const u8 = null,
+        check_origin: bool = true,
+        max_sessions: u32 = 8,
+        max_streams: u32 = 32,
+        max_buffer_mb: u32 = 128,
+        /// Extra relay source IP literals. Loopback is trusted automatically while
+        /// WEB mode is enabled; ports are ignored when matching these entries.
+        relay_sources: []const []const u8 = &.{},
+
+        pub fn effectiveHost(self: *const Web) []const u8 {
+            return self.host orelse "127.0.0.1";
+        }
+
+        pub fn effectiveWsPath(self: *const Web) []const u8 {
+            return self.ws_path orelse "/api/v1/socket";
+        }
+
+        pub fn effectiveClientIpHeader(self: *const Web) []const u8 {
+            return self.client_ip_header orelse "x-forwarded-for";
+        }
+    };
+
     /// Route regular DC traffic via Telegram MiddleProxy transport.
     /// Mirrors telemt's [general].use_middle_proxy behavior.
     use_middle_proxy: bool = false,
@@ -66,7 +100,8 @@ pub const Config = struct {
     mask: bool = true,
     /// Test-only hook to override the mask port
     mask_port: u16 = 443,
-    /// Maximum masking relay lifetime in seconds; 0 disables.
+    /// Maximum ordinary masking/probe relay lifetime in seconds; 0 disables.
+    /// WEB-domain carriers are exempt because their WebSocket is intentionally long-lived.
     mask_relay_max_secs: u32 = 0,
     /// TCP desync: split ServerHello into 1-byte + rest to evade DPI
     desync: bool = true,
@@ -102,6 +137,7 @@ pub const Config = struct {
     unsafe_override_limits: bool = false,
     /// Test-only hook to redirect upstream connections locally
     datacenter_override: ?net.Address = null,
+    web: Web = .{},
 
     /// Both relay directions ultimately feed a MessageQueue with this cap.
     /// Keep the value here so MiddleProxy framing and proxy backpressure share
@@ -142,6 +178,36 @@ pub const Config = struct {
 
     /// Emit startup warnings for configuration values known to cause issues.
     pub fn emitWarnings(self: *const Config) void {
+        if (self.web.enabled) {
+            const log = std.log.scoped(.config);
+            const worst = @as(u64, self.web.max_sessions) * (@as(u64, self.web.max_streams) + 1);
+            if (worst > self.max_connections) {
+                log.warn(
+                    "[web] may occupy up to {d} proxy connections ({d} sessions x ({d} streams + carrier)); max_connections is {d}",
+                    .{ worst, self.web.max_sessions, self.web.max_streams, self.max_connections },
+                );
+            }
+            if (self.web.domain == null) {
+                log.err("[web].enabled=true requires [web].domain", .{});
+            } else if (std.ascii.eqlIgnoreCase(self.web.domain.?, self.tls_domain)) {
+                log.err("[web].domain must differ from censorship.tls_domain", .{});
+            }
+            if (!self.mask) {
+                log.err("[web].enabled=true requires censorship.mask=true on a shared :443 listener", .{});
+            }
+            if (self.web.mask_backend == null) {
+                log.warn("[web].mask_backend is unset; WEB traffic reaching the proxy's :443 listener cannot be routed to its Caddy terminator", .{});
+            }
+            if (self.web.port == self.port or self.web.port == self.mask_port) {
+                log.err("[web].port={d} collides with proxy or masking listener", .{self.web.port});
+            }
+            for (self.web.relay_sources) |source| {
+                _ = std.Io.net.IpAddress.parse(source, 0) catch {
+                    log.warn("[web].relay_sources entry '{s}' is not an IP literal and will be ignored", .{source});
+                    continue;
+                };
+            }
+        }
         if (self.users.count() == 0) {
             const log = std.log.scoped(.config);
             log.warn("access.users is empty; no clients can authenticate until at least one user secret is configured", .{});
@@ -304,6 +370,58 @@ pub const Config = struct {
         }
     }
 
+    fn freeOwnedStringSlice(allocator: std.mem.Allocator, values: []const []const u8) void {
+        if (values.len == 0) return;
+        for (values) |value| allocator.free(value);
+        allocator.free(values);
+    }
+
+    /// Parse the small TOML string-array subset needed by `[web].relay_sources`.
+    /// Each element must be quoted; escapes are intentionally rejected because the
+    /// accepted values are plain IP literals.
+    fn parseStringArraySetting(allocator: std.mem.Allocator, value: []const u8) ![]const []const u8 {
+        const text = std.mem.trim(u8, value, " \t");
+        if (text.len < 2 or text[0] != '[' or text[text.len - 1] != ']') {
+            return error.InvalidStringArray;
+        }
+
+        var list: std.ArrayList([]const u8) = .empty;
+        errdefer {
+            for (list.items) |item| allocator.free(item);
+            list.deinit(allocator);
+        }
+
+        var pos: usize = 1;
+        const end = text.len - 1;
+        while (true) {
+            while (pos < end and (text[pos] == ' ' or text[pos] == '\t')) pos += 1;
+            if (pos == end) break;
+            if (text[pos] != '"') return error.InvalidStringArray;
+            pos += 1;
+            const start = pos;
+            while (pos < end and text[pos] != '"') : (pos += 1) {
+                if (text[pos] == '\\') return error.InvalidStringArray;
+            }
+            if (pos >= end) return error.InvalidStringArray;
+            const owned = try allocator.dupe(u8, text[start..pos]);
+            list.append(allocator, owned) catch |err| {
+                allocator.free(owned);
+                return err;
+            };
+            pos += 1;
+            while (pos < end and (text[pos] == ' ' or text[pos] == '\t')) pos += 1;
+            if (pos == end) break;
+            if (text[pos] != ',') return error.InvalidStringArray;
+            pos += 1;
+        }
+
+        if (list.items.len == 0) {
+            list.deinit(allocator);
+            return &.{};
+        }
+        return try list.toOwnedSlice(allocator);
+    }
+
     pub fn parse(allocator: std.mem.Allocator, content: []const u8) !Config {
         var cfg = Config{
             .users = std.StringHashMap([16]u8).init(allocator),
@@ -318,6 +436,7 @@ pub const Config = struct {
         var in_server_section = false;
         var in_general_section = false;
         var in_monitor_section = false;
+        var in_web_section = false;
         var server_tag_set = false;
         var line_number: usize = 0;
 
@@ -338,8 +457,9 @@ pub const Config = struct {
                 in_server_section = std.mem.eql(u8, line, "[server]");
                 in_general_section = std.mem.eql(u8, line, "[general]");
                 in_monitor_section = std.mem.eql(u8, line, "[monitor]");
+                in_web_section = std.mem.eql(u8, line, "[web]");
                 if (!in_users_section and !in_direct_users_section and !in_censorship_section and
-                    !in_server_section and !in_general_section and !in_monitor_section)
+                    !in_server_section and !in_general_section and !in_monitor_section and !in_web_section)
                 {
                     return failConfigLine(error.UnknownConfigSection, line_number, line);
                 }
@@ -506,6 +626,44 @@ pub const Config = struct {
                     } else {
                         return failConfigLine(error.UnknownConfigKey, line_number, line);
                     }
+                } else if (in_web_section) {
+                    if (std.mem.eql(u8, key, "enabled")) {
+                        if (parseBoolSetting(key, value)) |parsed| cfg.web.enabled = parsed;
+                    } else if (std.mem.eql(u8, key, "domain")) {
+                        try replaceOwnedOptionalString(allocator, &cfg.web.domain, value);
+                    } else if (std.mem.eql(u8, key, "listen") or std.mem.eql(u8, key, "host")) {
+                        try replaceOwnedOptionalString(allocator, &cfg.web.host, value);
+                    } else if (std.mem.eql(u8, key, "port")) {
+                        if (parseIntSetting(u16, key, value)) |parsed| {
+                            if (parsed == 0) warnInvalidValue(key, value, "integer in 1..65535") else cfg.web.port = parsed;
+                        }
+                    } else if (std.mem.eql(u8, key, "backend")) {
+                        try replaceOwnedOptionalString(allocator, &cfg.web.backend, value);
+                    } else if (std.mem.eql(u8, key, "mask_backend")) {
+                        try replaceOwnedOptionalString(allocator, &cfg.web.mask_backend, value);
+                    } else if (std.mem.eql(u8, key, "ws_path")) {
+                        try replaceOwnedOptionalString(allocator, &cfg.web.ws_path, value);
+                    } else if (std.mem.eql(u8, key, "trust_forwarded_for")) {
+                        if (parseBoolSetting(key, value)) |parsed| cfg.web.trust_forwarded_for = parsed;
+                    } else if (std.mem.eql(u8, key, "client_ip_header")) {
+                        try replaceOwnedOptionalString(allocator, &cfg.web.client_ip_header, value);
+                    } else if (std.mem.eql(u8, key, "check_origin")) {
+                        if (parseBoolSetting(key, value)) |parsed| cfg.web.check_origin = parsed;
+                    } else if (std.mem.eql(u8, key, "max_sessions")) {
+                        if (parseIntSetting(u32, key, value)) |parsed| cfg.web.max_sessions = @max(@as(u32, 1), parsed);
+                    } else if (std.mem.eql(u8, key, "max_streams")) {
+                        if (parseIntSetting(u32, key, value)) |parsed| cfg.web.max_streams = @max(@as(u32, 1), parsed);
+                    } else if (std.mem.eql(u8, key, "max_buffer_mb")) {
+                        if (parseIntSetting(u32, key, value)) |parsed| cfg.web.max_buffer_mb = @max(@as(u32, 8), parsed);
+                    } else if (std.mem.eql(u8, key, "relay_sources")) {
+                        const parsed = parseStringArraySetting(allocator, value) catch {
+                            return failConfigLine(error.InvalidStringArray, line_number, line);
+                        };
+                        freeOwnedStringSlice(allocator, cfg.web.relay_sources);
+                        cfg.web.relay_sources = parsed;
+                    } else {
+                        return failConfigLine(error.UnknownConfigKey, line_number, line);
+                    }
                 } else if (in_monitor_section) {
                     if (!std.mem.eql(u8, key, "host") and !std.mem.eql(u8, key, "port")) {
                         return failConfigLine(error.UnknownConfigKey, line_number, line);
@@ -546,6 +704,13 @@ pub const Config = struct {
         if (self.middle_proxy_nat_ip) |ip| {
             allocator.free(ip);
         }
+        if (self.web.domain) |value| allocator.free(value);
+        if (self.web.host) |value| allocator.free(value);
+        if (self.web.backend) |value| allocator.free(value);
+        if (self.web.mask_backend) |value| allocator.free(value);
+        if (self.web.ws_path) |value| allocator.free(value);
+        if (self.web.client_ip_header) |value| allocator.free(value);
+        freeOwnedStringSlice(allocator, self.web.relay_sources);
     }
 
     /// Get user secrets as a flat caller-owned slice for handshake validation.
@@ -1397,4 +1562,50 @@ test "parse config - multiple users" {
     const alice_secret = cfg.users.get("alice").?;
     try std.testing.expectEqual(@as(u8, 0x00), alice_secret[0]);
     try std.testing.expectEqual(@as(u8, 0xff), alice_secret[15]);
+}
+
+test "parse config - WEB relay settings" {
+    const content =
+        \\[web]
+        \\enabled = true
+        \\domain = "web.example.com"
+        \\listen = "127.0.0.1"
+        \\port = 8081
+        \\backend = "127.0.0.1:443"
+        \\mask_backend = "127.0.0.1:8444"
+        \\ws_path = "/api/v1/socket"
+        \\trust_forwarded_for = true
+        \\client_ip_header = "x-forwarded-for"
+        \\check_origin = true
+        \\max_sessions = 8
+        \\max_streams = 32
+        \\max_buffer_mb = 96
+        \\relay_sources = ["10.200.200.1", "2001:db8::1"]
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expect(cfg.web.enabled);
+    try std.testing.expectEqualStrings("web.example.com", cfg.web.domain.?);
+    try std.testing.expectEqualStrings("127.0.0.1", cfg.web.effectiveHost());
+    try std.testing.expectEqual(@as(u16, 8081), cfg.web.port);
+    try std.testing.expectEqualStrings("127.0.0.1:443", cfg.web.backend.?);
+    try std.testing.expectEqualStrings("127.0.0.1:8444", cfg.web.mask_backend.?);
+    try std.testing.expectEqual(@as(u32, 8), cfg.web.max_sessions);
+    try std.testing.expectEqual(@as(u32, 32), cfg.web.max_streams);
+    try std.testing.expectEqual(@as(u32, 96), cfg.web.max_buffer_mb);
+    try std.testing.expectEqual(@as(usize, 2), cfg.web.relay_sources.len);
+    try std.testing.expectEqualStrings("10.200.200.1", cfg.web.relay_sources[0]);
+    try std.testing.expectEqualStrings("2001:db8::1", cfg.web.relay_sources[1]);
+}
+
+test "parse config - malformed WEB relay source array is rejected" {
+    const content =
+        \\[web]
+        \\relay_sources = ["127.0.0.1", unquoted]
+    ;
+    try std.testing.expectError(error.InvalidStringArray, Config.parse(std.testing.allocator, content));
 }

@@ -50,8 +50,10 @@ case "${MTPROTO_DOCKER_INSTALL:-0}" in
 esac
 if [[ "$CADDY_RUNTIME" == "docker" ]]; then
     CADDYFILE="${MASK_CADDYFILE:-${INSTALL_DIR}/Caddyfile.mask}"
+    CADDY_WEB_DIR="${INSTALL_DIR}/caddy/web"
 else
     CADDYFILE="${MASK_CADDYFILE:-/etc/caddy/mtproto-mask.Caddyfile}"
+    CADDY_WEB_DIR="/etc/caddy/web"
 fi
 TUNNEL_HOST_IP=""
 
@@ -369,13 +371,16 @@ write_caddy_config() {
         bind_line="    bind 127.0.0.1 ${TUNNEL_HOST_IP}"
     fi
 
-    mkdir -p "$(dirname "$CADDYFILE")"
+    mkdir -p "$(dirname "$CADDYFILE")" "$CADDY_WEB_DIR"
+    touch "$CADDY_WEB_DIR/global.caddy" "$CADDY_WEB_DIR/site.caddy"
+    chmod 0644 "$CADDY_WEB_DIR/global.caddy" "$CADDY_WEB_DIR/site.caddy"
     cat > "$CADDYFILE" << CADDYEOF
-# mtproto-proxy self-domain 404 masking backend.
-# Public :443 is owned by mtproto-proxy. Caddy is only the 404 masking backend.
+# mtproto-proxy Caddy backend.
+# Public :443 is owned by mtproto-proxy. Optional WEB routes are imported below.
 
 {
     auto_https off
+    import /etc/caddy/web/global.caddy
 }
 
 http://:80 {
@@ -399,6 +404,11 @@ ${bind_line}
 }
 CADDYEOF
     fi
+
+    cat >> "$CADDYFILE" <<'CADDYEOF'
+
+import /etc/caddy/web/site.caddy
+CADDYEOF
 
     chown root:root "$CADDYFILE"
     chmod 0644 "$CADDYFILE"

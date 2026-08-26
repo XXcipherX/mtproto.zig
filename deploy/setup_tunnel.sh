@@ -23,8 +23,9 @@
 #   5. Adds policy routing so response packets go back to clients (not into tunnel)
 #   6. Patches the systemd service to run the proxy inside the namespace
 #   7. Applies selected tunnel mode for use_middle_proxy (direct/preserve/middleproxy)
-#   8. Adjusts local masking for netns mode + enables masking monitor
+#   8. Adjusts local Caddy masking for netns mode + enables masking monitor
 #   9. Restarts the proxy
+#  10. Refreshes an enabled WEB relay/Caddy route for the tunnel addresses
 #
 # Architecture:
 #
@@ -441,6 +442,32 @@ else
     fail "Proxy failed to start. Check: journalctl -u mtproto-proxy -n 30"
 fi
 
+# An already-enabled WEB deployment must follow the data plane into the network
+# namespace: Caddy reaches 10.200.200.1, while the relay opens MTProto streams to
+# 10.200.200.2. Re-running the idempotent Caddy-only helper updates those trusted
+# addresses and keeps ordinary MTProto enabled on the same public listener.
+WEB_ENABLED="$(get_config_value "$INSTALL_DIR/config.toml" "web" "enabled" "false")"
+WEB_DOMAIN="$(get_config_value "$INSTALL_DIR/config.toml" "web" "domain" "")"
+case "${WEB_ENABLED,,}" in
+    1|true|yes|on)
+        WEB_SETUP="${INSTALL_DIR}/setup_web.sh"
+        if [[ ! -x "$WEB_SETUP" ]]; then
+            WEB_SETUP="$(dirname "$0")/setup_web.sh"
+        fi
+
+        if [[ -x "$WEB_SETUP" && -n "$WEB_DOMAIN" ]]; then
+            info "Refreshing WEB relay and Caddy route for tunnel netns..."
+            if INSTALL_DIR="$INSTALL_DIR" bash "$WEB_SETUP" "$WEB_DOMAIN" < /dev/null; then
+                ok "WEB relay now uses the tunnel-aware backend and Caddy listener"
+            else
+                fail "WEB relay refresh failed; ordinary proxy is running but WEB routing is not ready"
+            fi
+        else
+            fail "WEB proxy is enabled, but setup_web.sh or [web].domain is missing"
+        fi
+        ;;
+esac
+
 # ── Step 7: Validate tunnel connectivity ────────────────────
 info "Validating Telegram DC connectivity through tunnel..."
 FAIL=0
@@ -484,6 +511,16 @@ if [[ -n "$EE_SECRET" ]]; then
 echo -e "  ${CYAN}tg://proxy?server=${PUBLIC_IP}&port=${PORT}&secret=${GREEN}${EE_SECRET}${RESET}"
 echo ""
 echo -e "  ${DIM}t.me/proxy?server=${PUBLIC_IP}&port=${PORT}&secret=${EE_SECRET}${RESET}"
+case "${WEB_ENABLED,,}" in
+    1|true|yes|on)
+        if [[ -n "$WEB_DOMAIN" ]]; then
+            echo ""
+            echo -e "  ${BOLD}WEB connection link:${RESET}"
+            echo -e "  ${CYAN}tg://webproxy?server=${WEB_DOMAIN}&secret=${GREEN}dd${SECRET}${RESET}"
+            echo -e "  ${DIM}t.me/webproxy?server=${WEB_DOMAIN}&secret=dd${SECRET}${RESET}"
+        fi
+        ;;
+esac
 else
 echo -e "  ${RED}Unable to build link:${RESET} no valid 32-hex secret found in [access.users]"
 fi

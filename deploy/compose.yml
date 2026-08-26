@@ -11,3 +11,22 @@ services:
       options:
         max-size: 10m
         max-file: "3"
+
+  mtproto-web-relay:
+    profiles: ["web"]
+    image: ${MTPROTO_IMAGE:-ghcr.io/xxcipherx/mtproto.zig:latest}
+    container_name: mtproto-web-relay
+    restart: unless-stopped
+    network_mode: host
+    command: ["web-relay", "/etc/mtproto-proxy/config.toml"]
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    volumes:
+      - ./config.toml:/etc/mtproto-proxy/config.toml:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"

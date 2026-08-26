@@ -28,6 +28,12 @@ ssh root@<SERVER_IP> 'cat /proc/$(pgrep -f mtproto-proxy)/limits | grep "open fi
 # Recent logs
 ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy --since "1 hour ago" --no-pager'
 
+# WEB source install: data plane, relay, and shared Caddy terminator
+ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy -u mtproto-web-relay -u mtproto-mask-caddy --since "1 hour ago" --no-pager'
+
+# WEB Docker install
+ssh root@<SERVER_IP> 'cd /opt/mtproto-proxy && docker compose --env-file .env -f compose.yml logs --since 1h mtproto-proxy mtproto-web-relay mtproto-mask-caddy'
+
 # Runtime capacity / fd-pressure signals
 ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy --since "1 hour ago" --no-pager | grep -E "conn stats|drops:|auto-clamping max_connections|baseline RAM ceiling|RAM admission clamp|max_connections clamped|fd quota reached|failed to resume accepts|connection saturation|saturation eased"'
 
@@ -53,6 +59,8 @@ Note:
 - `drops: ... hs_budget+=...` means the global handshake-inflight budget or the per-subnet unauthenticated concurrency allowance rejected a new handshake.
 - `drops: ... mp_fallback+=...` means MiddleProxy degraded and the proxy recovered by reconnecting directly to the same DC.
 - `drops: ... rate+=...` means the per-subnet token bucket rejected new connections; IPv4-mapped IPv6 addresses are grouped with their native IPv4 `/24`.
+- A healthy WEB carrier logs `web session opened ... (client address: real)` in the relay. `loopback` there means the browser address was not preserved through the Caddy/PROXY-v2 hop; inspect `[web].mask_backend`, Caddy listener wrappers, and `X-Forwarded-For` handling.
+- WEB stream failures should be correlated across `mtproto-web-relay` and the main proxy. The relay opens one backend connection per logical stream, so those streams also appear in the proxy's ordinary connection and close statistics.
 
 ## IPv6 Hopping and DNS
 

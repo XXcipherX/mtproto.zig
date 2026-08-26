@@ -121,6 +121,54 @@ port = 443
 # TCP port for the monitoring dashboard.
 # port = 61208
 
+[web]
+# Optional Telegram Desktop 7.1+ WEB transport. It runs alongside ordinary
+# FakeTLS MTProto; enabling it does not replace or disable existing links.
+# The bundled setup_web.sh extends the existing Caddy masking service and runs
+# `mtproto-proxy web-relay` as a separate process/container.
+# enabled = false
+
+# Public DNS name in tg://webproxy links. Use a second DNS-only A record that
+# points to this VPS. It MUST differ from censorship.tls_domain, because the two
+# names select different Caddy paths behind the same public :443 listener.
+# domain = "web.example.com"
+
+# Plain HTTP/WebSocket relay listener behind Caddy. Keep this local.
+# listen = "127.0.0.1"
+# port = 8081
+
+# Data-plane endpoint opened for each logical MTProto stream. The local default
+# is this proxy on server.port. Tunnel-netns installs use 10.200.200.2:443.
+# backend = "127.0.0.1:443"
+
+# Caddy TLS listener used only for WEB-domain SNI. It accepts a PROXY v2 header
+# from the main proxy so the browser address survives the masking hop.
+# setup_web.sh writes 127.0.0.1:8444 (or 10.200.200.1:8444 in tunnel mode).
+# mask_backend = "127.0.0.1:8444"
+
+# Same-origin WebSocket path embedded in the authenticated bridge page.
+# ws_path = "/api/v1/socket"
+
+# Caddy supplies X-Forwarded-For from the trusted PROXY v2 address. The relay
+# reads only the right-most value, which is written by the immediate hop.
+# trust_forwarded_for = true
+# client_ip_header = "x-forwarded-for"
+
+# Require Origin: https://<domain> on WebSocket upgrades.
+# check_origin = true
+
+# Resource limits. Every session occupies one front/masking connection plus up
+# to max_streams data-plane connections. setup_web.sh uses 8 x 32 by default,
+# at most 264 of the default 512 connection slots.
+# max_sessions = 8
+# max_streams = 32
+# max_buffer_mb = 128
+
+# Additional relay source IP literals trusted to send the direct-obfuscated
+# WEB stream into the data plane. Loopback is implicit. Tunnel-netns setup uses
+# ["10.200.200.1"]. Do not list untrusted addresses or CIDRs.
+# relay_sources = []
+
 [censorship]
 # Self-domain masking domain. Point this domain's DNS A record to this VPS.
 # Public :443 is handled by mtproto-proxy; ordinary HTTPS clients are forwarded
@@ -141,8 +189,9 @@ mask = true
 # netns mode, the runtime automatically targets 10.200.200.1:8443.
 mask_port = 8443
 
-# Maximum lifetime for a masking relay connection. This limits active probes
-# that keep the Caddy 404 backend connection open. 0 disables the cap.
+# Maximum lifetime for an ordinary masking relay connection. This limits active
+# probes that keep the Caddy 404 backend open. WEB-domain carriers are exempt.
+# 0 disables the cap for all masking relays.
 # mask_relay_max_secs = 0
 
 # Split ServerHello into 1-byte + short delay + rest (defeats passive DPI signatures).

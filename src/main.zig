@@ -14,6 +14,8 @@ const obfuscation = @import("protocol/obfuscation.zig");
 const tls = @import("protocol/tls.zig");
 const config = @import("config.zig");
 const proxy = @import("proxy/proxy.zig");
+const web_capability = @import("web/capability.zig");
+const web_relay = @import("web/relay.zig");
 
 // Custom lock-free log function: formats into a stack buffer and writes
 // to stderr in a single write() syscall. On Linux, write() is atomic for
@@ -725,6 +727,13 @@ fn writeConnectionLinkEntries(cfg: config.Config) void {
         writeRaw("      " ++ red ++ "⚠  public_ip is not configured; replace <SERVER_IP> manually." ++ R ++ "\n");
     }
 
+    var web_domain_buf: [web_capability.max_host_len]u8 = undefined;
+    const web_domain: ?[]const u8 = blk: {
+        if (!cfg.web.enabled) break :blk null;
+        const raw = cfg.web.domain orelse break :blk null;
+        break :blk web_capability.normalizeHost(raw, &web_domain_buf) catch null;
+    };
+
     var users = cfg.users;
     var it = users.iterator();
     while (it.next()) |entry| {
@@ -748,7 +757,40 @@ fn writeConnectionLinkEntries(cfg: config.Config) void {
             writeHexByte(byte);
         }
         writeRaw(R ++ "\n");
+
+        if (web_domain) |domain| {
+            writeStdout("      " ++ cyan ++ "tg://" ++ R ++ "webproxy?server={s}&secret=" ++ green ++ "dd", .{domain});
+            for (entry.value_ptr.*) |byte| writeHexByte(byte);
+            writeRaw(R ++ "\n");
+
+            writeStdout("      " ++ D ++ "t.me/webproxy?server={s}&secret=dd", .{domain});
+            for (entry.value_ptr.*) |byte| writeHexByte(byte);
+            writeRaw(R ++ "\n");
+        }
     }
+}
+
+fn runWebRelay(allocator: std.mem.Allocator, cfg: *const config.Config) !void {
+    var domain_buf: [web_capability.max_host_len]u8 = undefined;
+    var opts = web_relay.Options.fromConfig(cfg, &domain_buf) catch |err| {
+        const hint = switch (err) {
+            error.WebProxyDisabled => "set [web].enabled = true",
+            error.MissingDomain => "set [web].domain to the public WEB hostname",
+            error.InvalidDomain => "[web].domain must be an ASCII DNS hostname, not an IP",
+            error.InvalidBackend => "[web].backend must be host:port",
+            error.NoUsersConfigured => "add at least one [access.users] entry",
+        };
+        writeStderr("web relay cannot start: {s} ({s})\n", .{ @errorName(err), hint });
+        return err;
+    };
+    opts.backend = web_relay.resolveBackend(allocator, cfg) catch |err| {
+        writeStderr("web relay cannot resolve [web].backend: {s}\n", .{@errorName(err)});
+        return err;
+    };
+
+    var relay = try web_relay.Relay.init(allocator, opts, cfg);
+    defer relay.deinit();
+    try relay.run();
 }
 
 /// Print connection links and return without starting the proxy.
@@ -822,7 +864,14 @@ fn printBanner(
     } else {
         writeRaw(yellow ++ "disabled");
     }
-    writeRaw(R ++ "\n\n");
+    writeRaw(R ++ "\n");
+    writeRaw("      WEB Proxy    " ++ B);
+    if (cfg.web.enabled) {
+        writeStdout(green ++ "enabled" ++ R ++ " ({s})", .{cfg.web.domain orelse "domain missing"});
+    } else {
+        writeRaw(D ++ "disabled" ++ R);
+    }
+    writeRaw("\n\n");
 
     if (capacity_estimate) |est| {
         const capacity_mode = if (cfg.use_middle_proxy)
@@ -842,6 +891,14 @@ fn printBanner(
         });
         writeStdout("      RAM ceiling  " ++ B ++ "~{d}" ++ R ++ " baseline connections\n", .{est.safe_connections});
         writeStdout("      Configured   " ++ B ++ "{d}" ++ R ++ " connections\n", .{cfg.max_connections});
+        if (cfg.web.enabled) {
+            const web_slots = @as(u64, cfg.web.max_sessions) * (@as(u64, cfg.web.max_streams) + 1);
+            writeStdout("      WEB budget   up to {d} slots ({d} sessions × ({d} streams + carrier))\n", .{
+                web_slots,
+                cfg.web.max_sessions,
+                cfg.web.max_streams,
+            });
+        }
         writeRaw("      Admission    pauses at 90%, resumes at 80%\n");
         if (cfg.max_connections > est.safe_connections) {
             writeStdout("      " ++ yellow ++ "configured limit exceeds baseline RAM ceiling" ++ R ++ "\n", .{});
@@ -899,8 +956,11 @@ pub fn main(init: std.process.Init) !void {
     var config_path_set = false;
     var show_secrets = false;
     var print_links = false;
+    var web_relay_mode = false;
     while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--show-secrets")) {
+        if (std.mem.eql(u8, arg, "web-relay") and !config_path_set and !web_relay_mode) {
+            web_relay_mode = true;
+        } else if (std.mem.eql(u8, arg, "--show-secrets")) {
             show_secrets = true;
         } else if (std.mem.eql(u8, arg, "--print-links")) {
             print_links = true;
@@ -908,7 +968,7 @@ pub fn main(init: std.process.Init) !void {
             config_path = arg;
             config_path_set = true;
         } else {
-            writeStderr("\n  Usage: mtproto-proxy [config.toml] [--show-secrets | --print-links]\n\n", .{});
+            writeStderr("\n  Usage: mtproto-proxy [config.toml] [--show-secrets | --print-links]\n         mtproto-proxy web-relay [config.toml]\n\n", .{});
             return error.InvalidArguments;
         }
     }
@@ -916,13 +976,19 @@ pub fn main(init: std.process.Init) !void {
     // Parse config
     var cfg = config.Config.loadFromFile(allocator, config_path) catch |err| {
         writeStderr("\x1b[1m\x1b[31m  ✗ Failed to load config '{s}': {}\x1b[0m\n", .{ config_path, err });
-        writeStderr("\n  Usage: mtproto-proxy [config.toml] [--show-secrets | --print-links]\n\n", .{});
+        writeStderr("\n  Usage: mtproto-proxy [config.toml] [--show-secrets | --print-links]\n         mtproto-proxy web-relay [config.toml]\n\n", .{});
         return err;
     };
     defer cfg.deinit(allocator);
 
     // Apply runtime log level from config
     runtime_log_level = cfg.log_level;
+
+    if (web_relay_mode) {
+        if (show_secrets or print_links) return error.InvalidArguments;
+        cfg.emitWarnings();
+        return runWebRelay(allocator, &cfg);
+    }
 
     if (print_links) {
         printConnectionLinks(cfg);
@@ -980,6 +1046,13 @@ test {
     _ = tls;
     _ = config;
     _ = proxy;
+    _ = @import("proxy/web_support.zig");
+    _ = @import("web/frame.zig");
+    _ = @import("web/capability.zig");
+    _ = @import("web/ws.zig");
+    _ = @import("web/http.zig");
+    _ = @import("web/page.zig");
+    _ = web_relay;
 }
 
 test "shutdown signal mask covers SIGINT and SIGTERM" {
