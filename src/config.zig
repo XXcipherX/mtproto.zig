@@ -6,8 +6,103 @@
 const std = @import("std");
 const net = @import("net_compat.zig");
 const compat = @import("compat.zig");
+const web_capability = @import("web/capability.zig");
+
+fn hasAsciiSpaceOrControl(value: []const u8) bool {
+    for (value) |byte| {
+        if (byte <= ' ' or byte == 0x7f) return true;
+    }
+    return false;
+}
+
+fn isValidDomain(value: []const u8) bool {
+    if (value.len == 0 or hasAsciiSpaceOrControl(value)) return false;
+    var normalized: [web_capability.max_host_len]u8 = undefined;
+    _ = web_capability.normalizeHost(value, &normalized) catch return false;
+    return true;
+}
+
+fn isValidEndpointHost(value: []const u8) bool {
+    if (value.len == 0 or hasAsciiSpaceOrControl(value)) return false;
+
+    var host = value;
+    if (host.len >= 2 and host[0] == '[' and host[host.len - 1] == ']') {
+        host = host[1 .. host.len - 1];
+    }
+    if (host.len == 0) return false;
+
+    if (std.Io.net.IpAddress.parse(host, 0)) |_| return true else |_| {}
+    std.Io.net.HostName.validate(host) catch return false;
+    return true;
+}
+
+fn isValidHostPort(value: []const u8) bool {
+    if (value.len == 0 or hasAsciiSpaceOrControl(value)) return false;
+    const colon = std.mem.lastIndexOfScalar(u8, value, ':') orelse return false;
+    if (colon == 0 or colon + 1 >= value.len) return false;
+
+    const port = std.fmt.parseInt(u16, value[colon + 1 ..], 10) catch return false;
+    if (port == 0) return false;
+
+    var host = value[0..colon];
+    if (host.len >= 2 and host[0] == '[' and host[host.len - 1] == ']') {
+        host = host[1 .. host.len - 1];
+    }
+    return isValidEndpointHost(host);
+}
+
+fn isValidIpv4Literal(value: []const u8) bool {
+    var parts = std.mem.splitScalar(u8, value, '.');
+    var count: usize = 0;
+    while (parts.next()) |part| {
+        if (count >= 4 or part.len == 0 or part.len > 3) return false;
+        _ = std.fmt.parseInt(u8, part, 10) catch return false;
+        count += 1;
+    }
+    return count == 4;
+}
+
+fn isValidWsPath(value: []const u8) bool {
+    if (value.len == 0 or value.len > 2048 or value[0] != '/') return false;
+    for (value) |byte| {
+        if (byte <= ' ' or byte == 0x7f or byte == '?' or byte == '#') return false;
+    }
+    return true;
+}
+
+fn isValidHttpToken(value: []const u8) bool {
+    if (value.len == 0 or value.len > 128) return false;
+    for (value) |byte| {
+        const alpha_num = std.ascii.isAlphanumeric(byte);
+        const punctuation = switch (byte) {
+            '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => true,
+            else => false,
+        };
+        if (!alpha_num and !punctuation) return false;
+    }
+    return true;
+}
 
 pub const Config = struct {
+    pub const ValidationError = error{
+        EmptyUsers,
+        InvalidTlsDomain,
+        InvalidPublicAddress,
+        InvalidMiddleProxyNatIp,
+        MissingWebDomain,
+        InvalidWebDomain,
+        WebDomainMatchesTlsDomain,
+        WebRequiresMasking,
+        MissingWebMaskBackend,
+        InvalidWebMaskBackend,
+        InvalidWebBackend,
+        InvalidWebListenHost,
+        WebListenerPortCollision,
+        InvalidWebSocketPath,
+        InvalidWebClientIpHeader,
+        InvalidWebRelaySource,
+    };
+
     pub const UserSecret = struct { name: []const u8, secret: [16]u8 };
 
     /// `[web]` config shared by the ordinary MTProxy data plane and the separate
@@ -175,6 +270,65 @@ pub const Config = struct {
 
     pub fn userBypassesMiddleProxy(self: *const Config, user_name: []const u8) bool {
         return self.users.contains(user_name) and self.direct_users.contains(user_name);
+    }
+
+    pub fn validationErrorMessage(err: ValidationError) []const u8 {
+        return switch (err) {
+            error.EmptyUsers => "[access.users] must contain at least one valid 32-hex user secret",
+            error.InvalidTlsDomain => "censorship.tls_domain must be a valid fully-qualified ASCII hostname",
+            error.InvalidPublicAddress => "server.public_ip must be a valid IP literal or hostname",
+            error.InvalidMiddleProxyNatIp => "server.middle_proxy_nat_ip must be an IPv4 literal",
+            error.MissingWebDomain => "[web].enabled=true requires [web].domain",
+            error.InvalidWebDomain => "[web].domain must be a valid fully-qualified ASCII hostname",
+            error.WebDomainMatchesTlsDomain => "[web].domain must differ from censorship.tls_domain",
+            error.WebRequiresMasking => "[web].enabled=true requires censorship.mask=true",
+            error.MissingWebMaskBackend => "[web].enabled=true requires [web].mask_backend",
+            error.InvalidWebMaskBackend => "[web].mask_backend must be a valid host:port endpoint",
+            error.InvalidWebBackend => "[web].backend must be a valid host:port endpoint",
+            error.InvalidWebListenHost => "[web].host must be a valid IP literal or hostname",
+            error.WebListenerPortCollision => "[web].port must not collide with the proxy or masking port",
+            error.InvalidWebSocketPath => "[web].ws_path must be an absolute path without whitespace, query, or fragment",
+            error.InvalidWebClientIpHeader => "[web].client_ip_header must be a valid HTTP field name",
+            error.InvalidWebRelaySource => "every [web].relay_sources entry must be an IP literal",
+        };
+    }
+
+    /// Validate relationships that parsing individual TOML values cannot prove.
+    /// This is intentionally offline: no DNS lookup or socket is attempted.
+    pub fn validate(self: *const Config) ValidationError!void {
+        if (self.users.count() == 0) return error.EmptyUsers;
+        if (!isValidDomain(self.tls_domain)) return error.InvalidTlsDomain;
+
+        if (self.public_ip) |value| {
+            if (!isValidEndpointHost(value)) return error.InvalidPublicAddress;
+        }
+        if (self.middle_proxy_nat_ip) |value| {
+            if (!isValidIpv4Literal(value)) return error.InvalidMiddleProxyNatIp;
+        }
+
+        if (!self.web.enabled) return;
+
+        const web_domain = self.web.domain orelse return error.MissingWebDomain;
+        if (!isValidDomain(web_domain)) return error.InvalidWebDomain;
+        if (std.ascii.eqlIgnoreCase(web_domain, self.tls_domain)) return error.WebDomainMatchesTlsDomain;
+        if (!self.mask) return error.WebRequiresMasking;
+
+        const mask_backend = self.web.mask_backend orelse return error.MissingWebMaskBackend;
+        if (!isValidHostPort(mask_backend)) return error.InvalidWebMaskBackend;
+        if (self.web.backend) |backend| {
+            if (!isValidHostPort(backend)) return error.InvalidWebBackend;
+        }
+        if (self.web.host) |host| {
+            if (!isValidEndpointHost(host)) return error.InvalidWebListenHost;
+        }
+        if (self.web.port == self.port or self.web.port == self.mask_port) {
+            return error.WebListenerPortCollision;
+        }
+        if (!isValidWsPath(self.web.effectiveWsPath())) return error.InvalidWebSocketPath;
+        if (!isValidHttpToken(self.web.effectiveClientIpHeader())) return error.InvalidWebClientIpHeader;
+        for (self.web.relay_sources) |source| {
+            _ = std.Io.net.IpAddress.parse(source, 0) catch return error.InvalidWebRelaySource;
+        }
     }
 
     /// Emit startup warnings for configuration values known to cause issues.
@@ -1609,4 +1763,157 @@ test "parse config - malformed WEB relay source array is rejected" {
         \\relay_sources = ["127.0.0.1", unquoted]
     ;
     try std.testing.expectError(error.InvalidStringArray, Config.parse(std.testing.allocator, content));
+}
+
+fn expectValidationError(expected: Config.ValidationError, content: []const u8) !void {
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+    try std.testing.expectError(expected, cfg.validate());
+}
+
+test "config validation accepts ordinary and WEB deployments" {
+    var ordinary = try Config.parse(std.testing.allocator,
+        \\[server]
+        \\public_ip = "proxy.example.com"
+        \\middle_proxy_nat_ip = "203.0.113.10"
+        \\[censorship]
+        \\tls_domain = "proxy.example.com"
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    );
+    defer ordinary.deinit(std.testing.allocator);
+    try ordinary.validate();
+
+    var web = try Config.parse(std.testing.allocator,
+        \\[web]
+        \\enabled = true
+        \\domain = "web.example.com"
+        \\host = "127.0.0.1"
+        \\port = 8081
+        \\backend = "127.0.0.1:443"
+        \\mask_backend = "[2001:db8::1]:8444"
+        \\ws_path = "/api/v1/socket"
+        \\client_ip_header = "x-forwarded-for"
+        \\relay_sources = ["127.0.0.1", "2001:db8::1"]
+        \\[censorship]
+        \\tls_domain = "proxy.example.com"
+        \\mask = true
+        \\mask_port = 8443
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    );
+    defer web.deinit(std.testing.allocator);
+    try web.validate();
+}
+
+test "config validation rejects unusable core settings" {
+    try expectValidationError(error.EmptyUsers,
+        \\[censorship]
+        \\tls_domain = "proxy.example.com"
+    );
+    try expectValidationError(error.InvalidTlsDomain,
+        \\[censorship]
+        \\tls_domain = ""
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    );
+    try expectValidationError(error.InvalidPublicAddress,
+        \\[server]
+        \\public_ip = "https://proxy.example.com"
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    );
+    try expectValidationError(error.InvalidMiddleProxyNatIp,
+        \\[server]
+        \\middle_proxy_nat_ip = "203.0.113.999"
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    );
+}
+
+test "config validation rejects unsafe WEB relationships" {
+    try expectValidationError(error.MissingWebDomain,
+        \\[web]
+        \\enabled = true
+        \\mask_backend = "127.0.0.1:8444"
+        \\[censorship]
+        \\tls_domain = "proxy.example.com"
+        \\mask = true
+        \\mask_port = 8443
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    );
+    try expectValidationError(error.WebDomainMatchesTlsDomain,
+        \\[web]
+        \\enabled = true
+        \\domain = "PROXY.EXAMPLE.COM"
+        \\mask_backend = "127.0.0.1:8444"
+        \\[censorship]
+        \\tls_domain = "proxy.example.com"
+        \\mask = true
+        \\mask_port = 8443
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    );
+    try expectValidationError(error.WebRequiresMasking,
+        \\[web]
+        \\enabled = true
+        \\domain = "web.example.com"
+        \\mask_backend = "127.0.0.1:8444"
+        \\[censorship]
+        \\tls_domain = "proxy.example.com"
+        \\mask = false
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    );
+    try expectValidationError(error.MissingWebMaskBackend,
+        \\[web]
+        \\enabled = true
+        \\domain = "web.example.com"
+        \\[censorship]
+        \\tls_domain = "proxy.example.com"
+        \\mask = true
+        \\mask_port = 8443
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    );
+    try expectValidationError(error.InvalidWebBackend,
+        \\[web]
+        \\enabled = true
+        \\domain = "web.example.com"
+        \\backend = "missing-port"
+        \\mask_backend = "127.0.0.1:8444"
+        \\[censorship]
+        \\tls_domain = "proxy.example.com"
+        \\mask = true
+        \\mask_port = 8443
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    );
+    try expectValidationError(error.InvalidWebSocketPath,
+        \\[web]
+        \\enabled = true
+        \\domain = "web.example.com"
+        \\mask_backend = "127.0.0.1:8444"
+        \\ws_path = "relative"
+        \\[censorship]
+        \\tls_domain = "proxy.example.com"
+        \\mask = true
+        \\mask_port = 8443
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    );
+    try expectValidationError(error.InvalidWebRelaySource,
+        \\[web]
+        \\enabled = true
+        \\domain = "web.example.com"
+        \\mask_backend = "127.0.0.1:8444"
+        \\relay_sources = ["relay.example.com"]
+        \\[censorship]
+        \\tls_domain = "proxy.example.com"
+        \\mask = true
+        \\mask_port = 8443
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    );
 }

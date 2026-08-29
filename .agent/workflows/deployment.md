@@ -23,6 +23,7 @@ This workflow documents current build and deploy paths as implemented in `Makefi
 - `make test` : run unit tests
 - `make bench` : encapsulation microbench
 - `make soak` : 30s multithreaded soak
+- `mtproto-proxy --check-config <path>` : parse and semantically validate a config without opening a listener
 - `make stability-check PID=<pid> [HOST=127.0.0.1 PORT=443]` : churn + idle-pool stability harness
 - `make stability-check-load [HOST=127.0.0.1 PORT=443]` : load-only stability smoke
 - `make capacity-probe-idle` : idle-socket capacity probe

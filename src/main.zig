@@ -111,6 +111,15 @@ fn writeRaw(s: []const u8) void {
     writeStdoutBytes(s);
 }
 
+fn writeUsage() void {
+    writeStderr(
+        "\n  Usage: mtproto-proxy [config.toml] [--show-secrets | --print-links]\n" ++
+            "         mtproto-proxy --check-config [config.toml]\n" ++
+            "         mtproto-proxy web-relay [config.toml]\n\n",
+        .{},
+    );
+}
+
 fn ignoreSigpipe() void {
     if (builtin.os.tag != .linux) return;
     const action = posix.Sigaction{
@@ -956,6 +965,7 @@ pub fn main(init: std.process.Init) !void {
     var config_path_set = false;
     var show_secrets = false;
     var print_links = false;
+    var check_config = false;
     var web_relay_mode = false;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "web-relay") and !config_path_set and !web_relay_mode) {
@@ -964,25 +974,47 @@ pub fn main(init: std.process.Init) !void {
             show_secrets = true;
         } else if (std.mem.eql(u8, arg, "--print-links")) {
             print_links = true;
+        } else if (std.mem.eql(u8, arg, "--check-config")) {
+            check_config = true;
         } else if (!config_path_set) {
             config_path = arg;
             config_path_set = true;
         } else {
-            writeStderr("\n  Usage: mtproto-proxy [config.toml] [--show-secrets | --print-links]\n         mtproto-proxy web-relay [config.toml]\n\n", .{});
+            writeUsage();
             return error.InvalidArguments;
         }
+    }
+
+    if ((show_secrets and print_links) or
+        (check_config and (show_secrets or print_links or web_relay_mode)))
+    {
+        writeUsage();
+        return error.InvalidArguments;
     }
 
     // Parse config
     var cfg = config.Config.loadFromFile(allocator, config_path) catch |err| {
         writeStderr("\x1b[1m\x1b[31m  ✗ Failed to load config '{s}': {}\x1b[0m\n", .{ config_path, err });
-        writeStderr("\n  Usage: mtproto-proxy [config.toml] [--show-secrets | --print-links]\n         mtproto-proxy web-relay [config.toml]\n\n", .{});
+        writeUsage();
         return err;
     };
     defer cfg.deinit(allocator);
 
     // Apply runtime log level from config
     runtime_log_level = cfg.log_level;
+
+    cfg.validate() catch |err| {
+        writeStderr(
+            "\x1b[1m\x1b[31m  ✗ Invalid config '{s}': {s} ({s})\x1b[0m\n",
+            .{ config_path, config.Config.validationErrorMessage(err), @errorName(err) },
+        );
+        return err;
+    };
+
+    if (check_config) {
+        writeStdout("Config '{s}' is valid\n", .{config_path});
+        return;
+    }
 
     if (web_relay_mode) {
         if (show_secrets or print_links) return error.InvalidArguments;

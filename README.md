@@ -567,6 +567,14 @@ On startup, the proxy uses the lower of host RAM and every visible limit from th
 
 User secrets and `tg://`/`t.me` links are redacted from the daemon banner by default so they do not enter journald or container logs. Use the one-shot `--print-links` mode in a private terminal to load the config, print the links, and exit before opening the listener. The existing `--show-secrets` flag remains available for an intentional foreground daemon run with secrets included in its startup banner.
 
+Validate TOML syntax and cross-field semantics without opening a listener:
+
+```bash
+/opt/mtproto-proxy/mtproto-proxy --check-config /opt/mtproto-proxy/config.toml
+```
+
+The same validation runs automatically on every ordinary proxy and WEB-relay startup. It rejects unusable configurations such as an empty user set, invalid FakeTLS/WEB domains, a non-IPv4 `middle_proxy_nat_ip`, missing WEB masking backend, or colliding WEB listener ports.
+
 **4. Install the systemd service**
 
 ```bash

@@ -15,7 +15,9 @@ from pathlib import Path
 
 
 SECRET_HEX = "00112233445566778899aabbccddeeff"
-TLS_DOMAIN = "localhost"
+# The daemon now validates the same deployable FQDN shape that FakeTLS expects.
+# DNS is intentionally irrelevant here: the smoke client still connects to loopback.
+TLS_DOMAIN = "smoke.example"
 
 
 def fail(message: str, proc: subprocess.Popen[str] | None = None) -> None:
