@@ -4,16 +4,35 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // The proxy parses untrusted network input (FakeTLS, obfuscation,
+    // MiddleProxy, WEB, SOCKS5 and TOML). Keep runtime bounds, overflow and null
+    // checks enabled in production: a parser defect must fail closed instead of
+    // becoming unchecked undefined behaviour. Bench and soak retain the requested
+    // mode so ReleaseFast measurements remain meaningful. Operators can explicitly
+    // restore the requested mode with -Ddataplane_safety=false.
+    const dataplane_safety = b.option(
+        bool,
+        "dataplane_safety",
+        "Build the internet-facing proxy with runtime safety on (ReleaseSafe) even in release builds (default: true)",
+    ) orelse true;
+    const dataplane_optimize: std.builtin.OptimizeMode =
+        if (dataplane_safety and optimize == .ReleaseFast) .ReleaseSafe else optimize;
+
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = dataplane_optimize,
     });
 
     const exe = b.addExecutable(.{
         .name = "mtproto-proxy",
         .root_module = exe_mod,
     });
+
+    // Build an ELF position-independent executable so Linux can randomize its
+    // load address with ASLR. Zig already links immediate binding + RELRO by
+    // default; ReleaseSafe supplies the data-plane bounds and overflow checks.
+    exe.pie = true;
 
     b.installArtifact(exe);
 

@@ -58,6 +58,7 @@ jobs:
         run: |
           ls -lh zig-out/bin/mtproto-proxy
           file zig-out/bin/mtproto-proxy
+          readelf -h zig-out/bin/mtproto-proxy | grep -Eq 'Type:[[:space:]]+DYN'
 
       - name: Docker build smoke
         run: docker build --build-arg ZIG_VERSION=0.16.0 -t mtproto-zig-smoke .

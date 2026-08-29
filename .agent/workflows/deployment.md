@@ -18,7 +18,7 @@ This workflow documents current build and deploy paths as implemented in `Makefi
 ## Key Commands
 
 - `make build` : debug build
-- `make release` : release build (`ReleaseFast`)
+- `make release` : production proxy (`ReleaseSafe` data plane + PIE); benchmark targets remain `ReleaseFast`
 - `make run CONFIG=<path>` : run proxy with selected config
 - `make test` : run unit tests
 - `make fuzz [FUZZ_ITERATIONS=100K]` : bounded ReleaseSafe security fuzz campaign (64-bit Linux)
@@ -60,6 +60,12 @@ docker build --build-arg ZIG_VERSION=0.16.0 -t mtproto-zig-smoke .
 zig build -Doptimize=ReleaseFast bench
 zig build -Doptimize=ReleaseFast soak -- --seconds=10
 ```
+
+`-Doptimize=ReleaseFast` is intentionally still used by release/deploy commands:
+the build policy promotes only `mtproto-proxy` to `ReleaseSafe` while leaving
+bench/soak in the requested mode. `-Ddataplane_safety=false` is an explicit unsafe
+benchmark opt-out and must not be used for an exposed production service. The proxy
+ELF is always PIE.
 
 The default install graph contains only `mtproto-proxy`. Use `zig build install-bench` only when the standalone `mtproto-bench` binary is required; `bench` and `soak` build it explicitly without coupling `run` to the global install step.
 

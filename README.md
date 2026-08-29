@@ -107,6 +107,15 @@ The binary defaults to `config.toml`; the repository intentionally ships `config
 
 The example listens on privileged port `443`. Run locally with sufficient bind permissions (for example, as root) or change `[server].port` to a port above `1024`. The systemd unit uses `CAP_NET_BIND_SERVICE`, but `make run` does not grant that capability.
 
+Production release commands continue to request `ReleaseFast`, but the build policy
+compiles the internet-facing `mtproto-proxy` executable as `ReleaseSafe` by default.
+The parser data plane therefore retains bounds, overflow and null checks, while
+`bench` and `soak` stay genuinely `ReleaseFast`. The proxy is also emitted as PIE so
+Linux ASLR can randomize its load address. A deliberate benchmark-only comparison
+against the unsafe mode is available with
+`zig build -Doptimize=ReleaseFast -Ddataplane_safety=false`; do not use that opt-out
+for an exposed production proxy.
+
 ### Run Tests
 
 ```bash
@@ -162,7 +171,9 @@ python3 test/daemon_smoke.py --binary zig-out/bin/mtproto-proxy
 zig build -Doptimize=ReleaseFast soak -- --seconds=120 --threads=8 --max-payload=131072
 ```
 
-The GitHub workflow additionally verifies native `ReleaseFast`, Linux `x86_64`, deploy-target `x86_64_v3+aes`, Linux `aarch64`, Docker build smoke, and bench/soak paths.
+The GitHub workflow additionally verifies the production safety policy, PIE output,
+Linux `x86_64`, deploy-target `x86_64_v3+aes`, Linux `aarch64`, Docker build smoke,
+and genuine `ReleaseFast` bench/soak paths.
 
 `zig build test` runs the tests reachable from `src/main.zig` plus `src/bench.zig`. A normal `zig build` installs only `mtproto-proxy`; benchmark execution remains explicit through `bench`/`soak`, and `zig build install-bench` installs `mtproto-bench` when a standalone benchmark binary is needed.
 
@@ -175,7 +186,7 @@ The GitHub workflow additionally verifies native `ReleaseFast`, Linux `x86_64`, 
 | Target | Description |
 |--------|-------------|
 | `make build` | Debug build |
-| `make release` | Optimized build (`ReleaseFast`) |
+| `make release` | Production build (`ReleaseSafe` data plane + PIE by default) |
 | `make run CONFIG=<path>` | Run proxy (default: `config.toml`) |
 | `make test` | Run unit tests |
 | `make fuzz [FUZZ_ITERATIONS=100K]` | Run bounded ReleaseSafe security fuzzing (64-bit Linux) |
@@ -432,7 +443,7 @@ curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/in
 
 This will:
 1. Install **Zig 0.16.0** (if not present)
-2. Clone and build the proxy with `ReleaseFast` for the native CPU
+2. Clone and build the proxy with the production `ReleaseSafe` data-plane policy for the native CPU
 3. Generate a random 16-byte secret on first install
 4. Create a `systemd` service (`mtproto-proxy`)
 5. Open the configured proxy port in `ufw` (if active)
@@ -540,6 +551,10 @@ git clone https://github.com/XXcipherX/mtproto.zig.git
 cd mtproto.zig
 zig build -Doptimize=ReleaseFast
 ```
+
+Although the command requests the common release profile, the default
+`dataplane_safety=true` policy promotes the proxy executable itself to `ReleaseSafe`;
+the same policy applies to the source installer and Docker image.
 
 Or cross-compile on your Mac for a baseline-compatible x86_64 target:
 
