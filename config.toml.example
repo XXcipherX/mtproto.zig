@@ -26,8 +26,10 @@ port = 443
 # public_ip = "proxy.example.com"
 
 # Optional IPv4 override used in MiddleProxy NAT/AES derivation.
-# Useful when public_ip is a hostname or when auto-detection would pick the
-# wrong IPv4 because of tunnel egress.
+# Pin the IPv4 embedded into MiddleProxy NAT/AES derivation. public_ip is only
+# the client-facing address used in links and is never assumed to be DC egress.
+# Auto-detection trusts an AWG endpoint only inside the active tunnel netns;
+# otherwise it probes the process's real public egress IPv4.
 # middle_proxy_nat_ip = "203.0.113.10"
 
 # 32 hex-char promotion tag from @MTProxybot (enables sponsored channels).

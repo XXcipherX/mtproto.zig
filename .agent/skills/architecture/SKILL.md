@@ -77,7 +77,7 @@ Important behavior:
 - `force_media_middle_proxy=true` is the default, so `direct` only affects regular DC traffic; media path still prefers MiddleProxy when available unless that knob is disabled.
 - `[access.direct_users]` / `[access.admins]` bypass MiddleProxy for regular and media paths with real direct endpoints. DC203 still uses MiddleProxy when its route is available.
 - `datacenter_override` is test-only and disables MiddleProxy snapshot/updater routing.
-- `server.middle_proxy_nat_ip` can pin the IPv4 used for MiddleProxy NAT/AES derivation when AWG/public-IP detection would choose the wrong address.
+- `server.middle_proxy_nat_ip` can pin the IPv4 used for MiddleProxy NAT/AES derivation. `server.public_ip` is client-facing link metadata and is never assumed to be DC egress. Automatic detection trusts an AWG endpoint only while the proxy runs inside the active tunnel network namespace; direct mode probes the process's public egress instead.
 - `middleproxy_buffer_kb` is a per-direction cap. Each MiddleProxy context starts with 16 KiB C2S/S2C buffers and grows on demand up to `min(middleproxy_buffer_kb, 3840)` KiB; event-loop scratch buffers are lazy and reused. The effective cap reserves 256 KiB for MP/TLS framing before the 4 MiB relay-queue limit.
 - MiddleProxy handshake/read failures and upstream fatal hangups can fall back to direct when the connect plan has a direct fallback address.
 - Tunnel deployment supports `direct`, `preserve`, and `middleproxy` modes.

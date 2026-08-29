@@ -2108,19 +2108,7 @@ pub const ProxyState = struct {
                     var ip_buf: [16]u8 = undefined;
                     log.info("Using server.middle_proxy_nat_ip for middle-proxy NAT translation: {s}", .{formatIpv4Bytes(parsed_ip, &ip_buf)});
                 } else {
-                    log.info("server.middle_proxy_nat_ip='{s}' is not an IPv4 literal; falling back to AWG/public detection", .{configured_nat_ip});
-                }
-            }
-
-            if (detected_nat_ip4 == null) {
-                if (cfg.public_ip) |configured_public_ip| {
-                    if (parseIpv4Literal(configured_public_ip)) |parsed_ip| {
-                        detected_nat_ip4 = parsed_ip;
-                        var ip_buf: [16]u8 = undefined;
-                        log.info("Using server.public_ip for middle-proxy NAT translation: {s}", .{formatIpv4Bytes(parsed_ip, &ip_buf)});
-                    } else {
-                        log.info("server.public_ip='{s}' is not an IPv4 literal; middle-proxy NAT IP will be detected in the background", .{configured_public_ip});
-                    }
+                    log.info("server.middle_proxy_nat_ip='{s}' is not an IPv4 literal; falling back to active-tunnel/public-egress detection", .{configured_nat_ip});
                 }
             }
         }
@@ -2464,17 +2452,29 @@ pub const ProxyState = struct {
         self.middle_proxy_lock.unlock();
         if (already_known or self.middle_proxy_updater_stop.load(.acquire)) return;
 
-        var detected = try detectAwgEndpointIpv4(
-            self.allocator,
-            &self.middle_proxy_updater_stop,
-        );
-        if (detected == null and !self.middle_proxy_updater_stop.load(.acquire)) {
-            detected = try detectPublicIpv4(
+        // An AWG config file only describes a possible tunnel. Its Endpoint is the
+        // MiddleProxy egress address only while this process actually runs inside the
+        // tunnel network namespace. Trusting a stale host config in direct mode would
+        // put the VPN server's address into the KDF while Telegram observes the host's
+        // public egress address, causing every MiddleProxy handshake to fail.
+        const tunnel_active = isRunningInNonInitNetns();
+        var awg_ip: ?[4]u8 = null;
+        if (tunnel_active) {
+            awg_ip = try detectAwgEndpointIpv4(
                 self.allocator,
                 &self.middle_proxy_updater_stop,
             );
         }
-        const ip = detected orelse return;
+
+        var public_ip: ?[4]u8 = null;
+        if (awg_ip == null and !self.middle_proxy_updater_stop.load(.acquire)) {
+            public_ip = try detectPublicIpv4(
+                self.allocator,
+                &self.middle_proxy_updater_stop,
+            );
+        }
+
+        const ip = selectDetectedMiddleProxyNatIpv4(tunnel_active, awg_ip, public_ip) orelse return;
         if (self.middle_proxy_updater_stop.load(.acquire)) return error.UpdateCancelled;
 
         self.middle_proxy_lock.lock();
@@ -2486,7 +2486,11 @@ pub const ProxyState = struct {
         self.middle_proxy_lock.unlock();
 
         var ip_buf: [16]u8 = undefined;
-        log.info("Detected IPv4 for middle-proxy NAT translation: {s}", .{formatIpv4Bytes(ip, &ip_buf)});
+        if (tunnel_active and awg_ip != null) {
+            log.info("Using active AWG endpoint IPv4 for middle-proxy NAT translation: {s}", .{formatIpv4Bytes(ip, &ip_buf)});
+        } else {
+            log.info("Detected public-egress IPv4 for middle-proxy NAT translation: {s}", .{formatIpv4Bytes(ip, &ip_buf)});
+        }
     }
 
     fn refreshMaskAddresses(self: *ProxyState) void {
@@ -6517,6 +6521,17 @@ fn detectAwgEndpointIpv4(
     return null;
 }
 
+fn selectDetectedMiddleProxyNatIpv4(
+    tunnel_active: bool,
+    awg_ip: ?[4]u8,
+    public_ip: ?[4]u8,
+) ?[4]u8 {
+    if (tunnel_active) {
+        if (awg_ip) |ip| return ip;
+    }
+    return public_ip;
+}
+
 fn detectPublicIpv4(
     allocator: std.mem.Allocator,
     stop: ?*const std.atomic.Value(bool),
@@ -6546,6 +6561,30 @@ fn detectPublicIpv4(
     }
 
     return null;
+}
+
+test "middle-proxy NAT selection ignores a stale AWG endpoint in direct mode" {
+    const awg_ip = [4]u8{ 203, 0, 113, 9 };
+    const public_ip = [4]u8{ 198, 51, 100, 20 };
+
+    try std.testing.expectEqual(
+        @as(?[4]u8, public_ip),
+        selectDetectedMiddleProxyNatIpv4(false, awg_ip, public_ip),
+    );
+}
+
+test "middle-proxy NAT selection uses AWG endpoint only in tunnel mode" {
+    const awg_ip = [4]u8{ 203, 0, 113, 9 };
+    const public_ip = [4]u8{ 198, 51, 100, 20 };
+
+    try std.testing.expectEqual(
+        @as(?[4]u8, awg_ip),
+        selectDetectedMiddleProxyNatIpv4(true, awg_ip, public_ip),
+    );
+    try std.testing.expectEqual(
+        @as(?[4]u8, public_ip),
+        selectDetectedMiddleProxyNatIpv4(true, null, public_ip),
+    );
 }
 
 fn formatIpv4Bytes(ip: [4]u8, buf: *[16]u8) []const u8 {
