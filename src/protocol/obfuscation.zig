@@ -297,3 +297,21 @@ test "prepareTgNonce - fast mode key inversion" {
         try std.testing.expectEqual(expected_byte, nonce[8 + i]);
     }
 }
+
+test "fuzz obfuscated handshake parsing" {
+    try std.testing.fuzz({}, struct {
+        fn testOne(_: void, smith: *std.testing.Smith) anyerror!void {
+            var handshake: [constants.handshake_len]u8 = undefined;
+            smith.bytes(&handshake);
+            const secrets = [_]UserSecret{
+                .{ .name = "one", .secret = [_]u8{0x11} ** 16 },
+                .{ .name = "two", .secret = [_]u8{0xa5} ** 16 },
+            };
+
+            if (ObfuscationParams.fromHandshake(&handshake, &secrets)) |parsed| {
+                var params = parsed.params;
+                params.wipe();
+            }
+        }
+    }.testOne, .{});
+}

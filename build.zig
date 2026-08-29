@@ -80,6 +80,12 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
 
+    // Keep coverage-guided security fuzzing isolated from the benchmark test
+    // binary. Invoke with a bounded iteration count in CI, for example:
+    // `zig build -Doptimize=ReleaseSafe fuzz --fuzz=100K`.
+    const fuzz_step = b.step("fuzz", "Run wire-facing security fuzz harnesses");
+    fuzz_step.dependOn(&run_unit_tests.step);
+
     const bench_test_mod = b.createModule(.{
         .root_source_file = b.path("src/bench.zig"),
         .target = target,

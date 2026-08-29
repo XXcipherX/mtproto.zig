@@ -122,6 +122,28 @@ shellcheck --severity=error deploy/*.sh deploy/monitor/*.sh
 zig build -Doptimize=ReleaseSafe test
 ```
 
+On a 64-bit Linux development host, Zig 0.16 can drive the security parser
+harnesses with coverage-guided input generation. Use a finite per-target budget
+for a bounded local/CI campaign:
+
+```bash
+make fuzz                       # 100K iterations per target
+make fuzz FUZZ_ITERATIONS=1M   # deeper bounded campaign
+```
+
+Omit the limit only for an intentional interactive campaign, then stop it with
+`Ctrl+C`:
+
+```bash
+zig build -Doptimize=ReleaseSafe fuzz --fuzz
+```
+
+The dedicated `fuzz` build step covers FakeTLS and obfuscated handshakes,
+MiddleProxy stream framing, and the public WEB HTTP, WebSocket, PROXY-protocol
+and multiplexed-frame parsers without pulling the benchmark test binary into the
+campaign. CI runs 25K iterations per target for pull requests and 100K per target
+for pushes to `main`, in a separate parallel job with a 15-minute hard timeout.
+
 ### Performance & Stability Checks
 
 ```bash
@@ -156,6 +178,7 @@ The GitHub workflow additionally verifies native `ReleaseFast`, Linux `x86_64`, 
 | `make release` | Optimized build (`ReleaseFast`) |
 | `make run CONFIG=<path>` | Run proxy (default: `config.toml`) |
 | `make test` | Run unit tests |
+| `make fuzz [FUZZ_ITERATIONS=100K]` | Run bounded ReleaseSafe security fuzzing (64-bit Linux) |
 | `make bench` | Run ReleaseFast encapsulation microbenchmarks |
 | `make soak` | Run ReleaseFast multithreaded soak stress test (30s default) |
 | `make capacity-probe-idle` | Run the idle-socket capacity profile; requires the external `/root/benchmarks` workspace described in `test/README.md` |

@@ -304,3 +304,21 @@ test "close frame carries the code" {
         try closeFrame(&out, close_message_too_big),
     );
 }
+
+test "fuzz WebSocket frame header parsing" {
+    try std.testing.fuzz({}, struct {
+        fn testOne(_: void, smith: *std.testing.Smith) anyerror!void {
+            var storage: [1024]u8 = undefined;
+            const input = storage[0..smith.slice(&storage)];
+
+            if (parseHeader(input)) |parsed| switch (parsed) {
+                .incomplete => {},
+                .header => |header| {
+                    try std.testing.expect(header.header_len <= input.len);
+                    try std.testing.expect(header.payload_len <= max_message);
+                    try std.testing.expect(header.totalLen() >= header.header_len);
+                },
+            } else |_| {}
+        }
+    }.testOne, .{});
+}

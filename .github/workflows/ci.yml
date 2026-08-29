@@ -62,6 +62,29 @@ jobs:
       - name: Docker build smoke
         run: docker build --build-arg ZIG_VERSION=0.16.0 -t mtproto-zig-smoke .
 
+  fuzz:
+    name: Security Fuzz
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Run bounded coverage-guided fuzzing
+        shell: bash
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            fuzz_iterations=25K
+          else
+            fuzz_iterations=100K
+          fi
+          echo "Running ${fuzz_iterations} iterations per fuzz target"
+          zig build -Doptimize=ReleaseSafe fuzz --fuzz="$fuzz_iterations"
+
   bench:
     name: Bench & Soak
     runs-on: ubuntu-latest

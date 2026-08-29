@@ -294,3 +294,21 @@ test "serialize rejects oversized payload and short buffers" {
     var small: [4]u8 = undefined;
     try std.testing.expectError(error.NoSpace, serialize(&small, .welcome, 0, ""));
 }
+
+test "fuzz WEB multiplexed frame parsing" {
+    try std.testing.fuzz({}, struct {
+        fn testOne(_: void, smith: *std.testing.Smith) anyerror!void {
+            var storage: [1024]u8 = undefined;
+            const input = storage[0..smith.slice(&storage)];
+
+            if (parseOne(input)) |parsed| switch (parsed) {
+                .incomplete => {},
+                .frame => |result| {
+                    try std.testing.expect(result.consumed <= input.len);
+                    try std.testing.expect(result.value.payload.len <= max_payload);
+                    try std.testing.expect(result.value.stream_id <= max_stream_id);
+                },
+            } else |_| {}
+        }
+    }.testOne, .{});
+}

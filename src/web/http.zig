@@ -335,3 +335,22 @@ test "token list matching is case-insensitive and comma aware" {
     try std.testing.expect(listHasToken("Upgrade", "UPGRADE"));
     try std.testing.expect(!listHasToken("upgraded", "upgrade"));
 }
+
+test "fuzz HTTP request parsing" {
+    try std.testing.fuzz({}, struct {
+        fn testOne(_: void, smith: *std.testing.Smith) anyerror!void {
+            var storage: [max_head_bytes + 64]u8 = undefined;
+            const input = storage[0..smith.slice(&storage)];
+
+            _ = headEnd(input);
+            if (parse(input)) |request| {
+                try std.testing.expect(request.head_len <= input.len);
+                try std.testing.expect(request.headers_len <= max_headers);
+                _ = request.path();
+                _ = request.query("bridge");
+                _ = request.keepAlive();
+                _ = isWebSocketUpgrade(&request);
+            } else |_| {}
+        }
+    }.testOne, .{});
+}

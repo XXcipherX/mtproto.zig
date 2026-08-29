@@ -110,4 +110,4 @@ Do not reintroduce thread-per-connection or blocking relay loops.
 - Use error unions and avoid swallowing critical errors on control-path boundaries.
 - Keep tests close to protocol primitives and relay helpers.
 - For substantial behavior changes, update `README.md` and relevant `.agent` docs in the same change.
-- Keep CI expectations in mind: formatting, Debug tests, ReleaseSafe tests, real daemon smoke (valid FakeTLS plus bad-secret rejection), cross-builds, ShellCheck, Python harness syntax, Docker build smoke, bench, and soak.
+- Keep CI expectations in mind: formatting, Debug tests, ReleaseSafe tests, bounded coverage-guided security fuzzing, real daemon smoke (valid FakeTLS plus bad-secret rejection), cross-builds, ShellCheck, Python harness syntax, Docker build smoke, bench, and soak.

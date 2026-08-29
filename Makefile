@@ -1,4 +1,4 @@
-.PHONY: build release run test bench soak clean fmt deploy migrate update-dns stability-check stability-check-load capacity-probe-idle capacity-probe-active deploy-tunnel deploy-tunnel-only deploy-monitor monitor
+.PHONY: build release run test fuzz bench soak clean fmt deploy migrate update-dns stability-check stability-check-load capacity-probe-idle capacity-probe-active deploy-tunnel deploy-tunnel-only deploy-monitor monitor
 
 SERVER ?= 185.125.46.60
 CONFIG ?= config.toml
@@ -7,6 +7,7 @@ TUNNEL_MODE ?= direct
 HOST ?= 127.0.0.1
 PORT ?= 443
 PID ?=
+FUZZ_ITERATIONS ?= 100K
 
 build:
 	zig build
@@ -19,6 +20,9 @@ run:
 
 test:
 	zig build test
+
+fuzz:
+	zig build -Doptimize=ReleaseSafe fuzz --fuzz=$(FUZZ_ITERATIONS)
 
 bench:
 	zig build -Doptimize=ReleaseFast bench

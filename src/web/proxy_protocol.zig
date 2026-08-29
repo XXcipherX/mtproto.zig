@@ -227,3 +227,17 @@ test "parse v2 TCP4" {
 test "parse v2 incomplete" {
     try std.testing.expect(parse(v2_sig[0..8]) == .incomplete);
 }
+
+test "fuzz PROXY protocol header parsing" {
+    try std.testing.fuzz({}, struct {
+        fn testOne(_: void, smith: *std.testing.Smith) anyerror!void {
+            var storage: [256]u8 = undefined;
+            const input = storage[0..smith.slice(&storage)];
+
+            switch (parse(input)) {
+                .incomplete, .invalid => {},
+                .ok => |result| try std.testing.expect(result.consumed <= input.len),
+            }
+        }
+    }.testOne, .{});
+}

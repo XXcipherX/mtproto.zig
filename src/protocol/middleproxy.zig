@@ -783,6 +783,138 @@ pub fn crc32(data: []const u8) u32 {
     return std.hash.Crc32.hash(data);
 }
 
+fn expectKdfHex(
+    actual: anytype,
+    comptime key_hex: []const u8,
+    comptime iv_hex: []const u8,
+) !void {
+    var expected_key: [32]u8 = undefined;
+    var expected_iv: [16]u8 = undefined;
+    _ = std.fmt.hexToBytes(&expected_key, key_hex) catch unreachable;
+    _ = std.fmt.hexToBytes(&expected_iv, iv_hex) catch unreachable;
+    try std.testing.expectEqualSlices(u8, &expected_key, &actual[0]);
+    try std.testing.expectEqualSlices(u8, &expected_iv, &actual[1]);
+}
+
+test "middle proxy KDF matches fixed IPv4 client and server vectors" {
+    const nonce_srv = [_]u8{0x11} ** 16;
+    const nonce_clt = [_]u8{0x22} ** 16;
+    const timestamp = [_]u8{ 0xaa, 0xbb, 0xcc, 0xdd };
+    const server_ip = [_]u8{ 91, 105, 192, 110 };
+    const client_ip = [_]u8{ 203, 0, 113, 9 };
+    const client_port = [_]u8{ 0x5a, 0x0f };
+    const server_port = [_]u8{ 0xbb, 0x01 };
+    const secret = [_]u8{0x07} ** 16;
+
+    try expectKdfHex(
+        try getAesKeyAndIv(
+            &nonce_srv,
+            &nonce_clt,
+            &timestamp,
+            &server_ip,
+            &client_port,
+            "CLIENT",
+            &client_ip,
+            &server_port,
+            &secret,
+            null,
+            null,
+        ),
+        "c94ee251c4b9233b1549a640151c0723f9a5965b5a2ad65f6b80720f217c0256",
+        "81c322ed1bb98a2447fd6bb2bb929e8c",
+    );
+    try expectKdfHex(
+        try getAesKeyAndIv(
+            &nonce_srv,
+            &nonce_clt,
+            &timestamp,
+            &server_ip,
+            &client_port,
+            "SERVER",
+            &client_ip,
+            &server_port,
+            &secret,
+            null,
+            null,
+        ),
+        "8f15c2ab22d53b0ee69bc8a40f52e8f5e81d24599240e1402421ecf5bac4f9b1",
+        "5e7b170679eac80cc319aa01ebe4f3e9",
+    );
+}
+
+test "middle proxy KDF matches fixed NAT and IPv6 vectors" {
+    const nat_result = try getAesKeyAndIv(
+        &([_]u8{0x33} ** 16),
+        &([_]u8{0x44} ** 16),
+        &[_]u8{ 0x01, 0x02, 0x03, 0x04 },
+        &[_]u8{ 149, 154, 167, 51 },
+        &[_]u8{ 0x03, 0x10 },
+        "CLIENT",
+        &[_]u8{ 192, 0, 2, 7 },
+        &[_]u8{ 0xbb, 0x01 },
+        &([_]u8{0x5a} ** 16),
+        null,
+        null,
+    );
+    try expectKdfHex(
+        nat_result,
+        "47baf006fc7af759e137c38f814bdda41f75958bf2da274a9fbb944aff7898e0",
+        "61760e4a96242a30bf18ad0803033194",
+    );
+
+    const ipv6_result = try getAesKeyAndIv(
+        &([_]u8{0x55} ** 16),
+        &([_]u8{0x66} ** 16),
+        &[_]u8{ 0xde, 0xad, 0xbe, 0xef },
+        null,
+        &[_]u8{ 0x5a, 0x0f },
+        "SERVER",
+        null,
+        &[_]u8{ 0xbb, 0x01 },
+        &([_]u8{0x99} ** 16),
+        &([_]u8{0xab} ** 16),
+        &([_]u8{0xcd} ** 16),
+    );
+    try expectKdfHex(
+        ipv6_result,
+        "3b416ea3c070f15986529e0d8fb0eceef466992f4aec81b0548a9d1ece326133",
+        "f88cac4a52c118273827042c2a3a6fdf",
+    );
+}
+
+test "fuzz middle proxy stream framing" {
+    try std.testing.fuzz({}, struct {
+        fn testOne(_: void, smith: *std.testing.Smith) anyerror!void {
+            var input_storage: [1024]u8 = undefined;
+            const input = input_storage[0..smith.slice(&input_storage)];
+            const key = [_]u8{0} ** 32;
+            const iv = [_]u8{0} ** 16;
+
+            var allocator_storage: [40 * 1024]u8 = undefined;
+            var fba = std.heap.FixedBufferAllocator.init(&allocator_storage);
+            var ctx = try MiddleProxyContext.initWithBuffer(
+                fba.allocator(),
+                crypto.AesCbc.init(&key, &iv),
+                crypto.AesCbc.init(&key, &iv),
+                [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 },
+                -2,
+                net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
+                net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
+                .intermediate,
+                null,
+                MiddleProxyContext.initial_stream_buffer_size,
+            );
+            defer ctx.deinit();
+
+            var c2s_out: [8192]u8 = undefined;
+            if (ctx.encapsulateC2S(input, &c2s_out)) |_| {} else |_| {}
+
+            var s2c_out: [2048]u8 = undefined;
+            if (ctx.decapsulateS2C(input, &s2c_out)) |_| {} else |_| {}
+        }
+    }.testOne, .{});
+}
+
 test "proxy answer flags remain forward-compatible except for dropped responses" {
     // EXTMODE1 and an otherwise unknown advisory bit must not make a valid,
     // independently framed RPC_PROXY_ANS fail closed.

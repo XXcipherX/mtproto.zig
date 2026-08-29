@@ -21,6 +21,7 @@ This workflow documents current build and deploy paths as implemented in `Makefi
 - `make release` : release build (`ReleaseFast`)
 - `make run CONFIG=<path>` : run proxy with selected config
 - `make test` : run unit tests
+- `make fuzz [FUZZ_ITERATIONS=100K]` : bounded ReleaseSafe security fuzz campaign (64-bit Linux)
 - `make bench` : encapsulation microbench
 - `make soak` : 30s multithreaded soak
 - `mtproto-proxy --check-config <path>` : parse and semantically validate a config without opening a listener
@@ -48,6 +49,7 @@ python3 -m py_compile test/*.py
 shellcheck --severity=error deploy/*.sh deploy/monitor/*.sh
 zig build test
 zig build -Doptimize=ReleaseSafe test
+zig build -Doptimize=ReleaseSafe fuzz --fuzz=100K
 zig build
 python3 test/daemon_smoke.py --binary zig-out/bin/mtproto-proxy
 zig build -Doptimize=ReleaseFast

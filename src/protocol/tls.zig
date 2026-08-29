@@ -1152,3 +1152,22 @@ test "validateTlsHandshake rejects non-32 session id" {
     const result = try validateTlsHandshake(allocator, &handshake, &secrets, true);
     try std.testing.expect(result == null);
 }
+
+test "fuzz FakeTLS ClientHello parsing and validation" {
+    try std.testing.fuzz({}, struct {
+        fn testOne(_: void, smith: *std.testing.Smith) anyerror!void {
+            var storage: [4096]u8 = undefined;
+            const input = storage[0..smith.slice(&storage)];
+            const secrets = [_]UserSecret{.{
+                .name = "fuzz-user",
+                .secret = [_]u8{0x5a} ** 16,
+            }};
+
+            _ = isTlsHandshake(input);
+            _ = extractSni(input);
+            _ = extractFirstTls13Cipher(input);
+            _ = clientOffersPqKeyShare(input);
+            _ = validateTlsHandshake(std.testing.allocator, input, &secrets, true) catch null;
+        }
+    }.testOne, .{});
+}
