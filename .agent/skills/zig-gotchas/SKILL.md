@@ -14,7 +14,7 @@ This file tracks practical pitfalls and current runtime constraints for `mtproto
 - Non-blocking writes are queue-based (`MessageQueue`) and flushed with `writev`.
 - `MessageQueue` has intrusive page-sized storage blocks from one capped event-loop-wide pool and a 4 MiB pending-byte cap; queue overflow is a close-worthy backpressure signal.
 - Runtime discovery runs in a joinable updater thread after the listener is ready when MiddleProxy or masking resolution is active; shutdown is cooperative, DNS/HTTPS/curl tasks are canceled in their owning thread, and endpoint probes run in cancellable batches of at most four sockets.
-- Keep `SIGINT`/`SIGTERM` cleanup out of async signal context. The production handler may only notify the non-blocking `eventfd`; allocator, socket, epoll, listener, and updater cleanup belongs to the event-loop/defer path. The signal bridge must outlive every runtime worker and is dismantled only after the updater is joined. Do not permanently block these signals process-wide for `signalfd`: Zig 0.16's POSIX child-spawn path preserves the caller's signal mask across `exec`, which would also block `std.process` cancellation signals in curl fallback children.
+- Keep `SIGINT`/`SIGTERM` cleanup out of async signal context. The production handler may only notify the non-blocking `eventfd`; allocator, socket, epoll, listener, and updater cleanup belongs to the event-loop/defer path. The first notification disables listener interest and begins the configured graceful drain; accepts must never resume while `shutting_down`, and another notification or the deadline force-closes remaining slots. The signal bridge must outlive every runtime worker and is dismantled only after the updater is joined. Do not permanently block these signals process-wide for `signalfd`: Zig 0.16's POSIX child-spawn path preserves the caller's signal mask across `exec`, which would also block `std.process` cancellation signals in curl fallback children.
 - Zig 0.16 `Io.Future.cancel` and `Io.Group.cancel` are not thread-safe, while `Io.Select.cancel` is explicitly thread-safe. Runtime discovery nevertheless keeps cancellation with the Select owner because its tasks borrow scope-local buffers and arguments; `Select.cancel()` must be drained until `null` so late successful tasks cannot leak allocated results.
 - Before Zig 0.16's resolver reads `/etc/resolv.conf`, enforce nonzero final `attempts`, its 255-byte search buffer, its 512-byte line bound, and the 253-byte DNS wire-name limit for the base host plus any applied search suffix.
 
@@ -93,6 +93,7 @@ Do not reintroduce thread-per-connection or blocking relay loops.
 ## Timeout and Lifetime Notes
 
 - Current runtime enforces a fixed 10-second pre-first-byte timeout, configured handshake timeout after first byte, and configured relay idle timeout.
+- Process shutdown has a separate `graceful_shutdown_timeout_sec` deadline. It is armed in the existing `timerfd`; it is not a per-connection lifetime and must not be lost when slot deadlines or accept backoff are rearmed.
 - iOS silence recovery is an encrypted-stream heuristic, not MTProto parsing: it excludes media paths, accepts only server replies inside a 12-second response window, and arms after the userspace client queue drains. Preserve those guards when changing `client_silence_*` handling.
 - Fixed max connection lifetime (for example "30 minutes hard cap") is not implemented in current code.
 
@@ -111,4 +112,4 @@ Do not reintroduce thread-per-connection or blocking relay loops.
 - Use error unions and avoid swallowing critical errors on control-path boundaries.
 - Keep tests close to protocol primitives and relay helpers.
 - For substantial behavior changes, update `README.md` and relevant `.agent` docs in the same change.
-- Keep CI expectations in mind: formatting, Debug tests, ReleaseSafe tests, bounded coverage-guided security fuzzing, real daemon smoke (valid FakeTLS plus bad-secret rejection), cross-builds, ShellCheck, Python harness syntax, Docker build plus safe-default smoke, the Debian/Ubuntu Docker Compose installer E2E matrix, bench, and soak.
+- Keep CI expectations in mind: formatting, Debug tests, ReleaseSafe tests, bounded coverage-guided security fuzzing, real daemon smoke (valid FakeTLS, bad-secret rejection, and graceful SIGTERM drain), cross-builds, ShellCheck, Python harness syntax, Docker build plus safe-default smoke, the Debian/Ubuntu Docker Compose installer E2E matrix, bench, and soak.

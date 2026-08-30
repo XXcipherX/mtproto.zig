@@ -174,6 +174,9 @@ pub const Config = struct {
     client_silence_fast_after_idle_sec: u32 = 30,
     /// Handshake read timeout after first byte arrives
     handshake_timeout_sec: u32 = 15,
+    /// Graceful process shutdown timeout. SIGINT/SIGTERM stop new accepts and
+    /// let existing connections drain for this many seconds before forced close.
+    graceful_shutdown_timeout_sec: u32 = 15,
     /// Per-endpoint TCP connect deadline for Telegram DC candidates.
     /// Zero disables this configured ceiling; the remaining global handshake
     /// budget is still divided across candidates and direct fallback.
@@ -707,6 +710,10 @@ pub const Config = struct {
                         if (parseIntSetting(u32, key, value)) |parsed| {
                             cfg.handshake_timeout_sec = @max(@as(u32, 5), parsed);
                         }
+                    } else if (std.mem.eql(u8, key, "graceful_shutdown_timeout_sec")) {
+                        if (parseIntSetting(u32, key, value)) |parsed| {
+                            cfg.graceful_shutdown_timeout_sec = @max(@as(u32, 1), parsed);
+                        }
                     } else if (std.mem.eql(u8, key, "dc_connect_timeout_sec")) {
                         if (parseIntSetting(u32, key, value)) |parsed| {
                             cfg.dc_connect_timeout_sec = parsed;
@@ -902,6 +909,7 @@ test "parse config - valid complete" {
         \\client_silence_fast_close_sec = 2
         \\client_silence_fast_after_idle_sec = 30
         \\handshake_timeout_sec = 30
+        \\graceful_shutdown_timeout_sec = 20
         \\dc_connect_timeout_sec = 7
         \\fast_mode = true
         \\
@@ -931,6 +939,7 @@ test "parse config - valid complete" {
     try std.testing.expectEqual(@as(u32, 2), cfg.client_silence_fast_close_sec);
     try std.testing.expectEqual(@as(u32, 30), cfg.client_silence_fast_after_idle_sec);
     try std.testing.expectEqual(@as(u32, 30), cfg.handshake_timeout_sec);
+    try std.testing.expectEqual(@as(u32, 20), cfg.graceful_shutdown_timeout_sec);
     try std.testing.expectEqual(@as(u32, 7), cfg.dc_connect_timeout_sec);
     try std.testing.expectEqualStrings("example.com", cfg.tls_domain);
     try std.testing.expect(cfg.use_middle_proxy);
@@ -965,6 +974,7 @@ test "parse config - missing fields defaults" {
     try std.testing.expectEqual(@as(u32, 0), cfg.client_silence_fast_close_sec);
     try std.testing.expectEqual(@as(u32, 30), cfg.client_silence_fast_after_idle_sec);
     try std.testing.expectEqual(@as(u32, 15), cfg.handshake_timeout_sec);
+    try std.testing.expectEqual(@as(u32, 15), cfg.graceful_shutdown_timeout_sec);
     try std.testing.expectEqual(@as(u32, 10), cfg.dc_connect_timeout_sec);
     try std.testing.expectEqualStrings("google.com", cfg.tls_domain);
     try std.testing.expect(!cfg.use_middle_proxy); // Default is false
@@ -1147,6 +1157,7 @@ test "parse config - server runtime tunables lower bounds" {
         \\max_connections = 1
         \\idle_timeout_sec = 1
         \\handshake_timeout_sec = 1
+        \\graceful_shutdown_timeout_sec = 0
         \\[access.users]
         \\alice = "00112233445566778899aabbccddeeff"
     ;
@@ -1157,6 +1168,7 @@ test "parse config - server runtime tunables lower bounds" {
     try std.testing.expectEqual(@as(u32, 32), cfg.max_connections);
     try std.testing.expectEqual(@as(u32, 5), cfg.idle_timeout_sec);
     try std.testing.expectEqual(@as(u32, 5), cfg.handshake_timeout_sec);
+    try std.testing.expectEqual(@as(u32, 1), cfg.graceful_shutdown_timeout_sec);
 }
 
 test "parse config - idle timeout jitter clamps to 100 percent" {
@@ -1413,6 +1425,7 @@ test "parse config - full production-like config" {
         \\idle_timeout_sec = 120
         \\idle_timeout_jitter_pct = 15
         \\handshake_timeout_sec = 15
+        \\graceful_shutdown_timeout_sec = 15
         \\dc_connect_timeout_sec = 10
         \\backlog = 8192
         \\log_level = "info"
@@ -1445,6 +1458,7 @@ test "parse config - full production-like config" {
     try std.testing.expectEqual(@as(u32, 120), cfg.idle_timeout_sec);
     try std.testing.expectEqual(@as(u8, 15), cfg.idle_timeout_jitter_pct);
     try std.testing.expectEqual(@as(u32, 15), cfg.handshake_timeout_sec);
+    try std.testing.expectEqual(@as(u32, 15), cfg.graceful_shutdown_timeout_sec);
     try std.testing.expectEqual(@as(u32, 10), cfg.dc_connect_timeout_sec);
     try std.testing.expectEqual(@as(u32, 8192), cfg.backlog);
     try std.testing.expectEqual(std.log.Level.info, cfg.log_level);

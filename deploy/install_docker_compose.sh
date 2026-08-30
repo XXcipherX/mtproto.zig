@@ -255,6 +255,7 @@ services:
     image: ${MTPROTO_IMAGE:-ghcr.io/xxcipherx/mtproto.zig:latest}
     container_name: mtproto-proxy
     restart: unless-stopped
+    stop_grace_period: 25s
     network_mode: host
     ulimits:
       nofile:

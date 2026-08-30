@@ -75,6 +75,11 @@ port = 443
 # Default is 15; parser enforces a minimum of 5.
 # handshake_timeout_sec = 15
 
+# Seconds to drain existing connections after the first SIGINT/SIGTERM.
+# New accepts stop immediately; a second signal or the deadline closes any
+# remaining connections. Default is 15; parser enforces a minimum of 1.
+# graceful_shutdown_timeout_sec = 15
+
 # Per-endpoint deadline for the TCP connect to a Telegram DC candidate.
 # This is separate from the global handshake timeout: if one candidate is
 # black-holed, the proxy can abandon it and try the next candidate in time.

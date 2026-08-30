@@ -2743,6 +2743,8 @@ const EventLoop = struct {
     accept_paused: bool,
     accept_resume_ns: i128,
     saturation_paused: bool,
+    shutting_down: bool,
+    shutdown_deadline_ns: i128,
     deadline_heap: std.ArrayList(DeadlineEntry),
     armed_deadline_ns: i128,
     stats_next_log_ns: i128,
@@ -2795,6 +2797,8 @@ const EventLoop = struct {
         loop.accept_paused = false;
         loop.accept_resume_ns = 0;
         loop.saturation_paused = false;
+        loop.shutting_down = false;
+        loop.shutdown_deadline_ns = 0;
         loop.deadline_heap = .empty;
         try loop.deadline_heap.ensureTotalCapacity(state.allocator, state.config.max_connections);
         errdefer loop.deadline_heap.deinit(state.allocator);
@@ -2878,12 +2882,19 @@ const EventLoop = struct {
             }
 
             const n: usize = @intCast(rc);
+            var shutdown_signal_count: u64 = 0;
             for (events[0..n]) |ev| {
                 if (ev.data.u64 != epoll_shutdown_token) continue;
-                if (try self.consumeShutdownSignal()) {
-                    log.info("SIGINT/SIGTERM received; shutting down", .{});
-                    return;
+                shutdown_signal_count +|= try self.consumeShutdownSignal();
+            }
+            if (shutdown_signal_count > 0) {
+                if (!self.shutting_down) {
+                    self.beginGracefulShutdown();
+                    if (shutdown_signal_count > 1) self.forceImmediateShutdown();
+                } else {
+                    self.forceImmediateShutdown();
                 }
+                if (self.maybeCompleteShutdown(compat.monotonicNanoTimestamp())) return;
             }
 
             for (events[0..n]) |ev| {
@@ -2891,9 +2902,11 @@ const EventLoop = struct {
                 const ev_flags = ev.events;
                 if (token == epoll_shutdown_token) continue;
                 if (token == epoll_listener_token) {
-                    self.acceptNewConnections() catch |err| {
-                        log.err("accept loop error: {any}", .{err});
-                    };
+                    if (!self.shutting_down) {
+                        self.acceptNewConnections() catch |err| {
+                            log.err("accept loop error: {any}", .{err});
+                        };
+                    }
                     continue;
                 }
                 if (token == epoll_timer_token) {
@@ -2913,11 +2926,11 @@ const EventLoop = struct {
             }
 
             const now_ns = compat.monotonicNanoTimestamp();
-            if (self.accept_paused and now_ns >= self.accept_resume_ns) {
+            if (!self.shutting_down and self.accept_paused and now_ns >= self.accept_resume_ns) {
                 self.resumeAccepting();
             }
             // Saturation hysteresis: resume accepting when active drops below 80%
-            if (self.saturation_paused) {
+            if (!self.shutting_down and self.saturation_paused) {
                 const active = self.state.active_connections;
                 const resume_threshold = (self.state.config.max_connections * 8) / 10;
                 if (active <= resume_threshold) {
@@ -2928,20 +2941,21 @@ const EventLoop = struct {
             if (now_ns >= self.stats_next_log_ns) {
                 self.logPeriodicStats(now_ns);
             }
+            if (self.shutting_down and self.maybeCompleteShutdown(now_ns)) return;
             try self.rearmTimer();
         }
     }
 
-    fn consumeShutdownSignal(self: *EventLoop) !bool {
+    fn consumeShutdownSignal(self: *EventLoop) !u64 {
         var count: u64 = 0;
         const bytes = std.mem.asBytes(&count);
         const n = posix.read(self.shutdown_fd, bytes) catch |err| switch (err) {
-            error.WouldBlock => return false,
+            error.WouldBlock => return 0,
             else => |e| return e,
         };
         if (n == 0) return error.ShutdownEventFdClosed;
         if (n != bytes.len) return error.ShortShutdownEventRead;
-        return count != 0;
+        return count;
     }
 
     fn processSlotEvent(self: *EventLoop, slot: *ConnectionSlot, fd: posix.fd_t, events: u32) void {
@@ -3017,6 +3031,8 @@ const EventLoop = struct {
     }
 
     fn acceptNewConnections(self: *EventLoop) !void {
+        if (self.shutting_down) return;
+
         // Saturation hysteresis: if active > 90% of max, stop accepting entirely.
         // Resume only when active drops below 80% (checked in run() loop).
         const active_now = self.state.active_connections;
@@ -3199,7 +3215,7 @@ const EventLoop = struct {
     }
 
     fn wantsAcceptInterest(self: *const EventLoop) bool {
-        return shouldAcceptListen(self.accept_paused, self.saturation_paused);
+        return shouldAcceptListen(self.accept_paused, self.saturation_paused, self.shutting_down);
     }
 
     fn syncAcceptInterest(self: *EventLoop) !void {
@@ -3274,6 +3290,48 @@ const EventLoop = struct {
             log.info("saturation eased: active={d}/{d}; resuming accepts", .{ active, self.state.config.max_connections });
         } else {
             log.info("saturation eased: active={d}/{d}; accepts remain paused for fd quota", .{ active, self.state.config.max_connections });
+        }
+    }
+
+    fn beginGracefulShutdown(self: *EventLoop) void {
+        const now_ns = compat.monotonicNanoTimestamp();
+        self.shutting_down = true;
+        self.shutdown_deadline_ns = now_ns +
+            (@as(i128, @intCast(self.state.config.graceful_shutdown_timeout_sec)) * std.time.ns_per_s);
+
+        self.syncAcceptInterest() catch |err| {
+            log.warn("failed to disable listen socket during graceful shutdown: {any}", .{err});
+        };
+
+        log.warn(
+            "SIGINT/SIGTERM received: graceful shutdown started, active={d}, timeout={d}s",
+            .{ self.state.active_connections, self.state.config.graceful_shutdown_timeout_sec },
+        );
+    }
+
+    fn forceImmediateShutdown(self: *EventLoop) void {
+        self.shutdown_deadline_ns = compat.monotonicNanoTimestamp();
+        log.warn("SIGINT/SIGTERM received during graceful drain; forcing immediate shutdown", .{});
+    }
+
+    fn maybeCompleteShutdown(self: *EventLoop, now_ns: i128) bool {
+        const active = self.state.active_connections;
+        if (active == 0) {
+            log.info("graceful shutdown complete: all connections drained", .{});
+            return true;
+        }
+        if (now_ns < self.shutdown_deadline_ns) return false;
+
+        log.warn("graceful shutdown timeout reached; forcing close of {d} active connections", .{active});
+        self.forceCloseActiveSlots("shutdown timeout");
+        return true;
+    }
+
+    fn forceCloseActiveSlots(self: *EventLoop, reason: []const u8) void {
+        for (self.pool.slots) |slot_opt| {
+            if (slot_opt) |slot| {
+                if (slot.phase != .idle) self.closeSlot(slot, reason);
+            }
         }
     }
 
@@ -5399,6 +5457,9 @@ const EventLoop = struct {
 
     fn rearmTimer(self: *EventLoop) !void {
         var next: ?i128 = self.stats_next_log_ns;
+        if (self.shutting_down and self.shutdown_deadline_ns > 0) {
+            next = earlierDeadline(next, self.shutdown_deadline_ns);
+        }
         if (self.accept_paused and self.accept_resume_ns > 0) {
             next = earlierDeadline(next, self.accept_resume_ns);
         }
@@ -6202,8 +6263,8 @@ fn requiredFdsForConnections(max_connections: u32) usize {
     return @as(usize, max_connections) * 2 + nofile_fd_overhead;
 }
 
-fn shouldAcceptListen(accept_paused: bool, saturation_paused: bool) bool {
-    return !accept_paused and !saturation_paused;
+fn shouldAcceptListen(accept_paused: bool, saturation_paused: bool, shutting_down: bool) bool {
+    return !accept_paused and !saturation_paused and !shutting_down;
 }
 
 fn maxConnectionsForNofile(soft_nofile: usize) u32 {
@@ -7167,6 +7228,8 @@ test "middle proxy nonce response failures fall back to direct path" {
         .accept_paused = false,
         .accept_resume_ns = 0,
         .saturation_paused = false,
+        .shutting_down = false,
+        .shutdown_deadline_ns = 0,
         .deadline_heap = deadlines,
         .armed_deadline_ns = 0,
         .stats_next_log_ns = compat.monotonicNanoTimestamp() + stats_log_interval_ns,
@@ -7760,10 +7823,11 @@ test "fd requirement helpers" {
 }
 
 test "accept listen interest stays disabled while any pause reason is active" {
-    try std.testing.expect(shouldAcceptListen(false, false));
-    try std.testing.expect(!shouldAcceptListen(true, false));
-    try std.testing.expect(!shouldAcceptListen(false, true));
-    try std.testing.expect(!shouldAcceptListen(true, true));
+    try std.testing.expect(shouldAcceptListen(false, false, false));
+    try std.testing.expect(!shouldAcceptListen(true, false, false));
+    try std.testing.expect(!shouldAcceptListen(false, true, false));
+    try std.testing.expect(!shouldAcceptListen(true, true, false));
+    try std.testing.expect(!shouldAcceptListen(false, false, true));
 }
 
 test "parse ipv4 literal" {
@@ -8046,6 +8110,8 @@ test "handshake budget is charged once after the first client byte" {
         .accept_paused = false,
         .accept_resume_ns = 0,
         .saturation_paused = false,
+        .shutting_down = false,
+        .shutdown_deadline_ns = 0,
         .deadline_heap = .empty,
         .armed_deadline_ns = 0,
         .stats_next_log_ns = 0,

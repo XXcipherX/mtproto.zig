@@ -20,10 +20,10 @@ Production MTProto proxy implemented in Zig with FakeTLS entry, obfuscated MTPro
 ## Runtime Model
 
 - Relay path is a single-threaded Linux `epoll` event loop. The large `EventLoop` container (including fixed admission tables) is allocated once on the heap and initialized in place so Debug builds do not reserve multi-megabyte stack frames.
-- `SIGINT` and `SIGTERM` use a minimal `sigaction` handler that writes to a non-blocking `eventfd` registered in epoll. Shutdown work never runs in signal context: the event loop exits first, closes active slots, then the listener closes before the discovery updater is canceled and joined.
+- `SIGINT` and `SIGTERM` use a minimal `sigaction` handler that writes to a non-blocking `eventfd` registered in epoll. Shutdown work never runs in signal context: the first notification removes listener interest and lets active slots drain for `graceful_shutdown_timeout_sec`; another notification or the deadline closes the remaining slots. The listener then closes before the discovery updater is canceled and joined.
 - Connections are represented by pooled `ConnectionSlot` state objects.
 - Epoll payloads encode slot index, generation, and client/upstream role directly in `epoll_event.data.u64`; dispatch has no fd hash lookup, and generation checks reject stale events after slot/fd reuse.
-- Connection deadlines live in an indexed min-heap with one entry per active slot. A monotonic `timerfd` is armed to the earliest slot, accept-backoff, or stats deadline, eliminating the historical full-slot timer scan.
+- Connection deadlines live in an indexed min-heap with one entry per active slot. A monotonic `timerfd` is armed to the earliest slot, accept-backoff, process-shutdown, or stats deadline, eliminating the historical full-slot timer scan.
 - Outbound data uses intrusive `MessageQueue` blocks whose allocation occupies one page, served by one capped event-loop-wide free list. Queue pages, retained free-list pages, MiddleProxy stream buffers, and shared scratch are charged to one hard `ManagedBufferAllocator` budget. Appends pack the current tail before acquiring another block; bounded `writev` flushing and a 4 MiB pending-byte cap apply per direction queue. Read/drain/write loops have explicit byte and operation budgets per dispatch.
 - Relay slots track client/upstream read EOF and write shutdown independently. A frame-aligned EOF stops only that source read; after its destination queue drains, `shutdown(SHUT_WR)` propagates FIN without disabling the reverse direction. EOF inside a FakeTLS or MiddleProxy frame fails closed.
 - A joinable background updater starts after the listener when MiddleProxy or masking discovery is needed. It refreshes MiddleProxy metadata, detects the NAT IPv4, re-resolves all masking candidates hourly, probes endpoints in cancellable batches of four, can wake early after stalled MiddleProxy handshakes, and is stopped cooperatively on `ProxyState.deinit`. DNS, built-in HTTPS, and curl fallback operations race an atomic stop watcher inside an owner-thread `std.Io.Select`; every late allocated result is drained before the updater is joined.
@@ -95,6 +95,7 @@ Current runtime timeout control is event-loop based:
 - Pre-first-byte wait: fixed 10 seconds.
 - `idle_timeout_sec`: established relay idle timeout.
 - `handshake_timeout_sec`: timeout for handshake stages after first byte.
+- `graceful_shutdown_timeout_sec`: process-wide drain deadline after the first `SIGINT`/`SIGTERM`; a second signal forces immediate completion.
 - `client_silence_close_sec`: conservative unanswered-reply fallback on generic DC relays, enabled only after at least 30 seconds in relay and a delivered reply followed by further client traffic on the same connection.
 - `client_silence_fast_close_sec`: optional fast unanswered-reply close after an established generic relay resumes from `client_silence_fast_after_idle_sec` of silence.
 
@@ -157,7 +158,8 @@ If `max_connections` exceeds the baseline RAM ceiling, startup auto-clamps it be
 - Direct/MiddleProxy fallback logic still preserves media and non-media expectations.
 - MiddleProxy buffer changes preserve 16 KiB initial allocation, on-demand growth, and the 3840 KiB effective cap derived from the 4 MiB relay queue minus framing headroom.
 - Timeout behavior remains controlled by config timers.
+- Graceful process shutdown disables new accepts on the first signal, preserves existing relay progress until the configured deadline, and force-closes only after another signal or timeout.
 - WEB carrier requests remain capability-gated, WELCOME stays alone in the first binary carrier message, trusted relay status cannot be forged through PROXY v2, and direct-obfuscated RDHUP follows the direct relay path rather than FakeTLS record parsing.
-- CI remains green across `zig fmt --check`, Debug tests, ReleaseSafe tests, daemon smoke with positive and bad-secret paths, production ReleaseSafe+PIE builds, cross-builds, ShellCheck, Python syntax checks, Docker build plus safe-default smoke, the Debian/Ubuntu installer E2E matrix, genuine ReleaseFast bench, and soak.
+- CI remains green across `zig fmt --check`, Debug tests, ReleaseSafe tests, daemon smoke with positive, bad-secret, and graceful-SIGTERM paths, production ReleaseSafe+PIE builds, cross-builds, ShellCheck, Python syntax checks, Docker build plus safe-default smoke, the Debian/Ubuntu installer E2E matrix, genuine ReleaseFast bench, and soak.
 - Deploy docs remain aligned with current tunnel/direct-mode behavior.
 - Docs remain aligned with code paths and log messages.

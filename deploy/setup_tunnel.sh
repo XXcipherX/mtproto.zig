@@ -310,6 +310,8 @@ Group=mtproto
 WorkingDirectory=/opt/mtproto-proxy
 ExecStartPre=/usr/local/bin/setup_netns.sh
 ExecStart=/sbin/ip netns exec tg_proxy_ns /opt/mtproto-proxy/mtproto-proxy /opt/mtproto-proxy/config.toml
+KillSignal=SIGTERM
+TimeoutStopSec=25
 Restart=always
 RestartSec=3
 

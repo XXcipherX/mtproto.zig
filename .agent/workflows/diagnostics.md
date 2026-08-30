@@ -43,6 +43,9 @@ ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy --since "1 hour ago" --no-page
 # Timeout signals from event-loop timers
 ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy --since "1 hour ago" --no-pager | grep -E "idle pre-first-byte timeout|handshake timeout|relay idle timeout"'
 
+# Graceful process shutdown state
+ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy --since "1 hour ago" --no-pager | grep -E "graceful shutdown started|graceful shutdown complete|graceful shutdown timeout reached|forcing immediate shutdown"'
+
 # MiddleProxy metadata refresh state
 ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy --since "24 hours ago" --no-pager | grep -E "Middle-proxy cache updated|Middle-proxy reactive refresh|Initial middle-proxy refresh failed|Middle-proxy refresh failed"'
 
@@ -61,6 +64,7 @@ Note:
 - `drops: ... rate+=...` means the per-subnet token bucket rejected new connections; IPv4-mapped IPv6 addresses are grouped with their native IPv4 `/24`.
 - A healthy WEB carrier logs `web session opened ... (client address: real)` in the relay. `loopback` there means the browser address was not preserved through the Caddy/PROXY-v2 hop; inspect `[web].mask_backend`, Caddy listener wrappers, and `X-Forwarded-For` handling.
 - WEB stream failures should be correlated across `mtproto-web-relay` and the main proxy. The relay opens one backend connection per logical stream, so those streams also appear in the proxy's ordinary connection and close statistics.
+- `graceful shutdown started` means listener interest is already disabled while existing connections drain. `graceful shutdown complete` is a natural drain; `graceful shutdown timeout reached` means the remaining slots were force-closed. A second signal intentionally produces `forcing immediate shutdown`.
 
 ## IPv6 Hopping and DNS
 
@@ -126,7 +130,7 @@ ssh root@<SERVER_IP> 'cd /root/mtproto.zig && sudo python3 test/capacity_connect
 # Stability harness (from a repo checkout on the server)
 ssh root@<SERVER_IP> 'cd /root/mtproto.zig && sudo python3 test/connection_stability_check.py --host 127.0.0.1 --port 443 --pid $(pgrep -f mtproto-proxy | head -n1) --idle-connections 6000 --idle-cycles 3 --churn-total 30000 --churn-concurrency 300'
 
-# Real daemon smoke from a Linux checkout: positive FakeTLS plus bad-secret rejection
+# Real daemon smoke from a Linux checkout: positive FakeTLS, bad-secret rejection, and graceful SIGTERM drain
 ssh root@<SERVER_IP> 'cd /root/mtproto.zig && zig build && python3 test/daemon_smoke.py --binary zig-out/bin/mtproto-proxy'
 ```
 

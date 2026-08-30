@@ -69,7 +69,7 @@ ELF is always PIE.
 
 The default install graph contains only `mtproto-proxy`. Use `zig build install-bench` only when the standalone `mtproto-bench` binary is required; `bench` and `soak` build it explicitly without coupling `run` to the global install step.
 
-The daemon smoke launches a real localhost proxy, verifies a valid FakeTLS handshake, and checks that the same SNI with a bad secret does not receive a valid FakeTLS response. CI uses a shorter soak for pull requests and a longer soak on pushes.
+The daemon smoke launches a real localhost proxy, verifies a valid FakeTLS handshake, checks that the same SNI with a bad secret does not receive a valid FakeTLS response, and holds an authenticated connection across `SIGTERM` until the configured graceful-shutdown deadline forces a clean exit. CI uses a shorter soak for pull requests and a longer soak on pushes.
 
 Installer changes also require the separate `.github/workflows/installer-e2e.yml` matrix. It boots privileged systemd containers for Debian 12/13 and Ubuntu 24.04/26.04, runs the real Docker Compose installer twice, and checks the private config, Caddy-only topology, WEB relay, service health, HTTPS masking, external-only SYNFIX/NFQUEUE rules, disabled-by-default TCPMSS, and idempotent reinstall. Docker, Compose, Caddy, the proxy image, systemd, and iptables remain real; only public ACME and the external `nfqws` implementation use deterministic test substitutes. Run one case locally with:
 
@@ -192,7 +192,8 @@ The tracked `deploy/compose.yml` is a minimal proxy-only example. `deploy/instal
 
 ## Systemd Unit Notes (`deploy/mtproto-proxy.service`)
 
-- Default and tunnel-patched units run as `mtproto:mtproto`, use `Restart=always` with `RestartSec=3`, and ship with `LimitNOFILE=131582` plus `TasksMax=65535`.
+- Default and tunnel-patched units run as `mtproto:mtproto`, use `Restart=always` with `RestartSec=3`, send `SIGTERM`, allow 25 seconds with `TimeoutStopSec`, and ship with `LimitNOFILE=131582` plus `TasksMax=65535`.
+- The tracked and installer-generated Compose proxy service uses `stop_grace_period: 25s`. This leaves headroom around the proxy's default 15-second `graceful_shutdown_timeout_sec`; keep the supervisor allowance above any configured drain deadline.
 - Startup first auto-clamps `max_connections` to an effective-memory estimate using the lower of host RAM and every visible limit in the process's cgroup v2/v1 hierarchy (leaf plus parents, including non-standard mount points) unless `unsafe_override_limits=true`; it fails safe if fewer than 32 slots fit. `ProxyState.run` then clamps again if `RLIMIT_NOFILE` can cover at least 32 slots, otherwise it also fails startup safely.
 - The daemon banner redacts user secrets and proxy links. Prefer the one-shot `--print-links` mode: it loads the config, prints links in the current private terminal, and exits before initializing signals or opening the listener. In a running Compose install, execute `/usr/local/bin/mtproto-proxy /etc/mtproto-proxy/config.toml --print-links` inside the `mtproto-proxy` container. `--show-secrets` remains an explicit opt-in for a full foreground daemon run.
 - Runtime relay model is still single-thread `epoll` in proxy core.

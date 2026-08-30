@@ -10,6 +10,8 @@ User=mtproto
 Group=mtproto
 WorkingDirectory=/opt/mtproto-proxy
 ExecStart=/opt/mtproto-proxy/mtproto-proxy /opt/mtproto-proxy/config.toml
+KillSignal=SIGTERM
+TimeoutStopSec=25
 Restart=always
 RestartSec=3
 

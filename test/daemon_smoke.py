@@ -156,6 +156,51 @@ def verify_bad_secret_rejected(
     print("negative bad-secret smoke passed")
 
 
+def verify_graceful_shutdown(
+    proc: subprocess.Popen[str],
+    args: argparse.Namespace,
+    build_tls_auth_client_hello,
+) -> None:
+    with wait_for_port(
+        proc,
+        ["127.0.0.1", "::1"],
+        args.port,
+        args.startup_timeout_sec,
+    ) as sock:
+        hello = build_tls_auth_client_hello(bytes.fromhex(SECRET_HEX), TLS_DOMAIN)
+        sock.sendall(hello)
+        verify_fake_tls_response(sock)
+
+        started = time.monotonic()
+        proc.terminate()
+        try:
+            proc.wait(timeout=0.35)
+        except subprocess.TimeoutExpired:
+            pass
+        else:
+            raise RuntimeError("daemon exited immediately instead of draining an active connection")
+
+        try:
+            return_code = proc.wait(timeout=3.0)
+        except subprocess.TimeoutExpired as err:
+            raise RuntimeError("daemon exceeded its graceful shutdown deadline") from err
+
+        elapsed = time.monotonic() - started
+        if return_code != 0:
+            raise RuntimeError(f"daemon exited with code {return_code} during graceful shutdown")
+        if elapsed < 0.75:
+            raise RuntimeError(f"graceful shutdown deadline fired too early after {elapsed:.2f}s")
+
+    output = proc.stdout.read() if proc.stdout is not None else ""
+    for expected in (
+        "graceful shutdown started",
+        "graceful shutdown timeout reached",
+    ):
+        if expected not in output:
+            raise RuntimeError(f"daemon output is missing {expected!r}")
+    print("graceful SIGTERM drain smoke passed")
+
+
 def write_smoke_config(path: Path, port: int) -> None:
     path.write_text(
         textwrap.dedent(
@@ -170,6 +215,7 @@ def write_smoke_config(path: Path, port: int) -> None:
             max_connections = 64
             idle_timeout_sec = 5
             handshake_timeout_sec = 5
+            graceful_shutdown_timeout_sec = 1
             rate_limit_per_subnet = 0
 
             [censorship]
@@ -226,6 +272,7 @@ def main() -> int:
                 verify_fake_tls_response(sock)
                 print("positive FakeTLS handshake passed")
             verify_bad_secret_rejected(proc, args, build_tls_auth_client_hello)
+            verify_graceful_shutdown(proc, args, build_tls_auth_client_hello)
         except Exception as err:  # noqa: BLE001 - this is a test harness.
             fail(str(err), proc)
         finally:
