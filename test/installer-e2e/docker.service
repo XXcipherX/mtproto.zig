@@ -1,0 +1,19 @@
+[Unit]
+Description=Isolated Docker Engine for installer E2E
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/dockerd --host=unix:///var/run/docker.sock --storage-driver=vfs
+ExecReload=/bin/kill -s HUP $MAINPID
+Delegate=yes
+KillMode=process
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=infinity
+LimitNPROC=infinity
+TasksMax=infinity
+
+[Install]
+WantedBy=multi-user.target

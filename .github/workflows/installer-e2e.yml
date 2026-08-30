@@ -1,0 +1,62 @@
+name: Installer E2E
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/installer-e2e.yml"
+      - "deploy/**"
+      - "test/installer-e2e/**"
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/installer-e2e.yml"
+      - "deploy/**"
+      - "test/installer-e2e/**"
+
+concurrency:
+  group: installer-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  docker-compose-installer:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: debian:12
+            name: Debian 12
+            artifact: debian-12
+          - image: debian:13
+            name: Debian 13
+            artifact: debian-13
+          - image: ubuntu:24.04
+            name: Ubuntu 24.04
+            artifact: ubuntu-24-04
+          - image: ubuntu:26.04
+            name: Ubuntu 26.04
+            artifact: ubuntu-26-04
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Run isolated installer E2E
+        env:
+          MTPROTO_INSTALLER_E2E_IMAGE: ${{ matrix.image }}
+        run: test/installer-e2e/run.sh
+
+      - name: Upload installer logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: installer-e2e-${{ matrix.artifact }}
+          path: test/installer-e2e/logs/
+          if-no-files-found: ignore
+          retention-days: 14

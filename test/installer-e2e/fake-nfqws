@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# setup_nfqws.sh should configure and supervise a long-running process. The
+# protocol implementation itself belongs to zapret; the installer E2E only
+# needs a deterministic queue consumer placeholder and tests queue-bypass.
+set -euo pipefail
+
+trap 'exit 0' INT TERM
+while true; do
+    sleep 3600 &
+    wait "$!"
+done

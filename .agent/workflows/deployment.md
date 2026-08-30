@@ -46,7 +46,7 @@ Before merging behavior changes, match the GitHub workflow as closely as practic
 ```bash
 zig fmt --check build.zig src
 python3 -m py_compile test/*.py
-shellcheck --severity=error docker-entrypoint.sh deploy/*.sh deploy/monitor/*.sh
+shellcheck --severity=error docker-entrypoint.sh deploy/*.sh deploy/monitor/*.sh test/installer-e2e/run.sh test/installer-e2e/fake-*
 zig build test
 zig build -Doptimize=ReleaseSafe test
 zig build -Doptimize=ReleaseSafe fuzz --fuzz=100K
@@ -70,6 +70,12 @@ ELF is always PIE.
 The default install graph contains only `mtproto-proxy`. Use `zig build install-bench` only when the standalone `mtproto-bench` binary is required; `bench` and `soak` build it explicitly without coupling `run` to the global install step.
 
 The daemon smoke launches a real localhost proxy, verifies a valid FakeTLS handshake, and checks that the same SNI with a bad secret does not receive a valid FakeTLS response. CI uses a shorter soak for pull requests and a longer soak on pushes.
+
+Installer changes also require the separate `.github/workflows/installer-e2e.yml` matrix. It boots privileged systemd containers for Debian 12/13 and Ubuntu 24.04/26.04, runs the real Docker Compose installer twice, and checks the private config, Caddy-only topology, WEB relay, service health, HTTPS masking, external-only SYNFIX/NFQUEUE rules, disabled-by-default TCPMSS, and idempotent reinstall. Docker, Compose, Caddy, the proxy image, systemd, and iptables remain real; only public ACME and the external `nfqws` implementation use deterministic test substitutes. Run one case locally with:
+
+```bash
+MTPROTO_INSTALLER_E2E_IMAGE=debian:12 test/installer-e2e/run.sh
+```
 
 ## Docker Image Defaults
 

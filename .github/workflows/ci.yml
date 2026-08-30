@@ -25,7 +25,7 @@ jobs:
         run: python3 -m py_compile test/*.py test/web-bridge/*.py
 
       - name: ShellCheck deploy scripts
-        run: shellcheck --severity=error docker-entrypoint.sh deploy/*.sh deploy/monitor/*.sh
+        run: shellcheck --severity=error docker-entrypoint.sh deploy/*.sh deploy/monitor/*.sh test/installer-e2e/run.sh test/installer-e2e/fake-*
 
       - name: Run tests
         run: zig build test
