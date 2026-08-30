@@ -25,7 +25,7 @@ jobs:
         run: python3 -m py_compile test/*.py test/web-bridge/*.py
 
       - name: ShellCheck deploy scripts
-        run: shellcheck --severity=error deploy/*.sh deploy/monitor/*.sh
+        run: shellcheck --severity=error docker-entrypoint.sh deploy/*.sh deploy/monitor/*.sh
 
       - name: Run tests
         run: zig build test
@@ -62,6 +62,35 @@ jobs:
 
       - name: Docker build smoke
         run: docker build --build-arg ZIG_VERSION=0.16.0 -t mtproto-zig-smoke .
+
+      - name: Docker safe-default smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          container=mtproto-zig-safe-default-smoke
+          output_dir="$(mktemp -d)"
+          cleanup() {
+            docker rm -f "$container" >/dev/null 2>&1 || true
+            rm -rf "$output_dir"
+          }
+          trap cleanup EXIT
+
+          docker run -d --name "$container" mtproto-zig-smoke >/dev/null
+          for _ in $(seq 1 20); do
+            if docker cp "$container:/etc/mtproto-proxy/config.toml" "$output_dir/config.toml" 2>/dev/null; then
+              break
+            fi
+            sleep 0.25
+          done
+
+          test -f "$output_dir/config.toml"
+          test "$(stat -c '%a' "$output_dir/config.toml")" = 600
+          secret="$(awk -F '"' '/^[[:space:]]*user1[[:space:]]*=/{print $2; exit}' "$output_dir/config.toml")"
+          [[ "$secret" =~ ^[0-9a-f]{32}$ ]]
+          if docker logs "$container" 2>&1 | grep -Fq -- "$secret"; then
+            echo "generated access secret leaked into container logs" >&2
+            exit 1
+          fi
 
   fuzz:
     name: Security Fuzz

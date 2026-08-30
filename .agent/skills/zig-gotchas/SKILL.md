@@ -28,6 +28,7 @@ Do not reintroduce thread-per-connection or blocking relay loops.
 - Keep hot-path logging minimal (`debug` only where needed, avoid noisy per-packet logs).
 - Do not force global `.log_level = .debug` in production builds.
 - Startup output redacts user secrets and connection links by default. Prefer `--print-links`, whose one-shot path must return after config parsing and before daemon signal/listener initialization; it is safe to invoke inside a running container. `--show-secrets` is only an explicit opt-in for a full foreground daemon run. Never add secrets back to normal service logs.
+- The Docker image ships `config.toml.example` as documentation only. If the selected config path is absent, `docker-entrypoint.sh` must create it atomically with a fresh 32-hex secret and mode `0600`, without writing the secret to container logs. Inspection options must stay read-only, and the `web-relay` subcommand must pass through without implicit config creation.
 - HTTP discovery handles redirects explicitly and validates the resolved URI as HTTPS before opening the next request; never restore automatic `std.http` redirects, which also accept HTTP targets.
 
 ## Allocator and Concurrency
@@ -110,4 +111,4 @@ Do not reintroduce thread-per-connection or blocking relay loops.
 - Use error unions and avoid swallowing critical errors on control-path boundaries.
 - Keep tests close to protocol primitives and relay helpers.
 - For substantial behavior changes, update `README.md` and relevant `.agent` docs in the same change.
-- Keep CI expectations in mind: formatting, Debug tests, ReleaseSafe tests, bounded coverage-guided security fuzzing, real daemon smoke (valid FakeTLS plus bad-secret rejection), cross-builds, ShellCheck, Python harness syntax, Docker build smoke, bench, and soak.
+- Keep CI expectations in mind: formatting, Debug tests, ReleaseSafe tests, bounded coverage-guided security fuzzing, real daemon smoke (valid FakeTLS plus bad-secret rejection), cross-builds, ShellCheck, Python harness syntax, Docker build plus safe-default smoke, bench, and soak.

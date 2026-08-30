@@ -46,7 +46,7 @@ Before merging behavior changes, match the GitHub workflow as closely as practic
 ```bash
 zig fmt --check build.zig src
 python3 -m py_compile test/*.py
-shellcheck --severity=error deploy/*.sh deploy/monitor/*.sh
+shellcheck --severity=error docker-entrypoint.sh deploy/*.sh deploy/monitor/*.sh
 zig build test
 zig build -Doptimize=ReleaseSafe test
 zig build -Doptimize=ReleaseSafe fuzz --fuzz=100K
@@ -70,6 +70,12 @@ ELF is always PIE.
 The default install graph contains only `mtproto-proxy`. Use `zig build install-bench` only when the standalone `mtproto-bench` binary is required; `bench` and `soak` build it explicitly without coupling `run` to the global install step.
 
 The daemon smoke launches a real localhost proxy, verifies a valid FakeTLS handshake, and checks that the same SNI with a bad secret does not receive a valid FakeTLS response. CI uses a shorter soak for pull requests and a longer soak on pushes.
+
+## Docker Image Defaults
+
+`config.toml.example` is documentation, not a live container configuration. When a container starts without the selected config path, `docker-entrypoint.sh` atomically creates a private minimal config with a random 16-byte user secret and mode `0600`; the generated secret is never printed to Docker logs. A mounted config always takes precedence. Inspection options such as `--check-config` and `--print-links` remain read-only, while the `web-relay` subcommand is passed through unchanged because its Compose service mounts the shared config explicitly.
+
+The main CI workflow builds the image and starts it without a mounted config, then verifies the generated file permissions, 32-hex secret shape, and absence of that secret from container logs.
 
 ## WEB Proxy Deployment
 

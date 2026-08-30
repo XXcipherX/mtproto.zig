@@ -158,6 +158,6 @@ If `max_connections` exceeds the baseline RAM ceiling, startup auto-clamps it be
 - MiddleProxy buffer changes preserve 16 KiB initial allocation, on-demand growth, and the 3840 KiB effective cap derived from the 4 MiB relay queue minus framing headroom.
 - Timeout behavior remains controlled by config timers.
 - WEB carrier requests remain capability-gated, WELCOME stays alone in the first binary carrier message, trusted relay status cannot be forged through PROXY v2, and direct-obfuscated RDHUP follows the direct relay path rather than FakeTLS record parsing.
-- CI remains green across `zig fmt --check`, Debug tests, ReleaseSafe tests, daemon smoke with positive and bad-secret paths, production ReleaseSafe+PIE builds, cross-builds, ShellCheck, Python syntax checks, Docker build smoke, genuine ReleaseFast bench, and soak.
+- CI remains green across `zig fmt --check`, Debug tests, ReleaseSafe tests, daemon smoke with positive and bad-secret paths, production ReleaseSafe+PIE builds, cross-builds, ShellCheck, Python syntax checks, Docker build plus safe-default smoke, genuine ReleaseFast bench, and soak.
 - Deploy docs remain aligned with current tunnel/direct-mode behavior.
 - Docs remain aligned with code paths and log messages.

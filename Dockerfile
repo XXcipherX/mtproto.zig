@@ -78,11 +78,12 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/zig-out/bin/mtproto-proxy /usr/local/bin/mtproto-proxy
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
 
 WORKDIR /etc/mtproto-proxy
 
 COPY config.toml.example /usr/share/doc/mtproto-proxy/config.toml.example
-COPY config.toml.example /etc/mtproto-proxy/config.toml
 
-ENTRYPOINT ["/usr/local/bin/mtproto-proxy"]
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["/etc/mtproto-proxy/config.toml"]
