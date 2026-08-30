@@ -732,7 +732,8 @@ fn writeConnectionLinkEntries(cfg: config.Config) void {
     // while rendering links, so they require an explicitly configured address.
     const has_ip = cfg.public_ip != null;
     const server_ip = cfg.public_ip orelse "<SERVER_IP>";
-    if (!has_ip) {
+    const web_only = cfg.web.onlyActive();
+    if (!has_ip and !web_only) {
         writeRaw("      " ++ red ++ "⚠  public_ip is not configured; replace <SERVER_IP> manually." ++ R ++ "\n");
     }
 
@@ -748,24 +749,26 @@ fn writeConnectionLinkEntries(cfg: config.Config) void {
     while (it.next()) |entry| {
         writeStdout("      " ++ B ++ magenta ++ "{s}" ++ R ++ "\n", .{entry.key_ptr.*});
 
-        writeStdout("      " ++ cyan ++ "tg://" ++ R ++ "proxy?server={s}&port={d}&secret=", .{ server_ip, cfg.port });
-        writeRaw(green ++ "ee");
-        for (entry.value_ptr.*) |byte| {
-            writeHexByte(byte);
-        }
-        for (cfg.tls_domain) |byte| {
-            writeHexByte(byte);
-        }
-        writeRaw(R ++ "\n");
+        if (!web_only) {
+            writeStdout("      " ++ cyan ++ "tg://" ++ R ++ "proxy?server={s}&port={d}&secret=", .{ server_ip, cfg.port });
+            writeRaw(green ++ "ee");
+            for (entry.value_ptr.*) |byte| {
+                writeHexByte(byte);
+            }
+            for (cfg.tls_domain) |byte| {
+                writeHexByte(byte);
+            }
+            writeRaw(R ++ "\n");
 
-        writeStdout("      " ++ D ++ "t.me/proxy?server={s}&port={d}&secret=ee", .{ server_ip, cfg.port });
-        for (entry.value_ptr.*) |byte| {
-            writeHexByte(byte);
+            writeStdout("      " ++ D ++ "t.me/proxy?server={s}&port={d}&secret=ee", .{ server_ip, cfg.port });
+            for (entry.value_ptr.*) |byte| {
+                writeHexByte(byte);
+            }
+            for (cfg.tls_domain) |byte| {
+                writeHexByte(byte);
+            }
+            writeRaw(R ++ "\n");
         }
-        for (cfg.tls_domain) |byte| {
-            writeHexByte(byte);
-        }
-        writeRaw(R ++ "\n");
 
         if (web_domain) |domain| {
             writeStdout("      " ++ cyan ++ "tg://" ++ R ++ "webproxy?server={s}&secret=" ++ green ++ "dd", .{domain});
@@ -876,7 +879,10 @@ fn printBanner(
     writeRaw(R ++ "\n");
     writeRaw("      WEB Proxy    " ++ B);
     if (cfg.web.enabled) {
-        writeStdout(green ++ "enabled" ++ R ++ " ({s})", .{cfg.web.domain orelse "domain missing"});
+        writeStdout(
+            green ++ "{s}" ++ R ++ " ({s})",
+            .{ if (cfg.web.onlyActive()) "WEB-only" else "enabled", cfg.web.domain orelse "domain missing" },
+        );
     } else {
         writeRaw(D ++ "disabled" ++ R);
     }

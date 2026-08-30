@@ -12,7 +12,7 @@ Production MTProto proxy implemented in Zig with FakeTLS entry, obfuscated MTPro
 - Language: Zig 0.16.0
 - Networking: Linux sockets + `epoll` via a local Zig 0.16 `net_compat` facade
 - Cryptography: `std.crypto` primitives (SHA256/HMAC/AES-CTR/AES-CBC) plus project protocol layers
-- Optional WEB carrier: a separate `mtproto-proxy web-relay` process behind the existing Caddy service; ordinary FakeTLS and WEB links share the public proxy listener and user secrets
+- Optional WEB carrier: a separate `mtproto-proxy web-relay` process behind the existing Caddy service; ordinary FakeTLS and WEB links share the public proxy listener and user secrets by default, while `[web].only=true` can mask the direct door and retain only the relay path
 - HTTP metadata fetch: `src/http_fetch.zig` wraps `std.http` with bounded response sizes, whole-request timeout behavior, redirect-by-redirect resolver preflight, and owner-thread cancellation
 - Build: `build.zig` + `Makefile`
 - Deployment: Linux VPS + systemd (`deploy/mtproto-proxy.service`), with optional tunnel setup from `deploy/setup_tunnel.sh`
@@ -28,7 +28,7 @@ Production MTProto proxy implemented in Zig with FakeTLS entry, obfuscated MTPro
 - Relay slots track client/upstream read EOF and write shutdown independently. A frame-aligned EOF stops only that source read; after its destination queue drains, `shutdown(SHUT_WR)` propagates FIN without disabling the reverse direction. EOF inside a FakeTLS or MiddleProxy frame fails closed.
 - A joinable background updater starts after the listener when MiddleProxy or masking discovery is needed. It refreshes MiddleProxy metadata, detects the NAT IPv4, re-resolves all masking candidates hourly, probes endpoints in cancellable batches of four, can wake early after stalled MiddleProxy handshakes, and is stopped cooperatively on `ProxyState.deinit`. DNS, built-in HTTPS, and curl fallback operations race an atomic stop watcher inside an owner-thread `std.Io.Select`; every late allocated result is drained before the updater is joined.
 - MiddleProxy handshakes copy only the selected route candidates and a secret version/NAT value, release handshake-only storage at relay start, and parse each C2S frame header once. Current and immediately previous secrets live centrally under the metadata lock, so selector/KDF inputs stay consistent without a per-handshake secret copy. Runtime CBC state is direction-specific; high-frequency protocol randomness comes from a per-thread ChaCha20 DRBG reseeded from the OS CSPRNG.
-- WEB mode keeps failure isolation by running its HTTP/WebSocket multiplexer in a second process with its own single-threaded, level-triggered epoll loop. Caddy terminates the real browser TLS carrier on an internal listener; each logical WEB stream then returns to the ordinary proxy data plane as a PROXY-v2-prefixed direct-obfuscated connection.
+- WEB mode keeps failure isolation by running its HTTP/WebSocket multiplexer in a second process with its own single-threaded, level-triggered epoll loop. Caddy terminates the real browser TLS carrier on an internal listener; each logical WEB stream then returns to the ordinary proxy data plane as a PROXY-v2-prefixed direct-obfuscated connection. The optional WEB-only gate stays in that ordinary data plane, where trust is already fixed from the accepted peer.
 
 Code anchors:
 
@@ -54,13 +54,13 @@ Code anchors:
 
 ## WEB Proxy Flow (Telegram Desktop 7.1+)
 
-1. Telegram Desktop opens a browser HTTPS carrier to `[web].domain` on public `:443`; ordinary FakeTLS clients continue to use the same listener with `censorship.tls_domain`.
+1. Telegram Desktop opens a browser HTTPS carrier to `[web].domain` on public `:443`; with the default `[web].only=false`, ordinary FakeTLS clients continue to use the same listener with `censorship.tls_domain`.
 2. The proxy recognizes the WEB SNI and relays the untouched TLS connection to `[web].mask_backend`, prefixing PROXY v2 with the kernel-reported browser address.
 3. The existing Caddy service terminates TLS and returns a bodyless 404 for ordinary WEB-host requests. Only the capability-bearing bridge and WebSocket routes are sent to the loopback relay; invalid capabilities also receive an empty 404.
 4. The relay authenticates the bridge capability derived from the configured user secret and multiplexes logical streams with the Telegram Desktop WEB frame protocol.
 5. Every logical stream connects back to `[web].backend`, prefixes PROXY v2 with the browser address, and carries the client's `dd` direct-obfuscated MTProto stream into the normal DC/MiddleProxy routing path.
 
-Trust is fixed from the kernel-reported peer at `accept()`: only loopback plus explicit `[web].relay_sources` may enter the direct-obfuscated path. A PROXY header may replace the diagnostic/client address but must never grant trust. WEB-domain masking carriers are deliberately exempt from `mask_relay_max_secs`; ordinary masking/probe relays retain that lifetime cap.
+Trust is fixed from the kernel-reported peer at `accept()`: only loopback plus explicit `[web].relay_sources` may enter the direct-obfuscated path. A PROXY header may replace the diagnostic/client address but must never grant trust. When both `[web].enabled` and `[web].only` are true, every untrusted peer reaching the ordinary FakeTLS SNI is sent to the normal Caddy masking backend before secret validation, including clients holding a formerly valid direct link; the trusted relay remains admitted. `only` is inert when WEB is disabled. WEB-domain masking carriers are deliberately exempt from `mask_relay_max_secs`; ordinary masking/probe relays retain that lifetime cap.
 
 ## MiddleProxy Routing and Refresh
 
@@ -159,7 +159,7 @@ If `max_connections` exceeds the baseline RAM ceiling, startup auto-clamps it be
 - MiddleProxy buffer changes preserve 16 KiB initial allocation, on-demand growth, and the 3840 KiB effective cap derived from the 4 MiB relay queue minus framing headroom.
 - Timeout behavior remains controlled by config timers.
 - Graceful process shutdown disables new accepts on the first signal, preserves existing relay progress until the configured deadline, and force-closes only after another signal or timeout.
-- WEB carrier requests remain capability-gated, WELCOME stays alone in the first binary carrier message, trusted relay status cannot be forged through PROXY v2, and direct-obfuscated RDHUP follows the direct relay path rather than FakeTLS record parsing.
+- WEB carrier requests remain capability-gated, WELCOME stays alone in the first binary carrier message, trusted relay status cannot be forged through PROXY v2, and direct-obfuscated RDHUP follows the direct relay path rather than FakeTLS record parsing. WEB-only must continue to admit the trusted relay, mask every direct peer even with a valid secret, stay inert when WEB is disabled, and suppress ordinary connection links while active.
 - CI remains green across `zig fmt --check`, Debug tests, ReleaseSafe tests, daemon smoke with positive, bad-secret, and graceful-SIGTERM paths, production ReleaseSafe+PIE builds, cross-builds, ShellCheck, Python syntax checks, Docker build plus safe-default smoke, the Debian/Ubuntu installer E2E matrix, genuine ReleaseFast bench, and soak.
 - Deploy docs remain aligned with current tunnel/direct-mode behavior.
 - Docs remain aligned with code paths and log messages.

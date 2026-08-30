@@ -523,6 +523,7 @@ PORT="${PORT:-443}"
 TLS_DOMAIN="$(get_config_value "$INSTALL_DIR/config.toml" "censorship" "tls_domain" "$TLS_DOMAIN")"
 WEB_ENABLED="$(get_config_value "$INSTALL_DIR/config.toml" "web" "enabled" "false")"
 WEB_DOMAIN="$(get_config_value "$INSTALL_DIR/config.toml" "web" "domain" "")"
+WEB_ONLY="$(get_config_value "$INSTALL_DIR/config.toml" "web" "only" "false")"
 
 # Build ee-secret: ee + hex(secret) + hex(tls_domain)
 DOMAIN_HEX=$(echo -n "$TLS_DOMAIN" | xxd -p | tr -d '\n')
@@ -547,11 +548,13 @@ echo -e "  ${DIM}Config:${RESET}  $INSTALL_DIR/config.toml"
 echo -e "  ${DIM}Monitor:${RESET} systemctl status mtproto-mask-health.timer"
 echo -e "  ${DIM}Mon logs:${RESET} journalctl -t mtproto-mask-health -n 50"
 echo ""
-echo -e "  ${BOLD}Connection link:${RESET}"
 if [[ -n "$EE_SECRET" ]]; then
+if ! is_true "$WEB_ONLY"; then
+echo -e "  ${BOLD}Connection link:${RESET}"
 echo -e "  ${CYAN}tg://proxy?server=${PUBLIC_IP}&port=${PORT}&secret=${GREEN}${EE_SECRET}${RESET}"
 echo ""
 echo -e "  ${DIM}t.me/proxy?server=${PUBLIC_IP}&port=${PORT}&secret=${EE_SECRET}${RESET}"
+fi
 if is_true "$WEB_ENABLED" && [[ -n "$WEB_DOMAIN" ]]; then
 echo ""
 echo -e "  ${BOLD}WEB connection link:${RESET}"

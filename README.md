@@ -336,6 +336,7 @@ Useful environment variables:
 | `ENABLE_MASKING` | `true` | Install Caddy/certbot masking and set `mask = true`; Docker installs run Caddy in Compose |
 | `ENABLE_WEB` | `false` | Enable the Telegram Desktop WEB relay alongside ordinary MTProto; an existing enabled WEB setup is preserved when this variable is omitted |
 | `WEB_DOMAIN` | _(required with `ENABLE_WEB=true`)_ | Separate public DNS hostname used by `tg://webproxy` links; it must differ from `TLS_DOMAIN` |
+| `WEB_ONLY` | `false` | With `ENABLE_WEB=true`, mask all direct MTProto clients and serve only the trusted WEB relay; an existing value is preserved when omitted |
 | `ENABLE_TCPMSS` | `false` | Enable legacy `TCPMSS=88` ClientHello fragmentation fallback for external traffic; disabled by default with PQ-capable Caddy masking |
 | `ENABLE_SYNFIX` | `false` | Install inbound SYN pacing rules for external Android/Desktop routes that need it; loopback is excluded |
 | `SYNFIX_RATE` | `30/minute` | Per-source SYN rate for non-iOS-like fingerprints |
@@ -369,7 +370,7 @@ The one-shot process reads the container's mounted config, writes the secret lin
 
 ## WEB proxy (Telegram Desktop 7.1+)
 
-WEB mode is an additional transport, not a replacement for the ordinary proxy. Existing `tg://proxy` FakeTLS clients continue to use public TCP `443`; Telegram Desktop can additionally use a `tg://webproxy` link whose traffic is carried by a real browser HTTPS/WebSocket session.
+By default, WEB mode is an additional transport rather than a replacement for the ordinary proxy. Existing `tg://proxy` FakeTLS clients continue to use public TCP `443`; Telegram Desktop can additionally use a `tg://webproxy` link whose traffic is carried by a real browser HTTPS/WebSocket session. Optional WEB-only mode disables that direct door.
 
 ```text
 ordinary client ───────────────────────────────▶ mtproto-proxy :443 ─▶ Telegram
@@ -423,6 +424,27 @@ docker exec -it mtproto-proxy \
 ```
 
 WEB links use the same 16-byte `[access.users]` secret encoded as `dd<secret>`; FakeTLS links keep their existing `ee<secret><hex-domain>` encoding. The public proxy still rejects direct-obfuscated traffic from untrusted Internet peers: only loopback and explicit `[web].relay_sources` may carry WEB streams into that path.
+
+### WEB-only mode
+
+Set `[web].only = true` when a direct Telegram connection itself triggers blocking of the server IP. The data plane then answers MTProto only for the relay address trusted at `accept()` time. Every external FakeTLS client—including one with a valid old `ee` link—is sent to the same Caddy masking backend used for an invalid secret. Client-provided PROXY metadata cannot grant relay trust.
+
+For an existing Docker Compose installation:
+
+```bash
+curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/install_docker_compose.sh \
+  | sudo env ENABLE_WEB=true WEB_ONLY=true WEB_DOMAIN=web.example.com bash
+```
+
+For a source/systemd installation:
+
+```bash
+sudo /opt/mtproto-proxy/setup_web.sh --only web.example.com
+```
+
+The setup keeps direct MTProto available until Caddy and `mtproto-web-relay` are running, then activates the gate in a final proxy-only restart. `--print-links` and installer summaries emit only `tg://webproxy` links while the gate is active. To restore ordinary MTProto without removing WEB support, run `setup_web.sh --no-only web.example.com` (or rerun the Docker installer with `ENABLE_WEB=true WEB_ONLY=false`).
+
+WEB-only requires Caddy masking and an enabled WEB relay. It is ignored if `[web].enabled=false`, so removing WEB support cannot leave an unreachable all-masked proxy. Existing ordinary `tg://proxy` links do not work until WEB-only is disabled, and `[web].max_sessions` becomes the effective desktop-session ceiling.
 
 Capacity is deliberately separate from the relay's queue-memory limit. One WEB desktop session can occupy one front/masking connection plus up to `max_streams` backend proxy connections. The Caddy installer defaults to `max_sessions=8` and `max_streams=32`, a worst-case 264 proxy slots, which fits the default `max_connections=512`; increase these values together only after accounting for ordinary clients and relay memory.
 
@@ -888,8 +910,10 @@ rate_limit_per_subnet = 30                # Max new connections/sec per /24 subn
 
 [web]
 # Optional Telegram Desktop 7.1+ WEB transport. setup_web.sh writes these
-# values and extends the existing Caddy instance; ordinary MTProto remains on.
+# values and extends the existing Caddy instance; ordinary MTProto remains on
+# unless only=true is selected.
 # enabled = true
+# only = false                              # Mask direct MTProto and serve only the trusted WEB relay
 # domain = "web.example.com"               # Must differ from censorship.tls_domain
 # Ordinary requests receive the same empty 404 as the masking domain
 # listen = "127.0.0.1"                     # Plain HTTP/WebSocket relay, local only
@@ -955,6 +979,7 @@ alice = true   # direct where possible; CDN DC203 still requires MiddleProxy
 | `[monitor]` | `host` | `"127.0.0.1"` | Bind address for the optional monitoring dashboard HTTP server. This section is read by `proxy-monitor`, not by the proxy binary. Set to `"0.0.0.0"` to expose on all interfaces (warning: no built-in auth) |
 | `[monitor]` | `port` | `61208` | TCP port for the optional monitoring dashboard HTTP server |
 | `[web]` | `enabled` | `false` | Enable the separate Telegram Desktop WEB relay process and the trusted relay path in the data plane |
+| `[web]` | `only` / `web_only` | `false` | When WEB is enabled, mask direct MTProto for every non-relay peer. Existing `tg://proxy` links stop working; relay trust comes only from the address returned by `accept()` |
 | `[web]` | `domain` | _(none)_ | Public ASCII DNS hostname placed in `tg://webproxy` links. It must differ from `censorship.tls_domain`; changing it invalidates existing WEB capabilities/links |
 | `[web]` | `listen` / `host` | `"127.0.0.1"` | Plain HTTP/WebSocket relay bind address behind Caddy. Keep it on loopback for the bundled deployment |
 | `[web]` | `port` | `8081` | Local relay listener port |

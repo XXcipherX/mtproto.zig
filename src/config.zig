@@ -110,6 +110,9 @@ pub const Config = struct {
     /// `[access.users]` secrets; this section only configures its HTTPS carrier.
     pub const Web = struct {
         enabled: bool = false,
+        /// When enabled together with WEB, serve MTProto only to trusted relay
+        /// peers and send every direct client to the masking backend.
+        only: bool = false,
         domain: ?[]const u8 = null,
         host: ?[]const u8 = null,
         port: u16 = 8081,
@@ -136,6 +139,10 @@ pub const Config = struct {
 
         pub fn effectiveClientIpHeader(self: *const Web) []const u8 {
             return self.client_ip_header orelse "x-forwarded-for";
+        }
+
+        pub fn onlyActive(self: *const Web) bool {
+            return self.enabled and self.only;
         }
     };
 
@@ -365,6 +372,15 @@ pub const Config = struct {
                     continue;
                 };
             }
+            if (self.web.onlyActive()) {
+                log.warn(
+                    "[web].only=true: direct MTProto is masked for every peer except the trusted WEB relay",
+                    .{},
+                );
+            }
+        } else if (self.web.only) {
+            const log = std.log.scoped(.config);
+            log.warn("[web].only is ignored because [web].enabled=false", .{});
         }
         if (self.users.count() == 0) {
             const log = std.log.scoped(.config);
@@ -791,6 +807,8 @@ pub const Config = struct {
                 } else if (in_web_section) {
                     if (std.mem.eql(u8, key, "enabled")) {
                         if (parseBoolSetting(key, value)) |parsed| cfg.web.enabled = parsed;
+                    } else if (std.mem.eql(u8, key, "only") or std.mem.eql(u8, key, "web_only")) {
+                        if (parseBoolSetting(key, value)) |parsed| cfg.web.only = parsed;
                     } else if (std.mem.eql(u8, key, "domain")) {
                         try replaceOwnedOptionalString(allocator, &cfg.web.domain, value);
                     } else if (std.mem.eql(u8, key, "listen") or std.mem.eql(u8, key, "host")) {
@@ -1737,6 +1755,7 @@ test "parse config - WEB relay settings" {
     const content =
         \\[web]
         \\enabled = true
+        \\only = true
         \\domain = "web.example.com"
         \\listen = "127.0.0.1"
         \\port = 8081
@@ -1758,6 +1777,7 @@ test "parse config - WEB relay settings" {
     defer cfg.deinit(std.testing.allocator);
 
     try std.testing.expect(cfg.web.enabled);
+    try std.testing.expect(cfg.web.onlyActive());
     try std.testing.expectEqualStrings("web.example.com", cfg.web.domain.?);
     try std.testing.expectEqualStrings("127.0.0.1", cfg.web.effectiveHost());
     try std.testing.expectEqual(@as(u16, 8081), cfg.web.port);
@@ -1769,6 +1789,25 @@ test "parse config - WEB relay settings" {
     try std.testing.expectEqual(@as(usize, 2), cfg.web.relay_sources.len);
     try std.testing.expectEqualStrings("10.200.200.1", cfg.web.relay_sources[0]);
     try std.testing.expectEqualStrings("2001:db8::1", cfg.web.relay_sources[1]);
+}
+
+test "parse config - WEB-only is inert while WEB relay is disabled" {
+    var defaults = try Config.parse(std.testing.allocator,
+        \\[web]
+        \\enabled = true
+    );
+    defer defaults.deinit(std.testing.allocator);
+    try std.testing.expect(!defaults.web.only);
+    try std.testing.expect(!defaults.web.onlyActive());
+
+    var disabled = try Config.parse(std.testing.allocator,
+        \\[web]
+        \\enabled = false
+        \\web_only = true
+    );
+    defer disabled.deinit(std.testing.allocator);
+    try std.testing.expect(disabled.web.only);
+    try std.testing.expect(!disabled.web.onlyActive());
 }
 
 test "parse config - malformed WEB relay source array is rejected" {

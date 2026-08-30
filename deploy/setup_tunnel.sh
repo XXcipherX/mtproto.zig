@@ -59,6 +59,13 @@ ok()    { echo -e "${GREEN}✓${RESET} $*"; }
 warn()  { echo -e "${RED}⚠${RESET} $*"; }
 fail()  { echo -e "${RED}✗${RESET} $*" >&2; exit 1; }
 
+is_true() {
+    case "${1,,}" in
+        1|true|yes|on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 get_server_port() {
     local cfg="$1"
     awk '
@@ -450,6 +457,7 @@ fi
 # addresses and keeps ordinary MTProto enabled on the same public listener.
 WEB_ENABLED="$(get_config_value "$INSTALL_DIR/config.toml" "web" "enabled" "false")"
 WEB_DOMAIN="$(get_config_value "$INSTALL_DIR/config.toml" "web" "domain" "")"
+WEB_ONLY="$(get_config_value "$INSTALL_DIR/config.toml" "web" "only" "false")"
 case "${WEB_ENABLED,,}" in
     1|true|yes|on)
         WEB_SETUP="${INSTALL_DIR}/setup_web.sh"
@@ -508,11 +516,13 @@ echo -e "  ${DIM}Tunnel:${RESET}  ip netns exec $NS_NAME awg show"
 echo -e "  ${DIM}Monitor:${RESET} systemctl status mtproto-mask-health.timer"
 echo -e "  ${DIM}Mon logs:${RESET} journalctl -t mtproto-mask-health -n 50"
 echo ""
-echo -e "  ${BOLD}Connection link:${RESET}"
 if [[ -n "$EE_SECRET" ]]; then
+if ! is_true "$WEB_ONLY"; then
+echo -e "  ${BOLD}Connection link:${RESET}"
 echo -e "  ${CYAN}tg://proxy?server=${PUBLIC_IP}&port=${PORT}&secret=${GREEN}${EE_SECRET}${RESET}"
 echo ""
 echo -e "  ${DIM}t.me/proxy?server=${PUBLIC_IP}&port=${PORT}&secret=${EE_SECRET}${RESET}"
+fi
 case "${WEB_ENABLED,,}" in
     1|true|yes|on)
         if [[ -n "$WEB_DOMAIN" ]]; then

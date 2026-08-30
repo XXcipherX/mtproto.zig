@@ -15,7 +15,7 @@
 #   SECRET=<32 hex chars>
 #   USE_MIDDLE_PROXY=true|false
 #   ENABLE_MASKING=true|false
-#   ENABLE_WEB=true|false WEB_DOMAIN=web.example.com
+#   ENABLE_WEB=true|false WEB_DOMAIN=web.example.com WEB_ONLY=true|false
 #   ENABLE_TCPMSS=true|false
 #   ENABLE_SYNFIX=true|false
 #   SYNFIX_RATE=30/minute
@@ -39,6 +39,8 @@ ENABLE_MASKING="${ENABLE_MASKING:-true}"
 if [[ -v ENABLE_WEB ]]; then ENABLE_WEB_EXPLICIT=true; else ENABLE_WEB_EXPLICIT=false; fi
 ENABLE_WEB="${ENABLE_WEB:-false}"
 WEB_DOMAIN="${WEB_DOMAIN:-}"
+if [[ -v WEB_ONLY ]]; then WEB_ONLY_EXPLICIT=true; else WEB_ONLY_EXPLICIT=false; fi
+WEB_ONLY="${WEB_ONLY:-false}"
 ENABLE_TCPMSS="${ENABLE_TCPMSS:-false}"
 ENABLE_SYNFIX="${ENABLE_SYNFIX:-false}"
 SYNFIX_RATE="${SYNFIX_RATE:-30/minute}"
@@ -581,11 +583,17 @@ setup_masking_and_desync() {
 }
 
 restore_existing_web_settings() {
-    $ENABLE_WEB_EXPLICIT && return
     if is_true "$(get_config_value "$CONFIG_FILE" "web" "enabled" "false")"; then
-        ENABLE_WEB=true
-        WEB_DOMAIN="$(get_config_value "$CONFIG_FILE" "web" "domain" "$WEB_DOMAIN")"
+        if ! $ENABLE_WEB_EXPLICIT; then
+            ENABLE_WEB=true
+        fi
+        if [[ -z "$WEB_DOMAIN" ]]; then
+            WEB_DOMAIN="$(get_config_value "$CONFIG_FILE" "web" "domain" "")"
+        fi
         info "Preserving the existing WEB proxy configuration for ${WEB_DOMAIN}"
+        if ! $WEB_ONLY_EXPLICIT; then
+            WEB_ONLY="$(get_config_value "$CONFIG_FILE" "web" "only" "false")"
+        fi
     fi
 }
 
@@ -597,14 +605,17 @@ setup_web_proxy() {
                 bash "${INSTALL_DIR}/setup_web.sh" --remove < /dev/null
             return
         fi
+        is_true "$WEB_ONLY" && fail "WEB_ONLY=true requires ENABLE_WEB=true"
         info "WEB proxy disabled (set ENABLE_WEB=true WEB_DOMAIN=web.example.com to enable)"
         return
     fi
     [[ -n "$WEB_DOMAIN" ]] || fail "ENABLE_WEB=true requires WEB_DOMAIN=web.example.com"
     is_true "$ENABLE_MASKING" || fail "WEB proxy requires ENABLE_MASKING=true for ACME and SNI routing"
     info "Setting up Telegram WEB proxy on ${WEB_DOMAIN}..."
+    local only_arg="--no-only"
+    if is_true "$WEB_ONLY"; then only_arg="--only"; fi
     MTPROTO_DOCKER_INSTALL=1 INSTALL_DIR="$INSTALL_DIR" COMPOSE_FILE="$COMPOSE_FILE" ENV_FILE="$ENV_FILE" \
-        WEB_DOMAIN="$WEB_DOMAIN" bash "${INSTALL_DIR}/setup_web.sh" "$WEB_DOMAIN" < /dev/null
+        WEB_DOMAIN="$WEB_DOMAIN" bash "${INSTALL_DIR}/setup_web.sh" "$only_arg" "$WEB_DOMAIN" < /dev/null
 }
 
 validate_masking() {
@@ -638,11 +649,12 @@ validate_masking() {
 }
 
 print_summary() {
-    local link_secret domain_hex
+    local link_secret domain_hex web_only
     TLS_DOMAIN="$(get_config_value "$CONFIG_FILE" "censorship" "tls_domain" "$TLS_DOMAIN")"
     PUBLIC_IP="$(get_config_value "$CONFIG_FILE" "server" "public_ip" "$PUBLIC_IP")"
     PORT="$(get_config_value "$CONFIG_FILE" "server" "port" "$PORT")"
     SECRET="$(get_first_user_secret "$CONFIG_FILE")"
+    web_only="$(get_config_value "$CONFIG_FILE" "web" "only" "false")"
     domain_hex="$(domain_to_hex "$TLS_DOMAIN")"
 
     echo ""
@@ -658,10 +670,12 @@ print_summary() {
 
     if [[ -n "$SECRET" ]]; then
         link_secret="ee${SECRET}${domain_hex}"
-        echo -e "  ${BOLD}Connection link:${RESET}"
-        echo -e "  ${CYAN}tg://proxy?server=${PUBLIC_IP}&port=${PORT}&secret=${GREEN}${link_secret}${RESET}"
-        echo ""
-        echo -e "  ${DIM}t.me/proxy?server=${PUBLIC_IP}&port=${PORT}&secret=${link_secret}${RESET}"
+        if ! is_true "$web_only"; then
+            echo -e "  ${BOLD}Connection link:${RESET}"
+            echo -e "  ${CYAN}tg://proxy?server=${PUBLIC_IP}&port=${PORT}&secret=${GREEN}${link_secret}${RESET}"
+            echo ""
+            echo -e "  ${DIM}t.me/proxy?server=${PUBLIC_IP}&port=${PORT}&secret=${link_secret}${RESET}"
+        fi
         if is_true "$ENABLE_WEB" && [[ -n "$WEB_DOMAIN" ]]; then
             echo ""
             echo -e "  ${BOLD}WEB connection link:${RESET}"

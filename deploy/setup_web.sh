@@ -12,17 +12,52 @@ ACME_ROOT="${MASK_ACME_ROOT:-/var/www/certbot}"
 CADDYFILE="${CADDYFILE:-/etc/caddy/mtproto-mask.Caddyfile}"
 WEB_PORT="${WEB_PORT:-8081}"
 WEB_TLS_PORT="${WEB_TLS_PORT:-8444}"
-WEB_DOMAIN="${WEB_DOMAIN:-${1:-}}"
+WEB_DOMAIN="${WEB_DOMAIN:-}"
+if [[ -v WEB_ONLY ]]; then WEB_ONLY_EXPLICIT=true; else WEB_ONLY_EXPLICIT=false; fi
+WEB_ONLY="${WEB_ONLY:-false}"
 REMOVE=false
-
-if [[ "${1:-}" == "--remove" ]]; then
-    REMOVE=true
-    WEB_DOMAIN=""
-fi
 
 info() { printf '> %s\n' "$*"; }
 ok() { printf '+ %s\n' "$*"; }
 fail() { printf 'x %s\n' "$*" >&2; exit 1; }
+
+is_true() {
+    case "${1,,}" in
+        1|true|yes|on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+POSITIONAL_DOMAIN=""
+while (($# > 0)); do
+    case "$1" in
+        --remove)
+            REMOVE=true
+            ;;
+        --only)
+            WEB_ONLY=true
+            WEB_ONLY_EXPLICIT=true
+            ;;
+        --no-only)
+            WEB_ONLY=false
+            WEB_ONLY_EXPLICIT=true
+            ;;
+        -h|--help)
+            printf 'Usage: setup_web.sh [--only|--no-only] web.example.com\n'
+            printf '       setup_web.sh --remove\n'
+            exit 0
+            ;;
+        -*)
+            fail "Unknown option: $1"
+            ;;
+        *)
+            [[ -z "$POSITIONAL_DOMAIN" ]] || fail "Only one WEB domain may be specified"
+            POSITIONAL_DOMAIN="$1"
+            ;;
+    esac
+    shift
+done
+WEB_DOMAIN="${WEB_DOMAIN:-$POSITIONAL_DOMAIN}"
 
 [[ $EUID -eq 0 ]] || fail "Run as root"
 [[ -f "$CONFIG_FILE" ]] || fail "Config not found: ${CONFIG_FILE}"
@@ -87,6 +122,61 @@ set_config_value() {
     rm -f "$tmp"
 }
 
+remove_config_key() {
+    local section="$1" key="$2" tmp
+    tmp="$(mktemp)"
+    awk -v want_section="$section" -v want_key="$key" '
+        BEGIN { in_section = 0 }
+        /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
+            header = $0
+            gsub(/^[[:space:]]*\[|\][[:space:]]*$/, "", header)
+            in_section = (header == want_section)
+            print
+            next
+        }
+        in_section && $0 ~ "^[[:space:]]*" want_key "[[:space:]]*=" { next }
+        { print }
+    ' "$CONFIG_FILE" > "$tmp"
+    install -o "$CONFIG_UID" -g "$CONFIG_GID" -m "$CONFIG_MODE" "$tmp" "$CONFIG_FILE"
+    rm -f "$tmp"
+}
+
+get_config_value() {
+    local section="$1" key="$2" fallback="${3:-}"
+    awk -v want_section="$section" -v want_key="$key" -v fallback="$fallback" '
+        BEGIN { in_section = 0; value = "" }
+        /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
+            header = $0
+            gsub(/^[[:space:]]*\[|\][[:space:]]*$/, "", header)
+            in_section = (header == want_section)
+            next
+        }
+        in_section {
+            line = $0
+            sub(/[;#].*/, "", line)
+            if (line ~ "^[[:space:]]*" want_key "[[:space:]]*=") {
+                sub(/^[^=]*=/, "", line)
+                gsub(/^[[:space:]\"]+|[[:space:]\"]+$/, "", line)
+                value = line
+            }
+        }
+        END { print value == "" ? fallback : value }
+    ' "$CONFIG_FILE"
+}
+
+if ! $WEB_ONLY_EXPLICIT; then
+    WEB_ONLY="$(get_config_value web only "")"
+    if [[ -z "$WEB_ONLY" ]]; then
+        WEB_ONLY="$(get_config_value web web_only false)"
+    fi
+fi
+case "${WEB_ONLY,,}" in
+    1|true|yes|on) WEB_ONLY=true ;;
+    0|false|no|off|"") WEB_ONLY=false ;;
+    *) fail "WEB_ONLY must be true or false" ;;
+esac
+if $REMOVE; then WEB_ONLY=false; fi
+
 ensure_caddy_imports() {
     [[ -f "$CADDYFILE" ]] || fail "Existing Caddy masking config not found: ${CADDYFILE}. Run setup_masking.sh first."
     grep -Fq 'import /etc/caddy/web/global.caddy' "$CADDYFILE" \
@@ -120,9 +210,12 @@ if $REMOVE; then
     : > "$CADDY_WEB_DIR/global.caddy"
     : > "$CADDY_WEB_DIR/site.caddy"
     set_config_value web enabled false
+    remove_config_key web only
+    remove_config_key web web_only
     rm -f /etc/letsencrypt/renewal-hooks/deploy/mtproto-web-caddy-reload.sh
     if is_docker_install; then
         set_env_value COMPOSE_PROFILES ""
+        set_env_value WEB_ONLY false
         docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" stop mtproto-web-relay >/dev/null 2>&1 || true
         docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" rm -f mtproto-web-relay >/dev/null 2>&1 || true
         if grep -Eq '^[[:space:]]+mtproto-mask-caddy:[[:space:]]*$' "$COMPOSE_FILE" &&
@@ -237,6 +330,10 @@ if command -v ip >/dev/null 2>&1 && ip netns list 2>/dev/null | awk '{print $1}'
 fi
 
 set_config_value web enabled true
+# Keep the direct path available until Caddy and the WEB relay have both been
+# started and verified. WEB-only is activated in a final proxy-only restart.
+remove_config_key web only
+remove_config_key web web_only
 set_config_value web domain "\"${WEB_DOMAIN}\""
 set_config_value web listen '"127.0.0.1"'
 set_config_value web port "$WEB_PORT"
@@ -355,9 +452,30 @@ if is_docker_install; then
         || fail "Compose file lacks WEB relay; rerun the latest install_docker_compose.sh, then setup_web.sh"
     set_env_value COMPOSE_PROFILES web
     set_env_value WEB_DOMAIN "$WEB_DOMAIN"
+    set_env_value WEB_ONLY "$WEB_ONLY"
     docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" pull mtproto-proxy mtproto-web-relay mtproto-mask-caddy
     reload_caddy
     docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" up -d --force-recreate mtproto-proxy mtproto-web-relay
+    for _ in $(seq 1 10); do
+        if [[ "$(docker inspect -f '{{.State.Running}}' mtproto-proxy 2>/dev/null || true)" == "true" ]] &&
+            [[ "$(docker inspect -f '{{.State.Running}}' mtproto-web-relay 2>/dev/null || true)" == "true" ]]
+        then
+            break
+        fi
+        sleep 1
+    done
+    [[ "$(docker inspect -f '{{.State.Running}}' mtproto-proxy 2>/dev/null || true)" == "true" ]] \
+        || fail "MTProto data plane did not stay running"
+    [[ "$(docker inspect -f '{{.State.Running}}' mtproto-web-relay 2>/dev/null || true)" == "true" ]] \
+        || fail "WEB relay did not stay running; WEB-only was not activated"
+
+    if is_true "$WEB_ONLY"; then
+        set_config_value web only true
+        docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" up -d --force-recreate --no-deps mtproto-proxy
+        sleep 1
+        [[ "$(docker inspect -f '{{.State.Running}}' mtproto-proxy 2>/dev/null || true)" == "true" ]] \
+            || fail "MTProto data plane failed after WEB-only activation"
+    fi
 else
     cat > /etc/systemd/system/mtproto-web-relay.service <<EOF
 [Unit]
@@ -385,6 +503,18 @@ EOF
     reload_caddy
     systemctl enable mtproto-web-relay.service >/dev/null
     systemctl restart mtproto-proxy mtproto-web-relay.service
+    systemctl is-active --quiet mtproto-proxy \
+        || fail "MTProto data plane did not stay running"
+    systemctl is-active --quiet mtproto-web-relay.service \
+        || fail "WEB relay did not stay running; WEB-only was not activated"
+
+    if is_true "$WEB_ONLY"; then
+        set_config_value web only true
+        systemctl restart mtproto-proxy
+        sleep 1
+        systemctl is-active --quiet mtproto-proxy \
+            || fail "MTProto data plane failed after WEB-only activation"
+    fi
 fi
 
 mkdir -p /etc/letsencrypt/renewal-hooks/deploy
@@ -408,9 +538,17 @@ PROBE_IP="${PROBE_IP:-127.0.0.1}"
 curl -fsS --max-time 5 --resolve "${WEB_DOMAIN}:443:${PROBE_IP}" "https://${WEB_DOMAIN}/" >/dev/null \
     || info "End-to-end HTTPS probe is not ready yet; inspect the proxy, Caddy and relay logs"
 
-ok "WEB proxy enabled alongside ordinary MTProto, using the existing Caddy instance"
+if is_true "$WEB_ONLY"; then
+    ok "WEB proxy enabled in WEB-only mode, using the existing Caddy instance"
+else
+    ok "WEB proxy enabled alongside ordinary MTProto, using the existing Caddy instance"
+fi
 printf '  WEB:      tg://webproxy?server=%s&secret=dd%s\n' "$WEB_DOMAIN" "$SECRET"
-printf '  MTProto:  unchanged on the existing public endpoint\n'
+if is_true "$WEB_ONLY"; then
+    printf '  MTProto:  direct links are masked; only the trusted WEB relay is served\n'
+else
+    printf '  MTProto:  unchanged on the existing public endpoint\n'
+fi
 if is_docker_install; then
     printf '  Logs:     docker compose --env-file %s -f %s logs -f mtproto-proxy mtproto-web-relay mtproto-mask-caddy\n' "$ENV_FILE" "$COMPOSE_FILE"
 else

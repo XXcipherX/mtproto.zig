@@ -135,6 +135,13 @@ port = 443
 # `mtproto-proxy web-relay` as a separate process/container.
 # enabled = false
 
+# Optional WEB-only gate. When both enabled and only are true, the public data
+# plane serves MTProto only to the trusted local/configured WEB relay. Direct
+# FakeTLS clients are sent to the ordinary Caddy masking backend exactly like a
+# bad secret, so existing tg://proxy links stop working. The relay is identified
+# from the kernel address returned by accept(), never from a PROXY header.
+# only = false
+
 # Public DNS name in tg://webproxy links. Use a second DNS-only A record that
 # points to this VPS. It MUST differ from censorship.tls_domain, because the two
 # names select different Caddy paths behind the same public :443 listener.

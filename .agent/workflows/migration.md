@@ -70,7 +70,7 @@ Note:
 - `deploy/install.sh` and `make deploy` do not copy `test/` into `/opt/mtproto-proxy`; use a repo checkout or benchmark workspace for the optional Python harnesses above.
 - Replace `/root/mtproto.zig` in the optional probe command with your actual checkout path.
 - Replace `proxy.example.com` in the TLS-auth probe with the deployed `[censorship].tls_domain`.
-- The installer prints a link only when `[access.users]` contains at least one valid 32-hex secret; preserving old secrets is still what keeps existing client links valid.
+- The installer prints links only when `[access.users]` contains at least one valid 32-hex secret; preserving old secrets is still what keeps existing client links valid. Active WEB-only intentionally prints only `tg://webproxy` and suppresses ordinary direct links, which remain unusable until the gate is disabled.
 
 Operational note:
 

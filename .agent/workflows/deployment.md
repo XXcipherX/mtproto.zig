@@ -85,7 +85,7 @@ The main CI workflow builds the image and starts it without a mounted config, th
 
 ## WEB Proxy Deployment
 
-WEB mode is additive: ordinary `tg://proxy` FakeTLS traffic remains on public `:443`, while a second DNS-only hostname selects the browser carrier and the existing Caddy service. The WEB hostname must differ from `censorship.tls_domain`, public TCP `80` must remain reachable for HTTP-01, and no extra public data port is required.
+WEB mode is additive by default: ordinary `tg://proxy` FakeTLS traffic remains on public `:443`, while a second DNS-only hostname selects the browser carrier and the existing Caddy service. Optional `[web].only=true` instead masks the direct MTProto door and serves only the trusted WEB relay. The WEB hostname must differ from `censorship.tls_domain`, public TCP `80` must remain reachable for HTTP-01, and no extra public data port is required.
 
 For an existing Docker Compose installation created by this repository, update the installer and enable WEB in one idempotent pass:
 
@@ -95,6 +95,15 @@ curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/in
 ```
 
 This preserves `config.toml` and user secrets, adds the `mtproto-web-relay` profile service, and extends the existing `mtproto-mask-caddy` container. Ordinary requests to both the WEB and MTProto masking hostnames receive the same bodyless Caddy 404; only capability-bearing WEB bridge/carrier routes reach the relay. Source/systemd installations use `sudo /opt/mtproto-proxy/setup_web.sh web.example.com`. In tunnel-netns mode, rerunning `setup_tunnel.sh` refreshes the WEB backend/listener addresses automatically.
+
+To make WEB the only admitted transport in Docker Compose, pass the explicit gate together with WEB enablement:
+
+```bash
+curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/install_docker_compose.sh \
+  | sudo env ENABLE_WEB=true WEB_ONLY=true WEB_DOMAIN=web.example.com bash
+```
+
+For source/systemd installs, use `sudo /opt/mtproto-proxy/setup_web.sh --only web.example.com`; restore the additive mode with `--no-only`. Setup deliberately removes the gate while it starts and verifies Caddy, the main data plane, and `mtproto-web-relay`, then writes `only=true` and restarts only the main proxy. Never activate the gate before all three services are healthy. While active, formerly valid direct links are masked and output commands print only `tg://webproxy`; disabling WEB makes `only` inert.
 
 To disable only WEB while preserving ordinary MTProto and Caddy masking:
 
@@ -170,7 +179,7 @@ Current installer behavior also:
 - refreshes self-domain Caddy 404 masking (`setup_masking.sh`) and the masking health timer when available;
 - attempts optional `zapret` / `nfqws` setup; SYNFIX, NFQUEUE, and TCPMSS rules exclude loopback so local WEB relay streams remain untouched;
 - refreshes optional `proxy-monitor` files on disk and restarts that service if it is already active.
-- prints a connection link only when it can find a valid 32-hex secret in `[access.users]`.
+- prints connection links only when it can find a valid 32-hex secret in `[access.users]`; active WEB-only emits the WEB link and suppresses ordinary direct links.
 
 Fresh source installs omit `[general].use_middle_proxy`, so regular DC traffic uses the parser default `false`; `force_media_middle_proxy=true` still keeps media paths on MiddleProxy when possible. `config.toml.example` and the Docker Compose installer explicitly enable regular MiddleProxy routing instead.
 
@@ -195,7 +204,7 @@ The tracked `deploy/compose.yml` is a minimal proxy-only example. `deploy/instal
 - Default and tunnel-patched units run as `mtproto:mtproto`, use `Restart=always` with `RestartSec=3`, send `SIGTERM`, allow 25 seconds with `TimeoutStopSec`, and ship with `LimitNOFILE=131582` plus `TasksMax=65535`.
 - The tracked and installer-generated Compose proxy service uses `stop_grace_period: 25s`. This leaves headroom around the proxy's default 15-second `graceful_shutdown_timeout_sec`; keep the supervisor allowance above any configured drain deadline.
 - Startup first auto-clamps `max_connections` to an effective-memory estimate using the lower of host RAM and every visible limit in the process's cgroup v2/v1 hierarchy (leaf plus parents, including non-standard mount points) unless `unsafe_override_limits=true`; it fails safe if fewer than 32 slots fit. `ProxyState.run` then clamps again if `RLIMIT_NOFILE` can cover at least 32 slots, otherwise it also fails startup safely.
-- The daemon banner redacts user secrets and proxy links. Prefer the one-shot `--print-links` mode: it loads the config, prints links in the current private terminal, and exits before initializing signals or opening the listener. In a running Compose install, execute `/usr/local/bin/mtproto-proxy /etc/mtproto-proxy/config.toml --print-links` inside the `mtproto-proxy` container. `--show-secrets` remains an explicit opt-in for a full foreground daemon run.
+- The daemon banner redacts user secrets and proxy links. Prefer the one-shot `--print-links` mode: it loads the config, prints links in the current private terminal, and exits before initializing signals or opening the listener. In a running Compose install, execute `/usr/local/bin/mtproto-proxy /etc/mtproto-proxy/config.toml --print-links` inside the `mtproto-proxy` container. `--show-secrets` remains an explicit opt-in for a full foreground daemon run. WEB-only intentionally omits all direct links from either output path.
 - Runtime relay model is still single-thread `epoll` in proxy core.
 - Default unit keeps `ReadOnlyPaths=/opt/mtproto-proxy` and only `CAP_NET_BIND_SERVICE`.
 - Tunnel-patched unit keeps the hardening settings, adds `CAP_NET_ADMIN` + `CAP_SYS_ADMIN`, and uses `ExecStartPre=/usr/local/bin/setup_netns.sh` to recreate the namespace on every restart.

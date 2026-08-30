@@ -38,6 +38,14 @@ const middle_proxy_secret_url = "https://core.telegram.org/getProxySecret";
 const middle_proxy_update_period_ns: u64 = 60 * 60 * std.time.ns_per_s;
 const middle_proxy_reactive_cooldown_ns: u64 = 60 * std.time.ns_per_s;
 const middle_proxy_update_stop_poll_ns: u64 = std.time.ns_per_s;
+
+/// WEB-only serves the data plane only to peers trusted at accept(2) time.
+/// The accepted address is deliberately used instead of a later PROXY-protocol
+/// address, which is supplied by the client-facing relay.
+fn webOnlyMasksPeer(web_only: bool, trusted_peer: bool) bool {
+    return web_only and !trusted_peer;
+}
+
 const tunnel_mask_gateway_ip = "10.200.200.1";
 const min_nofile_soft: usize = 65535;
 const client_hello_inline_size: usize = 512;
@@ -1974,6 +1982,7 @@ pub const ProxyState = struct {
     mask_target: ?[]const u8,
     mask_addrs: []net.Address,
     trusted_web_peers: web_support.TrustedPeers,
+    web_only: bool = false,
     web_mask_addr: ?net.Address,
     replay_cache: ReplayCache,
     tls_server_hello_template: []u8,
@@ -1985,6 +1994,7 @@ pub const ProxyState = struct {
     stats_dropped_hs_budget: u64,
     stats_hs_timeout: u64,
     stats_mp_fallback: u64,
+    stats_web_only_masked: u64 = 0,
 
     middle_proxy_lock: MiddleProxyLock = .{},
     middle_proxy_addrs_primary: [5]net.Address,
@@ -2096,6 +2106,9 @@ pub const ProxyState = struct {
             }
             log.info("WEB relay trust enabled for loopback and {d} configured source(s)", .{relay_sources.len});
         }
+        if (cfg.web.onlyActive()) {
+            log.info("WEB-only mode active: direct MTProto is masked for every peer except the trusted relay", .{});
+        }
 
         var default_middle_proxy_secret = [_]u8{0} ** 256;
         @memcpy(default_middle_proxy_secret[0..middleproxy.proxy_secret.len], middleproxy.proxy_secret[0..]);
@@ -2124,6 +2137,7 @@ pub const ProxyState = struct {
             .mask_target = mask_target,
             .mask_addrs = resolved_addrs,
             .trusted_web_peers = trusted_web_peers,
+            .web_only = cfg.web.onlyActive(),
             .web_mask_addr = web_mask_addr,
             .replay_cache = ReplayCache.init(),
             .tls_server_hello_template = tls_template,
@@ -2133,6 +2147,7 @@ pub const ProxyState = struct {
             .stats_dropped_hs_budget = 0,
             .stats_hs_timeout = 0,
             .stats_mp_fallback = 0,
+            .stats_web_only_masked = 0,
             .middle_proxy_addrs_primary = constants.tg_middle_proxies_v4,
             .middle_proxy_addrs_media_primary = constants.tg_media_middle_proxies_v4,
             .middle_proxy_addr_203 = constants.getDcAddressV4(203),
@@ -2764,6 +2779,7 @@ const EventLoop = struct {
     prev_hs_timeout: u64,
     prev_mp_fallback: u64,
     prev_buffer_denials: u64,
+    prev_web_only_masked: u64 = 0,
     mp_c2s_scratch: ?[]u8,
     mp_s2c_scratch: ?[]u8,
     pending_close_fds: std.ArrayList(posix.fd_t),
@@ -2821,6 +2837,7 @@ const EventLoop = struct {
         loop.prev_hs_timeout = 0;
         loop.prev_mp_fallback = 0;
         loop.prev_buffer_denials = 0;
+        loop.prev_web_only_masked = 0;
         loop.mp_c2s_scratch = null;
         loop.mp_s2c_scratch = null;
         loop.pending_close_fds = .empty;
@@ -3150,6 +3167,7 @@ const EventLoop = struct {
         const cur_hst = self.state.stats_hs_timeout;
         const cur_mpf = self.state.stats_mp_fallback;
         const cur_buffer_denials = self.managed_buffers.denied_allocations;
+        const cur_web_only_masked = self.state.stats_web_only_masked;
 
         const d_cap = cur_cap - self.prev_dropped_cap;
         const d_sat = cur_sat - self.prev_dropped_saturation;
@@ -3158,6 +3176,7 @@ const EventLoop = struct {
         const d_hst = cur_hst - self.prev_hs_timeout;
         const d_mpf = cur_mpf - self.prev_mp_fallback;
         const d_buffer_denials = cur_buffer_denials - self.prev_buffer_denials;
+        const d_web_only_masked = cur_web_only_masked - self.prev_web_only_masked;
 
         self.prev_dropped_cap = cur_cap;
         self.prev_dropped_saturation = cur_sat;
@@ -3166,6 +3185,7 @@ const EventLoop = struct {
         self.prev_hs_timeout = cur_hst;
         self.prev_mp_fallback = cur_mpf;
         self.prev_buffer_denials = cur_buffer_denials;
+        self.prev_web_only_masked = cur_web_only_masked;
 
         const has_drops =
             d_cap + d_sat + d_rate + d_hs + d_hst + d_mpf + d_buffer_denials > 0;
@@ -3189,6 +3209,10 @@ const EventLoop = struct {
             log.info("drops: cap+={d} sat+={d} rate+={d} hs_budget+={d} hs_timeout+={d} mp_fallback+={d} memory_pressure+={d}", .{
                 d_cap, d_sat, d_rate, d_hs, d_hst, d_mpf, d_buffer_denials,
             });
+        }
+
+        if (d_web_only_masked > 0) {
+            log.info("web_only: direct clients masked+={d}", .{d_web_only_masked});
         }
 
         if (self.wedge_candidates_since_log + self.wedge_cancelled_since_log +
@@ -3718,6 +3742,18 @@ const EventLoop = struct {
             }
             self.startMasking(slot, client_hello) catch {
                 self.closeSlot(slot, "tls sni mismatch");
+            };
+            return;
+        }
+
+        // The WEB carrier's own SNI mismatch has already taken the Caddy path
+        // above. At this point the SNI is the ordinary FakeTLS domain: in WEB-only
+        // mode an external client gets the exact same masking behavior as a bad
+        // secret, while the relay remains allowed through.
+        if (webOnlyMasksPeer(self.state.web_only, slot.trusted_peer)) {
+            self.state.stats_web_only_masked +|= 1;
+            self.startMasking(slot, client_hello) catch {
+                self.closeSlot(slot, "web-only masking failed");
             };
             return;
         }
@@ -7828,6 +7864,13 @@ test "accept listen interest stays disabled while any pause reason is active" {
     try std.testing.expect(!shouldAcceptListen(false, true, false));
     try std.testing.expect(!shouldAcceptListen(true, true, false));
     try std.testing.expect(!shouldAcceptListen(false, false, true));
+}
+
+test "WEB-only masks direct peers and always serves its trusted relay" {
+    try std.testing.expect(!webOnlyMasksPeer(false, false));
+    try std.testing.expect(!webOnlyMasksPeer(false, true));
+    try std.testing.expect(webOnlyMasksPeer(true, false));
+    try std.testing.expect(!webOnlyMasksPeer(true, true));
 }
 
 test "parse ipv4 literal" {

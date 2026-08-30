@@ -34,6 +34,10 @@ ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy -u mtproto-web-relay -u mtprot
 # WEB Docker install
 ssh root@<SERVER_IP> 'cd /opt/mtproto-proxy && docker compose --env-file .env -f compose.yml logs --since 1h mtproto-proxy mtproto-web-relay mtproto-mask-caddy'
 
+# WEB-only activation and direct-client masking counter
+ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy --since "1 hour ago" --no-pager | grep -E "\[web\]\.only=true|WEB-only mode active|web_only: direct clients masked"'
+ssh root@<SERVER_IP> 'cd /opt/mtproto-proxy && docker compose --env-file .env -f compose.yml logs --since 1h mtproto-proxy | grep -E "\[web\]\.only=true|WEB-only mode active|web_only: direct clients masked"'
+
 # Runtime capacity / fd-pressure signals
 ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy --since "1 hour ago" --no-pager | grep -E "conn stats|drops:|auto-clamping max_connections|baseline RAM ceiling|RAM admission clamp|max_connections clamped|fd quota reached|failed to resume accepts|connection saturation|saturation eased"'
 
@@ -64,6 +68,7 @@ Note:
 - `drops: ... rate+=...` means the per-subnet token bucket rejected new connections; IPv4-mapped IPv6 addresses are grouped with their native IPv4 `/24`.
 - A healthy WEB carrier logs `web session opened ... (client address: real)` in the relay. `loopback` there means the browser address was not preserved through the Caddy/PROXY-v2 hop; inspect `[web].mask_backend`, Caddy listener wrappers, and `X-Forwarded-For` handling.
 - WEB stream failures should be correlated across `mtproto-web-relay` and the main proxy. The relay opens one backend connection per logical stream, so those streams also appear in the proxy's ordinary connection and close statistics.
+- In WEB-only mode, `web_only: direct clients masked+=N` counts external peers sent to Caddy instead of MTProto. It does not count trusted relay streams. If relay streams are also rejected, verify that `[web].backend` reaches the proxy from loopback or an explicit `[web].relay_sources` address; a PROXY header cannot grant trust.
 - `graceful shutdown started` means listener interest is already disabled while existing connections drain. `graceful shutdown complete` is a natural drain; `graceful shutdown timeout reached` means the remaining slots were force-closed. A second signal intentionally produces `forcing immediate shutdown`.
 
 ## IPv6 Hopping and DNS
