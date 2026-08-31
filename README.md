@@ -477,7 +477,7 @@ This will:
 11. Refresh optional monitor files if `proxy-monitor` already exists
 12. Print a ready-to-use `tg://` connection link when `[access.users]` contains a valid 32-hex secret
 
-On a fresh source install the generated config omits `[general].use_middle_proxy`, so regular DC1..5 traffic uses the parser default `false`; media traffic still prefers MiddleProxy because `force_media_middle_proxy=true` by default. This differs from `config.toml.example` and the Docker Compose installer, both of which enable regular MiddleProxy routing explicitly.
+On a fresh source install the generated config omits `[general].use_middle_proxy`, so regular DC1..5 traffic uses the parser default `false`; negative DC1..5 media traffic still prefers MiddleProxy because `force_media_middle_proxy=true` by default, while CDN DC203 always requires MiddleProxy. This differs from `config.toml.example` and the Docker Compose installer, both of which enable regular MiddleProxy routing explicitly.
 
 Inbound SYN pacing is disabled by default. Enable it only on filtered routes where Android/Desktop clients open too many parallel handshakes:
 
@@ -623,7 +623,7 @@ EOF
 
 ### &nbsp; Capacity & RAM Monitoring
 
-On startup, the proxy uses the lower of host RAM and every visible limit from the process's active cgroup v2/v1 hierarchy, including parent groups and non-standard mount points, and prints a **CAPACITY** banner. The estimate reserves fixed headroom, splits the remaining allowance between guaranteed connection baselines and a shared dynamically allocated buffer pool, and enforces that pool as a hard runtime limit. The displayed **RAM ceiling** is a baseline admission ceiling, not a promise that every admitted connection can simultaneously grow all MiddleProxy buffers and relay queues to their independent maxima. The banner reports the separately configured connection limit and the 90%/80% admission hysteresis. If `max_connections` exceeds the RAM ceiling, it auto-clamps unless `unsafe_override_limits = true`; if the ceiling cannot support the minimum 32 slots, startup fails instead of forcing an unsafe minimum.
+On startup, the proxy uses the lower of host RAM and every visible limit from the process's active cgroup v2/v1 hierarchy, including parent groups and non-standard mount points, and prints a **CAPACITY** banner. The estimate reserves fixed headroom, splits the remaining allowance between guaranteed connection baselines and a shared dynamically allocated buffer pool, and enforces that pool as a hard runtime limit. Because every normal runtime may receive mandatory CDN DC203 traffic, the baseline includes initial MiddleProxy buffers even when both optional DC1..5 routing preferences are disabled; the banner labels that case `direct DC1..5 + required DC203 middleproxy`. The displayed **RAM ceiling** is a baseline admission ceiling, not a promise that every admitted connection can simultaneously grow all MiddleProxy buffers and relay queues to their independent maxima. The banner reports the separately configured connection limit and the 90%/80% admission hysteresis. If `max_connections` exceeds the RAM ceiling, it auto-clamps unless `unsafe_override_limits = true`; if the ceiling cannot support the minimum 32 slots, startup fails instead of forcing an unsafe minimum.
 
 User secrets and `tg://`/`t.me` links are redacted from the daemon banner by default so they do not enter journald or container logs. Use the one-shot `--print-links` mode in a private terminal to load the config, print the links, and exit before opening the listener. The existing `--show-secrets` flag remains available for an intentional foreground daemon run with secrets included in its startup banner.
 
@@ -880,7 +880,7 @@ Create a `config.toml` in the project root:
 ```toml
 [general]
 use_middle_proxy = true                         # Telemt-compatible ME mode for promo parity
-force_media_middle_proxy = true                 # Default: keep media-path traffic on ME when endpoints are available
+force_media_middle_proxy = true                 # Prefer ME for negative DC1..5 media paths; DC203 always uses ME
 ad_tag = "1234567890abcdef1234567890abcdef"    # Optional alias for [server].tag
 
 [server]
@@ -955,8 +955,8 @@ alice = true   # direct where possible; CDN DC203 still requires MiddleProxy
 
 | Section | Key | Default | Description |
 |---------|-----|---------|-------------|
-| `[general]` | `use_middle_proxy` | `false` | Telemt-compatible ME mode for regular DC1..5. Media-path requests still prefer ME endpoints when available; direct fallback can be used only when the requested DC has a real direct endpoint |
-| `[general]` | `force_media_middle_proxy` | `true` | Keep media-path traffic (`dc=203` / negative `dc_idx`) on MiddleProxy when ME endpoints are available, even if regular DC traffic stays direct |
+| `[general]` | `use_middle_proxy` | `false` | Telemt-compatible ME mode for regular DC1..5. Optional ME routes can fall back only when the requested DC has a real direct endpoint; CDN DC203 is always MiddleProxy |
+| `[general]` | `force_media_middle_proxy` | `true` | Prefer MiddleProxy for negative DC1..5 media paths even if regular DC traffic stays direct. It does not control CDN DC203, which has no raw direct endpoint |
 | `[general]` | `ad_tag` | _(none)_ | Telemt-compatible alias for promotion tag; ignored if `[server].tag` is set |
 | `[server]` | `port` | `443` | TCP port to listen on |
 | `[server]` | `public_ip` | _(none)_ | IP/domain used in generated links. Set it explicitly when using `--print-links` or `--show-secrets`; external discovery is intentionally unavailable in the one-shot path and is not allowed to delay listener startup. For self-domain masking, use the same domain as `tls_domain`. Tunnel deploy scripts preserve an existing domain instead of replacing it with the tunnel exit IP |
@@ -1004,7 +1004,7 @@ alice = true   # direct where possible; CDN DC203 still requires MiddleProxy
 | `[censorship]` | `drs` | `false` | Dynamic Record Sizing: ramp TLS records from 1369→16384 bytes after warmup (mimics Chrome/Firefox) |
 | `[censorship]` | `fast_mode` | `false` | **Recommended** for direct-path traffic. Delegates S2C AES encryption to Telegram DC and reduces proxy CPU/RAM pressure |
 | `[access.users]` | `<name>` | -- | 32 hex-char secret (16 bytes) per user |
-| `[access.direct_users]` | `<name> = true` | _(none)_ | Optional per-user MiddleProxy bypass. `<name>` must match a user from `[access.users]`; the bypass covers regular and media paths with real direct endpoints, but CDN DC203 still uses its required MiddleProxy when available. Values `false`/`0`/`no` remove a previous duplicate entry. Alias section: `[access.admins]` |
+| `[access.direct_users]` | `<name> = true` | _(none)_ | Optional per-user MiddleProxy bypass. `<name>` must match a user from `[access.users]`; the bypass covers regular and media paths with real direct endpoints, but CDN DC203 always uses its required MiddleProxy. Values `false`/`0`/`no` remove a previous duplicate entry. Alias section: `[access.admins]` |
 
 </details>
 
@@ -1121,7 +1121,7 @@ If only media-heavy sessions fail on non-premium clients, check MiddleProxy logs
 sudo journalctl -u mtproto-proxy --since "15 min ago" | grep -E "dc=203|Middle-proxy"
 ```
 
-On startup the proxy refreshes DC203 metadata from Telegram automatically. If your server cannot reach `core.telegram.org`, it falls back to bundled defaults. DC203 has no real direct endpoint, so its MiddleProxy route never falls back to a raw direct stream.
+On startup the proxy refreshes DC203 metadata from Telegram automatically, regardless of the optional DC1..5 MiddleProxy preferences. If your server cannot reach `core.telegram.org`, it uses bundled defaults. DC203 has no real direct endpoint, so its route never falls back to a raw direct stream; if no MiddleProxy candidate is available, the connection fails closed and requests a debounced metadata refresh.
 
 ## &nbsp; License
 

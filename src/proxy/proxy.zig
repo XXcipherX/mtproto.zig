@@ -2150,12 +2150,12 @@ pub const ProxyState = struct {
             .stats_web_only_masked = 0,
             .middle_proxy_addrs_primary = constants.tg_middle_proxies_v4,
             .middle_proxy_addrs_media_primary = constants.tg_media_middle_proxies_v4,
-            .middle_proxy_addr_203 = constants.getDcAddressV4(203),
+            .middle_proxy_addr_203 = constants.tg_cdn_middle_proxy_v4,
             .middle_proxy_candidates = defaultMiddleProxyCandidateLists(constants.tg_middle_proxies_v4),
             .middle_proxy_candidate_lens = [_]usize{1} ** 5,
             .middle_proxy_media_candidates = defaultMiddleProxyCandidateLists(constants.tg_media_middle_proxies_v4),
             .middle_proxy_media_candidate_lens = [_]usize{1} ** 5,
-            .middle_proxy_candidates_203 = [_]net.Address{constants.getDcAddressV4(203)} ** 16,
+            .middle_proxy_candidates_203 = [_]net.Address{constants.tg_cdn_middle_proxy_v4} ** 16,
             .middle_proxy_candidates_203_len = 1,
             .middle_proxy_cooldowns = [_]MiddleProxyCooldown{.{}} ** middle_proxy_cooldown_slots,
             .middle_proxy_secret = default_middle_proxy_secret,
@@ -2225,9 +2225,7 @@ pub const ProxyState = struct {
             log.info("Listening on 0.0.0.0:{d} (epoll, single-thread)", .{self.config.port});
         }
 
-        if (self.config.datacenter_override == null and
-            (self.config.usesAnyMiddleProxy() or (self.config.mask and self.mask_target != null)))
-        {
+        if (self.config.requiresMiddleProxyRuntime()) {
             self.startMiddleProxyUpdater();
             middle_proxy_updater_started = self.middle_proxy_updater_thread != null;
         }
@@ -2420,7 +2418,7 @@ pub const ProxyState = struct {
             if (slept_ns >= middle_proxy_reactive_cooldown_ns and
                 self.middle_proxy_refresh_requested.swap(false, .acq_rel))
             {
-                log.info("Middle-proxy reactive refresh: stalled handshake(s) suggest stale metadata", .{});
+                log.info("Middle-proxy reactive refresh: failed connection(s) suggest stale metadata", .{});
                 return true;
             }
             const chunk = @min(middle_proxy_update_stop_poll_ns, middle_proxy_update_period_ns - slept_ns);
@@ -2431,7 +2429,7 @@ pub const ProxyState = struct {
     }
 
     fn middleProxyUpdaterMain(self: *ProxyState) void {
-        if (self.config.usesAnyMiddleProxy()) {
+        if (self.config.requiresMiddleProxyRuntime()) {
             self.ensureMiddleProxyNatIp() catch |err| {
                 if (err == error.UpdateCancelled or self.middle_proxy_updater_stop.load(.acquire)) return;
                 log.warn("Initial middle-proxy NAT IP discovery failed: {any}", .{err});
@@ -2447,7 +2445,7 @@ pub const ProxyState = struct {
         self.refreshMaskAddresses();
 
         while (self.waitMiddleProxyUpdatePeriod()) {
-            if (self.config.usesAnyMiddleProxy()) {
+            if (self.config.requiresMiddleProxyRuntime()) {
                 self.ensureMiddleProxyNatIp() catch |err| {
                     if (err == error.UpdateCancelled or self.middle_proxy_updater_stop.load(.acquire)) return;
                     log.warn("Middle-proxy NAT IP discovery failed: {any}", .{err});
@@ -4004,7 +4002,14 @@ const EventLoop = struct {
 
         const plan = buildDcConnectPlan(&self.state.config, dc_abs, slot.dc_idx, if (snapshot) |*s| s else null, slot.validation_force_direct);
         if (plan.count == 0) {
-            self.closeSlot(slot, "no upstream candidates");
+            if (dc_abs == 203 and self.state.config.datacenter_override == null) {
+                // DC 203 cannot fall back to a raw direct stream. Ask the
+                // debounced updater for fresh metadata and fail explicitly.
+                self.state.requestMiddleProxyRefresh();
+                self.closeSlot(slot, "no CDN DC 203 middle-proxy candidates");
+            } else {
+                self.closeSlot(slot, "no upstream candidates");
+            }
             return;
         }
 
@@ -4287,6 +4292,13 @@ const EventLoop = struct {
                 });
             }
             return true;
+        }
+
+        if (slot.use_middle_proxy) {
+            // Candidate exhaustion may mean Telegram rotated the route. The
+            // updater coalesces repeated requests, so this remains bounded
+            // under a burst of simultaneous failures.
+            self.state.requestMiddleProxyRefresh();
         }
 
         if (!slot.direct_fallback_used and slot.direct_fallback_addr != null and slot.use_middle_proxy) {
@@ -5110,6 +5122,10 @@ const EventLoop = struct {
 
     fn fallbackFromMiddleProxyToDirect(self: *EventLoop, slot: *ConnectionSlot) bool {
         if (slot.use_middle_proxy) {
+            // A protocol-stage failure can also indicate stale endpoint or
+            // secret metadata. Refresh reactively even when this route cannot
+            // use a direct fallback (notably CDN DC 203).
+            self.state.requestMiddleProxyRefresh();
             if (slot.current_upstream_addr) |addr| {
                 if (self.state.cooldownMiddleProxyCandidate(addr)) {
                     log.info("[{d}] cooling failed middle-proxy endpoint after handshake failure: dc_idx={d}", .{
@@ -6851,14 +6867,16 @@ fn prioritizeIpv4Addresses(addrs: []net.Address) void {
 
 fn shouldUseMiddleProxySnapshot(cfg: *const Config, dc_abs: usize, dc_idx: i16) bool {
     if (cfg.datacenter_override != null) return false;
+    // CDN DC 203 has no raw direct endpoint. Its MiddleProxy route is a
+    // protocol requirement, not an optional routing preference.
+    if (dc_abs == 203) return true;
     if (cfg.use_middle_proxy) return true;
 
-    const is_media_path = (dc_idx < 0) or (dc_abs == 203);
-    return cfg.force_media_middle_proxy and is_media_path;
+    return cfg.force_media_middle_proxy and dc_idx < 0;
 }
 
-fn directDcAddressV4(dc_abs: usize) net.Address {
-    return constants.getDcAddressV4(dc_abs);
+fn directDcAddressV4(dc_abs: usize) ?net.Address {
+    return constants.getDirectDcAddressV4(dc_abs);
 }
 
 fn buildDcConnectPlan(
@@ -6880,35 +6898,48 @@ fn buildDcConnectPlan(
         return plan;
     }
 
+    const direct_addr = directDcAddressV4(dc_abs);
+
     var middle_candidates: []const net.Address = &.{};
     if (snapshot) |snap| {
         middle_candidates = snap.selectedCandidates();
     }
     const middle_addr = if (middle_candidates.len > 0) middle_candidates[0] else null;
-    // DC 203 has no direct datacenter endpoint. Its constants-table address is
-    // itself a MiddleProxy (the proxy_for 203 entry), so sending a raw obfuscated
-    // client stream there succeeds at TCP connect but never produces a reply.
-    // A direct user may bypass MiddleProxy for real DC endpoints, but not for
-    // DC 203 when its required MiddleProxy route is available.
-    const cdn_dc = dc_abs == 203;
-    const has_cdn_middle_proxy = cdn_dc and middle_addr != null;
 
-    if (bypass_middle_proxy and !has_cdn_middle_proxy) {
-        plan.candidates[0] = directDcAddressV4(dc_abs);
+    // DC 203 has no direct datacenter endpoint. Its bundled address is a
+    // `proxy_for 203` MiddleProxy that speaks RPC transport, so sending a raw
+    // obfuscated client stream there succeeds at TCP connect but produces no
+    // reply. Handle this invariant before direct-user and preference switches.
+    const cdn_dc = dc_abs == 203;
+    if (cdn_dc) {
+        plan.use_middle_proxy = true;
+        for (middle_candidates) |addr| {
+            appendUniqueAddress(&plan.candidates, &plan.count, addr);
+        }
+        // Missing metadata fails closed: there is no valid direct fallback.
+        plan.direct_fallback = null;
+        return plan;
+    }
+
+    // Every remaining known DC is one of DC1..5 and has a real direct route.
+    const direct = direct_addr orelse return plan;
+
+    if (bypass_middle_proxy) {
+        plan.candidates[0] = direct;
         plan.count = 1;
         plan.use_middle_proxy = false;
         plan.direct_fallback = null;
         return plan;
     }
 
-    const force_media_middle_proxy = cfg.force_media_middle_proxy and plan.is_media_path and middle_addr != null;
+    const force_media_middle_proxy = cfg.force_media_middle_proxy and dc_idx < 0 and middle_addr != null;
     plan.use_middle_proxy = if (force_media_middle_proxy)
         true
     else
         cfg.use_middle_proxy and middle_addr != null;
 
     if (!plan.use_middle_proxy) {
-        plan.candidates[0] = directDcAddressV4(dc_abs);
+        plan.candidates[0] = direct;
         plan.count = 1;
         plan.direct_fallback = null;
         return plan;
@@ -6923,19 +6954,17 @@ fn buildDcConnectPlan(
     }
 
     if (plan.count == 0) {
-        // Safety fallback: if cache has no middle-proxy endpoint for this DC,
-        // avoid dropping valid users and go direct.
+        // DC1..5 have real direct endpoints, so an empty optional MiddleProxy
+        // snapshot can safely fall back without changing application protocol.
         plan.use_middle_proxy = false;
-        plan.candidates[0] = directDcAddressV4(dc_abs);
+        plan.candidates[0] = direct;
         plan.count = 1;
         plan.direct_fallback = null;
         return plan;
     }
 
-    // If middle-proxy connect/handshake fails, retry a real DC endpoint directly.
-    // DC 203 is the exception: its so-called direct address is another MiddleProxy,
-    // and retrying a raw client stream there would only create a silent black hole.
-    plan.direct_fallback = if (cdn_dc) null else directDcAddressV4(dc_abs);
+    // Optional MiddleProxy routing for DC1..5 may retry their real direct endpoint.
+    plan.direct_fallback = direct;
     return plan;
 }
 
@@ -7414,7 +7443,7 @@ test "proxy state init propagates user secret allocation failures" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, initProxyStateAndDeinit, .{cfg});
 }
 
-test "media-only middle-proxy mode requests metadata for negative media DCs" {
+test "DC 203 always requests MiddleProxy metadata" {
     var cfg = Config{
         .users = std.StringHashMap([16]u8).init(std.testing.allocator),
         .direct_users = std.StringHashMap(void).init(std.testing.allocator),
@@ -7430,12 +7459,15 @@ test "media-only middle-proxy mode requests metadata for negative media DCs" {
 
     cfg.force_media_middle_proxy = false;
     try std.testing.expect(!shouldUseMiddleProxySnapshot(&cfg, 4, -4));
+    try std.testing.expect(shouldUseMiddleProxySnapshot(&cfg, 203, 203));
+    try std.testing.expect(shouldUseMiddleProxySnapshot(&cfg, 203, -203));
 
     cfg.use_middle_proxy = true;
     try std.testing.expect(shouldUseMiddleProxySnapshot(&cfg, 4, 4));
 
     cfg.datacenter_override = net.Address.initIp4(.{ 127, 0, 0, 1 }, 443);
     try std.testing.expect(!shouldUseMiddleProxySnapshot(&cfg, 4, -4));
+    try std.testing.expect(!shouldUseMiddleProxySnapshot(&cfg, 203, -203));
 }
 
 test "middle proxy updater stop joins sleeping thread" {
@@ -7501,7 +7533,7 @@ test "direct users bypass middle-proxy routing except CDN DC 203" {
     const admin_plan = buildDcConnectPlan(&cfg, 4, 4, &regular_snapshot, true);
     try std.testing.expect(!admin_plan.use_middle_proxy);
     try std.testing.expect(admin_plan.direct_fallback == null);
-    try std.testing.expect(admin_plan.candidates[0].eql(constants.getDcAddressV4(4)));
+    try std.testing.expect(admin_plan.candidates[0].eql(constants.getDirectDcAddressV4(4).?));
 
     const regular_media = buildDcConnectPlan(&cfg, 203, -203, &media_203_snapshot, false);
     try std.testing.expect(regular_media.use_middle_proxy);
@@ -7517,11 +7549,32 @@ test "direct users bypass middle-proxy routing except CDN DC 203" {
     try std.testing.expect(admin_media.candidates[0].eql(mp_dc203));
     try std.testing.expect(admin_media.direct_fallback == null);
 
-    // Preserve the previous last-resort behavior if no DC 203 MiddleProxy route
-    // is known at all; there is no usable alternative to put in the plan.
+    // A missing DC 203 route fails closed instead of sending raw MTProto to a
+    // MiddleProxy endpoint. The caller requests a debounced metadata refresh.
     const admin_media_no_mp = buildDcConnectPlan(&cfg, 203, -203, null, true);
-    try std.testing.expect(!admin_media_no_mp.use_middle_proxy);
-    try std.testing.expect(admin_media_no_mp.candidates[0].eql(constants.getDcAddressV4(203)));
+    try std.testing.expect(admin_media_no_mp.use_middle_proxy);
+    try std.testing.expectEqual(@as(usize, 0), admin_media_no_mp.count);
+    try std.testing.expect(admin_media_no_mp.direct_fallback == null);
+
+    // Disabling both optional MiddleProxy preferences keeps real media DCs
+    // direct, but cannot override the protocol requirement for CDN DC 203.
+    cfg.use_middle_proxy = false;
+    cfg.force_media_middle_proxy = false;
+
+    const direct_media_dc5 = buildDcConnectPlan(&cfg, 5, -5, &media_dc5_snapshot, false);
+    try std.testing.expect(!direct_media_dc5.use_middle_proxy);
+    try std.testing.expectEqual(@as(usize, 1), direct_media_dc5.count);
+    try std.testing.expect(direct_media_dc5.candidates[0].eql(constants.getDirectDcAddressV4(5).?));
+
+    const mandatory_cdn = buildDcConnectPlan(&cfg, 203, -203, &media_203_snapshot, false);
+    try std.testing.expect(mandatory_cdn.use_middle_proxy);
+    try std.testing.expectEqual(@as(usize, 1), mandatory_cdn.count);
+    try std.testing.expect(mandatory_cdn.candidates[0].eql(mp_dc203));
+    try std.testing.expect(mandatory_cdn.direct_fallback == null);
+
+    const mandatory_cdn_direct_user = buildDcConnectPlan(&cfg, 203, -203, &media_203_snapshot, true);
+    try std.testing.expect(mandatory_cdn_direct_user.use_middle_proxy);
+    try std.testing.expect(mandatory_cdn_direct_user.candidates[0].eql(mp_dc203));
 }
 
 test "unknown datacenter indices produce no connect plan" {

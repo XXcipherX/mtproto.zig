@@ -7,9 +7,9 @@ use_middle_proxy = true
 # fresh source-installer default is false; the Docker Compose installer default
 # is true. Media paths still prefer MiddleProxy by default in either case.
 
-# Keep media-path traffic on MiddleProxy by default, even when regular DC1..5
-# traffic stays direct. Set to false if you want media to follow use_middle_proxy
-# without special preference.
+# Prefer MiddleProxy for negative DC1..5 media paths even when regular traffic
+# stays direct. Set to false to keep those media paths direct too. CDN DC 203
+# always uses MiddleProxy because it has no raw direct endpoint.
 # force_media_middle_proxy = true
 
 # Telemt-compatible alias for promotion tag (alternative to [server].tag).
@@ -238,7 +238,7 @@ user2 = "ffeeddccbbaa99887766554433221100"
 
 [access.direct_users]
 # Optional: users that bypass MiddleProxy when a real direct DC path exists.
-# CDN DC 203 still uses MiddleProxy because it has no direct endpoint.
+# CDN DC 203 always uses MiddleProxy because it has no direct endpoint.
 # Useful for admin/service accounts that should always use fast mode.
 # Names here must match keys from [access.users].
 # Value must be true/1/yes to enable.

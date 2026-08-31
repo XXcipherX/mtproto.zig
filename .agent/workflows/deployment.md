@@ -183,7 +183,7 @@ Current installer behavior also:
 - refreshes optional `proxy-monitor` files on disk and restarts that service if it is already active.
 - prints connection links only when it can find a valid 32-hex secret in `[access.users]`; active WEB-only emits the WEB link and suppresses ordinary direct links.
 
-Fresh source installs omit `[general].use_middle_proxy`, so regular DC traffic uses the parser default `false`; `force_media_middle_proxy=true` still keeps media paths on MiddleProxy when possible. `config.toml.example` and the Docker Compose installer explicitly enable regular MiddleProxy routing instead.
+Fresh source installs omit `[general].use_middle_proxy`, so regular DC traffic uses the parser default `false`; `force_media_middle_proxy=true` still prefers MiddleProxy for negative DC1..5 media paths. CDN DC203 always uses MiddleProxy independently of both preferences. `config.toml.example` and the Docker Compose installer explicitly enable regular MiddleProxy routing instead.
 
 Self-domain masking notes:
 

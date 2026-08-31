@@ -48,7 +48,7 @@ Code anchors:
 5. Proxy derives MTProto crypto params and chooses upstream strategy:
 - Direct DC path.
 - MiddleProxy path (`use_middle_proxy=true` and endpoint available).
-- Media path (`dc=203` or negative index) prefers MiddleProxy endpoint when available; DC203 has no real direct endpoint.
+- Negative DC1..5 media paths may prefer MiddleProxy; DC203 always requires it because it has no real direct endpoint.
 6. If MiddleProxy connect/handshake fails, proxy can reconnect directly when the selected DC has a real fallback endpoint. DC203 never uses a raw direct fallback.
 7. Bidirectional relay starts (`relaying` phase).
 
@@ -72,10 +72,10 @@ Trust is fixed from the kernel-reported peer at `accept()`: only loopback plus e
 
 Important behavior:
 
-- If a MiddleProxy endpoint is unavailable, direct path is allowed by the current connect-plan logic when that DC has a real direct endpoint; DC203 is excluded.
+- If a MiddleProxy endpoint is unavailable, direct path is allowed by the current connect-plan logic only when that DC has a real direct endpoint. DC203 fails closed and requests a debounced metadata refresh.
 - Each MiddleProxy handshake stage has a 5-second deadline. A stalled or malformed endpoint is cooled for 60 seconds, triggers reactive refresh, and falls back directly when possible, except for DC203.
-- `force_media_middle_proxy=true` is the default, so `direct` only affects regular DC traffic; media path still prefers MiddleProxy when available unless that knob is disabled.
-- `[access.direct_users]` / `[access.admins]` bypass MiddleProxy for regular and media paths with real direct endpoints. DC203 still uses MiddleProxy when its route is available.
+- `force_media_middle_proxy=true` is the default preference for negative DC1..5 media paths. Disabling it makes those paths direct but never changes DC203 routing.
+- `[access.direct_users]` / `[access.admins]` bypass MiddleProxy for regular and media paths with real direct endpoints. DC203 always uses MiddleProxy.
 - `datacenter_override` is test-only and disables MiddleProxy snapshot/updater routing.
 - `server.middle_proxy_nat_ip` can pin the IPv4 used for MiddleProxy NAT/AES derivation. `server.public_ip` is client-facing link metadata and is never assumed to be DC egress. Automatic detection trusts an AWG endpoint only while the proxy runs inside the active tunnel network namespace; direct mode probes the process's public egress instead.
 - `middleproxy_buffer_kb` is a per-direction cap. Each MiddleProxy context starts with 16 KiB C2S/S2C buffers and grows on demand up to `min(middleproxy_buffer_kb, 3840)` KiB; event-loop scratch buffers are lazy and reused. The effective cap reserves 256 KiB for MP/TLS framing before the 4 MiB relay-queue limit.
@@ -129,7 +129,7 @@ managed_buffer_limit =
 
 The startup ceiling no longer multiplies every connection by two full 4 MiB relay queues and two full MiddleProxy caps. Those are independent protective maxima, not simultaneous guaranteed resident memory. The ceiling therefore guarantees baseline admission under the enforced shared budget; it is not a simultaneous full-buffer throughput claim. The event loop routes queue blocks, retained free-list blocks, MiddleProxy C2S/S2C buffers, and shared scratch through `ManagedBufferAllocator`. It tracks requested live bytes, refuses remap so allocate-before-free growth is charged at its transient peak, and keeps recycled queue pages charged until they are actually destroyed. Budget exhaustion follows existing OOM handling: optional shrink retains the existing buffer, while required growth closes the requesting connection or falls back to the direct path where possible. Every denial is reported as `memory_pressure+=...` in periodic stats.
 
-The runtime limit includes the 16 KiB-per-direction MiddleProxy baseline for every configured slot plus the shared burst reserve, but is capped so the unmanaged baseline and managed allocation ceiling cannot exceed `allocatable_bytes` together. When effective memory cannot be detected, the managed pool uses a 64 MiB default. For a 960 MiB limit with media MiddleProxy enabled and `max_connections=256`, the banner reports a ~40 KiB baseline, ~216 MiB shared dynamic-pool limit, a baseline RAM ceiling of ~5324, the separately configured cap, and the 90%/80% admission hysteresis.
+The runtime limit includes the 16 KiB-per-direction MiddleProxy baseline for every configured slot plus the shared burst reserve, but is capped so the unmanaged baseline and managed allocation ceiling cannot exceed `allocatable_bytes` together. This baseline applies to every normal runtime because CDN DC203 can require MiddleProxy independently of the optional DC1..5 routing preferences; only the test-only `datacenter_override` bypasses it. When effective memory cannot be detected, the managed pool uses a 64 MiB default. For a 960 MiB limit and `max_connections=256`, the banner reports a ~40 KiB baseline, ~216 MiB shared dynamic-pool limit, a baseline RAM ceiling of ~5324, the separately configured cap, and the 90%/80% admission hysteresis.
 
 The cgroup detector resolves the process membership through `/proc/self/cgroup` and `/proc/self/mountinfo`, then takes the lowest readable leaf or ancestor limit. In cgroup v2 a numeric `0` is a real hard limit; only `max` means unlimited. Conventional `/sys/fs/cgroup` paths remain a fallback when procfs mount metadata is unavailable.
 

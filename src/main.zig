@@ -597,8 +597,8 @@ fn estimateCapacity(cfg: *const config.Config, total_ram_bytes: u64) CapacityEst
     // MiddleProxy growth, and shared scratch are charged to one runtime-enforced
     // managed budget instead of multiplying their rare maxima by every slot.
     const tls_working_bytes: u64 = @intCast(6 * 1024);
-    const uses_middle_proxy = cfg.usesAnyMiddleProxy();
-    const managed_initial_per_conn_bytes: u64 = if (uses_middle_proxy)
+    const requires_middle_proxy_runtime = cfg.requiresMiddleProxyRuntime();
+    const managed_initial_per_conn_bytes: u64 = if (requires_middle_proxy_runtime)
         @intCast(config.Config.middle_proxy_initial_stream_buffer_bytes * 2)
     else
         0;
@@ -894,7 +894,7 @@ fn printBanner(
         else if (cfg.force_media_middle_proxy)
             "media middleproxy mode"
         else
-            "direct mode";
+            "direct DC1..5 + required DC203 middleproxy";
         writeRaw("  " ++ D ++ "───" ++ R ++ " " ++ B ++ cyan ++ "CAPACITY" ++ R ++ " " ++ D ++ "────────────────────────────────────" ++ R ++ "\n");
         writeStdout("      Memory limit " ++ B ++ "{d} MiB" ++ R ++ "\n", .{est.effective_memory_bytes / (1024 * 1024)});
         writeStdout("      Baseline     ~{d} KiB/connection ({s})\n", .{
@@ -1143,7 +1143,7 @@ test "capacity safety clamp keeps configured limit when override enabled" {
     try std.testing.expectEqual(@as(u32, 4096), cfg.max_connections);
 }
 
-test "capacity estimate accounts for media-only middle proxy overhead" {
+test "capacity estimate accounts for mandatory DC 203 MiddleProxy overhead" {
     var direct_cfg = config.Config{
         .users = std.StringHashMap([16]u8).init(std.testing.allocator),
         .direct_users = std.StringHashMap(void).init(std.testing.allocator),
@@ -1166,62 +1166,52 @@ test "capacity estimate accounts for media-only middle proxy overhead" {
     const direct_est = estimateCapacity(&direct_cfg, total_ram_bytes);
     const media_est = estimateCapacity(&media_cfg, total_ram_bytes);
 
-    try std.testing.expect(media_est.per_conn_bytes > direct_est.per_conn_bytes);
-    try std.testing.expect(media_est.safe_connections < direct_est.safe_connections);
+    try std.testing.expectEqual(media_est.managed_initial_per_conn_bytes, direct_est.managed_initial_per_conn_bytes);
+    try std.testing.expectEqual(media_est.per_conn_bytes, direct_est.per_conn_bytes);
+    try std.testing.expectEqual(media_est.safe_connections, direct_est.safe_connections);
 }
 
 test "capacity estimate reserves one shared managed buffer pool" {
-    var direct_cfg = config.Config{
+    var cfg = config.Config{
         .users = std.StringHashMap([16]u8).init(std.testing.allocator),
         .direct_users = std.StringHashMap(void).init(std.testing.allocator),
         .use_middle_proxy = false,
         .force_media_middle_proxy = false,
     };
-    defer direct_cfg.deinit(std.testing.allocator);
-
-    var media_cfg = config.Config{
-        .users = std.StringHashMap([16]u8).init(std.testing.allocator),
-        .direct_users = std.StringHashMap(void).init(std.testing.allocator),
-        .use_middle_proxy = false,
-        .force_media_middle_proxy = true,
-    };
-    defer media_cfg.deinit(std.testing.allocator);
+    defer cfg.deinit(std.testing.allocator);
 
     const total_ram_bytes: u64 = 960 * 1024 * 1024;
-    const direct_est = estimateCapacity(&direct_cfg, total_ram_bytes);
-    const media_est = estimateCapacity(&media_cfg, total_ram_bytes);
+    const est = estimateCapacity(&cfg, total_ram_bytes);
 
-    try std.testing.expectEqual(@as(u64, 416 * 1024 * 1024), direct_est.allocatable_bytes);
-    try std.testing.expectEqual(@as(u64, 208 * 1024 * 1024), direct_est.managed_burst_reserve_bytes);
-    try std.testing.expectEqual(@as(u64, 8 * 1024), direct_est.per_conn_bytes);
-    try std.testing.expectEqual(@as(u32, 26_624), direct_est.safe_connections);
+    try std.testing.expectEqual(@as(u64, 416 * 1024 * 1024), est.allocatable_bytes);
+    try std.testing.expectEqual(@as(u64, 208 * 1024 * 1024), est.managed_burst_reserve_bytes);
 
     try std.testing.expectEqual(
         @as(u64, 2 * config.Config.middle_proxy_initial_stream_buffer_bytes),
-        media_est.managed_initial_per_conn_bytes,
+        est.managed_initial_per_conn_bytes,
     );
-    try std.testing.expectEqual(@as(u64, 40 * 1024), media_est.per_conn_bytes);
-    try std.testing.expectEqual(@as(u32, 5_324), media_est.safe_connections);
+    try std.testing.expectEqual(@as(u64, 40 * 1024), est.per_conn_bytes);
+    try std.testing.expectEqual(@as(u32, 5_324), est.safe_connections);
     try std.testing.expectEqual(
         @as(u64, 216 * 1024 * 1024),
-        managedBufferLimitForConnections(media_est, 256),
+        managedBufferLimitForConnections(est, 256),
     );
 
     const unmanaged_per_conn =
-        media_est.per_conn_bytes - media_est.managed_initial_per_conn_bytes;
+        est.per_conn_bytes - est.managed_initial_per_conn_bytes;
     const safe_limit =
-        managedBufferLimitForConnections(media_est, media_est.safe_connections);
+        managedBufferLimitForConnections(est, est.safe_connections);
     try std.testing.expect(
         safe_limit +
-            @as(u64, media_est.safe_connections) * unmanaged_per_conn <=
-            media_est.allocatable_bytes,
+            @as(u64, est.safe_connections) * unmanaged_per_conn <=
+            est.allocatable_bytes,
     );
 
-    const overridden_connections = media_est.safe_connections + 1;
+    const overridden_connections = est.safe_connections + 1;
     try std.testing.expectEqual(
-        media_est.allocatable_bytes -
+        est.allocatable_bytes -
             @as(u64, overridden_connections) * unmanaged_per_conn,
-        managedBufferLimitForConnections(media_est, overridden_connections),
+        managedBufferLimitForConnections(est, overridden_connections),
     );
     try std.testing.expectEqual(
         proxy.default_managed_buffer_limit_bytes,

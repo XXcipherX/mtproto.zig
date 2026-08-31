@@ -149,8 +149,8 @@ pub const Config = struct {
     /// Route regular DC traffic via Telegram MiddleProxy transport.
     /// Mirrors telemt's [general].use_middle_proxy behavior.
     use_middle_proxy: bool = false,
-    /// Force media-path traffic (DC203 / negative dc_idx) through MiddleProxy,
-    /// even when use_middle_proxy is false.
+    /// Prefer MiddleProxy for negative DC1..5 media paths even when
+    /// use_middle_proxy is false. CDN DC 203 always requires MiddleProxy.
     force_media_middle_proxy: bool = true,
     port: u16 = 443,
     /// Explicit public IP address. If set, bypasses detection via external services.
@@ -199,7 +199,7 @@ pub const Config = struct {
     tls_domain_owned: bool = false,
     users: std.StringHashMap([16]u8),
     /// Users that bypass MiddleProxy when the requested DC has a direct endpoint.
-    /// CDN DC 203 still requires MiddleProxy when its route is available.
+    /// CDN DC 203 always requires MiddleProxy and is never bypassed.
     /// Section: [access.direct_users] (alias: [access.admins])
     direct_users: std.StringHashMap(void),
     /// Whether to mask bad clients (forward to tls_domain)
@@ -266,8 +266,13 @@ pub const Config = struct {
         return @min(self.middleProxyConfiguredBufferBytes(), middle_proxy_stream_buffer_cap_bytes);
     }
 
-    pub fn usesAnyMiddleProxy(self: *const Config) bool {
-        return self.use_middle_proxy or self.force_media_middle_proxy;
+    pub fn requiresMiddleProxyRuntime(self: *const Config) bool {
+        // Every normal runtime may receive a CDN DC 203 request. DC 203 has no
+        // raw direct endpoint, so its MiddleProxy metadata, NAT identity, buffer
+        // budget, and updater must remain available regardless of the optional
+        // routing preferences for DC1..5. datacenter_override is test-only and
+        // deliberately replaces every upstream route.
+        return self.datacenter_override == null;
     }
 
     pub fn middleProxyC2sScratchBytes(self: *const Config) usize {
@@ -387,7 +392,7 @@ pub const Config = struct {
             log.warn("access.users is empty; no clients can authenticate until at least one user secret is configured", .{});
         }
 
-        if (self.usesAnyMiddleProxy() and self.middleproxy_buffer_kb < 1024) {
+        if (self.requiresMiddleProxyRuntime() and self.middleproxy_buffer_kb < 1024) {
             const log = std.log.scoped(.config);
             log.warn(
                 "middleproxy_buffer_kb={d} is below recommended minimum (1024). " ++
@@ -396,7 +401,7 @@ pub const Config = struct {
                 .{self.middleproxy_buffer_kb},
             );
         }
-        if (self.usesAnyMiddleProxy() and self.middleProxyConfiguredBufferBytes() > middle_proxy_stream_buffer_cap_bytes) {
+        if (self.requiresMiddleProxyRuntime() and self.middleProxyConfiguredBufferBytes() > middle_proxy_stream_buffer_cap_bytes) {
             const log = std.log.scoped(.config);
             log.warn(
                 "middleproxy_buffer_kb={d} exceeds runtime cap ({d} KiB); " ++
@@ -1061,19 +1066,22 @@ test "parse config - access admins alias" {
     try std.testing.expect(cfg.userBypassesMiddleProxy("alice"));
 }
 
-test "middle proxy scratch helpers cover media-only mode" {
+test "middle proxy runtime remains available for mandatory CDN routing" {
     var cfg = Config{
         .users = std.StringHashMap([16]u8).init(std.testing.allocator),
         .direct_users = std.StringHashMap(void).init(std.testing.allocator),
         .use_middle_proxy = false,
-        .force_media_middle_proxy = true,
+        .force_media_middle_proxy = false,
         .middleproxy_buffer_kb = 1024,
     };
     defer cfg.deinit(std.testing.allocator);
 
-    try std.testing.expect(cfg.usesAnyMiddleProxy());
+    try std.testing.expect(cfg.requiresMiddleProxyRuntime());
     try std.testing.expectEqual(@as(usize, 1024 * 1024 + Config.middle_proxy_c2s_scratch_headroom), cfg.middleProxyC2sScratchBytes());
     try std.testing.expectEqual(@as(usize, 2 * 1024 * 1024 + Config.middle_proxy_c2s_scratch_headroom), cfg.middleProxySharedScratchBytes());
+
+    cfg.datacenter_override = net.Address.initIp4(.{ 127, 0, 0, 1 }, 443);
+    try std.testing.expect(!cfg.requiresMiddleProxyRuntime());
 }
 
 test "parse config - middleproxy buffer size" {
@@ -1245,7 +1253,7 @@ test "parse config - inline comments after values" {
         \\unsafe_override_limits = true # explicit override
         \\public_ip = "proxy.example.com" # keep quoted strings working
         \\[general]
-        \\force_media_middle_proxy = false ; disable media MP
+        \\force_media_middle_proxy = false ; disable optional DC1..5 media MP
         \\[access.users]
         \\alice = "00112233445566778899aabbccddeeff" # main user
     ;

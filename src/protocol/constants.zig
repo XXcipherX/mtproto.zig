@@ -45,25 +45,22 @@ pub const tg_media_middle_proxies_v4 = [5]net.Address{
     net.Address.initIp4(.{ 91, 108, 56, 170 }, tg_middle_proxy_port),
 };
 
-/// Resolves physical Datacenter IP by its index, handling special media DCs.
-pub fn getDcAddressV4(abs_dc: usize) net.Address {
-    if (abs_dc == 0) {
-        return tg_datacenters_v4[0];
-    }
-    if (abs_dc == 203) {
-        // Media DC 203 has a dedicated network, resolving to MiddleProxy IP
-        return net.Address.initIp4(.{ 91, 105, 192, 110 }, tg_datacenter_port);
-    }
+/// Bundled fallback for Telegram's `proxy_for 203` route. Despite using port
+/// 443, this endpoint speaks the MiddleProxy RPC transport and must never
+/// receive a raw obfuscated client stream.
+pub const tg_cdn_middle_proxy_v4 = net.Address.initIp4(.{ 91, 105, 192, 110 }, tg_datacenter_port);
+
+/// Resolves a real direct Telegram datacenter endpoint. CDN DC 203 is
+/// intentionally excluded because it is reachable only through MiddleProxy.
+pub fn getDirectDcAddressV4(abs_dc: usize) ?net.Address {
     if (abs_dc >= 1 and abs_dc <= tg_datacenters_v4.len) {
         return tg_datacenters_v4[abs_dc - 1];
     }
-    // Fallback to modulo arithmetic for unknown DC indices
-    const fallback_idx = (abs_dc - 1) % tg_datacenters_v4.len;
-    return tg_datacenters_v4[fallback_idx];
+    return null;
 }
 
 pub fn isKnownDcV4(abs_dc: usize) bool {
-    return abs_dc == 203 or (abs_dc >= 1 and abs_dc <= tg_datacenters_v4.len);
+    return abs_dc == 203 or getDirectDcAddressV4(abs_dc) != null;
 }
 
 // ============= Protocol Tags =============
@@ -178,8 +175,12 @@ test "invalid proto tag" {
     try std.testing.expect(ProtoTag.fromBytes(.{ 0xff, 0xff, 0xff, 0xff }) == null);
 }
 
-test "getDcAddressV4 handles zero index defensively" {
-    try std.testing.expect(getDcAddressV4(0).eql(tg_datacenters_v4[0]));
+test "direct DC lookup excludes CDN MiddleProxy routes" {
+    try std.testing.expect(getDirectDcAddressV4(1).?.eql(tg_datacenters_v4[0]));
+    try std.testing.expect(getDirectDcAddressV4(5).?.eql(tg_datacenters_v4[4]));
+    try std.testing.expect(getDirectDcAddressV4(0) == null);
+    try std.testing.expect(getDirectDcAddressV4(6) == null);
+    try std.testing.expect(getDirectDcAddressV4(203) == null);
 }
 
 test "isKnownDcV4 distinguishes fallback-only indices" {
