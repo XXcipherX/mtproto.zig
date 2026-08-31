@@ -3796,10 +3796,13 @@ const EventLoop = struct {
             0x1303 => "0x1303",
             else => "unknown",
         } else "none";
-        log.debug("[{d}] valid FakeTLS ClientHello: key_share={s} cipher={s}", .{
+        var client_ip_buf: [64]u8 = undefined;
+        const client_ip = formatClientIp(slot.peer_addr, &client_ip_buf);
+        log.debug("[{d}] valid FakeTLS ClientHello: key_share={s} cipher={s} client={s}", .{
             slot.conn_id,
             if (offers_pq) "X25519MLKEM768(0x11ec)" else "x25519(0x001d)",
             cipher_label,
+            client_ip,
         });
 
         slot.server_hello = (if (offers_pq)
@@ -6456,6 +6459,38 @@ fn formatAddress(addr: net.Address, buf: *[64]u8) []const u8 {
     }
 }
 
+/// Format an authenticated client's real IP without its ephemeral source port.
+/// Unlike `formatAddress`, this deliberately exposes the address: callers must
+/// keep it out of production-level logs.
+fn formatClientIp(addr: net.Address, buf: *[64]u8) []const u8 {
+    if (addr.any.family == posix.AF.INET) {
+        const bytes = std.mem.asBytes(&addr.in.sa.addr);
+        return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{
+            bytes[0], bytes[1], bytes[2], bytes[3],
+        }) catch "?";
+    }
+
+    if (addr.any.family == posix.AF.INET6) {
+        const bytes: *const [16]u8 = @ptrCast(&addr.in6.sa.addr);
+        const is_ipv4_mapped = std.mem.eql(u8, bytes[0..10], &[_]u8{0} ** 10) and
+            std.mem.eql(u8, bytes[10..12], &[_]u8{ 0xff, 0xff });
+        if (is_ipv4_mapped) {
+            return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{
+                bytes[12], bytes[13], bytes[14], bytes[15],
+            }) catch "?";
+        }
+
+        var writer: std.Io.Writer = .fixed(buf);
+        addr.format(&writer) catch return "?";
+        const endpoint = writer.buffered();
+        if (endpoint.len < 2 or endpoint[0] != '[') return "?";
+        const closing = std.mem.indexOfScalar(u8, endpoint, ']') orelse return "?";
+        return endpoint[1..closing];
+    }
+
+    return "?";
+}
+
 fn ensureReadBuf(slot: *ConnectionSlot, allocator: std.mem.Allocator) ![]u8 {
     if (slot.read_buf) |buf| return buf;
     const buf = try allocator.alloc(u8, read_buf_size);
@@ -7878,6 +7913,16 @@ test "parse ipv4 literal" {
     try std.testing.expectEqual([4]u8{ 179, 43, 141, 146 }, parsed);
     try std.testing.expect(parseIpv4Literal("179.43.141") == null);
     try std.testing.expect(parseIpv4Literal("179.43.141.999") == null);
+}
+
+test "client IP formatting omits port and normalizes mapped IPv4" {
+    var buf: [64]u8 = undefined;
+    const native = net.Address.initIp4(.{ 203, 0, 113, 7 }, 54321);
+    try std.testing.expectEqualStrings("203.0.113.7", formatClientIp(native, &buf));
+
+    const mapped_bytes = [_]u8{0} ** 10 ++ [_]u8{ 0xff, 0xff } ++ [_]u8{ 203, 0, 113, 7 };
+    const mapped = net.Address.initIp6(mapped_bytes, 54321, 0, 0);
+    try std.testing.expectEqualStrings("203.0.113.7", formatClientIp(mapped, &buf));
 }
 
 test "middle proxy ipv4 kdf bytes are endian explicit" {
