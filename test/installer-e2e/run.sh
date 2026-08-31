@@ -85,6 +85,20 @@ wait_for_status() {
     return 1
 }
 
+assert_no_alt_svc() {
+    local domain="$1" port="$2" headers=""
+    if ! headers="$(docker exec "$CONTAINER" curl -sk --max-time 3 \
+        --resolve "${domain}:${port}:127.0.0.1" \
+        -D - -o /dev/null "https://${domain}:${port}/" 2>/dev/null)"; then
+        echo "${domain}:${port} failed while checking response headers" >&2
+        return 1
+    fi
+    if grep -qi '^alt-svc:' <<<"$headers"; then
+        echo "${domain}:${port} unexpectedly advertises an Alt-Svc endpoint" >&2
+        return 1
+    fi
+}
+
 verify_install() {
     docker exec \
         -e INSTALL_DIR="$INSTALL_DIR" \
@@ -108,6 +122,11 @@ grep -F 'enabled = true' "$CONFIG_FILE" >/dev/null
 grep -F 'domain = "web.example.test"' "$CONFIG_FILE" >/dev/null
 grep -F 'COMPOSE_PROFILES=web' "$ENV_FILE" >/dev/null
 grep -F 'command: ["web-relay", "/etc/mtproto-proxy/config.toml"]' "$COMPOSE_FILE" >/dev/null
+grep -F 'servers 127.0.0.1:8443 {' "$INSTALL_DIR/Caddyfile.mask" >/dev/null
+grep -F 'protocols h1 h2' "$INSTALL_DIR/Caddyfile.mask" >/dev/null
+! grep -Eq 'protocols .*h3' "$INSTALL_DIR/Caddyfile.mask"
+grep -F 'protocols h1 h2' "$INSTALL_DIR/caddy/web/global.caddy" >/dev/null
+! grep -Eq 'protocols .*h3' "$INSTALL_DIR/caddy/web/global.caddy"
 if grep -Rqi -- 'nginx' "$INSTALL_DIR"; then
     echo "installer unexpectedly generated an nginx artifact" >&2
     exit 1
@@ -138,6 +157,8 @@ CONTAINER_TEST
 
     wait_for_status "$TLS_DOMAIN" 8443 404
     wait_for_status "$WEB_DOMAIN" 443 404
+    assert_no_alt_svc "$TLS_DOMAIN" 8443
+    assert_no_alt_svc "$WEB_DOMAIN" 443
 }
 
 echo "::group::Build isolated ${BASE_IMAGE} host"
@@ -159,12 +180,14 @@ echo "::endgroup::"
 
 echo "::group::Fresh Docker Compose install"
 run_installer 2>&1 | tee "$LOG_DIR/${SAFE_IMAGE}.install.log"
+grep -F 'WEB HTTPS probe returned expected HTTP 404' "$LOG_DIR/${SAFE_IMAGE}.install.log" >/dev/null
 verify_install 2>&1 | tee "$LOG_DIR/${SAFE_IMAGE}.verify.log"
 echo "::endgroup::"
 
 echo "::group::Idempotent reinstall"
 before_hash="$(docker exec "$CONTAINER" sha256sum "$CONFIG_FILE" | awk '{print $1}')"
 run_installer 2>&1 | tee "$LOG_DIR/${SAFE_IMAGE}.reinstall.log"
+grep -F 'WEB HTTPS probe returned expected HTTP 404' "$LOG_DIR/${SAFE_IMAGE}.reinstall.log" >/dev/null
 after_hash="$(docker exec "$CONTAINER" sha256sum "$CONFIG_FILE" | awk '{print $1}')"
 if [[ "$before_hash" != "$after_hash" ]]; then
     echo "config.toml changed across identical installer rerun" >&2

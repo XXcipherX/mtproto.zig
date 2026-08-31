@@ -148,7 +148,7 @@ If `max_connections` exceeds the baseline RAM ceiling, startup auto-clamps it be
 - Config parsing is strict for proxy-owned sections/keys and malformed lines; `[monitor].host`/`port` remain accepted for the external dashboard. Config load errors propagate as a non-zero process exit.
 - TCPMSS clamping, SYN pacing, and zapret/nfqws integration are external-path mitigations; deploy rules exclude loopback so WEB relay streams never enter pacing, tiny-MSS, or NFQUEUE processing.
 - Split-TLS desync (`desync=true`) as split write of fake ServerHello.
-- Self-domain masking setup (`setup_masking.sh`) configures Caddy 2.10+ on `127.0.0.1:8443` and, in tunnel netns mode, `10.200.200.1:8443`; non-proxy requests receive 404. Optional WEB setup extends that same Caddy instance with an internal PROXY-protocol listener on `8444` and a loopback relay on `8081`. Source installs use `mtproto-mask-caddy.service`; Docker Compose installs use the `mtproto-mask-caddy` service/container.
+- Self-domain masking setup (`setup_masking.sh`) configures Caddy 2.10+ on `127.0.0.1:8443` and, in tunnel netns mode, `10.200.200.1:8443`; non-proxy requests receive 404. Optional WEB setup extends that same Caddy instance with an internal PROXY-protocol listener on `8444` and a loopback relay on `8081`. Both local TLS listeners are limited to HTTP/1.1 and HTTP/2 so Caddy cannot advertise the non-public UDP `8443` or `8444` as an HTTP/3 alternative. Source installs use `mtproto-mask-caddy.service`; Docker Compose installs use the `mtproto-mask-caddy` service/container.
 
 ## What To Verify During Changes
 

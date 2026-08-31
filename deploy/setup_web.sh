@@ -354,6 +354,7 @@ if ! is_docker_install; then chown -R caddy:caddy "$CADDY_WEB_DIR" 2>/dev/null |
 
 cat > "$CADDY_WEB_DIR/global.caddy" <<EOF
 servers 127.0.0.1:${WEB_TLS_PORT} {
+    protocols h1 h2
     listener_wrappers {
         proxy_protocol {
             timeout 2s
@@ -369,6 +370,7 @@ if [[ -n "$TUNNEL_HOST_IP" ]]; then
     cat >> "$CADDY_WEB_DIR/global.caddy" <<EOF
 
 servers ${TUNNEL_HOST_IP}:${WEB_TLS_PORT} {
+    protocols h1 h2
     listener_wrappers {
         proxy_protocol {
             timeout 2s
@@ -535,8 +537,22 @@ chmod 0755 /etc/letsencrypt/renewal-hooks/deploy/mtproto-web-caddy-reload.sh
 sleep 1
 PROBE_IP="${TUNNEL_HOST_IP:+10.200.200.2}"
 PROBE_IP="${PROBE_IP:-127.0.0.1}"
-curl -fsS --max-time 5 --resolve "${WEB_DOMAIN}:443:${PROBE_IP}" "https://${WEB_DOMAIN}/" >/dev/null \
-    || info "End-to-end HTTPS probe is not ready yet; inspect the proxy, Caddy and relay logs"
+PROBE_STATUS=""
+if PROBE_STATUS="$(
+    curl -sS --max-time 5 \
+        --resolve "${WEB_DOMAIN}:443:${PROBE_IP}" \
+        --output /dev/null \
+        --write-out '%{http_code}' \
+        "https://${WEB_DOMAIN}/"
+)"; then
+    if [[ "$PROBE_STATUS" == "404" ]]; then
+        ok "WEB HTTPS probe returned expected HTTP 404"
+    else
+        info "WEB HTTPS probe returned HTTP ${PROBE_STATUS}, expected 404; inspect the proxy and Caddy logs"
+    fi
+else
+    info "WEB HTTPS probe failed before receiving the expected 404; inspect the proxy and Caddy logs"
+fi
 
 if is_true "$WEB_ONLY"; then
     ok "WEB proxy enabled in WEB-only mode, using the existing Caddy instance"

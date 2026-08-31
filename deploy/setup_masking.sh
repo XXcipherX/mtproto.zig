@@ -380,6 +380,25 @@ write_caddy_config() {
 
 {
     auto_https off
+CADDYEOF
+
+    if [[ "$cert_ready" == "1" ]]; then
+        cat >> "$CADDYFILE" << CADDYEOF
+    servers 127.0.0.1:${MASK_PORT} {
+        protocols h1 h2
+    }
+CADDYEOF
+
+        if [[ -n "$TUNNEL_HOST_IP" ]]; then
+            cat >> "$CADDYFILE" << CADDYEOF
+    servers ${TUNNEL_HOST_IP}:${MASK_PORT} {
+        protocols h1 h2
+    }
+CADDYEOF
+        fi
+    fi
+
+    cat >> "$CADDYFILE" << CADDYEOF
     import /etc/caddy/web/global.caddy
 }
 

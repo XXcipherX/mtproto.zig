@@ -23,11 +23,15 @@ done
 }
 
 cert_dir="/etc/letsencrypt/live/${domain}"
+trust_cert="/usr/local/share/ca-certificates/mtproto-e2e-${domain}.crt"
 mkdir -p "$cert_dir"
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
     -keyout "$cert_dir/privkey.pem" \
     -out "$cert_dir/fullchain.pem" \
-    -days 2 -nodes -subj "/CN=${domain}" >/dev/null 2>&1
+    -days 2 -nodes -subj "/CN=${domain}" \
+    -addext "subjectAltName=DNS:${domain}" >/dev/null 2>&1
 chmod 0600 "$cert_dir/privkey.pem"
 chmod 0644 "$cert_dir/fullchain.pem"
+install -m 0644 "$cert_dir/fullchain.pem" "$trust_cert"
+update-ca-certificates >/dev/null
 printf 'fake-certbot: issued test certificate for %s\n' "$domain"
