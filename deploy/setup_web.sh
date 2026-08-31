@@ -354,15 +354,15 @@ if ! is_docker_install; then chown -R caddy:caddy "$CADDY_WEB_DIR" 2>/dev/null |
 
 cat > "$CADDY_WEB_DIR/global.caddy" <<EOF
 servers 127.0.0.1:${WEB_TLS_PORT} {
-    protocols h1 h2
-    listener_wrappers {
-        proxy_protocol {
-            timeout 2s
-            allow 127.0.0.0/8
-            fallback_policy require
-        }
-        tls
-    }
+	protocols h1 h2
+	listener_wrappers {
+		proxy_protocol {
+			timeout 2s
+			allow 127.0.0.0/8
+			fallback_policy require
+		}
+		tls
+	}
 }
 EOF
 
@@ -370,46 +370,44 @@ if [[ -n "$TUNNEL_HOST_IP" ]]; then
     cat >> "$CADDY_WEB_DIR/global.caddy" <<EOF
 
 servers ${TUNNEL_HOST_IP}:${WEB_TLS_PORT} {
-    protocols h1 h2
-    listener_wrappers {
-        proxy_protocol {
-            timeout 2s
-            allow 10.200.200.0/24
-            fallback_policy require
-        }
-        tls
-    }
+	protocols h1 h2
+	listener_wrappers {
+		proxy_protocol {
+			timeout 2s
+			allow 10.200.200.0/24
+			fallback_policy require
+		}
+		tls
+	}
 }
 EOF
 fi
 
 cat > "$CADDY_WEB_DIR/site.caddy" <<EOF
 https://${WEB_DOMAIN}:${WEB_TLS_PORT} {
-    bind 127.0.0.1
-    tls /etc/caddy/web/cert/fullchain.pem /etc/caddy/web/cert/privkey.pem {
-        curves x25519mlkem768 x25519
-    }
-    @web_bridge_page {
-        path /
-        query bridge=*
-    }
-    @web_bridge_socket {
-        path /api/v1/socket
-        query b=*
-    }
-    route {
-        reverse_proxy @web_bridge_page 127.0.0.1:${WEB_PORT} {
-            header_up X-Forwarded-For {remote_host}
-            flush_interval -1
-            stream_close_delay 5m
-        }
-        reverse_proxy @web_bridge_socket 127.0.0.1:${WEB_PORT} {
-            header_up X-Forwarded-For {remote_host}
-            flush_interval -1
-            stream_close_delay 5m
-        }
-        respond 404
-    }
+	bind 127.0.0.1
+	tls /etc/caddy/web/cert/fullchain.pem /etc/caddy/web/cert/privkey.pem {
+		curves x25519mlkem768 x25519
+	}
+	@web_bridge_page {
+		path /
+		query bridge=*
+	}
+	@web_bridge_socket {
+		path /api/v1/socket
+		query b=*
+	}
+	route {
+		reverse_proxy @web_bridge_page 127.0.0.1:${WEB_PORT} {
+			flush_interval -1
+			stream_close_delay 5m
+		}
+		reverse_proxy @web_bridge_socket 127.0.0.1:${WEB_PORT} {
+			flush_interval -1
+			stream_close_delay 5m
+		}
+		respond 404
+	}
 }
 EOF
 
@@ -418,31 +416,29 @@ if [[ -n "$TUNNEL_HOST_IP" ]]; then
     cat >> "$CADDY_WEB_DIR/site.caddy" <<EOF
 
 https://${WEB_DOMAIN}:${WEB_TLS_PORT} {
-    bind ${TUNNEL_HOST_IP}
-    tls /etc/caddy/web/cert/fullchain.pem /etc/caddy/web/cert/privkey.pem {
-        curves x25519mlkem768 x25519
-    }
-    @web_bridge_page {
-        path /
-        query bridge=*
-    }
-    @web_bridge_socket {
-        path /api/v1/socket
-        query b=*
-    }
-    route {
-        reverse_proxy @web_bridge_page 127.0.0.1:${WEB_PORT} {
-            header_up X-Forwarded-For {remote_host}
-            flush_interval -1
-            stream_close_delay 5m
-        }
-        reverse_proxy @web_bridge_socket 127.0.0.1:${WEB_PORT} {
-            header_up X-Forwarded-For {remote_host}
-            flush_interval -1
-            stream_close_delay 5m
-        }
-        respond 404
-    }
+	bind ${TUNNEL_HOST_IP}
+	tls /etc/caddy/web/cert/fullchain.pem /etc/caddy/web/cert/privkey.pem {
+		curves x25519mlkem768 x25519
+	}
+	@web_bridge_page {
+		path /
+		query bridge=*
+	}
+	@web_bridge_socket {
+		path /api/v1/socket
+		query b=*
+	}
+	route {
+		reverse_proxy @web_bridge_page 127.0.0.1:${WEB_PORT} {
+			flush_interval -1
+			stream_close_delay 5m
+		}
+		reverse_proxy @web_bridge_socket 127.0.0.1:${WEB_PORT} {
+			flush_interval -1
+			stream_close_delay 5m
+		}
+		respond 404
+	}
 }
 EOF
 fi

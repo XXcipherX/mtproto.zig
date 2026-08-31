@@ -365,10 +365,10 @@ disable_legacy_host_caddy_service() {
 
 write_caddy_config() {
     local cert_ready="$1"
-    local bind_line="    bind 127.0.0.1"
+    local bind_line=$'\tbind 127.0.0.1'
 
     if [[ -n "$TUNNEL_HOST_IP" && "$cert_ready" == "1" ]]; then
-        bind_line="    bind 127.0.0.1 ${TUNNEL_HOST_IP}"
+        bind_line=$'\tbind 127.0.0.1 '"${TUNNEL_HOST_IP}"
     fi
 
     mkdir -p "$(dirname "$CADDYFILE")" "$CADDY_WEB_DIR"
@@ -377,37 +377,36 @@ write_caddy_config() {
     cat > "$CADDYFILE" << CADDYEOF
 # mtproto-proxy Caddy backend.
 # Public :443 is owned by mtproto-proxy. Optional WEB routes are imported below.
-
 {
-    auto_https off
+	auto_https off
 CADDYEOF
 
     if [[ "$cert_ready" == "1" ]]; then
         cat >> "$CADDYFILE" << CADDYEOF
-    servers 127.0.0.1:${MASK_PORT} {
-        protocols h1 h2
-    }
+	servers 127.0.0.1:${MASK_PORT} {
+		protocols h1 h2
+	}
 CADDYEOF
 
         if [[ -n "$TUNNEL_HOST_IP" ]]; then
             cat >> "$CADDYFILE" << CADDYEOF
-    servers ${TUNNEL_HOST_IP}:${MASK_PORT} {
-        protocols h1 h2
-    }
+	servers ${TUNNEL_HOST_IP}:${MASK_PORT} {
+		protocols h1 h2
+	}
 CADDYEOF
         fi
     fi
 
     cat >> "$CADDYFILE" << CADDYEOF
-    import /etc/caddy/web/global.caddy
+	import /etc/caddy/web/global.caddy
 }
 
 http://:80 {
-    root * ${ACME_ROOT}
-    handle /.well-known/acme-challenge/* {
-        file_server
-    }
-    respond 404
+	root * ${ACME_ROOT}
+	handle /.well-known/acme-challenge/* {
+		file_server
+	}
+	respond 404
 }
 CADDYEOF
 
@@ -416,10 +415,10 @@ CADDYEOF
 
 https://${TLS_DOMAIN}:${MASK_PORT} {
 ${bind_line}
-    tls ${CERT_DIR}/cert.pem ${CERT_DIR}/key.pem {
-        curves x25519mlkem768 x25519
-    }
-    respond 404
+	tls ${CERT_DIR}/cert.pem ${CERT_DIR}/key.pem {
+		curves x25519mlkem768 x25519
+	}
+	respond 404
 }
 CADDYEOF
     fi

@@ -127,6 +127,7 @@ grep -F 'protocols h1 h2' "$INSTALL_DIR/Caddyfile.mask" >/dev/null
 ! grep -Eq 'protocols .*h3' "$INSTALL_DIR/Caddyfile.mask"
 grep -F 'protocols h1 h2' "$INSTALL_DIR/caddy/web/global.caddy" >/dev/null
 ! grep -Eq 'protocols .*h3' "$INSTALL_DIR/caddy/web/global.caddy"
+! grep -R -F 'header_up X-Forwarded-For' "$INSTALL_DIR/caddy/web"
 if grep -Rqi -- 'nginx' "$INSTALL_DIR"; then
     echo "installer unexpectedly generated an nginx artifact" >&2
     exit 1
@@ -142,6 +143,9 @@ for service in docker mtproto-proxy nfqws-mtproto mtproto-mask-health.timer; do
 done
 for container in mtproto-proxy mtproto-web-relay mtproto-mask-caddy; do
     test "$(docker inspect -f '{{.State.Running}}' "$container")" = true
+done
+for caddy_file in /etc/caddy/Caddyfile /etc/caddy/web/global.caddy /etc/caddy/web/site.caddy; do
+    docker exec mtproto-mask-caddy caddy fmt --diff "$caddy_file" >/dev/null
 done
 
 test "$(iptables -S INPUT | grep -c -- '-j MTPR_SYNFIX')" = 1
@@ -181,6 +185,8 @@ echo "::endgroup::"
 echo "::group::Fresh Docker Compose install"
 run_installer 2>&1 | tee "$LOG_DIR/${SAFE_IMAGE}.install.log"
 grep -F 'WEB HTTPS probe returned expected HTTP 404' "$LOG_DIR/${SAFE_IMAGE}.install.log" >/dev/null
+! grep -Eq 'Unnecessary header_up X-Forwarded-For|Caddyfile input is not formatted' \
+    "$LOG_DIR/${SAFE_IMAGE}.install.log"
 verify_install 2>&1 | tee "$LOG_DIR/${SAFE_IMAGE}.verify.log"
 echo "::endgroup::"
 
@@ -188,6 +194,8 @@ echo "::group::Idempotent reinstall"
 before_hash="$(docker exec "$CONTAINER" sha256sum "$CONFIG_FILE" | awk '{print $1}')"
 run_installer 2>&1 | tee "$LOG_DIR/${SAFE_IMAGE}.reinstall.log"
 grep -F 'WEB HTTPS probe returned expected HTTP 404' "$LOG_DIR/${SAFE_IMAGE}.reinstall.log" >/dev/null
+! grep -Eq 'Unnecessary header_up X-Forwarded-For|Caddyfile input is not formatted' \
+    "$LOG_DIR/${SAFE_IMAGE}.reinstall.log"
 after_hash="$(docker exec "$CONTAINER" sha256sum "$CONFIG_FILE" | awk '{print $1}')"
 if [[ "$before_hash" != "$after_hash" ]]; then
     echo "config.toml changed across identical installer rerun" >&2
