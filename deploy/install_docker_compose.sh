@@ -22,7 +22,7 @@
 #   SYNFIX_BURST=1
 #   SYNFIX_ACTION=drop|reject|icmp-host-unreachable
 #   MASK_PORT=8443
-#   CADDY_IMAGE=caddy:2.10-alpine
+#   CADDY_IMAGE=caddy:2-alpine
 #   GHCR_USER=<user> GHCR_TOKEN=<token>   # for private GHCR packages
 
 set -euo pipefail
@@ -48,7 +48,7 @@ SYNFIX_BURST="${SYNFIX_BURST:-1}"
 SYNFIX_ACTION="${SYNFIX_ACTION:-drop}"
 MASK_PORT="${MASK_PORT:-8443}"
 MASK_ACME_ROOT="${MASK_ACME_ROOT:-${MASK_SITE_ROOT:-/var/www/certbot}}"
-CADDY_IMAGE="${CADDY_IMAGE:-caddy:2.10-alpine}"
+CADDY_IMAGE="${CADDY_IMAGE:-caddy:2-alpine}"
 COMPOSE_FILE="${INSTALL_DIR}/compose.yml"
 ENV_FILE="${INSTALL_DIR}/.env"
 CONFIG_FILE="${INSTALL_DIR}/config.toml"
@@ -276,7 +276,7 @@ EOF
         cat >> "$COMPOSE_FILE" <<'EOF'
 
   mtproto-mask-caddy:
-    image: ${CADDY_IMAGE:-caddy:2.10-alpine}
+    image: ${CADDY_IMAGE:-caddy:2-alpine}
     container_name: mtproto-mask-caddy
     restart: unless-stopped
     network_mode: host

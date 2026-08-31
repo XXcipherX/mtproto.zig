@@ -81,6 +81,8 @@ MTPROTO_INSTALLER_E2E_IMAGE=debian:12 test/installer-e2e/run.sh
 
 `config.toml.example` is documentation, not a live container configuration. When a container starts without the selected config path, `docker-entrypoint.sh` atomically creates a private minimal config with a random 16-byte user secret and mode `0600`; the generated secret is never printed to Docker logs. A mounted config always takes precedence. Inspection options such as `--check-config` and `--print-links` remain read-only, while the `web-relay` subcommand is passed through unchanged because its Compose service mounts the shared config explicitly.
 
+The Docker Compose installer defaults `CADDY_IMAGE` to `caddy:2-alpine`. This follows stable Caddy 2 minor and patch releases while preventing an implicit jump to a future Caddy 3; operators who require a fully controlled rollout can override the variable with an exact image tag or digest. A floating tag changes a server only when the image is pulled and the Caddy container is recreated.
+
 The main CI workflow builds the image and starts it without a mounted config, then verifies the generated file permissions, 32-hex secret shape, and absence of that secret from container logs.
 
 ## WEB Proxy Deployment

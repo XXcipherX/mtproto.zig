@@ -343,7 +343,7 @@ Useful environment variables:
 | `SYNFIX_BURST` | `1` | Per-source SYN burst for non-iOS-like fingerprints |
 | `SYNFIX_ACTION` | `drop` | Over-limit SYN action: `drop` is quiet, `reject` sends TCP reset, `icmp-host-unreachable` fails the attempt immediately without an RST |
 | `MASK_PORT` | `8443` | Local Caddy HTTPS masking backend port |
-| `CADDY_IMAGE` | `caddy:2.10-alpine` | Caddy image used by the Docker Compose installer |
+| `CADDY_IMAGE` | `caddy:2-alpine` | Caddy image used by the Docker Compose installer; follows stable Caddy 2 releases without crossing into a future major version |
 | `GHCR_USER` / `GHCR_TOKEN` | _(empty)_ | Optional login for private GHCR packages |
 
 The installer requires Docker Compose v2 (`docker compose`) and installs Docker Engine + the Compose plugin via Docker's convenience script if either Docker or the plugin is missing. When `IMAGE` is not set, compatible x86_64 hosts automatically pull the `latest-amd64-v3` image; if that tag is unavailable, the installer falls back to generic `latest`. The proxy, WEB relay, and Caddy Compose services use `network_mode: host`; the proxy owns public `:443`, Caddy owns public ACME `:80` plus local masking/WEB listeners, and the relay stays on loopback. Re-run the installer to pull and restart with newer images, or update manually:
