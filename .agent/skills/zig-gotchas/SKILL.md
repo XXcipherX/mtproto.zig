@@ -95,7 +95,7 @@ Do not reintroduce thread-per-connection or blocking relay loops.
 
 - Current runtime enforces a fixed 10-second pre-first-byte timeout, configured handshake timeout after first byte, and configured relay idle timeout.
 - Process shutdown has a separate `graceful_shutdown_timeout_sec` deadline. It is armed in the existing `timerfd`; it is not a per-connection lifetime and must not be lost when slot deadlines or accept backoff are rearmed.
-- iOS silence recovery is an encrypted-stream heuristic, not MTProto parsing: it excludes media paths, accepts only server replies inside a 12-second response window, and arms after the userspace client queue drains. Preserve those guards when changing `client_silence_*` handling.
+- iOS silence recovery is an encrypted-stream heuristic, not MTProto parsing: preserve upstream request-delivery accounting, the 12-second response window, client-queue delivery accounting, cancellation on any client progress, fresh-reconnect backoff keyed by real IP/access user/DC, the cooldown anchored to the most recent actual breaker close, one arm/suppression diagnostic per logical episode, and exclusions for media/DC203, masking, half-close, backpressure, and graceful shutdown. `client_silence_close_sec` is the only public control; do not reintroduce separate fast-path tuning keys.
 - Fixed max connection lifetime (for example "30 minutes hard cap") is not implemented in current code.
 
 ## Practical Change Guardrails

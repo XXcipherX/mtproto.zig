@@ -53,13 +53,14 @@ Field-capture behavior:
 - Pre-warms multiple idle sockets.
 - Can split the 64-byte obfuscation handshake across TLS records.
 - May delay first payload after `ServerHello`.
+- On affected iOS sessions, an unanswered fresh generic-DC exchange can repeat as a close/reconnect chain with upstream bytes delivered but no later client progress; the proxy cannot inspect the encrypted `bad_server_salt` message itself.
 
 Proxy implications:
 
 - Continue assembling MTProto handshake until full 64 bytes are collected.
 - Preserve pipelined appdata after the 64-byte MTProto nonce; some clients can send early payload without waiting for a separate relay read.
 - Do not treat short idle prewarmed sockets as protocol failure.
-- Keep proxy-side wedge recovery limited to generic DC relays. The fast path is only eligible after established relay traffic resumes from a configured quiet period; media relays and fresh reconnects must not enter it. Do not arm the conservative fallback before 30 seconds in relay, and then require a delivered server reply followed by further client traffic on the same connection.
+- Keep proxy-side wedge recovery limited to generic DC relays and treat it as an encrypted-stream heuristic. The relay cannot identify the client platform, so the enabled rule applies to the same timing pattern from any client. A request must reach upstream, a response must begin inside the source-backed 12-second window, and the response must drain to the client before silence timing starts. Any client progress cancels the candidate. Every recovery shares the internal per-real-IP/access-user/DC `T`/`2T`/`4T` budget; after those three waves, use normal idle timeout for 30 minutes from the most recent actual breaker close, without extending the cooldown for healthy matching traffic. Exclude media/DC203, masking, half-close, backpressure, and graceful shutdown. A continuation after an earlier delivered reply and at least 30 seconds in relay upgrades the candidate to `proven` for diagnostics, but never bypasses the group budget.
 
 ## Android (Telegram Android)
 

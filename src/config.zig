@@ -101,6 +101,8 @@ pub const Config = struct {
         InvalidWebSocketPath,
         InvalidWebClientIpHeader,
         InvalidWebRelaySource,
+        ClientSilenceTimeoutTooShort,
+        ClientSilenceTimeoutNotBeforeIdle,
     };
 
     pub const UserSecret = struct { name: []const u8, secret: [16]u8 };
@@ -170,15 +172,9 @@ pub const Config = struct {
     idle_timeout_sec: u32 = 120,
     /// Per-connection idle timeout jitter in percent; 0 disables.
     idle_timeout_jitter_pct: u8 = 15,
-    /// Conservative close for an unanswered generic-DC reply; 0 = disabled.
-    /// This bounds an iOS MtProtoKit bad_salt wedge where the client stops
-    /// sending until the DC closes the socket.
+    /// Close a generic-DC relay after a fully delivered server reply remains
+    /// unanswered. Recoveries are internally bounded; 0 = disabled.
     client_silence_close_sec: u32 = 0,
-    /// Faster close for the same silence pattern after an established client
-    /// resumes from a quiet relay period; 0 = disabled.
-    client_silence_fast_close_sec: u32 = 0,
-    /// Relay quiet period required before fast silence handling is eligible.
-    client_silence_fast_after_idle_sec: u32 = 30,
     /// Handshake read timeout after first byte arrives
     handshake_timeout_sec: u32 = 15,
     /// Graceful process shutdown timeout. SIGINT/SIGTERM stop new accepts and
@@ -305,6 +301,8 @@ pub const Config = struct {
             error.InvalidWebSocketPath => "[web].ws_path must be an absolute path without whitespace, query, or fragment",
             error.InvalidWebClientIpHeader => "[web].client_ip_header must be a valid HTTP field name",
             error.InvalidWebRelaySource => "every [web].relay_sources entry must be an IP literal",
+            error.ClientSilenceTimeoutTooShort => "server.client_silence_close_sec must be 0 or at least 10 seconds",
+            error.ClientSilenceTimeoutNotBeforeIdle => "server.client_silence_close_sec must be lower than server.idle_timeout_sec",
         };
     }
 
@@ -319,6 +317,12 @@ pub const Config = struct {
         }
         if (self.middle_proxy_nat_ip) |value| {
             if (!isValidIpv4Literal(value)) return error.InvalidMiddleProxyNatIp;
+        }
+        if (self.client_silence_close_sec > 0) {
+            if (self.client_silence_close_sec < 10) return error.ClientSilenceTimeoutTooShort;
+            if (self.client_silence_close_sec >= self.idle_timeout_sec) {
+                return error.ClientSilenceTimeoutNotBeforeIdle;
+            }
         }
 
         if (!self.web.enabled) return;
@@ -719,14 +723,6 @@ pub const Config = struct {
                         if (parseIntSetting(u32, key, value)) |parsed| {
                             cfg.client_silence_close_sec = parsed;
                         }
-                    } else if (std.mem.eql(u8, key, "client_silence_fast_close_sec")) {
-                        if (parseIntSetting(u32, key, value)) |parsed| {
-                            cfg.client_silence_fast_close_sec = parsed;
-                        }
-                    } else if (std.mem.eql(u8, key, "client_silence_fast_after_idle_sec")) {
-                        if (parseIntSetting(u32, key, value)) |parsed| {
-                            cfg.client_silence_fast_after_idle_sec = @max(@as(u32, 5), parsed);
-                        }
                     } else if (std.mem.eql(u8, key, "handshake_timeout_sec")) {
                         if (parseIntSetting(u32, key, value)) |parsed| {
                             cfg.handshake_timeout_sec = @max(@as(u32, 5), parsed);
@@ -929,8 +925,6 @@ test "parse config - valid complete" {
         \\idle_timeout_sec = 180
         \\idle_timeout_jitter_pct = 25
         \\client_silence_close_sec = 15
-        \\client_silence_fast_close_sec = 2
-        \\client_silence_fast_after_idle_sec = 30
         \\handshake_timeout_sec = 30
         \\graceful_shutdown_timeout_sec = 20
         \\dc_connect_timeout_sec = 7
@@ -959,8 +953,6 @@ test "parse config - valid complete" {
     try std.testing.expectEqual(@as(u32, 180), cfg.idle_timeout_sec);
     try std.testing.expectEqual(@as(u8, 25), cfg.idle_timeout_jitter_pct);
     try std.testing.expectEqual(@as(u32, 15), cfg.client_silence_close_sec);
-    try std.testing.expectEqual(@as(u32, 2), cfg.client_silence_fast_close_sec);
-    try std.testing.expectEqual(@as(u32, 30), cfg.client_silence_fast_after_idle_sec);
     try std.testing.expectEqual(@as(u32, 30), cfg.handshake_timeout_sec);
     try std.testing.expectEqual(@as(u32, 20), cfg.graceful_shutdown_timeout_sec);
     try std.testing.expectEqual(@as(u32, 7), cfg.dc_connect_timeout_sec);
@@ -994,8 +986,6 @@ test "parse config - missing fields defaults" {
     try std.testing.expectEqual(@as(u32, 120), cfg.idle_timeout_sec);
     try std.testing.expectEqual(@as(u8, 15), cfg.idle_timeout_jitter_pct);
     try std.testing.expectEqual(@as(u32, 0), cfg.client_silence_close_sec);
-    try std.testing.expectEqual(@as(u32, 0), cfg.client_silence_fast_close_sec);
-    try std.testing.expectEqual(@as(u32, 30), cfg.client_silence_fast_after_idle_sec);
     try std.testing.expectEqual(@as(u32, 15), cfg.handshake_timeout_sec);
     try std.testing.expectEqual(@as(u32, 15), cfg.graceful_shutdown_timeout_sec);
     try std.testing.expectEqual(@as(u32, 10), cfg.dc_connect_timeout_sec);
@@ -1211,20 +1201,38 @@ test "parse config - idle timeout jitter clamps to 100 percent" {
     try std.testing.expectEqual(@as(u8, 100), cfg.idle_timeout_jitter_pct);
 }
 
-test "parse config - fast client silence idle threshold clamps to five seconds" {
-    const content =
-        \\[server]
-        \\client_silence_fast_close_sec = 2
-        \\client_silence_fast_after_idle_sec = 1
+test "validate config - client silence timeout has safe bounds" {
+    var cfg = try Config.parse(std.testing.allocator,
         \\[access.users]
         \\alice = "00112233445566778899aabbccddeeff"
-    ;
-
-    var cfg = try Config.parse(std.testing.allocator, content);
+    );
     defer cfg.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(u32, 2), cfg.client_silence_fast_close_sec);
-    try std.testing.expectEqual(@as(u32, 5), cfg.client_silence_fast_after_idle_sec);
+    cfg.client_silence_close_sec = 9;
+    try std.testing.expectError(error.ClientSilenceTimeoutTooShort, cfg.validate());
+
+    cfg.client_silence_close_sec = cfg.idle_timeout_sec;
+    try std.testing.expectError(error.ClientSilenceTimeoutNotBeforeIdle, cfg.validate());
+
+    cfg.client_silence_close_sec = 15;
+    try cfg.validate();
+}
+
+test "parse config - removed client silence fast keys are rejected" {
+    try std.testing.expectError(
+        error.UnknownConfigKey,
+        Config.parse(
+            std.testing.allocator,
+            "[server]\nclient_silence_fast_close_sec = 2\n",
+        ),
+    );
+    try std.testing.expectError(
+        error.UnknownConfigKey,
+        Config.parse(
+            std.testing.allocator,
+            "[server]\nclient_silence_fast_after_idle_sec = 30\n",
+        ),
+    );
 }
 
 test "parse config - spaces and tabs" {

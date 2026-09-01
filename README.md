@@ -606,9 +606,7 @@ port = 443
 public_ip = "proxy.example.com"
 # tag = "<your-promotion-tag>"   # Optional: 32 hex-char promotion tag from @MTProxybot
 # max_connections = 10000        # Optional high-capacity override; startup auto-clamps unless unsafe_override_limits=true
-# client_silence_close_sec = 0             # Fallback after a mature (30s+) proven healthy relay exchange
-# client_silence_fast_close_sec = 0        # Fast close after resumed generic relay traffic; 0 = off
-# client_silence_fast_after_idle_sec = 30  # Quiet relay period required by the fast path
+# client_silence_close_sec = 0      # Unified bounded iOS wedge recovery; use 15 to enable
 
 [censorship]
 tls_domain = "proxy.example.com"
@@ -892,9 +890,7 @@ middleproxy_buffer_kb = 2048               # ME C2S/S2C buffers grow on demand u
 max_connections = 512                      # Safe default for small (1 vCPU / ~1 GB) VPS
 idle_timeout_sec = 120
 # idle_timeout_jitter_pct = 15             # Per-connection idle timeout jitter in percent; 0 disables
-# client_silence_close_sec = 0             # Fallback after a mature (30s+) proven healthy relay exchange
-# client_silence_fast_close_sec = 0        # Fast close after resumed generic relay traffic; 0 = off
-# client_silence_fast_after_idle_sec = 30  # Quiet relay period required by the fast path
+# client_silence_close_sec = 0             # Unified bounded iOS wedge recovery; use 15 to enable
 handshake_timeout_sec = 15
 # graceful_shutdown_timeout_sec = 15       # Drain active connections after SIGINT/SIGTERM; a second signal forces exit
 # dc_connect_timeout_sec = 10              # Per-DC TCP connect ceiling; 0 still shares the global budget across candidates
@@ -965,9 +961,7 @@ alice = true   # direct where possible; CDN DC203 still requires MiddleProxy
 | `[server]` | `max_connections` | `512` | Configured concurrent connection cap (small-VPS tuned default, parser lower bound 32), distinct from the banner's baseline RAM ceiling. On Linux, startup first auto-clamps this to that effective-memory ceiling unless `unsafe_override_limits=true`; the proxy then clamps again if `RLIMIT_NOFILE` can support at least 32 slots, otherwise startup fails safely |
 | `[server]` | `idle_timeout_sec` | `120` | Established relay idle timeout in seconds (parser lower bound 5). Pre-first-byte admission uses a separate fixed 10-second deadline |
 | `[server]` | `idle_timeout_jitter_pct` | `15` | Per-connection random jitter applied once when the slot is admitted to `idle_timeout_sec` (`±N%`, clamped to `0..100`). The effective timeout is then reused for every deadline update, floored to at least 5 seconds and at least half the base timeout. Set `0` to disable |
-| `[server]` | `client_silence_close_sec` | `0` | Conservative iOS MtProtoKit wedge fallback for proven generic DC relays. Eligibility requires at least 30 seconds in the relay phase and a delivered server reply followed by further client traffic, so startup exchanges on fresh reconnects cannot arm a close loop. A later server payload is considered a reply only when it arrives within the client's 12-second response window, and the timer starts after the userspace client queue drains. Media relays are excluded. `0` disables it; `15` is the recommended fallback |
-| `[server]` | `client_silence_fast_close_sec` | `0` | Optional fast close for the same unanswered-reply pattern when an established generic relay has just resumed after `client_silence_fast_after_idle_sec` of silence. Any client payload cancels the candidate, and a fresh reconnect is not immediately eligible, preventing reconnect loops. `0` disables it; `2` is the recommended iOS value |
-| `[server]` | `client_silence_fast_after_idle_sec` | `30` | Minimum quiet relay period before the fast iOS wedge path is eligible (parser lower bound 5). Has no effect while `client_silence_fast_close_sec=0` |
+| `[server]` | `client_silence_close_sec` | `0` | Unified proxy-side recovery for the field-captured iOS `bad_server_salt` silence pattern on generic DC relays. A request must first reach the upstream socket, subsequent server payload must begin within the [source-backed 12-second client window](https://github.com/TelegramMessenger/Telegram-iOS/blob/b16d9acdffa9b3f88db68e26b77a3713e87a92e3/submodules/MtProtoKit/Sources/MTTcpConnection.m#L980), and the response timer starts only after the client output queue drains. Because MTProto payload and client platform are not visible to the relay, this is a bounded timing heuristic applied to the same pattern from any client, not iOS identification or message matching. Any client progress cancels it; media/DC203, masking, half-closed, backpressured, and graceful-shutdown paths are excluded. Every recovery is bounded per real client IP + access user + DC to `T`, `2T`, `4T` (up to four parallel relays per wave); after three waves, ordinary idle timeout takes over for 30 minutes from the most recent actual breaker close. Normal matching traffic does not extend that cooldown. A mature healthy continuation upgrades only the diagnostic confidence (`proven`), never bypasses the group budget. `0` disables it; values below `10` or not below `idle_timeout_sec` are rejected; `15` is recommended |
 | `[server]` | `handshake_timeout_sec` | `15` | Timeout for completing handshake after first byte (parser lower bound 5) |
 | `[server]` | `graceful_shutdown_timeout_sec` | `15` | Drain deadline after the first SIGINT/SIGTERM (parser lower bound 1). New accepts stop immediately; a second signal or expiry forcibly closes remaining connections |
 | `[server]` | `dc_connect_timeout_sec` | `10` | Per-endpoint TCP connect ceiling for Telegram DC and MiddleProxy candidates. Every attempt is also capped by its share of the remaining global handshake budget, including the final MiddleProxy candidate and reserved direct fallback. `0` disables only the configured ceiling; global budget sharing remains active |
@@ -1007,6 +1001,8 @@ alice = true   # direct where possible; CDN DC203 still requires MiddleProxy
 | `[access.direct_users]` | `<name> = true` | _(none)_ | Optional per-user MiddleProxy bypass. `<name>` must match a user from `[access.users]`; the bypass covers regular and media paths with real direct endpoints, but CDN DC203 always uses its required MiddleProxy. Values `false`/`0`/`no` remove a previous duplicate entry. Alias section: `[access.admins]` |
 
 </details>
+
+`client_silence_fast_close_sec` and `client_silence_fast_after_idle_sec` were removed in favor of the single bounded `client_silence_close_sec` policy. Remove the legacy keys before upgrading; strict config parsing rejects unknown keys.
 
 > **Operational note** &nbsp; High-churn mobile networks can produce many normal disconnects (`ConnectionResetByPeer`/`EndOfStream`). In release builds these are logged at debug level to keep production logs signal-focused.
 
