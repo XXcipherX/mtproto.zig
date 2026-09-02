@@ -1168,6 +1168,9 @@ const WedgeTracker = struct {
     response_kind: ?WedgeResponseKind = null,
     gate_ticket: ?WedgeGateTicket = null,
     arm_reported: bool = false,
+    // Proven candidates remain active on every matching exchange, but report
+    // each recovery-gate stage only once during this connection's lifetime.
+    reported_proven_stages: u8 = 0,
     fresh_available: bool = true,
     // Set only after a mature relay's client continues after a fully delivered
     // reply. The proof survives later exchanges but never crosses a slot reset.
@@ -1180,9 +1183,11 @@ const WedgeTracker = struct {
     fn resetExchange(self: *WedgeTracker) void {
         const fresh_available = self.fresh_available;
         const proven = self.proven;
+        const reported_proven_stages = self.reported_proven_stages;
         self.* = .{
             .fresh_available = fresh_available,
             .proven = proven,
+            .reported_proven_stages = reported_proven_stages,
         };
     }
 
@@ -1199,10 +1204,12 @@ const WedgeTracker = struct {
         const proven = self.proven or
             (self.phase == .waiting_for_client and relayCanBeProven(now_ms, relay_started_at_ms));
         const fresh_available = self.fresh_available and !was_waiting_for_client;
+        const reported_proven_stages = self.reported_proven_stages;
         self.* = .{
             .phase = .request_pending_delivery,
             .fresh_available = fresh_available,
             .proven = proven,
+            .reported_proven_stages = reported_proven_stages,
         };
         return cancelled;
     }
@@ -1274,9 +1281,16 @@ const WedgeTracker = struct {
         self.phase = .waiting_for_client;
         self.deadline_ms = now_ms + timeout_ms;
         self.gate_ticket = gate_ticket;
-        const report = !self.arm_reported;
+        const first_candidate_arm = !self.arm_reported;
         self.arm_reported = true;
-        return report;
+        if (!first_candidate_arm or self.response_kind.? != .proven) return first_candidate_arm;
+
+        if (gate_ticket.?.penalty >= WedgeRecoveryGate.max_penalty) return false;
+        const stage_shift: u3 = @intCast(gate_ticket.?.penalty);
+        const stage_bit = @as(u8, 1) << stage_shift;
+        const report_stage = self.reported_proven_stages & stage_bit == 0;
+        self.reported_proven_stages |= stage_bit;
+        return report_stage;
     }
 
     fn deferForClientBackpressure(self: *WedgeTracker) void {
@@ -1438,6 +1452,33 @@ test "wedge tracker reports one arm across fragmented server delivery" {
     const rearmed = WedgeGateTicket{ .armed_ms = 1_400, .timeout_ms = 15_000, .penalty = 0 };
     try std.testing.expect(!tracker.noteReplyDelivered(1_400, rearmed.timeout_ms, rearmed));
     try std.testing.expectEqual(@as(?i64, 16_400), tracker.nextDeadlineMs());
+}
+
+test "wedge tracker reports each proven backoff stage once per connection" {
+    var tracker = WedgeTracker{
+        .fresh_available = false,
+        .proven = true,
+    };
+
+    try std.testing.expect(!tracker.noteClientPayload(1_000, 500));
+    tracker.noteRequestDelivered(1_050);
+    try std.testing.expect(tracker.noteServerPayload(1_100));
+    const stage_one = WedgeGateTicket{ .armed_ms = 1_200, .timeout_ms = 15_000, .penalty = 0 };
+    try std.testing.expect(tracker.noteReplyDelivered(1_200, stage_one.timeout_ms, stage_one));
+
+    try std.testing.expect(tracker.noteClientPayload(1_300, 500));
+    tracker.noteRequestDelivered(1_350);
+    try std.testing.expect(tracker.noteServerPayload(1_400));
+    const stage_one_again = WedgeGateTicket{ .armed_ms = 1_500, .timeout_ms = 15_000, .penalty = 0 };
+    try std.testing.expect(!tracker.noteReplyDelivered(1_500, stage_one_again.timeout_ms, stage_one_again));
+    try std.testing.expectEqual(@as(?i64, 16_500), tracker.nextDeadlineMs());
+
+    try std.testing.expect(tracker.noteClientPayload(1_600, 500));
+    tracker.noteRequestDelivered(1_650);
+    try std.testing.expect(tracker.noteServerPayload(1_700));
+    const stage_two = WedgeGateTicket{ .armed_ms = 1_800, .timeout_ms = 30_000, .penalty = 1 };
+    try std.testing.expect(tracker.noteReplyDelivered(1_800, stage_two.timeout_ms, stage_two));
+    try std.testing.expectEqual(@as(?i64, 31_800), tracker.nextDeadlineMs());
 }
 
 test "wedge tracker ignores replies outside the client watchdog window" {
