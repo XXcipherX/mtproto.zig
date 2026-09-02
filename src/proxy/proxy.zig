@@ -1903,6 +1903,8 @@ const ConnectionSlot = struct {
 
     // Masking: bytes already read from client before deciding to mask
     mask_prebuffer: ?[]u8 = null,
+    mask_c2s_bytes: u64 = 0,
+    mask_s2c_bytes: u64 = 0,
     mask_addr_override: ?net.Address = null,
     mask_send_proxy_header: bool = false,
     /// Long-lived HTTPS/WebSocket carrier for the configured WEB domain. Unlike
@@ -4450,6 +4452,7 @@ const EventLoop = struct {
         @memcpy(pre[0..proxy_header.len], proxy_header);
         @memcpy(pre[proxy_header.len..], buffered);
         slot.mask_prebuffer = pre;
+        slot.mask_c2s_bytes += buffered.len;
 
         slot.upstream_candidates = candidates;
         slot.upstream_candidate_next = 1;
@@ -5198,6 +5201,7 @@ const EventLoop = struct {
             self.closeSlot(slot, "mask queue upstream failed");
             return;
         };
+        slot.mask_c2s_bytes += n;
     }
 
     fn relayRawUpstreamToClient(self: *EventLoop, slot: *ConnectionSlot) void {
@@ -5222,6 +5226,7 @@ const EventLoop = struct {
             self.closeSlot(slot, "mask queue client failed");
             return;
         };
+        slot.mask_s2c_bytes += n;
     }
 
     fn middleProxyBegin(self: *EventLoop, slot: *ConnectionSlot) void {
@@ -6369,11 +6374,13 @@ const EventLoop = struct {
                         self.closeSlot(slot, "mask rdhup queue upstream failed");
                         return;
                     };
+                    slot.mask_c2s_bytes += n;
                 } else {
                     _ = queueClient(slot, read_buf[0..n]) catch {
                         self.closeSlot(slot, "mask rdhup queue client failed");
                         return;
                     };
+                    slot.mask_s2c_bytes += n;
                 }
                 slot.last_activity_ms = compat.monotonicMilliTimestamp();
                 if ((from_client and slot.hasUpstreamPending()) or
@@ -6387,15 +6394,30 @@ const EventLoop = struct {
 
     fn closeSlot(self: *EventLoop, slot: *ConnectionSlot, reason: []const u8) void {
         if (slot.phase == .idle) return;
-        log.debug("[{d}] closing: dc_idx={d} media={} phase={s} reason={s} c2s={d} s2c={d}", .{
-            slot.conn_id,
-            slot.dc_idx,
-            slot.is_media_path,
-            @tagName(slot.phase),
-            reason,
-            slot.c2s_bytes,
-            slot.s2c_bytes,
-        });
+        if (slot.phase == .mask_relaying) {
+            var client_ip_buf: [64]u8 = undefined;
+            const client_ip = formatClientIp(slot.peer_addr, &client_ip_buf);
+            log.debug("[{d}] closing: dc_idx={d} media={} phase={s} reason={s} raw_c2s={d} raw_s2c={d} client={s}", .{
+                slot.conn_id,
+                slot.dc_idx,
+                slot.is_media_path,
+                @tagName(slot.phase),
+                reason,
+                slot.mask_c2s_bytes,
+                slot.mask_s2c_bytes,
+                client_ip,
+            });
+        } else {
+            log.debug("[{d}] closing: dc_idx={d} media={} phase={s} reason={s} c2s={d} s2c={d}", .{
+                slot.conn_id,
+                slot.dc_idx,
+                slot.is_media_path,
+                @tagName(slot.phase),
+                reason,
+                slot.c2s_bytes,
+                slot.s2c_bytes,
+            });
+        }
         self.removeSlotDeadline(slot);
 
         if (!isInvalidFd(slot.client_fd)) {

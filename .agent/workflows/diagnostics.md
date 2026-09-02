@@ -67,6 +67,7 @@ Note:
 - `drops: ... mp_fallback+=...` means MiddleProxy degraded and the proxy recovered by reconnecting directly to the same DC.
 - `drops: ... rate+=...` means the per-subnet token bucket rejected new connections; IPv4-mapped IPv6 addresses are grouped with their native IPv4 `/24`.
 - At debug level, `valid FakeTLS ClientHello: ... client=<ip>` identifies the authenticated client's IP without its ephemeral source port; unauthenticated and invalid-secret probes do not emit this line.
+- A `phase=mask_relaying` close reports the client IP without its source port plus `raw_c2s`/`raw_s2c`, the raw bytes queued toward and received from the mask backend. These are separate from decoded MTProto byte counters.
 - A healthy WEB carrier logs `web session opened ... (client address: real)` in the relay. `loopback` there means the browser address was not preserved through the Caddy/PROXY-v2 hop; inspect `[web].mask_backend`, Caddy listener wrappers, and `X-Forwarded-For` handling.
 - WEB stream failures should be correlated across `mtproto-web-relay` and the main proxy. The relay opens one backend connection per logical stream, so those streams also appear in the proxy's ordinary connection and close statistics.
 - In WEB-only mode, `web_only: direct clients masked+=N` counts external peers sent to Caddy instead of MTProto. It does not count trusted relay streams. If relay streams are also rejected, verify that `[web].backend` reaches the proxy from loopback or an explicit `[web].relay_sources` address; a PROXY header cannot grant trust.
