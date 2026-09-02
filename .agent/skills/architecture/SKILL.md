@@ -55,7 +55,7 @@ Code anchors:
 ## WEB Proxy Flow (Telegram Desktop 7.1+)
 
 1. Telegram Desktop opens a browser HTTPS carrier to `[web].domain` on public `:443`; with the default `[web].only=false`, ordinary FakeTLS clients continue to use the same listener with `censorship.tls_domain`.
-2. The proxy recognizes the WEB SNI and relays the untouched TLS connection to `[web].mask_backend`, prefixing PROXY v2 with the kernel-reported browser address.
+2. The proxy recognizes the WEB SNI with a bounds-checked routing parser that is independent of FakeTLS key-share/cipher policy, then relays the untouched TLS connection to `[web].mask_backend`, prefixing PROXY v2 with the kernel-reported browser address.
 3. The existing Caddy service terminates TLS and returns a bodyless 404 for ordinary WEB-host requests. Only the capability-bearing bridge and WebSocket routes are sent to the loopback relay; invalid capabilities also receive an empty 404.
 4. The relay authenticates the bridge capability derived from the configured user secret and multiplexes logical streams with the Telegram Desktop WEB frame protocol.
 5. Every logical stream connects back to `[web].backend`, prefixes PROXY v2 with the browser address, and carries the client's `dd` direct-obfuscated MTProto stream into the normal DC/MiddleProxy routing path.
@@ -139,7 +139,7 @@ If `max_connections` exceeds the baseline RAM ceiling, startup auto-clamps it be
 ## DPI Evasion Components
 
 - FakeTLS ServerHello template with runtime digest patching.
-- FakeTLS uses one strict ClientHello framing parser for authentication, SNI, cipher, and PQ key-share reads. It accepts only 32-byte Session IDs, stores the Session ID by value, and securely releases the full ClientHello as soon as the synthetic ServerHello is built.
+- FakeTLS uses one strict ClientHello parser for authentication, cipher, and PQ key-share reads. WEB SNI routing has an independent bounds-checked extension walker so unrelated TLS evolution cannot select the wrong Caddy certificate. FakeTLS accepts only 32-byte Session IDs, stores the Session ID by value, and securely releases the full ClientHello as soon as the synthetic ServerHello is built.
 - Anti-replay cache compares the full canonical HMAC digest, retains entries for the maximum FakeTLS timestamp-validity horizon, and replaces the oldest entry in a saturated bounded probe window so cache pressure cannot masquerade as a proven replay.
 - MTProto obfuscation rejects reserved nonces before decrypting protocol tags.
 - Unknown MTProto DC indices are rejected before endpoint planning; modulo fallback is not part of the connection path.

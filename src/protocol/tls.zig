@@ -689,9 +689,82 @@ pub fn isTlsHandshake(first_bytes: []const u8) bool {
         (first_bytes[2] == 0x01 or first_bytes[2] == 0x03);
 }
 
-/// Extract SNI from a TLS ClientHello.
+/// Extract SNI for listener routing without applying FakeTLS-specific policy to
+/// unrelated extensions. Authentication still uses parseClientHello(), whose
+/// cipher and key-share checks intentionally remain strict.
 pub fn extractSni(handshake: []const u8) ?[]const u8 {
-    return (parseClientHello(handshake) orelse return null).sni;
+    if (handshake.len < 5 + 4 + 2 + 32 + 1 + 2 + 2 + 1 + 1 + 2) return null;
+    if (handshake[0] != constants.tls_record_handshake) return null;
+    if (handshake[1] != 0x03 or (handshake[2] != 0x01 and handshake[2] != 0x03)) return null;
+
+    const record_len: usize = std.mem.readInt(u16, handshake[3..5], .big);
+    if (record_len != handshake.len - 5) return null;
+    if (handshake[5] != 0x01) return null;
+    const hello_len: usize = std.mem.readInt(u24, handshake[6..9], .big);
+    if (hello_len != record_len - 4) return null;
+
+    var pos: usize = 9;
+    if (2 + 32 > handshake.len - pos) return null;
+    pos += 2 + 32;
+
+    if (pos >= handshake.len) return null;
+    const session_id_len: usize = handshake[pos];
+    pos += 1;
+    if (session_id_len > 32 or session_id_len > handshake.len - pos) return null;
+    pos += session_id_len;
+
+    if (2 > handshake.len - pos) return null;
+    const cipher_suites_len: usize = std.mem.readInt(u16, handshake[pos..][0..2], .big);
+    pos += 2;
+    if (cipher_suites_len < 2 or cipher_suites_len % 2 != 0 or cipher_suites_len > handshake.len - pos) return null;
+    pos += cipher_suites_len;
+
+    if (pos >= handshake.len) return null;
+    const compression_len: usize = handshake[pos];
+    pos += 1;
+    if (compression_len == 0 or compression_len > handshake.len - pos) return null;
+    pos += compression_len;
+
+    if (2 > handshake.len - pos) return null;
+    const extensions_len: usize = std.mem.readInt(u16, handshake[pos..][0..2], .big);
+    pos += 2;
+    if (extensions_len != handshake.len - pos) return null;
+    const extensions = handshake[pos..];
+
+    var ext_pos: usize = 0;
+    var sni: ?[]const u8 = null;
+    var seen_sni = false;
+    while (ext_pos < extensions.len) {
+        if (extensions.len - ext_pos < 4) return null;
+        const ext_type = std.mem.readInt(u16, extensions[ext_pos..][0..2], .big);
+        const ext_len: usize = std.mem.readInt(u16, extensions[ext_pos + 2 ..][0..2], .big);
+        ext_pos += 4;
+        if (ext_len > extensions.len - ext_pos) return null;
+        const payload = extensions[ext_pos .. ext_pos + ext_len];
+
+        if (ext_type == 0x0000) {
+            if (seen_sni or payload.len < 2) return null;
+            seen_sni = true;
+            const names_len: usize = std.mem.readInt(u16, payload[0..2], .big);
+            if (names_len != payload.len - 2) return null;
+            var name_pos: usize = 2;
+            while (name_pos < payload.len) {
+                if (payload.len - name_pos < 3) return null;
+                const name_type = payload[name_pos];
+                const name_len: usize = std.mem.readInt(u16, payload[name_pos + 1 ..][0..2], .big);
+                name_pos += 3;
+                if (name_len > payload.len - name_pos) return null;
+                if (name_type == 0) {
+                    if (name_len == 0 or sni != null) return null;
+                    sni = payload[name_pos .. name_pos + name_len];
+                }
+                name_pos += name_len;
+            }
+        }
+        ext_pos += ext_len;
+    }
+
+    return sni;
 }
 
 /// Return the first non-GREASE TLS 1.3 cipher suite offered by the client.
@@ -935,7 +1008,7 @@ test "extractSni - malformed returns null" {
     try std.testing.expect(extractSni(&[_]u8{ 0x17, 0x03, 0x01, 0x00, 0x00 }) == null);
 }
 
-test "all ClientHello readers share strict record framing" {
+test "ClientHello readers reject malformed record framing" {
     const domain = "example.com";
     var ch = [_]u8{0} ** 72;
     const base = buildTestClientHello(0, 0);
@@ -957,6 +1030,37 @@ test "all ClientHello readers share strict record framing" {
     // A truncated nested extension is rejected consistently by every reader.
     std.mem.writeInt(u16, ch[54..56], 17, .big);
     try std.testing.expect(extractSni(&ch) == null);
+    try std.testing.expect(extractFirstTls13Cipher(&ch) == null);
+    try std.testing.expect(!clientOffersPqKeyShare(&ch));
+}
+
+test "SNI routing ignores unrelated FakeTLS key-share policy" {
+    const domain = "example.com";
+    var ch = [_]u8{0} ** 83;
+    const base = buildTestClientHello(0, 0);
+    @memcpy(ch[0..50], base[0..50]);
+    std.mem.writeInt(u16, ch[3..5], @intCast(ch.len - 5), .big);
+    std.mem.writeInt(u24, ch[6..9], @intCast(ch.len - 9), .big);
+    std.mem.writeInt(u16, ch[50..52], 31, .big);
+
+    // A valid SNI extension followed by a structurally framed but noncanonical
+    // X25519 key share. Listener routing must still find the WEB hostname; the
+    // strict FakeTLS readers must continue rejecting the key share.
+    std.mem.writeInt(u16, ch[52..54], 0x0000, .big);
+    std.mem.writeInt(u16, ch[54..56], 16, .big);
+    std.mem.writeInt(u16, ch[56..58], 14, .big);
+    ch[58] = 0;
+    std.mem.writeInt(u16, ch[59..61], @intCast(domain.len), .big);
+    @memcpy(ch[61..72], domain);
+
+    std.mem.writeInt(u16, ch[72..74], 0x0033, .big);
+    std.mem.writeInt(u16, ch[74..76], 7, .big);
+    std.mem.writeInt(u16, ch[76..78], 5, .big);
+    std.mem.writeInt(u16, ch[78..80], 0x001d, .big);
+    std.mem.writeInt(u16, ch[80..82], 1, .big);
+    ch[82] = 0xaa;
+
+    try std.testing.expectEqualStrings(domain, extractSni(&ch).?);
     try std.testing.expect(extractFirstTls13Cipher(&ch) == null);
     try std.testing.expect(!clientOffersPqKeyShare(&ch));
 }
