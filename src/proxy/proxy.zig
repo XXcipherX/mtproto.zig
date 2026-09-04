@@ -898,6 +898,22 @@ const ClientTransport = enum {
     direct_obfuscated,
 };
 
+const MaskCause = enum {
+    none,
+    non_tls,
+    invalid_tls_length,
+    missing_sni,
+    malformed_client_hello,
+    sni_mismatch,
+    web_carrier,
+    web_only,
+    invalid_session_id,
+    secret_mismatch,
+    timestamp_skew,
+    replay,
+    validation_error,
+};
+
 const ConnectionPhase = enum {
     idle,
     reading_web_prefix,
@@ -1905,6 +1921,9 @@ const ConnectionSlot = struct {
     mask_prebuffer: ?[]u8 = null,
     mask_c2s_bytes: u64 = 0,
     mask_s2c_bytes: u64 = 0,
+    mask_cause: MaskCause = .none,
+    /// Server time minus authenticated client time for timestamp-skew masking.
+    mask_timestamp_skew_s: ?i64 = null,
     mask_addr_override: ?net.Address = null,
     mask_send_proxy_header: bool = false,
     /// Long-lived HTTPS/WebSocket carrier for the configured WEB domain. Unlike
@@ -3980,7 +3999,7 @@ const EventLoop = struct {
                 self.readDirectObfuscatedHandshake(slot);
                 return;
             }
-            self.startMasking(slot, slot.tls_hdr_buf[0..]) catch {
+            self.startMasking(slot, slot.tls_hdr_buf[0..], .non_tls) catch {
                 self.closeSlot(slot, "non-tls masked failed");
             };
             return;
@@ -3988,7 +4007,7 @@ const EventLoop = struct {
 
         const record_len = std.mem.readInt(u16, slot.tls_hdr_buf[3..5], .big);
         if (record_len < constants.min_tls_client_hello_size or record_len > constants.max_tls_plaintext_size) {
-            self.startMasking(slot, slot.tls_hdr_buf[0..]) catch {
+            self.startMasking(slot, slot.tls_hdr_buf[0..], .invalid_tls_length) catch {
                 self.closeSlot(slot, "bad tls length");
             };
             return;
@@ -4060,26 +4079,34 @@ const EventLoop = struct {
 
         const client_hello = hello_buf[0..slot.client_hello_len];
 
-        const maybe_sni = tls.extractSni(client_hello);
-        if (maybe_sni == null) {
-            self.startMasking(slot, client_hello) catch {
-                self.closeSlot(slot, "tls missing sni");
-            };
-            return;
-        }
-
-        const sni = maybe_sni.?;
+        const sni = switch (tls.inspectSni(client_hello)) {
+            .found => |value| value,
+            .missing => {
+                self.startMasking(slot, client_hello, .missing_sni) catch {
+                    self.closeSlot(slot, "tls missing sni");
+                };
+                return;
+            },
+            .malformed => {
+                self.startMasking(slot, client_hello, .malformed_client_hello) catch {
+                    self.closeSlot(slot, "malformed client hello");
+                };
+                return;
+            },
+        };
         if (!std.ascii.eqlIgnoreCase(sni, self.state.config.tls_domain)) {
+            var mask_cause: MaskCause = .sni_mismatch;
             if (self.state.web_mask_addr) |web_addr| {
                 if (self.state.config.web.domain) |web_domain| {
                     if (std.ascii.eqlIgnoreCase(sni, web_domain)) {
                         slot.mask_addr_override = web_addr;
                         slot.mask_send_proxy_header = true;
                         slot.web_carrier = true;
+                        mask_cause = .web_carrier;
                     }
                 }
             }
-            self.startMasking(slot, client_hello) catch {
+            self.startMasking(slot, client_hello, mask_cause) catch {
                 self.closeSlot(slot, "tls sni mismatch");
             };
             return;
@@ -4091,28 +4118,42 @@ const EventLoop = struct {
         // secret, while the relay remains allowed through.
         if (webOnlyMasksPeer(self.state.web_only, slot.trusted_peer)) {
             self.state.stats_web_only_masked +|= 1;
-            self.startMasking(slot, client_hello) catch {
+            self.startMasking(slot, client_hello, .web_only) catch {
                 self.closeSlot(slot, "web-only masking failed");
             };
             return;
         }
 
-        var validation = tls.validateTlsHandshake(
+        var validation_diagnostic: tls.TlsValidationDiagnostic = .{};
+        var validation = tls.validateTlsHandshakeDetailed(
             self.state.allocator,
             client_hello,
             self.state.user_secrets,
             false,
-        ) catch null;
+            &validation_diagnostic,
+        ) catch {
+            self.startMasking(slot, client_hello, .validation_error) catch {
+                self.closeSlot(slot, "tls validation error masking failed");
+            };
+            return;
+        };
         defer if (validation) |*value| value.wipe();
 
         const v = if (validation) |*value| value else {
-            self.startMasking(slot, client_hello) catch {
+            const mask_cause: MaskCause = switch (validation_diagnostic.failure) {
+                .malformed_client_hello => .malformed_client_hello,
+                .invalid_session_id => .invalid_session_id,
+                .secret_mismatch => .secret_mismatch,
+                .timestamp_skew => .timestamp_skew,
+            };
+            slot.mask_timestamp_skew_s = validation_diagnostic.timestamp_skew_s;
+            self.startMasking(slot, client_hello, mask_cause) catch {
                 self.closeSlot(slot, "tls validation failed");
             };
             return;
         };
         if (self.state.replay_cache.checkAndInsert(&v.canonical_hmac)) {
-            self.startMasking(slot, client_hello) catch {
+            self.startMasking(slot, client_hello, .replay) catch {
                 self.closeSlot(slot, "replay detected, masking failed");
             };
             return;
@@ -4416,8 +4457,14 @@ const EventLoop = struct {
         };
     }
 
-    fn startMasking(self: *EventLoop, slot: *ConnectionSlot, buffered: []const u8) !void {
+    fn startMasking(
+        self: *EventLoop,
+        slot: *ConnectionSlot,
+        buffered: []const u8,
+        cause: MaskCause,
+    ) !void {
         if (!self.state.config.mask) return error.MaskingDisabled;
+        slot.mask_cause = cause;
         const override = slot.mask_addr_override;
         slot.mask_addr_override = null;
         const candidates = if (override) |addr| blk: {
@@ -6397,16 +6444,32 @@ const EventLoop = struct {
         if (slot.phase == .mask_relaying) {
             var client_ip_buf: [64]u8 = undefined;
             const client_ip = formatClientIp(slot.peer_addr, &client_ip_buf);
-            log.debug("[{d}] closing: dc_idx={d} media={} phase={s} reason={s} raw_c2s={d} raw_s2c={d} client={s}", .{
-                slot.conn_id,
-                slot.dc_idx,
-                slot.is_media_path,
-                @tagName(slot.phase),
-                reason,
-                slot.mask_c2s_bytes,
-                slot.mask_s2c_bytes,
-                client_ip,
-            });
+            if (slot.mask_timestamp_skew_s) |skew_s| {
+                log.debug("[{d}] closing: dc_idx={d} media={} phase={s} mask_cause={s} skew_s={d} reason={s} raw_c2s={d} raw_s2c={d} client={s}", .{
+                    slot.conn_id,
+                    slot.dc_idx,
+                    slot.is_media_path,
+                    @tagName(slot.phase),
+                    @tagName(slot.mask_cause),
+                    skew_s,
+                    reason,
+                    slot.mask_c2s_bytes,
+                    slot.mask_s2c_bytes,
+                    client_ip,
+                });
+            } else {
+                log.debug("[{d}] closing: dc_idx={d} media={} phase={s} mask_cause={s} reason={s} raw_c2s={d} raw_s2c={d} client={s}", .{
+                    slot.conn_id,
+                    slot.dc_idx,
+                    slot.is_media_path,
+                    @tagName(slot.phase),
+                    @tagName(slot.mask_cause),
+                    reason,
+                    slot.mask_c2s_bytes,
+                    slot.mask_s2c_bytes,
+                    client_ip,
+                });
+            }
         } else {
             log.debug("[{d}] closing: dc_idx={d} media={} phase={s} reason={s} c2s={d} s2c={d}", .{
                 slot.conn_id,

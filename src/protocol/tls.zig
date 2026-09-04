@@ -39,6 +39,20 @@ pub const TlsValidation = struct {
     }
 };
 
+pub const TlsValidationFailure = enum {
+    malformed_client_hello,
+    invalid_session_id,
+    secret_mismatch,
+    timestamp_skew,
+};
+
+pub const TlsValidationDiagnostic = struct {
+    failure: TlsValidationFailure = .malformed_client_hello,
+    /// Server wall clock minus the authenticated client timestamp, in seconds.
+    /// Populated only when `failure == .timestamp_skew`.
+    timestamp_skew_s: ?i64 = null,
+};
+
 const ParsedClientHello = struct {
     digest: []const u8,
     session_id: []const u8,
@@ -177,11 +191,34 @@ pub fn validateTlsHandshake(
     secrets: []const UserSecret,
     ignore_time_skew: bool,
 ) !?TlsValidation {
+    var ignored_diagnostic: TlsValidationDiagnostic = .{};
+    return validateTlsHandshakeDetailed(
+        allocator,
+        handshake,
+        secrets,
+        ignore_time_skew,
+        &ignored_diagnostic,
+    );
+}
+
+/// Validate a TLS ClientHello and retain the reason for an authentication
+/// failure. The normal wrapper above deliberately preserves its optional API.
+pub fn validateTlsHandshakeDetailed(
+    allocator: std.mem.Allocator,
+    handshake: []const u8,
+    secrets: []const UserSecret,
+    ignore_time_skew: bool,
+    diagnostic: *TlsValidationDiagnostic,
+) !?TlsValidation {
     _ = allocator;
 
+    diagnostic.* = .{};
     const parsed = parseClientHello(handshake) orelse return null;
     if (parsed.digest.ptr != handshake[constants.tls_digest_pos..].ptr) return null;
-    if (parsed.session_id.len != 32) return null;
+    if (parsed.session_id.len != 32) {
+        diagnostic.failure = .invalid_session_id;
+        return null;
+    }
     var digest: [constants.tls_digest_len]u8 = parsed.digest[0..constants.tls_digest_len].*;
     defer std.crypto.secureZero(u8, &digest);
 
@@ -193,6 +230,7 @@ pub fn validateTlsHandshake(
     else
         0;
 
+    var saw_matching_hmac = false;
     for (secrets) |*entry| {
         var hmac = HmacSha256.init(&entry.secret);
         defer std.crypto.secureZero(u8, std.mem.asBytes(&hmac));
@@ -205,6 +243,7 @@ pub fn validateTlsHandshake(
 
         // Constant-time comparison of first 28 bytes using stdlib
         if (!std.crypto.timing_safe.eql([28]u8, digest[0..28].*, computed[0..28].*)) continue;
+        saw_matching_hmac = true;
 
         // Extract timestamp from last 4 bytes (XOR)
         const timestamp = std.mem.readInt(u32, &[4]u8{
@@ -217,6 +256,8 @@ pub fn validateTlsHandshake(
         if (!ignore_time_skew) {
             const time_diff = now - @as(i64, @intCast(timestamp));
             if (time_diff < constants.time_skew_min or time_diff > constants.time_skew_max) {
+                diagnostic.failure = .timestamp_skew;
+                diagnostic.timestamp_skew_s = time_diff;
                 continue;
             }
         }
@@ -231,6 +272,7 @@ pub fn validateTlsHandshake(
         };
     }
 
+    if (!saw_matching_hmac) diagnostic.failure = .secret_mismatch;
     return null;
 }
 
@@ -689,73 +731,79 @@ pub fn isTlsHandshake(first_bytes: []const u8) bool {
         (first_bytes[2] == 0x01 or first_bytes[2] == 0x03);
 }
 
-/// Extract SNI for listener routing without applying FakeTLS-specific policy to
+pub const SniInspection = union(enum) {
+    found: []const u8,
+    missing,
+    malformed,
+};
+
+/// Inspect SNI for listener routing without applying FakeTLS-specific policy to
 /// unrelated extensions. Authentication still uses parseClientHello(), whose
 /// cipher and key-share checks intentionally remain strict.
-pub fn extractSni(handshake: []const u8) ?[]const u8 {
-    if (handshake.len < 5 + 4 + 2 + 32 + 1 + 2 + 2 + 1 + 1 + 2) return null;
-    if (handshake[0] != constants.tls_record_handshake) return null;
-    if (handshake[1] != 0x03 or (handshake[2] != 0x01 and handshake[2] != 0x03)) return null;
+pub fn inspectSni(handshake: []const u8) SniInspection {
+    if (handshake.len < 5 + 4 + 2 + 32 + 1 + 2 + 2 + 1 + 1 + 2) return .malformed;
+    if (handshake[0] != constants.tls_record_handshake) return .malformed;
+    if (handshake[1] != 0x03 or (handshake[2] != 0x01 and handshake[2] != 0x03)) return .malformed;
 
     const record_len: usize = std.mem.readInt(u16, handshake[3..5], .big);
-    if (record_len != handshake.len - 5) return null;
-    if (handshake[5] != 0x01) return null;
+    if (record_len != handshake.len - 5) return .malformed;
+    if (handshake[5] != 0x01) return .malformed;
     const hello_len: usize = std.mem.readInt(u24, handshake[6..9], .big);
-    if (hello_len != record_len - 4) return null;
+    if (hello_len != record_len - 4) return .malformed;
 
     var pos: usize = 9;
-    if (2 + 32 > handshake.len - pos) return null;
+    if (2 + 32 > handshake.len - pos) return .malformed;
     pos += 2 + 32;
 
-    if (pos >= handshake.len) return null;
+    if (pos >= handshake.len) return .malformed;
     const session_id_len: usize = handshake[pos];
     pos += 1;
-    if (session_id_len > 32 or session_id_len > handshake.len - pos) return null;
+    if (session_id_len > 32 or session_id_len > handshake.len - pos) return .malformed;
     pos += session_id_len;
 
-    if (2 > handshake.len - pos) return null;
+    if (2 > handshake.len - pos) return .malformed;
     const cipher_suites_len: usize = std.mem.readInt(u16, handshake[pos..][0..2], .big);
     pos += 2;
-    if (cipher_suites_len < 2 or cipher_suites_len % 2 != 0 or cipher_suites_len > handshake.len - pos) return null;
+    if (cipher_suites_len < 2 or cipher_suites_len % 2 != 0 or cipher_suites_len > handshake.len - pos) return .malformed;
     pos += cipher_suites_len;
 
-    if (pos >= handshake.len) return null;
+    if (pos >= handshake.len) return .malformed;
     const compression_len: usize = handshake[pos];
     pos += 1;
-    if (compression_len == 0 or compression_len > handshake.len - pos) return null;
+    if (compression_len == 0 or compression_len > handshake.len - pos) return .malformed;
     pos += compression_len;
 
-    if (2 > handshake.len - pos) return null;
+    if (2 > handshake.len - pos) return .malformed;
     const extensions_len: usize = std.mem.readInt(u16, handshake[pos..][0..2], .big);
     pos += 2;
-    if (extensions_len != handshake.len - pos) return null;
+    if (extensions_len != handshake.len - pos) return .malformed;
     const extensions = handshake[pos..];
 
     var ext_pos: usize = 0;
     var sni: ?[]const u8 = null;
     var seen_sni = false;
     while (ext_pos < extensions.len) {
-        if (extensions.len - ext_pos < 4) return null;
+        if (extensions.len - ext_pos < 4) return .malformed;
         const ext_type = std.mem.readInt(u16, extensions[ext_pos..][0..2], .big);
         const ext_len: usize = std.mem.readInt(u16, extensions[ext_pos + 2 ..][0..2], .big);
         ext_pos += 4;
-        if (ext_len > extensions.len - ext_pos) return null;
+        if (ext_len > extensions.len - ext_pos) return .malformed;
         const payload = extensions[ext_pos .. ext_pos + ext_len];
 
         if (ext_type == 0x0000) {
-            if (seen_sni or payload.len < 2) return null;
+            if (seen_sni or payload.len < 2) return .malformed;
             seen_sni = true;
             const names_len: usize = std.mem.readInt(u16, payload[0..2], .big);
-            if (names_len != payload.len - 2) return null;
+            if (names_len != payload.len - 2) return .malformed;
             var name_pos: usize = 2;
             while (name_pos < payload.len) {
-                if (payload.len - name_pos < 3) return null;
+                if (payload.len - name_pos < 3) return .malformed;
                 const name_type = payload[name_pos];
                 const name_len: usize = std.mem.readInt(u16, payload[name_pos + 1 ..][0..2], .big);
                 name_pos += 3;
-                if (name_len > payload.len - name_pos) return null;
+                if (name_len > payload.len - name_pos) return .malformed;
                 if (name_type == 0) {
-                    if (name_len == 0 or sni != null) return null;
+                    if (name_len == 0 or sni != null) return .malformed;
                     sni = payload[name_pos .. name_pos + name_len];
                 }
                 name_pos += name_len;
@@ -764,7 +812,15 @@ pub fn extractSni(handshake: []const u8) ?[]const u8 {
         ext_pos += ext_len;
     }
 
-    return sni;
+    if (sni) |value| return .{ .found = value };
+    return .missing;
+}
+
+pub fn extractSni(handshake: []const u8) ?[]const u8 {
+    return switch (inspectSni(handshake)) {
+        .found => |sni| sni,
+        .missing, .malformed => null,
+    };
 }
 
 /// Return the first non-GREASE TLS 1.3 cipher suite offered by the client.
@@ -1001,11 +1057,67 @@ test "validateTlsHandshake - invalid user" {
     try std.testing.expect(result == null);
 }
 
+test "validateTlsHandshakeDetailed classifies authentication failures" {
+    const allocator = std.testing.allocator;
+    var secrets = [_]UserSecret{.{ .name = "alice", .secret = [_]u8{0x1A} ** 16 }};
+    var diagnostic: TlsValidationDiagnostic = undefined;
+
+    const bad_secret = buildTestClientHello(32, 0xaa);
+    const bad_secret_result = try validateTlsHandshakeDetailed(
+        allocator,
+        &bad_secret,
+        &secrets,
+        true,
+        &diagnostic,
+    );
+    try std.testing.expect(bad_secret_result == null);
+    try std.testing.expectEqual(TlsValidationFailure.secret_mismatch, diagnostic.failure);
+    try std.testing.expect(diagnostic.timestamp_skew_s == null);
+
+    const bad_session = buildTestClientHello(4, 0xaa);
+    const bad_session_result = try validateTlsHandshakeDetailed(
+        allocator,
+        &bad_session,
+        &secrets,
+        true,
+        &diagnostic,
+    );
+    try std.testing.expect(bad_session_result == null);
+    try std.testing.expectEqual(TlsValidationFailure.invalid_session_id, diagnostic.failure);
+    try std.testing.expect(diagnostic.timestamp_skew_s == null);
+
+    var stale = buildTestClientHello(32, 0xaa);
+    const stale_hmac = crypto.sha256Hmac(&secrets[0].secret, &stale);
+    @memcpy(stale[constants.tls_digest_pos..][0..constants.tls_digest_len], stale_hmac[0..]);
+    const stale_result = try validateTlsHandshakeDetailed(
+        allocator,
+        &stale,
+        &secrets,
+        false,
+        &diagnostic,
+    );
+    try std.testing.expect(stale_result == null);
+    try std.testing.expectEqual(TlsValidationFailure.timestamp_skew, diagnostic.failure);
+    try std.testing.expect(diagnostic.timestamp_skew_s != null);
+    try std.testing.expect(diagnostic.timestamp_skew_s.? > constants.time_skew_max);
+}
+
 test "extractSni - malformed returns null" {
     // Too short
-    try std.testing.expect(extractSni(&[_]u8{ 0x16, 0x03, 0x01, 0x00 }) == null);
+    const short = [_]u8{ 0x16, 0x03, 0x01, 0x00 };
+    try std.testing.expect(extractSni(&short) == null);
+    try std.testing.expect(switch (inspectSni(&short)) {
+        .malformed => true,
+        else => false,
+    });
     // Not a handshake type
     try std.testing.expect(extractSni(&[_]u8{ 0x17, 0x03, 0x01, 0x00, 0x00 }) == null);
+
+    const without_sni = buildTestClientHello(32, 0xaa);
+    try std.testing.expect(switch (inspectSni(&without_sni)) {
+        .missing => true,
+        else => false,
+    });
 }
 
 test "ClientHello readers reject malformed record framing" {
