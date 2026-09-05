@@ -13,6 +13,7 @@ CADDYFILE="${CADDYFILE:-/etc/caddy/mtproto-mask.Caddyfile}"
 WEB_PORT="${WEB_PORT:-8081}"
 WEB_TLS_PORT="${WEB_TLS_PORT:-8444}"
 WEB_DOMAIN="${WEB_DOMAIN:-}"
+WEB_FORCE_DOMAIN_CHANGE="${WEB_FORCE_DOMAIN_CHANGE:-false}"
 if [[ -v WEB_ONLY ]]; then WEB_ONLY_EXPLICIT=true; else WEB_ONLY_EXPLICIT=false; fi
 WEB_ONLY="${WEB_ONLY:-false}"
 REMOVE=false
@@ -42,8 +43,11 @@ while (($# > 0)); do
             WEB_ONLY=false
             WEB_ONLY_EXPLICIT=true
             ;;
+        --force)
+            WEB_FORCE_DOMAIN_CHANGE=true
+            ;;
         -h|--help)
-            printf 'Usage: setup_web.sh [--only|--no-only] web.example.com\n'
+            printf 'Usage: setup_web.sh [--only|--no-only] [--force] web.example.com\n'
             printf '       setup_web.sh --remove\n'
             exit 0
             ;;
@@ -164,11 +168,12 @@ get_config_value() {
     ' "$CONFIG_FILE"
 }
 
+WEB_PREVIOUS_ONLY="$(get_config_value web only "")"
+if [[ -z "$WEB_PREVIOUS_ONLY" ]]; then
+    WEB_PREVIOUS_ONLY="$(get_config_value web web_only false)"
+fi
 if ! $WEB_ONLY_EXPLICIT; then
-    WEB_ONLY="$(get_config_value web only "")"
-    if [[ -z "$WEB_ONLY" ]]; then
-        WEB_ONLY="$(get_config_value web web_only false)"
-    fi
+    WEB_ONLY="$WEB_PREVIOUS_ONLY"
 fi
 case "${WEB_ONLY,,}" in
     1|true|yes|on) WEB_ONLY=true ;;
@@ -185,16 +190,23 @@ ensure_caddy_imports() {
         || fail "Caddy WEB site import is missing. Rerun the latest setup_masking.sh first."
 }
 
-reload_caddy() {
+validate_caddy() {
     if is_docker_install; then
         docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" run --rm --no-deps \
             mtproto-mask-caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+    else
+        caddy validate --config "$CADDYFILE" --adapter caddyfile
+    fi
+}
+
+reload_caddy() {
+    validate_caddy || return 1
+    if is_docker_install; then
         docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" up -d --force-recreate mtproto-mask-caddy
         sleep 1
         [[ "$(docker inspect -f '{{.State.Running}}' mtproto-mask-caddy 2>/dev/null || true)" == "true" ]] \
             || fail "Caddy did not stay running after the WEB configuration reload"
     else
-        caddy validate --config "$CADDYFILE" --adapter caddyfile
         if systemctl is-active --quiet mtproto-mask-caddy.service; then
             systemctl reload mtproto-mask-caddy.service || systemctl restart mtproto-mask-caddy.service
         else
@@ -255,6 +267,12 @@ done
 [[ ! "${WEB_LABELS[-1]}" =~ ^[0-9]+$ ]] || fail "WEB domain must not end in a numeric label"
 [[ ! "${WEB_LABELS[-1]}" =~ ^0[xX][0-9A-Fa-f]+$ ]] || fail "WEB domain must not end in an IP-like hexadecimal label"
 WEB_DOMAIN="${WEB_DOMAIN,,}"
+EXISTING_WEB_DOMAIN="$(get_config_value web domain "")"
+if [[ -n "$EXISTING_WEB_DOMAIN" && "${EXISTING_WEB_DOMAIN,,}" != "$WEB_DOMAIN" ]] &&
+    ! is_true "$WEB_FORCE_DOMAIN_CHANGE"
+then
+    fail "Changing [web].domain invalidates existing WEB links. Use --force or WEB_FORCE_DOMAIN_CHANGE=true to change it explicitly."
+fi
 
 for port_value in "$WEB_PORT" "$WEB_TLS_PORT"; do
     [[ "$port_value" =~ ^[0-9]+$ ]] && (( port_value >= 1 && port_value <= 65535 )) \
@@ -307,16 +325,40 @@ command -v certbot >/dev/null 2>&1 || {
     DEBIAN_FRONTEND=noninteractive apt-get install -y certbot < /dev/null
 }
 mkdir -p "$ACME_ROOT/.well-known/acme-challenge"
+chmod 0755 "$ACME_ROOT" "$ACME_ROOT/.well-known" "$ACME_ROOT/.well-known/acme-challenge"
 
 LE_CERT="/etc/letsencrypt/live/${WEB_DOMAIN}/fullchain.pem"
 LE_KEY="/etc/letsencrypt/live/${WEB_DOMAIN}/privkey.pem"
-if [[ ! -f "$LE_CERT" || ! -f "$LE_KEY" ]]; then
+if [[ ! -f "$LE_CERT" || ! -f "$LE_KEY" ]] ||
+    ! openssl x509 -checkend 86400 -noout -in "$LE_CERT" >/dev/null 2>&1
+then
     info "Requesting Let's Encrypt certificate for ${WEB_DOMAIN} through the existing Caddy :80 ACME webroot"
     certbot certonly --webroot -w "$ACME_ROOT" -d "$WEB_DOMAIN" \
         --non-interactive --agree-tos --register-unsafely-without-email
 else
     ok "Reusing Let's Encrypt certificate for ${WEB_DOMAIN}"
 fi
+
+# Validate the existing Caddy tree before replacing any live WEB files. If the
+# candidate fails validation, restore the previous config and certificate pair.
+validate_caddy || fail "Existing Caddy configuration is invalid; fix it before enabling WEB"
+WEB_BACKUP="$(mktemp -d "${CADDY_WEB_DIR}/.backup.XXXXXX")"
+cp -a "$CADDY_WEB_DIR/global.caddy" "$CADDY_WEB_DIR/site.caddy" "$CADDY_WEB_DIR/cert" "$WEB_BACKUP/"
+cp -a "$CONFIG_FILE" "$WEB_BACKUP/config.toml"
+WEB_CANDIDATE_VALID=false
+cleanup_web_candidate() {
+    local status=$?
+    if ! $WEB_CANDIDATE_VALID; then
+        cp -a "$WEB_BACKUP/global.caddy" "$WEB_BACKUP/site.caddy" "$CADDY_WEB_DIR/"
+        rm -f "$CADDY_WEB_DIR/cert/fullchain.pem" "$CADDY_WEB_DIR/cert/privkey.pem"
+        cp -a "$WEB_BACKUP/cert/." "$CADDY_WEB_DIR/cert/"
+        cp -a "$WEB_BACKUP/config.toml" "$CONFIG_FILE"
+        info "Restored the previous WEB configuration after setup failed"
+    fi
+    rm -rf -- "$WEB_BACKUP"
+    return "$status"
+}
+trap cleanup_web_candidate EXIT
 
 TUNNEL_HOST_IP=""
 BACKEND='127.0.0.1:443'
@@ -330,9 +372,13 @@ if command -v ip >/dev/null 2>&1 && ip netns list 2>/dev/null | awk '{print $1}'
 fi
 
 set_config_value web enabled true
-# Keep the direct path available until Caddy and the WEB relay have both been
-# started and verified. WEB-only is activated in a final proxy-only restart.
-remove_config_key web only
+# Keep an existing WEB-only gate intact during reinstall. A new gate is enabled
+# only after Caddy and the relay have both passed the health checks below.
+if is_true "$WEB_ONLY" && is_true "$WEB_PREVIOUS_ONLY"; then
+    set_config_value web only true
+else
+    remove_config_key web only
+fi
 remove_config_key web web_only
 set_config_value web domain "\"${WEB_DOMAIN}\""
 set_config_value web listen '"127.0.0.1"'
@@ -443,6 +489,22 @@ https://${WEB_DOMAIN}:${WEB_TLS_PORT} {
 EOF
 fi
 
+verify_web_path() {
+    local probe_ip="${TUNNEL_HOST_IP:+10.200.200.2}" status attempt
+    probe_ip="${probe_ip:-127.0.0.1}"
+    for attempt in 1 2 3 4 5 6; do
+        if status="$(curl -sS --max-time 5 --resolve "${WEB_DOMAIN}:443:${probe_ip}" \
+            --output /dev/null --write-out '%{http_code}' "https://${WEB_DOMAIN}/")" &&
+            [[ "$status" == "404" ]] &&
+            curl -fsS --max-time 5 "http://127.0.0.1:${WEB_PORT}/metrics" --output /dev/null
+        then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
 if is_docker_install; then
     command -v docker >/dev/null 2>&1 || fail "Docker is not installed"
     docker compose version >/dev/null 2>&1 || fail "Docker Compose v2 is required"
@@ -453,6 +515,7 @@ if is_docker_install; then
     set_env_value WEB_ONLY "$WEB_ONLY"
     docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" pull mtproto-proxy mtproto-web-relay mtproto-mask-caddy
     reload_caddy
+    WEB_CANDIDATE_VALID=true
     docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" up -d --force-recreate mtproto-proxy mtproto-web-relay
     for _ in $(seq 1 10); do
         if [[ "$(docker inspect -f '{{.State.Running}}' mtproto-proxy 2>/dev/null || true)" == "true" ]] &&
@@ -468,6 +531,7 @@ if is_docker_install; then
         || fail "WEB relay did not stay running; WEB-only was not activated"
 
     if is_true "$WEB_ONLY"; then
+        verify_web_path || fail "WEB HTTPS/relay checks failed; a new WEB-only gate was not activated"
         set_config_value web only true
         docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" up -d --force-recreate --no-deps mtproto-proxy
         sleep 1
@@ -499,6 +563,7 @@ WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
     reload_caddy
+    WEB_CANDIDATE_VALID=true
     systemctl enable mtproto-web-relay.service >/dev/null
     systemctl restart mtproto-proxy mtproto-web-relay.service
     systemctl is-active --quiet mtproto-proxy \
@@ -507,6 +572,7 @@ EOF
         || fail "WEB relay did not stay running; WEB-only was not activated"
 
     if is_true "$WEB_ONLY"; then
+        verify_web_path || fail "WEB HTTPS/relay checks failed; a new WEB-only gate was not activated"
         set_config_value web only true
         systemctl restart mtproto-proxy
         sleep 1

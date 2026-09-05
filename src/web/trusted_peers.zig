@@ -56,7 +56,7 @@ pub fn sameHost(a: Address, b: Address) bool {
             .ip6 => false,
         },
         .ip6 => |x| switch (nb) {
-            .ip6 => |y| std.mem.eql(u8, &x.bytes, &y.bytes),
+            .ip6 => |y| std.mem.eql(u8, &x.bytes, &y.bytes) and x.interface.index == y.interface.index,
             .ip4 => false,
         },
     };
@@ -154,6 +154,13 @@ test "explicit sources are matched on address only, ignoring the ephemeral port"
 test "an empty source list allocates nothing" {
     const parsed = try parseSources(std.testing.allocator, &.{}, null);
     try std.testing.expectEqual(@as(usize, 0), parsed.len);
+}
+
+test "IPv6 relay trust includes the interface scope but ignores the port" {
+    const bytes = (try Address.parse("fe80::1", 0)).ip6.bytes;
+    const expected = net_helpers.ip6(bytes, 443, 0, 2);
+    try std.testing.expect(sameHost(expected, net_helpers.ip6(bytes, 1234, 0, 2)));
+    try std.testing.expect(!sameHost(expected, net_helpers.ip6(bytes, 443, 0, 3)));
 }
 
 test "v4 and v6 never match each other" {

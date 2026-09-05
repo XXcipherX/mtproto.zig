@@ -58,6 +58,7 @@ pub fn queueOrWriteMsg(
             return err;
         };
 
+        if (n == 0) return error.ConnectionReset;
         noteTraffic(counter, n);
         noteTrafficOptional(user_counter, n);
         if (n == data.len) return true;

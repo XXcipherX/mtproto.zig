@@ -144,12 +144,13 @@ port = 443
 # Requests without a valid bridge capability receive an empty 404 response.
 # domain = "web.example.com"
 
-# Plain HTTP/WebSocket relay listener behind Caddy. Keep this local.
+# Plain HTTP/WebSocket relay listener behind Caddy. IP literal only; keep local.
 # listen = "127.0.0.1"
 # port = 8081
 
 # Data-plane endpoint opened for each logical MTProto stream. The local default
 # is this proxy on server.port. Tunnel-netns installs use 10.200.200.2:443.
+# Backend and mask_backend hostnames refresh every minute; IP literals need no DNS.
 # backend = "127.0.0.1:443"
 
 # Caddy TLS listener used only for WEB-domain SNI. It accepts a PROXY v2 header
@@ -161,7 +162,7 @@ port = 443
 # ws_path = "/api/v1/socket"
 
 # Caddy supplies X-Forwarded-For from the trusted PROXY v2 address. The relay
-# reads only the right-most value, which is written by the immediate hop.
+# trusts only a loopback peer and reads the right-most value of the last header line.
 # trust_forwarded_for = true
 # client_ip_header = "x-forwarded-for"
 
@@ -173,6 +174,8 @@ port = 443
 # at most 264 of the default 512 connection slots.
 # max_sessions = 8
 # max_streams = 32
+# Hard aggregate buffered-payload limit (input, fragments, batches and queues).
+# This is not RSS: retained allocator capacity and kernel socket memory are separate.
 # max_buffer_mb = 128
 
 # Additional relay source IP literals trusted to send the direct-obfuscated

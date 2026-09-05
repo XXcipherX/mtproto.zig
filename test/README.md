@@ -19,6 +19,16 @@ real. Run one image locally with:
 MTPROTO_INSTALLER_E2E_IMAGE=debian:12 test/installer-e2e/run.sh
 ```
 
+## WEB bridge contract
+
+`zig build web-bridge` needs Python 3, Node.js and the configured Zig compiler. It
+runs `web-bridge/render.zig` to render the production bridge and HELLO/WELCOME
+vectors, then passes the actual script to the Node harness. Missing tools fail the
+step. The harness checks native WebView startup, MessagePort transfer, reconnect
+handshake deduplication, retry exhaustion, capability absence and terminal BYE.
+This is an offline browser-contract check, not a live Telegram connectivity test.
+The existing GitHub CI WEB-bridge step runs it separately from Zig unit tests.
+
 ## Tools
 
 - `capacity_connections_probe.py` — concurrent connection sweeps with RSS tracking.

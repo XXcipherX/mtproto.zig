@@ -105,7 +105,20 @@ curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/in
   | sudo env ENABLE_WEB=true WEB_ONLY=true WEB_DOMAIN=web.example.com bash
 ```
 
-For source/systemd installs, use `sudo /opt/mtproto-proxy/setup_web.sh --only web.example.com`; restore the additive mode with `--no-only`. Setup deliberately removes the gate while it starts and verifies Caddy, the main data plane, and `mtproto-web-relay`, then writes `only=true` and restarts only the main proxy. Never activate the gate before all three services are healthy. While active, formerly valid direct links are masked and output commands print only `tg://webproxy`; disabling WEB makes `only` inert.
+For source/systemd installs, use `sudo /opt/mtproto-proxy/setup_web.sh --only web.example.com`; restore the additive mode with `--no-only`. Reinstall preserves an already active gate unless explicitly disabled. A new gate stays disabled until Caddy, the main data plane, and `mtproto-web-relay` are running, the WEB HTTPS route returns its expected 404 with a valid certificate, and local relay `/metrics` responds. Setup then writes `only=true` and restarts only the main proxy. While active, formerly valid direct links are masked and output commands print only `tg://webproxy`; disabling WEB makes `only` inert.
+
+Changing an existing WEB domain requires `--force` or `WEB_FORCE_DOMAIN_CHANGE=true`
+because installed links keep the old hostname. WEB setup checks certificate expiry
+before reuse and gives Caddy read/traverse access to the HTTP-01 webroot. It validates
+the existing Caddy tree and backs up the WEB config/certificate pair and `config.toml`
+before replacement; failures before successful Caddy activation restore those files.
+This is not a rollback of subsequent container/service startup or ACME issuance.
+
+WEB hostname backends refresh about once per minute; IP literals spawn no DNS
+thread. Changing user secrets or WEB configuration still requires restarting both
+the main proxy and WEB relay, not sending SIGHUP. `zig build web-bridge` renders
+the production Zig bridge and protocol vectors before running the Node harness;
+missing Zig/Node dependencies fail the step rather than silently skipping it.
 
 To disable only WEB while preserving ordinary MTProto and Caddy masking:
 

@@ -1924,7 +1924,6 @@ const ConnectionSlot = struct {
     mask_cause: MaskCause = .none,
     /// Server time minus authenticated client time for timestamp-skew masking.
     mask_timestamp_skew_s: ?i64 = null,
-    mask_addr_override: ?net.Address = null,
     mask_send_proxy_header: bool = false,
     /// Long-lived HTTPS/WebSocket carrier for the configured WEB domain. Unlike
     /// probe-cover relays it must not be cut off by mask_relay_max_secs.
@@ -2306,18 +2305,6 @@ fn slotCandidateCount(slot: *const ConnectionSlot) usize {
     return 0;
 }
 
-fn parseWebHostPort(allocator: std.mem.Allocator, spec: []const u8) ?net.Address {
-    const colon = std.mem.lastIndexOfScalar(u8, spec, ':') orelse return null;
-    const host = std.mem.trim(u8, spec[0..colon], "[] ");
-    if (host.len == 0) return null;
-    const port = std.fmt.parseInt(u16, spec[colon + 1 ..], 10) catch return null;
-    if (port == 0) return null;
-    const list = net.getAddressList(allocator, host, port) catch return null;
-    defer list.deinit();
-    if (list.addrs.len == 0) return null;
-    return list.addrs[0];
-}
-
 pub const ProxyState = struct {
     allocator: std.mem.Allocator,
     config: Config,
@@ -2330,7 +2317,7 @@ pub const ProxyState = struct {
     mask_addrs: []net.Address,
     trusted_web_peers: web_support.TrustedPeers,
     web_only: bool = false,
-    web_mask_addr: ?net.Address,
+    web_mask_dns: ?*web_support.DnsCache = null,
     replay_cache: ReplayCache,
     tls_server_hello_template: []u8,
 
@@ -2443,12 +2430,19 @@ pub const ProxyState = struct {
             .enabled = cfg.web.enabled,
             .extra = relay_sources,
         };
-        var web_mask_addr: ?net.Address = null;
+        var web_mask_dns: ?*web_support.DnsCache = null;
+        errdefer if (web_mask_dns) |cache| cache.destroy();
         if (cfg.web.enabled) {
             if (cfg.web.mask_backend) |spec| {
-                web_mask_addr = parseWebHostPort(allocator, spec);
-                if (web_mask_addr == null) {
-                    log.warn("[web].mask_backend '{s}' is invalid or cannot be resolved", .{spec});
+                web_mask_dns = try web_support.createMaskDns(allocator, spec);
+                const snapshot = web_mask_dns.?.snapshot(0);
+                if (snapshot.len == 0) {
+                    log.warn("[web].mask_backend could not be resolved; background DNS refresh will retry", .{});
+                }
+                for (snapshot.slice()) |address| {
+                    if (web_support.isLoopback(web_support.fromIo(address)) and address.getPort() == cfg.port) {
+                        return error.WebMaskBackendLoopsToProxy;
+                    }
                 }
             }
             log.info("WEB relay trust enabled for loopback and {d} configured source(s)", .{relay_sources.len});
@@ -2485,7 +2479,7 @@ pub const ProxyState = struct {
             .mask_addrs = resolved_addrs,
             .trusted_web_peers = trusted_web_peers,
             .web_only = cfg.web.onlyActive(),
-            .web_mask_addr = web_mask_addr,
+            .web_mask_dns = web_mask_dns,
             .replay_cache = ReplayCache.init(),
             .tls_server_hello_template = tls_template,
             .stats_dropped_cap = 0,
@@ -2519,6 +2513,7 @@ pub const ProxyState = struct {
     }
 
     pub fn deinit(self: *ProxyState) void {
+        if (self.web_mask_dns) |cache| cache.destroy();
         self.stopMiddleProxyUpdater();
         self.middle_proxy_lock.lock();
         std.crypto.secureZero(u8, &self.middle_proxy_secret);
@@ -2536,6 +2531,7 @@ pub const ProxyState = struct {
 
     pub fn run(self: *ProxyState, shutdown_fd: posix.fd_t) !void {
         if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
+        if (self.web_mask_dns) |cache| try cache.start();
 
         var middle_proxy_updater_started = false;
         defer {
@@ -4096,10 +4092,9 @@ const EventLoop = struct {
         };
         if (!std.ascii.eqlIgnoreCase(sni, self.state.config.tls_domain)) {
             var mask_cause: MaskCause = .sni_mismatch;
-            if (self.state.web_mask_addr) |web_addr| {
+            if (self.state.web_mask_dns != null) {
                 if (self.state.config.web.domain) |web_domain| {
                     if (std.ascii.eqlIgnoreCase(sni, web_domain)) {
-                        slot.mask_addr_override = web_addr;
                         slot.mask_send_proxy_header = true;
                         slot.web_carrier = true;
                         mask_cause = .web_carrier;
@@ -4465,12 +4460,18 @@ const EventLoop = struct {
     ) !void {
         if (!self.state.config.mask) return error.MaskingDisabled;
         slot.mask_cause = cause;
-        const override = slot.mask_addr_override;
-        slot.mask_addr_override = null;
-        const candidates = if (override) |addr| blk: {
-            const one = try self.state.allocator.alloc(net.Address, 1);
-            one[0] = addr;
-            break :blk one;
+        const candidates = if (slot.web_carrier) blk: {
+            const cache = self.state.web_mask_dns orelse return error.NoMaskAddress;
+            const snapshot = cache.snapshot(0);
+            const copy = try self.state.allocator.alloc(net.Address, snapshot.len);
+            errdefer self.state.allocator.free(copy);
+            for (snapshot.slice(), copy) |address, *destination| {
+                destination.* = web_support.fromIo(address);
+                if (web_support.isLoopback(destination.*) and address.getPort() == self.state.config.port) {
+                    return error.WebMaskBackendLoopsToProxy;
+                }
+            }
+            break :blk copy;
         } else blk: {
             self.state.middle_proxy_lock.lock();
             const copy = self.state.allocator.dupe(net.Address, self.state.mask_addrs) catch |err| {

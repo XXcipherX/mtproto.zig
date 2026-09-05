@@ -425,6 +425,44 @@ docker exec -it mtproto-proxy \
 
 WEB links use the same 16-byte `[access.users]` secret encoded as `dd<secret>`; FakeTLS links keep their existing `ee<secret><hex-domain>` encoding. The public proxy still rejects direct-obfuscated traffic from untrusted Internet peers: only loopback and explicit `[web].relay_sources` may carry WEB streams into that path.
 
+WEB relay hardening is adapted from upstream PR #408. Backend queues now accommodate
+the protocol's full 4 MiB receive window, and WebSocket messages can carry one maximum
+1 MiB relay payload plus its header. Outbound DATA/WINDOW frames are batched within an
+event-loop pass; input frames are consumed with one buffer compaction per pass.
+Pre-adoption browser reconnects replay the initial handshake only once, and the bridge
+always uses same-origin WSS. Forwarded client addresses are accepted only from a
+loopback terminator, using the right-most value of the last matching header line.
+
+`[web].max_buffer_mb` limits buffered payload across HTTP/WebSocket input, fragmented
+messages, outbound batches, and socket queues at every append. It is **not** a process
+RSS limit: retained allocation capacity, queue freelists, metadata and kernel socket
+buffers are separate. Soft throttling stops backend reads and new credit before the
+payload ceiling; reaching the hard ceiling closes the affected path.
+
+Hostname-based `[web].backend` and `mask_backend` addresses refresh every minute,
+retain the last successful DNS answer, and provide up to 16 candidates per connect
+attempt. Literal addresses do not start a DNS worker. Failed backend connects preserve
+queued PROXY metadata and MTProto bytes until a candidate connects. The relay listener
+itself requires an IP literal. Changing access users or other relay settings requires
+restarting both proxy processes; SIGHUP reports that a restart is required.
+
+WEB metrics are available only by directly querying the loopback relay:
+
+```bash
+curl -sS http://127.0.0.1:8081/metrics
+```
+
+They report sessions, streams, refused streams/accepts, throttling, buffered payload
+and outgoing bytes. The public Caddy routes do not expose this endpoint.
+Existing Docker/source configurations need no new parameters for these changes.
+
+Re-running WEB setup preserves an existing WEB-only gate. Activating a new gate
+requires successful HTTPS and loopback relay checks. Setup validates Caddy before
+replacing its WEB files and restores the previous files/config if candidate validation
+fails. It also checks certificate expiry. Changing an existing WEB domain invalidates
+distributed links and requires explicit `--force` for `setup_web.sh`, or
+`WEB_FORCE_DOMAIN_CHANGE=true` in the install environment.
+
 ### WEB-only mode
 
 Set `[web].only = true` when a direct Telegram connection itself triggers blocking of the server IP. The data plane then answers MTProto only for the relay address trusted at `accept()` time. Every external FakeTLS client—including one with a valid old `ee` link—is sent to the same Caddy masking backend used for an invalid secret. Client-provided PROXY metadata cannot grant relay trust.
@@ -442,7 +480,7 @@ For a source/systemd installation:
 sudo /opt/mtproto-proxy/setup_web.sh --only web.example.com
 ```
 
-The setup keeps direct MTProto available until Caddy and `mtproto-web-relay` are running, then activates the gate in a final proxy-only restart. `--print-links` and installer summaries emit only `tg://webproxy` links while the gate is active. To restore ordinary MTProto without removing WEB support, run `setup_web.sh --no-only web.example.com` (or rerun the Docker installer with `ENABLE_WEB=true WEB_ONLY=false`).
+For first activation, setup keeps direct MTProto available until Caddy and `mtproto-web-relay` pass their checks, then activates the gate in a final proxy-only restart. Reinstall preserves an already active gate. `--print-links` and installer summaries emit only `tg://webproxy` links while the gate is active. To restore ordinary MTProto without removing WEB support, run `setup_web.sh --no-only web.example.com` (or rerun the Docker installer with `ENABLE_WEB=true WEB_ONLY=false`).
 
 WEB-only requires Caddy masking and an enabled WEB relay. It is ignored if `[web].enabled=false`, so removing WEB support cannot leave an unreachable all-masked proxy. Existing ordinary `tg://proxy` links do not work until WEB-only is disabled, and `[web].max_sessions` becomes the effective desktop-session ceiling.
 

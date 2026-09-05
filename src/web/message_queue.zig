@@ -2,7 +2,8 @@ const std = @import("std");
 const posix = std.posix;
 
 const msg_block_size: usize = 2048;
-const msg_free_cap_per_queue: usize = 4;
+// Retain one complete 32 KiB relay read to avoid churn under backpressure.
+const msg_free_cap_per_queue: usize = 16;
 
 const MsgBlock = struct {
     len: usize,

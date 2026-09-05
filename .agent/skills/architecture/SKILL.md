@@ -62,6 +62,35 @@ Code anchors:
 
 Trust is fixed from the kernel-reported peer at `accept()`: only loopback plus explicit `[web].relay_sources` may enter the direct-obfuscated path. A PROXY header may replace the diagnostic/client address but must never grant trust. When both `[web].enabled` and `[web].only` are true, every untrusted peer reaching the ordinary FakeTLS SNI is sent to the normal Caddy masking backend before secret validation, including clients holding a formerly valid direct link; the trusted relay remains admitted. `only` is inert when WEB is disabled. WEB-domain masking carriers are deliberately exempt from `mask_relay_max_secs`; ordinary masking/probe relays retain that lifetime cap.
 
+## WEB Relay Invariants (upstream PR #408 adaptation)
+
+- WEB backend queues fit the full 4 MiB granted stream window plus PROXY-v2 metadata.
+  Incoming WebSocket messages fit a maximum 1 MiB relay payload plus its frame header.
+- The relay accounts buffered payload on every input, fragment, batch and queue
+  mutation. `web.max_buffer_mb` is a hard payload budget, not RSS or allocated capacity;
+  retained buffers/freelists, connection metadata and kernel sockets remain outside it.
+- DATA/WINDOW frames batch within an event-loop pass; timer-generated frames flush
+  before waiting again. WebSocket input compacts once per read pass and processing
+  stops after CLOSE. Recently closed stream history scales with `max_streams`.
+- Deferred fd/object teardown capacity is reserved before publishing a connection,
+  so OOM cannot cause an fd reuse or free inside the current epoll batch.
+- `src/web/dns_cache.zig` refreshes hostname backends and WEB Caddy targets every
+  minute, preserves the last good snapshot, and joins on shutdown. Literal-only caches
+  spawn no thread. Linux uses a five-second-bounded NSS/getent child, with inherited
+  signalfd masks reset in that child; DNS work never runs in a relay event callback.
+- Each connect freezes up to 16 candidates. Failed backend connects retain queued
+  PROXY and MTProto bytes; established streams are never replayed to another backend.
+  WEB Caddy candidates use the data plane's existing mask-connect retry machinery.
+- Only loopback HTTP peers may supply forwarded client IPs; use the last matching
+  field line and its right-most value. Explicit data-plane relay trust remains fixed
+  at accept time. IPv6 trusted-peer comparison includes the interface scope.
+- The hidden bridge always uses same-origin WSS and deduplicates the initial handshake
+  on pre-adoption reconnect. Keep the fork's empty Caddy 404, not upstream cover pages.
+- Relay `/metrics` is restricted to direct loopback GET/HEAD requests with a loopback
+  Host and without forwarding/Origin headers; never publish it through Caddy.
+- WEB capabilities/config are startup snapshots. Restart both processes for access
+  changes; relay SIGHUP only reports that a restart is required.
+
 ## MiddleProxy Routing and Refresh
 
 - Config text source: `https://core.telegram.org/getProxyConfig`

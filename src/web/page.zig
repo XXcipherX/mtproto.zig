@@ -97,14 +97,14 @@ const script_body =
     \\function connect(){
     \\ if(dead||ws||!CAP)return;
     \\ status(attempts?"reconnecting":"connecting");
-    \\ var scheme=location.protocol==="http:"?"ws://":"wss://";
+    \\ var scheme="wss://";
     \\ var socket;
     \\ try{socket=new WebSocket(scheme+location.host+WS_PATH+"?b="+CAP)}catch(e){fail();return}
     \\ ws=socket;socket.binaryType="arraybuffer";
     \\ socket.onopen=function(){
     \\  if(ws!==socket)return;
     \\  wsReady=true;
-    \\  if(attempts){toRelay=preAdopt.concat(toRelay)}
+    \\  if(attempts){toRelay=preAdopt.slice()}
     \\  flushToRelay();status("connected");
     \\ };
     \\ socket.onmessage=function(ev){
@@ -169,7 +169,7 @@ const script_body =
     \\  if(!d||d.t!=="tproxy-init"||d.v!==1)return;
     \\  if(!ev.ports||!ev.ports.length)return;
     \\  var o=ev.origin||"";
-    \\  if(o.indexOf("http://127.0.0.1:")!==0&&o.indexOf("http://[::1]:")!==0)return;
+    \\  if(o.indexOf("http://127.0.0.1:")!==0)return;
     \\  useParentPort(ev.ports[0]);
     \\ }catch(e){}
     \\});
@@ -202,6 +202,7 @@ const script_body =
 /// `location.search` by the script rather than templated into the body, so the response
 /// carries no per-user bytes at all.
 pub fn renderBridge(allocator: std.mem.Allocator, ws_path: []const u8) ![]u8 {
+    if (ws_path.len == 0 or ws_path[0] != '/' or std.mem.startsWith(u8, ws_path, "//") or std.mem.indexOfAny(u8, ws_path, "?#\\") != null) return error.InvalidWebSocketPath;
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, bridge_head);
@@ -233,6 +234,12 @@ fn appendJsString(allocator: std.mem.Allocator, out: *std.ArrayList(u8), value: 
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
+
+test "bridge requires an origin-relative websocket path" {
+    for ([_][]const u8{ "", "socket", "//other.test/socket", "/socket?x=1", "/socket#fragment", "/a\\b" }) |path| {
+        try std.testing.expectError(error.InvalidWebSocketPath, renderBridge(std.testing.allocator, path));
+    }
+}
 
 test "bridge shell contains no visible cover template" {
     try std.testing.expect(std.mem.endsWith(u8, bridge_head, "<body>"));

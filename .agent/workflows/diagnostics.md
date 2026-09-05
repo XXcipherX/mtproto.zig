@@ -73,6 +73,23 @@ Note:
 - In WEB-only mode, `web_only: direct clients masked+=N` counts external peers sent to Caddy instead of MTProto. It does not count trusted relay streams. If relay streams are also rejected, verify that `[web].backend` reaches the proxy from loopback or an explicit `[web].relay_sources` address; a PROXY header cannot grant trust.
 - `graceful shutdown started` means listener interest is already disabled while existing connections drain. `graceful shutdown complete` is a natural drain; `graceful shutdown timeout reached` means the remaining slots were force-closed. A second signal intentionally produces `forcing immediate shutdown`.
 
+## WEB Metrics and DNS
+
+For a local WEB relay snapshot (adjust the configured port):
+
+```bash
+curl -fsS http://127.0.0.1:8081/metrics
+```
+
+This endpoint requires a direct loopback peer and loopback Host, with no forwarded
+or Origin headers; do not expose it through Caddy. It reports WEB sessions, streams,
+buffered payload, refused admissions and forwarded byte counters. Its buffer gauge
+is not RSS and is independent of the main process's `managed_buf`: retained
+allocations and kernel sockets are excluded. Repeated refusals indicate pressure
+against the configured WEB limits, not necessarily a main-proxy capacity problem.
+Hostname WEB backend/mask targets refresh every minute, retain the last successful
+DNS snapshot on failure, and freeze candidate lists for each connect attempt.
+
 ## IPv6 Hopping and DNS
 
 Installer-managed cron invokes `ipv6-hop.sh` without arguments every five minutes, so each run rotates IPv6 unconditionally. The script's `--auto` mode is a separate foreground ban-detection loop and is not installed as a service/cron job.

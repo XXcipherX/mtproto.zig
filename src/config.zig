@@ -296,7 +296,7 @@ pub const Config = struct {
             error.MissingWebMaskBackend => "[web].enabled=true requires [web].mask_backend",
             error.InvalidWebMaskBackend => "[web].mask_backend must be a valid host:port endpoint",
             error.InvalidWebBackend => "[web].backend must be a valid host:port endpoint",
-            error.InvalidWebListenHost => "[web].host must be a valid IP literal or hostname",
+            error.InvalidWebListenHost => "[web].host must be a valid IP literal",
             error.WebListenerPortCollision => "[web].port must not collide with the proxy or masking port",
             error.InvalidWebSocketPath => "[web].ws_path must be an absolute path without whitespace, query, or fragment",
             error.InvalidWebClientIpHeader => "[web].client_ip_header must be a valid HTTP field name",
@@ -338,7 +338,7 @@ pub const Config = struct {
             if (!isValidHostPort(backend)) return error.InvalidWebBackend;
         }
         if (self.web.host) |host| {
-            if (!isValidEndpointHost(host)) return error.InvalidWebListenHost;
+            _ = std.Io.net.IpAddress.parse(host, self.web.port) catch return error.InvalidWebListenHost;
         }
         if (self.web.port == self.port or self.web.port == self.mask_port) {
             return error.WebListenerPortCollision;
@@ -1873,6 +1873,12 @@ test "config validation accepts ordinary and WEB deployments" {
     );
     defer web.deinit(std.testing.allocator);
     try web.validate();
+
+    // Offline validation must agree with the relay's IP-literal bind API.
+    std.testing.allocator.free(web.web.host.?);
+    web.web.host = null;
+    web.web.host = try std.testing.allocator.dupe(u8, "localhost");
+    try std.testing.expectError(error.InvalidWebListenHost, web.validate());
 }
 
 test "config validation rejects unusable core settings" {

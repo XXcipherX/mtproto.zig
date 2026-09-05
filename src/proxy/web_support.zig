@@ -5,6 +5,22 @@
 const std = @import("std");
 const posix = std.posix;
 const net = @import("../net_compat.zig");
+pub const DnsCache = @import("../web/dns_cache.zig").Cache;
+
+/// WEB terminator addresses refresh independently; failed lookups keep the last snapshot.
+pub fn createMaskDns(allocator: std.mem.Allocator, spec: []const u8) !*DnsCache {
+    const helpers = @import("../web/net_helpers.zig");
+    const colon = std.mem.lastIndexOfScalar(u8, spec, ':') orelse return error.InvalidWebMaskBackend;
+    const host = std.mem.trim(u8, spec[0..colon], "[] ");
+    const port = try std.fmt.parseInt(u16, spec[colon + 1 ..], 10);
+    if (host.len == 0 or port == 0) return error.InvalidWebMaskBackend;
+    const cache = try DnsCache.create(allocator);
+    errdefer cache.destroy();
+    const list = helpers.getAddressList(allocator, host, port) catch null;
+    defer if (list) |addresses| addresses.deinit();
+    _ = try cache.add(host, port, if (list) |addresses| helpers.AddressCandidates.init(addresses.addrs) else .{});
+    return cache;
+}
 
 pub const TrustedPeers = struct {
     enabled: bool = false,
@@ -36,7 +52,7 @@ pub fn parseSources(allocator: std.mem.Allocator, sources: []const []const u8) !
     return try out.toOwnedSlice(allocator);
 }
 
-fn fromIo(addr: std.Io.net.IpAddress) net.Address {
+pub fn fromIo(addr: std.Io.net.IpAddress) net.Address {
     return switch (addr) {
         .ip4 => |v4| net.Address.initIp4(v4.bytes, v4.port),
         .ip6 => |v6| net.Address.initIp6(v6.bytes, v6.port, v6.flow, v6.interface.index),
@@ -73,7 +89,7 @@ pub fn sameHost(a_raw: net.Address, b_raw: net.Address) bool {
         const b_bytes = v4Bytes(b);
         return std.mem.eql(u8, &a_bytes, &b_bytes);
     }
-    if (a.any.family == posix.AF.INET6) return std.mem.eql(u8, &a.in6.sa.addr, &b.in6.sa.addr);
+    if (a.any.family == posix.AF.INET6) return std.mem.eql(u8, &a.in6.sa.addr, &b.in6.sa.addr) and a.in6.sa.scope_id == b.in6.sa.scope_id;
     return false;
 }
 

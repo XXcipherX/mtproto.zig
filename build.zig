@@ -78,9 +78,10 @@ pub fn build(b: *std.Build) void {
 
     // The WEB bridge is JavaScript executed inside Telegram Desktop's hidden WebView,
     // so Zig unit tests cannot exercise its client-facing contract. CI drives the
-    // rendered page through a small Node harness; developer machines without Node skip
-    // this optional target cleanly.
-    const web_bridge_cmd = b.addSystemCommand(&.{ "python3", "test/web-bridge/run.py" });
+    // production renderer and a Node harness. Missing tools must fail this target.
+    const web_bridge_cmd = b.addSystemCommand(&.{"python3"});
+    web_bridge_cmd.addFileArg(b.path("test/web-bridge/run.py"));
+    web_bridge_cmd.setEnvironmentVariable("ZIG", b.graph.zig_exe);
     const web_bridge_step = b.step("web-bridge", "Run WEB proxy bridge-page contract tests");
     web_bridge_step.dependOn(&web_bridge_cmd.step);
 

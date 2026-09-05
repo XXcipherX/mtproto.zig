@@ -16,8 +16,8 @@
 //!
 //!  1. Because we know every configured user secret, we can recompute the capability
 //!     and learn *which user* is behind a bridge request without ever seeing the
-//!     MTProto stream. That gives per-user accounting and lets a disabled user be
-//!     refused at the HTTP layer.
+//!     MTProto stream. Capabilities are a startup snapshot; restart the relay as well
+//!     as the data plane when changing access users.
 //!  2. A visitor who cannot present a capability derived from a real secret never sees
 //!     the bridge page at all — they get the same empty 404 as the ordinary MTProto
 //!     masking hostname.

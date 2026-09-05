@@ -55,6 +55,15 @@ Do not reintroduce thread-per-connection or blocking relay loops.
 
 ## Queueing and Partial Write Model
 
+The following block-pool rules describe the ordinary proxy. The separate WEB relay
+uses `src/web/message_queue.zig` and accounts pending payload lengths (input,
+fragments, frame batches, and output queues), not allocated capacity, against
+`web.max_buffer_mb`. Update accounting on every mutation and before releasing a
+connection. Reserve deferred-close/free list capacity before exposing a new fd to
+epoll; OOM must not force immediate teardown inside an event batch. A connecting
+WEB backend must queue the PROXY header and payload until `SO_ERROR` succeeds, and
+retain those bytes across candidate retries. Never retry an established stream.
+
 - Outbound data is queued in intrusive page-sized blocks served by the shared `MessageBlockPool`; append into the current tail before acquiring a new page.
 - Recycled/destroyed queue blocks are securely wiped. If appending an acquired block pointer fails, return it to the shared pool (or destroy it) before propagating OOM.
 - Flush path uses scatter-gather `writev` with explicit queue consumption.
@@ -62,6 +71,17 @@ Do not reintroduce thread-per-connection or blocking relay loops.
 - Keep per-dispatch byte/operation budgets on queue flushes and RDHUP drains so one fd cannot monopolize the single event-loop thread.
 - Legacy `writeAll` assumptions are outdated for this codebase.
 - Avoid owned-slice queue helpers that require later freeing; current queue paths copy into block storage and keep ownership local.
+
+## WEB DNS and Child Processes
+
+WEB DNS is separate from the ordinary proxy updater. Its joinable cache worker
+resolves hostname targets through a bounded NSS child on Linux and publishes
+immutable address snapshots. Literal targets require no worker. The WEB relay
+uses signalfd, so its child-process wrapper must reset inherited TERM/INT/HUP/USR1
+signal handling with `/usr/bin/env --default-signal` before running getent; without
+this, timeout cancellation can hang. Do not remove that wrapper or move DNS work
+into the epoll callbacks. SIGHUP does not reload WEB capabilities: restart both
+processes after changing shared access settings.
 
 ## MiddleProxy Specific Notes
 
