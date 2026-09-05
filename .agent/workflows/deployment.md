@@ -200,6 +200,8 @@ Fresh source installs omit `[general].use_middle_proxy`, so regular DC traffic u
 
 Self-domain masking notes:
 
+- The OpenSSL masking probe reads the negotiated group from modern `Negotiated TLS1.3 group` and legacy `Server Temp Key`/`Peer Temp Key` output. Offered groups, null groups, and failed ciphers are not negotiation evidence. This is advisory diagnostics, not proof of single-round TLS or a runtime routing gate.
+
 - Preferred setup is `MASK_DOMAIN=proxy.example.com`, with DNS `A` pointing to the VPS.
 - Public `:443` stays owned by `mtproto-proxy`; Caddy listens on `127.0.0.1:8443` and returns 404 for non-proxy requests.
 - Public `:80` must be reachable for Let's Encrypt HTTP-01 unless the operator provisions certificates manually.

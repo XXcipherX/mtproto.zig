@@ -152,11 +152,23 @@ is_true() {
     esac
 }
 
+negotiated_tls_group() {
+    # Match the selected group only, never offered groups or OpenSSL errors.
+    awk -F ': *' '
+        /^[[:space:]]*(Server Temp Key|Peer Temp Key|Negotiated TLS1[.]3 group):/ {
+            group = $2
+            sub(/,.*/, "", group)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", group)
+            if (group != "" && group != "<NULL>" && group != "(NONE)") print group
+        }
+    '
+}
+
 check_pq_fronting_backend() {
     local host="$1"
     local port="$2"
     local servername="$3"
-    local out legacy_out
+    local out legacy_out group
 
     is_true "$CHECK_PQ_DOMAIN" || return 0
     command -v openssl >/dev/null 2>&1 || {
@@ -171,19 +183,14 @@ check_pq_fronting_backend() {
         -groups X25519MLKEM768:X25519 \
         -tls1_3 2>&1 || true)"
 
-    if grep -q "Server Temp Key" <<<"$out"; then
-        if grep -Eqi "MLKEM|ML-KEM" <<<"$out"; then
+    group="$(negotiated_tls_group <<<"$out")"
+    if [[ -n "$group" ]] && ! grep -Eq 'Cipher is \(NONE\)|Cipher[[:space:]]*:[[:space:]]*(0000|\(NONE\))' <<<"$out"; then
+        if grep -Eqi '^X25519ML-?KEM768$' <<<"$group"; then
             ok "Masking backend negotiates X25519MLKEM768 for ${servername}"
         else
             warn "Masking backend negotiates a classical TLS group, not X25519MLKEM768"
             warn "Since the June-2026 TSPU rollout this can mark iOS clients and everyone sharing their NAT egress IP"
         fi
-        return 0
-    fi
-
-    if grep -q "CONNECTED" <<<"$out"; then
-        warn "Masking backend connected but did not expose a single-round X25519MLKEM768/X25519 Server Temp Key"
-        warn "Avoid HRR / non-x25519 masking targets; FakeTLS emits a single ServerHello"
         return 0
     fi
 
@@ -193,7 +200,8 @@ check_pq_fronting_backend() {
         -groups X25519 \
         -tls1_3 2>&1 || true)"
 
-    if grep -q "Server Temp Key" <<<"$legacy_out"; then
+    group="$(negotiated_tls_group <<<"$legacy_out")"
+    if grep -Eqi '^X25519$' <<<"$group" && ! grep -Eq 'Cipher is \(NONE\)|Cipher[[:space:]]*:[[:space:]]*(0000|\(NONE\))' <<<"$legacy_out"; then
         warn "Couldn't test X25519MLKEM768, but x25519 works. This host may have OpenSSL older than 3.5"
         warn "Verify ${servername} with @Sni_checker_bot before sharing links"
     else
