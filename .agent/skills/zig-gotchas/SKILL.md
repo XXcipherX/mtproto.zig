@@ -41,6 +41,8 @@ Do not reintroduce thread-per-connection or blocking relay loops.
 
 ## Socket and I/O Realities
 
+- Bounded file helpers in `src/compat.zig` must read until actual EOF, not trust stat size. Zig 0.16 `allocRemaining` uses `Writer.Allocating.sendFile`, which treats zero stat size as EOF for procfs. Preserve the byte cap, accept exact-cap EOF, and reject larger input with `StreamTooLong`; cgroup membership/mount discovery depends on this.
+
 - Sockets are non-blocking and epoll-driven.
 - `SO_SNDTIMEO` and TCP keepalive are configured for relay sockets.
 - Handshake/idle behavior is driven by monotonic `timerfd` plus an indexed min-heap (`idle_timeout_sec`, `handshake_timeout_sec`); each active slot owns at most one heap entry.
