@@ -177,6 +177,20 @@ Important operational notes:
 
 ## One-line operator update path
 
+Firewall snapshots in the source/Compose installers and SYNFIX/NFQUEUE helpers
+are written to private temporary files beside `/etc/iptables/rules.v4` or
+`rules.v6`, then renamed only after a successful nonempty dump. Failed saves
+preserve the old snapshot; required IPv4 persistence or boot-service enablement
+failure is fatal to that script, while unavailable IPv6 is reported explicitly.
+`netfilter-persistent` remains the only boot-restoration mechanism; do not add a
+second TCPMSS service. Rule operations wait up to ten seconds for the xtables
+lock, and inserted TCPMSS/NFQUEUE rules and SYNFIX entry/mark rules are read back.
+Standalone SYNFIX setup requires `iptables-persistent`/`netfilter-persistent` to
+be installed; the main installers and NFQUEUE setup install these dependencies.
+These are whole-host snapshots, as before, not a firewall transaction or rollback
+of already applied live rules. Preserve all loopback exclusions and optional
+TCPMSS defaults.
+
 ```bash
 curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/install.sh | sudo bash
 ```

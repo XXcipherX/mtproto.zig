@@ -79,20 +79,33 @@ is_true() {
     esac
 }
 
+# Keep the last boot snapshot intact if dumping the live rules fails.
+save_iptables_snapshot() {
+    local command="$1" destination="$2" temporary
+    mkdir -p /etc/iptables || return 1
+    temporary="$(mktemp "${destination}.XXXXXX")" || return 1
+    if "$command" > "$temporary" && [[ -s "$temporary" ]] && mv -f -- "$temporary" "$destination"; then
+        return 0
+    fi
+    rm -f -- "$temporary"
+    warn "Could not save $destination; previous snapshot preserved"
+    return 1
+}
+
 enable_netfilter_persistent() {
-    command -v systemctl >/dev/null 2>&1 || return 0
-    systemctl enable netfilter-persistent.service >/dev/null 2>&1 || true
+    systemctl enable netfilter-persistent.service >/dev/null ||
+        fail "Cannot enable firewall restoration; install iptables-persistent and netfilter-persistent"
 }
 
 save_ipv4_iptables() {
-    mkdir -p /etc/iptables
-    iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+    save_iptables_snapshot iptables-save /etc/iptables/rules.v4 ||
+        fail "IPv4 firewall rules are active but could not be persisted"
     enable_netfilter_persistent
 }
 
 save_ipv6_iptables() {
-    mkdir -p /etc/iptables
-    ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
+    save_iptables_snapshot ip6tables-save /etc/iptables/rules.v6 ||
+        warn "IPv6 rules were not persisted (IPv6 may be unavailable)"
     enable_netfilter_persistent
 }
 
@@ -474,14 +487,15 @@ apply_firewall_and_tcpmss() {
     # rule spellings so an update removes the old loopback-inclusive form.
     if command -v iptables >/dev/null 2>&1; then
         local tcpmss_v4_removed=false
-        while iptables -t mangle -D OUTPUT -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88 2>/dev/null; do
+        while iptables -w 10 -t mangle -D OUTPUT -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88 2>/dev/null; do
             tcpmss_v4_removed=true
         done
-        while iptables -t mangle -D OUTPUT ! -o lo -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88 2>/dev/null; do
+        while iptables -w 10 -t mangle -D OUTPUT ! -o lo -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88 2>/dev/null; do
             tcpmss_v4_removed=true
         done
         if is_true "$ENABLE_TCPMSS"; then
-            iptables -t mangle -A OUTPUT ! -o lo -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88
+            iptables -w 10 -t mangle -A OUTPUT ! -o lo -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88
+            iptables -w 10 -t mangle -C OUTPUT ! -o lo -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88
             TCPMSS_OK=true
             ok "TCPMSS=88 clamping applied to external IPv4 traffic (loopback excluded)"
         elif $tcpmss_v4_removed; then
@@ -496,14 +510,15 @@ apply_firewall_and_tcpmss() {
 
     if command -v ip6tables >/dev/null 2>&1; then
         local tcpmss_v6_removed=false
-        while ip6tables -t mangle -D OUTPUT -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88 2>/dev/null; do
+        while ip6tables -w 10 -t mangle -D OUTPUT -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88 2>/dev/null; do
             tcpmss_v6_removed=true
         done
-        while ip6tables -t mangle -D OUTPUT ! -o lo -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88 2>/dev/null; do
+        while ip6tables -w 10 -t mangle -D OUTPUT ! -o lo -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88 2>/dev/null; do
             tcpmss_v6_removed=true
         done
         if is_true "$ENABLE_TCPMSS"; then
-            if ip6tables -t mangle -A OUTPUT ! -o lo -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88 2>/dev/null; then
+            if ip6tables -w 10 -t mangle -A OUTPUT ! -o lo -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88 2>/dev/null; then
+                ip6tables -w 10 -t mangle -C OUTPUT ! -o lo -p tcp --sport "$PORT" --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88
                 TCPMSS_OK=true
                 ok "TCPMSS=88 clamping applied to external IPv6 traffic (loopback excluded)"
             else

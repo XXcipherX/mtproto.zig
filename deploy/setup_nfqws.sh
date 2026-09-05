@@ -45,6 +45,34 @@ ok()    { echo -e "${GREEN}✓${RESET} $*"; }
 warn()  { echo -e "${RED}⚠${RESET} $*"; }
 fail()  { echo -e "${RED}✗${RESET} $*" >&2; exit 1; }
 
+# Keep the last boot snapshot intact if dumping the live rules fails.
+save_iptables_snapshot() {
+    local command="$1" destination="$2" temporary
+    mkdir -p /etc/iptables || return 1
+    temporary="$(mktemp "${destination}.XXXXXX")" || return 1
+    if "$command" > "$temporary" && [[ -s "$temporary" ]] && mv -f -- "$temporary" "$destination"; then
+        return 0
+    fi
+    rm -f -- "$temporary"
+    warn "Could not save $destination; previous snapshot preserved"
+    return 1
+}
+
+enable_netfilter_persistent() {
+    systemctl enable netfilter-persistent.service >/dev/null ||
+        fail "Cannot enable firewall restoration; install iptables-persistent and netfilter-persistent"
+}
+
+persist_rules() {
+    save_iptables_snapshot iptables-save /etc/iptables/rules.v4 ||
+        fail "IPv4 firewall changes could not be persisted"
+    if command -v ip6tables-save >/dev/null 2>&1; then
+        save_iptables_snapshot ip6tables-save /etc/iptables/rules.v6 ||
+            warn "IPv6 rules were not persisted (IPv6 may be unavailable)"
+    fi
+    enable_netfilter_persistent
+}
+
 get_server_port() {
     local cfg="$1"
     awk '
@@ -74,9 +102,9 @@ remove_nfqws_rules() {
     while IFS= read -r rule; do
         rule="${rule/-A /-D }"
         # shellcheck disable=SC2086
-        $ipt -t mangle $rule 2>/dev/null || true
+        "$ipt" -w 10 -t mangle $rule 2>/dev/null || true
     done < <(
-        "$ipt" -t mangle -S OUTPUT 2>/dev/null | awk -v q="${NFQUEUE_NUM}" '
+        "$ipt" -w 10 -t mangle -S OUTPUT 2>/dev/null | awk -v q="${NFQUEUE_NUM}" '
             $1 == "-A" && $2 == "OUTPUT" && $0 ~ ("-j NFQUEUE --queue-num " q "($| )") {
                 print
             }
@@ -119,8 +147,7 @@ if $REMOVE; then
     # Remove iptables rules
     remove_nfqws_rules iptables
     remove_nfqws_rules ip6tables
-    iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-    ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
+    persist_rules
 
     ok "nfqws-mtproto removed"
     exit 0
@@ -132,7 +159,7 @@ DEBIAN_FRONTEND=noninteractive apt-get update -qq < /dev/null || true
 DEBIAN_FRONTEND=noninteractive apt-get install -y \
     -o Dpkg::Options::="--force-confdef" \
     -o Dpkg::Options::="--force-confold" \
-    build-essential git libnetfilter-queue-dev libcap-dev iptables libmnl-dev zlib1g-dev \
+    build-essential git libnetfilter-queue-dev libcap-dev iptables iptables-persistent netfilter-persistent libmnl-dev zlib1g-dev \
     < /dev/null >/dev/null 2>&1
 ok "Dependencies installed"
 
@@ -164,17 +191,20 @@ remove_nfqws_rules ip6tables
 # desync instead of black-holing proxy egress. '! -o lo' is required for WEB:
 # each relay stream returns through loopback, where desync has no censorship
 # benefit and would add a userspace nfqws round trip to every packet.
-iptables -t mangle -A OUTPUT ! -o lo -p tcp --sport "$PORT" -j NFQUEUE --queue-num "$NFQUEUE_NUM" --queue-bypass
+iptables -w 10 -t mangle -A OUTPUT ! -o lo -p tcp --sport "$PORT" -j NFQUEUE --queue-num "$NFQUEUE_NUM" --queue-bypass
+iptables -w 10 -t mangle -C OUTPUT ! -o lo -p tcp --sport "$PORT" -j NFQUEUE --queue-num "$NFQUEUE_NUM" --queue-bypass
 
 # Safely handle IPv6 (may be disabled on some kernels)
 if command -v ip6tables &>/dev/null; then
-    ip6tables -t mangle -A OUTPUT ! -o lo -p tcp --sport "$PORT" -j NFQUEUE --queue-num "$NFQUEUE_NUM" --queue-bypass 2>/dev/null || true
+    if ip6tables -w 10 -t mangle -A OUTPUT ! -o lo -p tcp --sport "$PORT" -j NFQUEUE --queue-num "$NFQUEUE_NUM" --queue-bypass; then
+        ip6tables -w 10 -t mangle -C OUTPUT ! -o lo -p tcp --sport "$PORT" -j NFQUEUE --queue-num "$NFQUEUE_NUM" --queue-bypass
+    else
+        warn "IPv6 NFQUEUE skipped (IPv6 may be unavailable)"
+    fi
 fi
 
 # Persist rules
-mkdir -p /etc/iptables
-iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
+persist_rules
 ok "NFQUEUE rules applied (queue ${NFQUEUE_NUM}, queue-bypass enabled, loopback excluded)"
 
 # ── Create systemd service ──────────────────────────────────

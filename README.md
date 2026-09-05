@@ -1074,6 +1074,14 @@ alice = true   # direct where possible; CDN DC203 still requires MiddleProxy
 
 ## &nbsp; Troubleshooting ("Updating...")
 
+Deployment firewall rules are restored by `netfilter-persistent`. The installers
+and SYNFIX/NFQUEUE helpers preserve the previous saved rules if a new snapshot
+fails, and report persistence errors instead of silently claiming success.
+An error does not roll back live rules: resolve it and rerun setup before rebooting.
+Standalone SYNFIX setup requires the `iptables-persistent` and
+`netfilter-persistent` packages. TCPMSS remains opt-in; loopback traffic remains
+excluded from SYNFIX, NFQUEUE, and TCPMSS.
+
 If your Telegram app is stuck on "Updating...", your provider or network is dropping the connection.
 
 ### 0. Runtime expectations (important)

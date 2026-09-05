@@ -109,27 +109,43 @@ esac
 
 remove_rules() {
     if command -v iptables >/dev/null 2>&1; then
-        while iptables -D INPUT -p tcp --dport "$PORT" --syn -j "$CHAIN" 2>/dev/null; do :; done
-        while iptables -D INPUT ! -i lo -p tcp --dport "$PORT" --syn -j "$CHAIN" 2>/dev/null; do :; done
-        while iptables -t mangle -D PREROUTING \
+        while iptables -w 10 -D INPUT -p tcp --dport "$PORT" --syn -j "$CHAIN" 2>/dev/null; do :; done
+        while iptables -w 10 -D INPUT ! -i lo -p tcp --dport "$PORT" --syn -j "$CHAIN" 2>/dev/null; do :; done
+        while iptables -w 10 -t mangle -D PREROUTING \
             -p tcp --dport "$PORT" --syn \
             -m u32 --u32 "$IOS_U32" \
             -j MARK --set-mark "$IOS_MARK" 2>/dev/null; do :; done
-        while iptables -t mangle -D PREROUTING \
+        while iptables -w 10 -t mangle -D PREROUTING \
             ! -i lo -p tcp --dport "$PORT" --syn \
             -m u32 --u32 "$IOS_U32" \
             -j MARK --set-mark "$IOS_MARK" 2>/dev/null; do :; done
-        iptables -F "$CHAIN" 2>/dev/null || true
-        iptables -X "$CHAIN" 2>/dev/null || true
+        iptables -w 10 -F "$CHAIN" 2>/dev/null || true
+        iptables -w 10 -X "$CHAIN" 2>/dev/null || true
     fi
 }
 
-persist_rules() {
-    mkdir -p /etc/iptables
-    iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-    if command -v systemctl >/dev/null 2>&1; then
-        systemctl enable netfilter-persistent.service >/dev/null 2>&1 || true
+# Keep the last boot snapshot intact if dumping the live rules fails.
+save_iptables_snapshot() {
+    local command="$1" destination="$2" temporary
+    mkdir -p /etc/iptables || return 1
+    temporary="$(mktemp "${destination}.XXXXXX")" || return 1
+    if "$command" > "$temporary" && [[ -s "$temporary" ]] && mv -f -- "$temporary" "$destination"; then
+        return 0
     fi
+    rm -f -- "$temporary"
+    warn "Could not save $destination; previous snapshot preserved"
+    return 1
+}
+
+enable_netfilter_persistent() {
+    systemctl enable netfilter-persistent.service >/dev/null ||
+        fail "Cannot enable firewall restoration; install iptables-persistent and netfilter-persistent"
+}
+
+persist_rules() {
+    save_iptables_snapshot iptables-save /etc/iptables/rules.v4 ||
+        fail "IPv4 firewall changes could not be persisted"
+    enable_netfilter_persistent
 }
 
 if $REMOVE; then
@@ -145,19 +161,19 @@ command -v iptables >/dev/null 2>&1 || fail "iptables not found"
 info "Installing MTProto SYN fix for TCP/${PORT}..."
 remove_rules
 
-iptables -N "$CHAIN"
+iptables -w 10 -N "$CHAIN"
 
-iptables -t mangle -A PREROUTING \
+iptables -w 10 -t mangle -A PREROUTING \
     ! -i lo -p tcp --dport "$PORT" --syn \
     -m u32 --u32 "$IOS_U32" \
     -j MARK --set-mark "$IOS_MARK"
 
-iptables -A "$CHAIN" \
+iptables -w 10 -A "$CHAIN" \
     -p tcp --dport "$PORT" --syn \
     -m mark --mark "$IOS_MARK" \
     -j ACCEPT
 
-iptables -A "$CHAIN" \
+iptables -w 10 -A "$CHAIN" \
     -p tcp --dport "$PORT" --syn \
     -m hashlimit \
     --hashlimit-name "mtproto_${PORT}" \
@@ -170,25 +186,27 @@ iptables -A "$CHAIN" \
 
 case "$SYNFIX_ACTION" in
     reject)
-        iptables -A "$CHAIN" \
+        iptables -w 10 -A "$CHAIN" \
             -p tcp --dport "$PORT" --syn \
             -j REJECT --reject-with tcp-reset
         ;;
     icmp-host-unreachable)
-        iptables -A "$CHAIN" \
+        iptables -w 10 -A "$CHAIN" \
             -p tcp --dport "$PORT" --syn \
             -j REJECT --reject-with icmp-host-unreachable
         ;;
     drop)
-        iptables -A "$CHAIN" \
+        iptables -w 10 -A "$CHAIN" \
             -p tcp --dport "$PORT" --syn \
             -j DROP
         ;;
 esac
 
-iptables -A "$CHAIN" -j RETURN
+iptables -w 10 -A "$CHAIN" -j RETURN
 
-iptables -I INPUT 1 ! -i lo -p tcp --dport "$PORT" --syn -j "$CHAIN"
+iptables -w 10 -I INPUT 1 ! -i lo -p tcp --dport "$PORT" --syn -j "$CHAIN"
+iptables -w 10 -C INPUT ! -i lo -p tcp --dport "$PORT" --syn -j "$CHAIN"
+iptables -w 10 -t mangle -C PREROUTING ! -i lo -p tcp --dport "$PORT" --syn -m u32 --u32 "$IOS_U32" -j MARK --set-mark "$IOS_MARK"
 persist_rules
 
 ok "MTProto SYN fix applied"
