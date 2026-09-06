@@ -27,6 +27,10 @@ pub const AesCtr = struct {
     /// Expanded AES-256 encryption context type (backend-independent)
     const EncCtx = @TypeOf(Aes256.initEnc([_]u8{0} ** 32));
 
+    /// Main AES-CTR batch width. Eight independent counter blocks expose enough
+    /// instruction-level parallelism for the x86_64 AES-NI production target.
+    const wide_blocks = 8;
+
     pub fn init(key: *const [32]u8, iv: u128) AesCtr {
         return .{
             .enc_ctx = Aes256.initEnc(key.*),
@@ -45,65 +49,68 @@ pub const AesCtr = struct {
 
     /// Apply keystream to data in-place (encrypt or decrypt).
     pub fn apply(self: *AesCtr, data: []u8) void {
-        const wide_blocks = 4;
-        const wide_bytes = 16 * wide_blocks;
-        var wide_counters: [wide_bytes]u8 = undefined;
-        defer std.crypto.secureZero(u8, &wide_counters);
-        var wide_keystream: [wide_bytes]u8 = undefined;
-        defer std.crypto.secureZero(u8, &wide_keystream);
-        var ctr_bytes: [16]u8 = undefined;
-        defer std.crypto.secureZero(u8, &ctr_bytes);
-        var block_keystream: [16]u8 = undefined;
-        defer std.crypto.secureZero(u8, &block_keystream);
         var i: usize = 0;
 
-        while (i < data.len) {
-            if (self.buffer_pos >= 16 and data.len - i >= wide_bytes) {
-                for (0..wide_blocks) |block_index| {
+        // Finish a partial keystream block before entering the aligned bulk path.
+        if (self.buffer_pos < 16 and i < data.len) {
+            const available = @as(usize, 16 - self.buffer_pos);
+            const take = @min(available, data.len - i);
+            for (0..take) |j| data[i + j] ^= self.buffer[self.buffer_pos + j];
+            self.buffer_pos += @intCast(take);
+            i += take;
+        }
+
+        const wide_bytes = 16 * wide_blocks;
+        while (data.len - i >= wide_bytes) {
+            var counters: [wide_bytes]u8 = undefined;
+            inline for (0..wide_blocks) |block_index| {
+                std.mem.writeInt(
+                    u128,
+                    counters[block_index * 16 ..][0..16],
+                    self.ctr +% @as(u128, block_index),
+                    .big,
+                );
+            }
+            const chunk: *[wide_bytes]u8 = data[i..][0..wide_bytes];
+            self.enc_ctx.xorWide(wide_blocks, chunk, chunk, counters);
+            self.ctr +%= wide_blocks;
+            i += wide_bytes;
+        }
+
+        // Keep sub-128-byte tails on parallel AES rather than regressing them to
+        // eight scalar encryptions after increasing the main batch width.
+        inline for (.{ 4, 2, 1 }) |blocks| {
+            const bytes = blocks * 16;
+            if (data.len - i >= bytes) {
+                var counters: [bytes]u8 = undefined;
+                inline for (0..blocks) |block_index| {
                     std.mem.writeInt(
                         u128,
-                        wide_counters[block_index * 16 ..][0..16],
+                        counters[block_index * 16 ..][0..16],
                         self.ctr +% @as(u128, block_index),
                         .big,
                     );
                 }
-                self.enc_ctx.encryptWide(wide_blocks, &wide_keystream, &wide_counters);
-                for (0..wide_blocks) |block_index| {
-                    xorBlockInPlace(
-                        data[i + block_index * 16 ..][0..16],
-                        wide_keystream[block_index * 16 ..][0..16],
-                    );
-                }
-                self.ctr +%= wide_blocks;
-                i += wide_bytes;
-                continue;
+                const chunk: *[bytes]u8 = data[i..][0..bytes];
+                self.enc_ctx.xorWide(blocks, chunk, chunk, counters);
+                self.ctr +%= blocks;
+                i += bytes;
             }
+        }
 
-            if (self.buffer_pos >= 16 and data.len - i >= 16) {
-                std.mem.writeInt(u128, &ctr_bytes, self.ctr, .big);
-                self.enc_ctx.encrypt(&block_keystream, &ctr_bytes);
-                xorBlockInPlace(data[i..][0..16], &block_keystream);
-                self.ctr +%= 1;
-                i += 16;
-                continue;
-            }
-
+        // Preserve unused keystream bytes for continuity across apply() calls.
+        while (i < data.len) {
             if (self.buffer_pos >= 16) {
-                // Generate new keystream block
+                var ctr_bytes: [16]u8 = undefined;
+                defer std.crypto.secureZero(u8, &ctr_bytes);
                 std.mem.writeInt(u128, &ctr_bytes, self.ctr, .big);
                 self.enc_ctx.encrypt(&self.buffer, &ctr_bytes);
                 self.ctr +%= 1;
                 self.buffer_pos = 0;
             }
-
             const available = @as(usize, 16 - self.buffer_pos);
-            const remaining = data.len - i;
-            const take = @min(available, remaining);
-
-            for (0..take) |j| {
-                data[i + j] ^= self.buffer[self.buffer_pos + j];
-            }
-
+            const take = @min(available, data.len - i);
+            for (0..take) |j| data[i + j] ^= self.buffer[self.buffer_pos + j];
             self.buffer_pos += @intCast(take);
             i += take;
         }
@@ -360,6 +367,51 @@ test "AesCtr roundtrip" {
     dec.apply(&buf);
 
     try std.testing.expectEqualSlices(u8, original, &buf);
+}
+
+test "AesCtr wide path matches byte-at-a-time across boundaries and counter wrap" {
+    const allocator = std.testing.allocator;
+    const key = [_]u8{0x42} ** 32;
+    const iv: u128 = std.math.maxInt(u128) - 5;
+    const lengths = [_]usize{
+        0,   1,    15,  16,  17,  31,  63,  64,
+        65,  127,  128, 129, 191, 192, 255, 256,
+        257, 1000,
+    };
+    const chunk_sizes = [_]usize{ 3, 17, 65, 1, 127, 8, 31 };
+
+    for (lengths) |len| {
+        const plain = try allocator.alloc(u8, len);
+        defer allocator.free(plain);
+        for (plain, 0..) |*byte, index| byte.* = @truncate(index *% 73 +% len *% 29);
+
+        const reference = try allocator.dupe(u8, plain);
+        defer allocator.free(reference);
+        var scalar = AesCtr.init(&key, iv);
+        for (reference) |*byte| {
+            var one = [_]u8{byte.*};
+            scalar.apply(&one);
+            byte.* = one[0];
+        }
+
+        const wide = try allocator.dupe(u8, plain);
+        defer allocator.free(wide);
+        var batched = AesCtr.init(&key, iv);
+        batched.apply(wide);
+        try std.testing.expectEqualSlices(u8, reference, wide);
+
+        const chunked = try allocator.dupe(u8, plain);
+        defer allocator.free(chunked);
+        var split = AesCtr.init(&key, iv);
+        var offset: usize = 0;
+        var chunk_index: usize = 0;
+        while (offset < len) : (chunk_index += 1) {
+            const take = @min(len - offset, chunk_sizes[chunk_index % chunk_sizes.len]);
+            split.apply(chunked[offset .. offset + take]);
+            offset += take;
+        }
+        try std.testing.expectEqualSlices(u8, reference, chunked);
+    }
 }
 
 test "AesCtr in-place symmetry" {
