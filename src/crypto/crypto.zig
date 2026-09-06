@@ -190,6 +190,7 @@ pub const AesCbcDecryptor = struct {
     iv: [16]u8,
 
     const block_size = 16;
+    const wide_blocks = 8;
     const DecCtx = @TypeOf(Aes256.initDec([_]u8{0} ** 32));
 
     pub fn init(key: *const [32]u8, iv: *const [16]u8) AesCbcDecryptor {
@@ -208,36 +209,24 @@ pub const AesCbcDecryptor = struct {
         var prev: [16]u8 = self.iv;
 
         var offset: usize = 0;
-        const wide_blocks = 4;
-        const wide_bytes = block_size * wide_blocks;
-        while (data.len - offset >= wide_bytes) : (offset += wide_bytes) {
-            var encrypted: [wide_bytes]u8 = undefined;
-            var decrypted: [wide_bytes]u8 = undefined;
-            @memcpy(encrypted[0..], data[offset .. offset + wide_bytes]);
-            self.dec_ctx.decryptWide(wide_blocks, &decrypted, &encrypted);
+        inline for (.{ wide_blocks, 4, 2, 1 }) |blocks| {
+            const bytes = block_size * blocks;
+            while (data.len - offset >= bytes) {
+                const chunk: *[bytes]u8 = data[offset..][0..bytes];
+                const encrypted = chunk.*;
+                self.dec_ctx.decryptWide(blocks, chunk, &encrypted);
 
-            for (0..wide_blocks) |block_index| {
-                const block_offset = block_index * block_size;
-                const block: *[16]u8 = data[offset + block_offset ..][0..16];
-                block.* = decrypted[block_offset..][0..16].*;
-                const chain = if (block_index == 0)
-                    &prev
-                else
-                    encrypted[block_offset - block_size ..][0..16];
-                xorBlockInPlace(block, chain);
+                inline for (0..blocks) |block_index| {
+                    const block_offset = block_index * block_size;
+                    const chain = if (block_index == 0)
+                        &prev
+                    else
+                        encrypted[block_offset - block_size ..][0..16];
+                    xorBlockInPlace(chunk[block_offset..][0..16], chain);
+                }
+                prev = encrypted[bytes - block_size ..][0..16].*;
+                offset += bytes;
             }
-            prev = encrypted[wide_bytes - block_size ..][0..16].*;
-        }
-
-        while (offset < data.len) : (offset += block_size) {
-            const block: *[16]u8 = data[offset..][0..16];
-            const saved = block.*;
-            // Decrypt
-            var decrypted: [16]u8 = undefined;
-            self.dec_ctx.decrypt(&decrypted, block);
-            block.* = decrypted;
-            xorBlockInPlace(block, &prev);
-            prev = saved;
         }
 
         // Persist IV for chaining across calls
@@ -448,6 +437,32 @@ test "AesCbc roundtrip" {
     var decryptor = AesCbcDecryptor.init(&key, &iv);
     try decryptor.decryptInPlace(&plaintext);
     try std.testing.expectEqualSlices(u8, &original, &plaintext);
+}
+
+test "AesCbc eight-block decryption preserves tails and split-call chaining" {
+    const key = [_]u8{0x5a} ** 32;
+    const iv = [_]u8{0xa5} ** 16;
+
+    var plaintext: [480]u8 = undefined;
+    for (&plaintext, 0..) |*byte, index| byte.* = @truncate(index *% 37 +% 11);
+
+    var ciphertext = plaintext;
+    var encryptor = AesCbcEncryptor.init(&key, &iv);
+    try encryptor.encryptInPlace(&ciphertext);
+
+    var one_shot = ciphertext;
+    var one_shot_decryptor = AesCbcDecryptor.init(&key, &iv);
+    try one_shot_decryptor.decryptInPlace(&one_shot);
+    try std.testing.expectEqualSlices(u8, &plaintext, &one_shot);
+
+    var split = ciphertext;
+    var split_decryptor = AesCbcDecryptor.init(&key, &iv);
+    try split_decryptor.decryptInPlace(split[0..16]);
+    try split_decryptor.decryptInPlace(split[16..80]);
+    try split_decryptor.decryptInPlace(split[80..208]);
+    try split_decryptor.decryptInPlace(split[208..240]);
+    try split_decryptor.decryptInPlace(split[240..]);
+    try std.testing.expectEqualSlices(u8, &plaintext, &split);
 }
 
 test "AesCbc chaining works" {
