@@ -103,6 +103,7 @@ processes after changing shared access settings.
 - A connection snapshots the MiddleProxy secret version and NAT IPv4 together with its endpoint plan. The current and immediately previous secrets remain centrally available under the metadata lock, so rotation cannot split key-selector and KDF inputs mid-handshake without copying the secret into every slot.
 - The snapshot contains only the selected route candidates, not every DC/media list. C2S scratch sizing is a constant-time upper bound; frame headers are parsed once by encapsulation.
 - CBC encrypt/decrypt state is direction-specific, and high-frequency random output uses the thread-local DRBG. New entropy-sensitive code must preserve periodic OS-CSPRNG reseeding.
+- AES-CBC decryption batches independent AES transforms in an `8/4/2/1` cascade, then applies CBC chaining in ciphertext order. Encryption remains serial by definition. Preserve the IV across calls and keep the one-shot/split-call equivalence test when changing either direction.
 
 ## Protocol Validation Notes
 
