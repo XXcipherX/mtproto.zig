@@ -31,8 +31,8 @@ pub const tg_middle_proxies_v4 = [5]net.Address{
     net.Address.initIp4(.{ 149, 154, 175, 50 }, tg_middle_proxy_port),
     net.Address.initIp4(.{ 149, 154, 161, 144 }, tg_middle_proxy_port),
     net.Address.initIp4(.{ 149, 154, 175, 100 }, tg_middle_proxy_port),
-    net.Address.initIp4(.{ 91, 108, 4, 169 }, tg_middle_proxy_port),
-    net.Address.initIp4(.{ 91, 108, 56, 170 }, tg_middle_proxy_port),
+    net.Address.initIp4(.{ 91, 108, 4, 140 }, tg_middle_proxy_port),
+    net.Address.initIp4(.{ 91, 108, 56, 163 }, tg_middle_proxy_port),
 };
 
 /// Default MiddleProxy endpoints per primary DC (1..5), media path (dc_idx < 0).
@@ -41,8 +41,8 @@ pub const tg_media_middle_proxies_v4 = [5]net.Address{
     net.Address.initIp4(.{ 149, 154, 175, 50 }, tg_middle_proxy_port),
     net.Address.initIp4(.{ 149, 154, 161, 184 }, tg_middle_proxy_port),
     net.Address.initIp4(.{ 149, 154, 175, 100 }, tg_middle_proxy_port),
-    net.Address.initIp4(.{ 149, 154, 164, 250 }, tg_middle_proxy_port),
-    net.Address.initIp4(.{ 91, 108, 56, 170 }, tg_middle_proxy_port),
+    net.Address.initIp4(.{ 149, 154, 166, 120 }, tg_middle_proxy_port),
+    net.Address.initIp4(.{ 91, 108, 56, 163 }, tg_middle_proxy_port),
 };
 
 /// Bundled fallback for Telegram's `proxy_for 203` route. Despite using port
