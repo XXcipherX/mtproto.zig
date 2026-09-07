@@ -2,9 +2,9 @@
 //!
 //! The relay's carrier between the bridge page and us is a same-origin WebSocket.
 //! That is the fastest carrier tdesktop's restricted WebView profile permits: its
-//! injected lock script allows *only* inline script plus `fetch`/`WebSocket` to the
-//! page's exact origin, so `wss://<our host>/…` is available while everything else
-//! (workers, WebRTC, WebTransport, WebAssembly, storage) is not.
+//! injected lock script isolates response data outside the page's exact origin, while
+//! our bridge itself uses only `wss://<our host>/…` and never attempts a cross-origin
+//! request. Workers, WebRTC, WebTransport, WebAssembly and storage remain unavailable.
 //!
 //! Scope is deliberately narrow — we are both endpoints' only peer:
 //!

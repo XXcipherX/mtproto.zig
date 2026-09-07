@@ -913,28 +913,25 @@ pub const Relay = struct {
             self.respondPage(conn, "200 OK", "Content-Type: text/plain; version=0.0.4\r\nCache-Control: no-store\r\n", body, keep, request.method == .head);
             return;
         }
-        if (request.method == .other) {
-            self.respondStatus(conn, "405 Method Not Allowed");
-            return;
-        }
-
-        const presented = request.query("b") orelse request.query("bridge");
-        const user = if (presented) |value| self.matchCapability(value) else null;
-
-        if (http.isWebSocketUpgrade(request) and
-            std.mem.eql(u8, request.path(), self.opts.ws_path))
-        {
-            if (user) |name| {
-                self.upgrade(conn, request, name);
+        // Caddy sends every request for the WEB hostname through this handler. Select
+        // the hidden carrier only after the complete request shape is canonical; every
+        // other valid HTTP request receives one indistinguishable empty masking 404.
+        if (request.canonicalGetQuery("/", "bridge", capability.capability_len)) |presented| {
+            if (self.matchCapability(presented) != null) {
+                self.respondPage(conn, "200 OK", self.bridge_headers, self.bridge_page, keep, false);
             } else {
                 self.respondEmpty(conn, "404 Not Found", keep);
             }
             return;
         }
 
-        if (std.mem.eql(u8, request.path(), "/")) {
-            if (user != null) {
-                self.respondPage(conn, "200 OK", self.bridge_headers, self.bridge_page, keep, request.method == .head);
+        if (request.canonicalGetQuery(self.opts.ws_path, "b", capability.capability_len)) |presented| {
+            if (http.isWebSocketUpgrade(request)) {
+                if (self.matchCapability(presented)) |name| {
+                    self.upgrade(conn, request, name);
+                } else {
+                    self.respondEmpty(conn, "404 Not Found", keep);
+                }
             } else {
                 self.respondEmpty(conn, "404 Not Found", keep);
             }
@@ -1027,14 +1024,18 @@ pub const Relay = struct {
             return;
         }
         const key = request.header("sec-websocket-key") orelse {
-            self.respondStatus(conn, "400 Bad Request");
+            self.respondEmpty(conn, "404 Not Found", false);
             return;
         };
         if (!ws.validKey(key)) {
-            self.respondStatus(conn, "400 Bad Request");
+            self.respondEmpty(conn, "404 Not Found", false);
             return;
         }
         if (self.opts.check_origin) {
+            if (request.headerCount("origin") != 1) {
+                self.respondEmpty(conn, "404 Not Found", false);
+                return;
+            }
             const origin = request.header("origin") orelse "";
             var expected: [capability.max_host_len + 16]u8 = undefined;
             const want = std.fmt.bufPrint(&expected, "https://{s}", .{self.opts.domain}) catch "";

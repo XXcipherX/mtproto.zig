@@ -128,6 +128,10 @@ grep -F 'protocols h1 h2' "$INSTALL_DIR/Caddyfile.mask" >/dev/null
 grep -F 'protocols h1 h2' "$INSTALL_DIR/caddy/web/global.caddy" >/dev/null
 ! grep -Eq 'protocols .*h3' "$INSTALL_DIR/caddy/web/global.caddy"
 ! grep -R -F 'header_up X-Forwarded-For' "$INSTALL_DIR/caddy/web"
+grep -F -- '-Via' "$INSTALL_DIR/caddy/web/site.caddy" >/dev/null
+grep -F 'reverse_proxy 127.0.0.1:8081 {' "$INSTALL_DIR/caddy/web/site.caddy" >/dev/null
+grep -F 'handle_errors {' "$INSTALL_DIR/caddy/web/site.caddy" >/dev/null
+! grep -Eq '@web_bridge_(page|socket)|query (bridge|b)=\*' "$INSTALL_DIR/caddy/web/site.caddy"
 if grep -Rqi -- 'nginx' "$INSTALL_DIR"; then
     echo "installer unexpectedly generated an nginx artifact" >&2
     exit 1

@@ -10,9 +10,11 @@
 //!
 //! It runs inside `lib_webview`'s restricted profile, whose document-start lock script
 //! `undefined`s storage, workers, WebAssembly, WebRTC, WebTransport, media capture and
-//! more, and installs a `<meta>` CSP that permits only inline script plus connections to
-//! this exact origin. So the script below is deliberately ES5-ish, allocation-light, and
-//! uses nothing but `WebSocket`, `postMessage`, `setInterval` and the DOM.
+//! more, and installs a `<meta>` CSP that keeps response data on this exact origin. The
+//! bridge never attempts a cross-origin request; client policy may cancel one, but does
+//! not promise that every browser engine emits no such packet. The script below is
+//! deliberately ES5-ish, allocation-light, and uses only `WebSocket`, `postMessage`,
+//! `setInterval` and the DOM.
 //!
 //! ## The two client transports it must speak
 //!

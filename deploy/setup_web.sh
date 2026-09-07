@@ -435,23 +435,14 @@ https://${WEB_DOMAIN}:${WEB_TLS_PORT} {
 	tls /etc/caddy/web/cert/fullchain.pem /etc/caddy/web/cert/privkey.pem {
 		curves x25519mlkem768 x25519
 	}
-	@web_bridge_page {
-		path /
-		query bridge=*
+	header {
+		-Via
 	}
-	@web_bridge_socket {
-		path /api/v1/socket
-		query b=*
+	reverse_proxy 127.0.0.1:${WEB_PORT} {
+		flush_interval -1
+		stream_close_delay 5m
 	}
-	route {
-		reverse_proxy @web_bridge_page 127.0.0.1:${WEB_PORT} {
-			flush_interval -1
-			stream_close_delay 5m
-		}
-		reverse_proxy @web_bridge_socket 127.0.0.1:${WEB_PORT} {
-			flush_interval -1
-			stream_close_delay 5m
-		}
+	handle_errors {
 		respond 404
 	}
 }
@@ -466,23 +457,14 @@ https://${WEB_DOMAIN}:${WEB_TLS_PORT} {
 	tls /etc/caddy/web/cert/fullchain.pem /etc/caddy/web/cert/privkey.pem {
 		curves x25519mlkem768 x25519
 	}
-	@web_bridge_page {
-		path /
-		query bridge=*
+	header {
+		-Via
 	}
-	@web_bridge_socket {
-		path /api/v1/socket
-		query b=*
+	reverse_proxy 127.0.0.1:${WEB_PORT} {
+		flush_interval -1
+		stream_close_delay 5m
 	}
-	route {
-		reverse_proxy @web_bridge_page 127.0.0.1:${WEB_PORT} {
-			flush_interval -1
-			stream_close_delay 5m
-		}
-		reverse_proxy @web_bridge_socket 127.0.0.1:${WEB_PORT} {
-			flush_interval -1
-			stream_close_delay 5m
-		}
+	handle_errors {
 		respond 404
 	}
 }

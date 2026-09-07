@@ -58,6 +58,19 @@ pub const Request = struct {
         return null;
     }
 
+    /// Number of field lines matching `name` (ASCII case-insensitive).
+    ///
+    /// The browser emits one line for each WebSocket handshake field. Rejecting
+    /// duplicates keeps the authenticated carrier request canonical instead of letting
+    /// an intermediary and the relay disagree about which value is authoritative.
+    pub fn headerCount(self: *const Request, name: []const u8) usize {
+        var count: usize = 0;
+        for (self.headers()) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, name)) count += 1;
+        }
+        return count;
+    }
+
     /// **Last** header matching `name` (ASCII case-insensitive), or null.
     ///
     /// RFC 9110 §5.2 makes repeated field lines equivalent to one comma-joined value, in
@@ -90,6 +103,29 @@ pub const Request = struct {
     /// Raw (still percent-encoded) value of query parameter `key`, or null.
     pub fn query(self: *const Request, key: []const u8) ?[]const u8 {
         return queryValue(self.target, key);
+    }
+
+    /// Return the value only for the exact browser carrier request
+    /// `GET <expected_path>?<key>=<value>`, with no body or alternate query spelling.
+    ///
+    /// Generic query parsing is intentionally insufficient for authentication: accepting
+    /// duplicate parameters, extra parameters, another path, or HEAD would create more
+    /// externally distinguishable carrier shapes than the protocol defines.
+    pub fn canonicalGetQuery(
+        self: *const Request,
+        expected_path: []const u8,
+        key: []const u8,
+        value_len: usize,
+    ) ?[]const u8 {
+        if (self.method != .get or self.has_body) return null;
+        if (!std.mem.startsWith(u8, self.target, expected_path)) return null;
+
+        const rest = self.target[expected_path.len..];
+        const prefix_len = 1 + key.len + 1; // `?`, key, `=`
+        if (rest.len != prefix_len + value_len or rest[0] != '?') return null;
+        if (!std.mem.eql(u8, rest[1 .. 1 + key.len], key)) return null;
+        if (rest[1 + key.len] != '=') return null;
+        return rest[prefix_len..];
     }
 
     /// Whether the connection may be reused after this response. HTTP/1.1 defaults to
@@ -215,6 +251,8 @@ pub fn parse(buf: []const u8) ParseError!Request {
 /// True when the request is a well-formed RFC 6455 upgrade handshake.
 pub fn isWebSocketUpgrade(req: *const Request) bool {
     if (req.method != .get or req.has_body) return false;
+    if (req.headerCount("upgrade") != 1 or req.headerCount("connection") != 1) return false;
+    if (req.headerCount("sec-websocket-version") != 1 or req.headerCount("sec-websocket-key") != 1) return false;
     if (!req.headerHasToken("upgrade", "websocket")) return false;
     if (!req.headerHasToken("connection", "upgrade")) return false;
     const version = req.header("sec-websocket-version") orelse return false;
@@ -295,12 +333,61 @@ test "recognises a WebSocket upgrade and its variations" {
     try std.testing.expectEqualStrings("dGhlIHNhbXBsZSBub25jZQ==", req.header("sec-websocket-key").?);
 }
 
+test "canonical carrier queries reject alternate request shapes" {
+    const token = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+    var storage: [512]u8 = undefined;
+    const page_text = try std.fmt.bufPrint(&storage, "GET /?bridge={s} HTTP/1.1\r\nHost: proxy.example.com\r\n\r\n", .{token});
+    const page = try parse(page_text);
+    try std.testing.expectEqualStrings(token, page.canonicalGetQuery("/", "bridge", token.len).?);
+    try std.testing.expect(page.canonicalGetQuery("/", "b", token.len) == null);
+
+    const socket_text = try std.fmt.bufPrint(&storage, "GET /api/v1/socket?b={s} HTTP/1.1\r\nHost: proxy.example.com\r\n\r\n", .{token});
+    const socket = try parse(socket_text);
+    try std.testing.expectEqualStrings(token, socket.canonicalGetQuery("/api/v1/socket", "b", token.len).?);
+    try std.testing.expect(socket.canonicalGetQuery("/api/v1/socket", "bridge", token.len) == null);
+
+    const alternatives = [_][]const u8{
+        "HEAD /?bridge=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA HTTP/1.1\r\nHost: proxy.example.com\r\n\r\n",
+        "POST /?bridge=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA HTTP/1.1\r\nHost: proxy.example.com\r\n\r\n",
+        "GET /?bridge=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&x=1 HTTP/1.1\r\nHost: proxy.example.com\r\n\r\n",
+        "GET /?x=1&bridge=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA HTTP/1.1\r\nHost: proxy.example.com\r\n\r\n",
+        "GET /?bridge=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&bridge=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA HTTP/1.1\r\nHost: proxy.example.com\r\n\r\n",
+        "GET /wrong?bridge=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA HTTP/1.1\r\nHost: proxy.example.com\r\n\r\n",
+        "GET /?bridge=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA HTTP/1.1\r\nHost: proxy.example.com\r\nContent-Length: 1\r\n\r\n",
+    };
+    for (alternatives) |text| {
+        const request = try parse(text);
+        try std.testing.expect(request.canonicalGetQuery("/", "bridge", token.len) == null);
+    }
+
+    const alternate_socket = try parse(
+        "GET /api/v1/socket?b=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&x=1 HTTP/1.1\r\n" ++
+            "Host: proxy.example.com\r\n\r\n",
+    );
+    try std.testing.expect(alternate_socket.canonicalGetQuery("/api/v1/socket", "b", token.len) == null);
+}
+
 test "an upgrade missing version 13 is not an upgrade" {
     const bad =
         "GET / HTTP/1.1\r\nHost: h\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n" ++
         "Sec-WebSocket-Version: 8\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
     const req = try parse(bad);
     try std.testing.expect(!isWebSocketUpgrade(&req));
+}
+
+test "duplicate WebSocket handshake fields are not canonical" {
+    const duplicate_key = try parse(
+        "GET /api/v1/socket?b=cap HTTP/1.1\r\n" ++
+            "Host: proxy.example.com\r\n" ++
+            "Connection: Upgrade\r\n" ++
+            "Upgrade: websocket\r\n" ++
+            "Sec-WebSocket-Version: 13\r\n" ++
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+    );
+    try std.testing.expectEqual(@as(usize, 2), duplicate_key.headerCount("sec-websocket-key"));
+    try std.testing.expect(!isWebSocketUpgrade(&duplicate_key));
 }
 
 test "an empty body declaration is accepted, the way a static host would" {
