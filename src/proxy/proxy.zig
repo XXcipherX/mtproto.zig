@@ -6497,7 +6497,9 @@ const EventLoop = struct {
                 });
             }
         } else {
-            log.debug("[{d}] closing: dc_idx={d} media={} phase={s} reason={s} c2s={d} s2c={d}", .{
+            var client_ip_buf: [64]u8 = undefined;
+            const client_ip = formatClientIp(slot.peer_addr, &client_ip_buf);
+            log.debug("[{d}] closing: dc_idx={d} media={} phase={s} reason={s} c2s={d} s2c={d} client={s}", .{
                 slot.conn_id,
                 slot.dc_idx,
                 slot.is_media_path,
@@ -6505,6 +6507,7 @@ const EventLoop = struct {
                 reason,
                 slot.c2s_bytes,
                 slot.s2c_bytes,
+                client_ip,
             });
         }
         self.removeSlotDeadline(slot);
