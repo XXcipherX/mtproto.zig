@@ -181,7 +181,7 @@ def verify_graceful_shutdown(
             raise RuntimeError("daemon exited immediately instead of draining an active connection")
 
         try:
-            return_code = proc.wait(timeout=3.0)
+            return_code = proc.wait(timeout=args.shutdown_timeout_sec)
         except subprocess.TimeoutExpired as err:
             raise RuntimeError("daemon exceeded its graceful shutdown deadline") from err
 
@@ -243,6 +243,13 @@ def main() -> int:
     parser.add_argument("--binary", default="zig-out/bin/mtproto-proxy")
     parser.add_argument("--port", type=int, default=16543)
     parser.add_argument("--startup-timeout-sec", type=float, default=6.0)
+    parser.add_argument("--shutdown-timeout-sec", type=float, default=3.0)
+    parser.add_argument(
+        "--launcher",
+        nargs=argparse.REMAINDER,
+        default=[],
+        help="command and arguments prepended to the daemon; this option must be last",
+    )
     args = parser.parse_args()
 
     binary = Path(args.binary)
@@ -254,7 +261,7 @@ def main() -> int:
         write_smoke_config(config_path, args.port)
 
         proc = subprocess.Popen(
-            [str(binary), str(config_path)],
+            [*args.launcher, str(binary), str(config_path)],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,

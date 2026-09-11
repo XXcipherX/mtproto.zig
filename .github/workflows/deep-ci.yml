@@ -32,3 +32,50 @@ jobs:
 
       - name: Run multithreaded soak under ThreadSanitizer
         run: zig build -Doptimize=ReleaseSafe -Dtsan=true soak -- --seconds=30 --threads=4
+
+  valgrind:
+    name: Valgrind Memcheck
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Install Valgrind
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes valgrind
+
+      - name: Build baseline ReleaseSafe daemon
+        run: zig build -Doptimize=ReleaseSafe -Dcpu=baseline
+
+      - name: Run real daemon smoke under Memcheck
+        run: |
+          python3 test/daemon_smoke.py \
+            --binary zig-out/bin/mtproto-proxy \
+            --startup-timeout-sec 20 \
+            --shutdown-timeout-sec 20 \
+            --launcher \
+            valgrind \
+            --tool=memcheck \
+            --leak-check=full \
+            --show-leak-kinds=all \
+            --errors-for-leak-kinds=definite,indirect \
+            --track-origins=yes \
+            --num-callers=40 \
+            --max-stackframe=8388608 \
+            --error-exitcode=97 \
+            --log-file=valgrind.log
+
+      - name: Upload Memcheck report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: valgrind-memcheck-report
+          path: valgrind.log
+          if-no-files-found: warn
+          retention-days: 30

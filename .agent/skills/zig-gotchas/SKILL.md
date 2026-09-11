@@ -11,6 +11,7 @@ This file tracks practical pitfalls and current runtime constraints for `mtproto
 
 - Relay core is Linux `epoll` event loop, single-threaded on hot path.
 - The large `EventLoop` container and its fixed subnet tables are heap-allocated and initialized in place; returning it by value can overflow the Debug daemon stack. Connection pools allocate slot indexes and a deadline-heap entry per active slot, while `ConnectionSlot` objects are heap-created on demand. Epoll payloads carry index/generation/role directly; do not reintroduce an fd hash map.
+- The Valgrind profile must use a baseline-CPU ReleaseSafe build plus `--max-stackframe=8388608`. Native GitHub CPUs can select SHA-NI instructions unsupported by Ubuntu 24.04's Valgrind 3.22, while the proxy's legitimate multi-MiB initialization frame otherwise looks like a stack switch and creates false invalid-access reports.
 - Non-blocking writes are queue-based (`MessageQueue`) and flushed with `writev`.
 - `MessageQueue` has intrusive page-sized storage blocks from one capped event-loop-wide pool and a 4 MiB pending-byte cap; queue overflow is a close-worthy backpressure signal.
 - Runtime discovery runs in a joinable updater thread after the listener is ready when MiddleProxy or masking resolution is active; shutdown is cooperative, DNS/HTTPS/curl tasks are canceled in their owning thread, and endpoint probes run in cancellable batches of at most four sockets.
@@ -138,4 +139,4 @@ processes after changing shared access settings.
 - Use error unions and avoid swallowing critical errors on control-path boundaries.
 - Keep tests close to protocol primitives and relay helpers.
 - For substantial behavior changes, update `README.md` and relevant `.agent` docs in the same change.
-- Keep CI expectations in mind: formatting, Debug/ReleaseSafe/ReleaseFast tests, bounded coverage-guided security fuzzing, real daemon smoke (valid FakeTLS, bad-secret rejection, and graceful SIGTERM drain), cross-builds plus native ARM64 runtime coverage, ShellCheck, Python harness syntax, Docker build plus safe-default smoke, the Debian/Ubuntu Docker Compose installer E2E matrix, bench/soak, and weekly/manual ThreadSanitizer tests plus soak.
+- Keep CI expectations in mind: formatting, Debug/ReleaseSafe/ReleaseFast tests, bounded coverage-guided security fuzzing, real daemon smoke (valid FakeTLS, bad-secret rejection, and graceful SIGTERM drain), cross-builds plus native ARM64 runtime coverage, ShellCheck, Python harness syntax, Docker build plus safe-default smoke, the Debian/Ubuntu Docker Compose installer E2E matrix, bench/soak, and weekly/manual ThreadSanitizer plus Valgrind Memcheck checks.

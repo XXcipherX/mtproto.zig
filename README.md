@@ -156,11 +156,27 @@ for pushes to `main`, in a separate parallel job with a 15-minute hard timeout.
 
 The separate **Deep CI** workflow runs weekly and on demand. Its ThreadSanitizer
 job instruments only the unit-test and benchmark/soak artifacts; normal production
-builds are unchanged. The same checks can be reproduced on supported Linux hosts:
+builds are unchanged. A separate Valgrind Memcheck job drives the real daemon
+smoke through a controlled startup and graceful shutdown. Invalid memory accesses
+and definite/indirect leaks fail the job; all leak categories remain available in
+the uploaded report. Its ReleaseSafe build uses a baseline CPU so Ubuntu's
+Valgrind never has to emulate unsupported host-specific crypto instructions; an
+8 MiB stack-frame threshold covers the proxy's legitimate initialization frame
+without suppressing memory errors. The checks can be reproduced on supported
+Linux hosts:
 
 ```bash
 zig build -Doptimize=ReleaseSafe -Dtsan=true test
 zig build -Doptimize=ReleaseSafe -Dtsan=true soak -- --seconds=30 --threads=4
+
+zig build -Doptimize=ReleaseSafe -Dcpu=baseline
+python3 test/daemon_smoke.py --binary zig-out/bin/mtproto-proxy \
+  --startup-timeout-sec 20 --shutdown-timeout-sec 20 \
+  --launcher valgrind --tool=memcheck \
+  --leak-check=full --show-leak-kinds=all \
+  --errors-for-leak-kinds=definite,indirect --track-origins=yes \
+  --max-stackframe=8388608 \
+  --error-exitcode=97 --log-file=valgrind.log
 ```
 
 ### Performance & Stability Checks
