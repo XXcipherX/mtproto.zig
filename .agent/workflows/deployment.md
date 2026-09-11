@@ -72,6 +72,8 @@ The default install graph contains only `mtproto-proxy`. Use `zig build install-
 
 The daemon smoke launches a real localhost proxy, verifies a valid FakeTLS handshake, checks that the same SNI with a bad secret does not receive a valid FakeTLS response, and holds an authenticated connection across `SIGTERM` until the configured graceful-shutdown deadline forces a clean exit. CI uses a shorter soak for pull requests and a longer soak on pushes. In addition to the aarch64 cross-build, the official `ubuntu-24.04-arm` runner executes unit tests, this daemon smoke and a short four-worker soak natively so architecture-specific runtime defects cannot hide behind successful cross-compilation.
 
+The separate `.github/workflows/deep-ci.yml` workflow runs weekly and through `workflow_dispatch`. Its `-Dtsan=true` option applies ThreadSanitizer only to the `src/main.zig` and `src/bench.zig` test artifacts plus the benchmark executable used by soak; it never instruments the normal production proxy build. Keep `TSAN_OPTIONS=halt_on_error=1:exitcode=66` so a reported race fails the job instead of becoming advisory output.
+
 Installer changes also require the separate `.github/workflows/installer-e2e.yml` matrix. It boots privileged systemd containers for Debian 12/13 and Ubuntu 24.04/26.04, runs the real Docker Compose installer twice, and checks the private config, Caddy-only topology, WEB relay, service health, HTTPS masking, external-only SYNFIX/NFQUEUE rules, disabled-by-default TCPMSS, and idempotent reinstall. Docker, Compose, Caddy, the proxy image, systemd, and iptables remain real; only public ACME and the external `nfqws` implementation use deterministic test substitutes. Run one case locally with:
 
 ```bash

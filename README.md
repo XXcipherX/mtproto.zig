@@ -154,6 +154,15 @@ and multiplexed-frame parsers without pulling the benchmark test binary into the
 campaign. CI runs 25K iterations per target for pull requests and 100K per target
 for pushes to `main`, in a separate parallel job with a 15-minute hard timeout.
 
+The separate **Deep CI** workflow runs weekly and on demand. Its ThreadSanitizer
+job instruments only the unit-test and benchmark/soak artifacts; normal production
+builds are unchanged. The same checks can be reproduced on supported Linux hosts:
+
+```bash
+zig build -Doptimize=ReleaseSafe -Dtsan=true test
+zig build -Doptimize=ReleaseSafe -Dtsan=true soak -- --seconds=30 --threads=4
+```
+
 ### Performance & Stability Checks
 
 ```bash

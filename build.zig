@@ -3,6 +3,11 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const tsan = b.option(
+        bool,
+        "tsan",
+        "Instrument test and soak artifacts with ThreadSanitizer (default: false)",
+    ) orelse false;
 
     // The proxy parses untrusted network input (FakeTLS, obfuscation,
     // MiddleProxy, WEB, SOCKS5 and TOML). Keep runtime bounds, overflow and null
@@ -48,6 +53,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/bench.zig"),
         .target = target,
         .optimize = optimize,
+        .sanitize_thread = tsan,
     });
 
     const bench_exe = b.addExecutable(.{
@@ -90,6 +96,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+        .sanitize_thread = tsan,
     });
 
     const unit_tests = b.addTest(.{
@@ -110,6 +117,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/bench.zig"),
         .target = target,
         .optimize = optimize,
+        .sanitize_thread = tsan,
     });
 
     const bench_tests = b.addTest(.{
