@@ -141,5 +141,8 @@ processes after changing shared access settings.
 - Avoid value captures and optional-unwrapping copies for secret-bearing records. Use pointer captures where ownership permits, clear named handshake/KDF/hash/cipher temporaries with `std.crypto.secureZero`, and wipe only the sensitive fields of structs that also contain enums or pointers.
 - Use error unions and avoid swallowing critical errors on control-path boundaries.
 - Keep tests close to protocol primitives and relay helpers.
+- Handshake benchmarks must use protocol-valid vectors and the production
+  candidate-store adapter. Keep 1/4/8-candidate results as comparable CI
+  artifacts; do not turn shared-runner timing into a hard pass/fail threshold.
 - For substantial behavior changes, update `README.md` and relevant `.agent` docs in the same change.
-- Keep CI expectations in mind: formatting, Debug/ReleaseSafe/ReleaseFast tests, bounded coverage-guided security fuzzing with explicit `.zig-cache/f/crash` detection and artifact preservation, real daemon smoke (valid FakeTLS, bad-secret rejection, and graceful SIGTERM drain), cross-builds plus native ARM64 runtime coverage, ShellCheck, Python harness syntax, Docker build plus safe-default smoke, the Debian/Ubuntu Docker Compose installer E2E matrix, bench/soak, and weekly/manual ThreadSanitizer, Valgrind Memcheck, plus extended fuzz checks.
+- Keep CI expectations in mind: formatting, Debug/ReleaseSafe/ReleaseFast tests, bounded coverage-guided security fuzzing with explicit `.zig-cache/f/crash` detection and artifact preservation, real daemon smoke (valid FakeTLS, bad-secret rejection, and graceful SIGTERM drain), cross-builds plus native ARM64 runtime coverage, ShellCheck, Python harness syntax, Docker build plus safe-default smoke, the Debian/Ubuntu Docker Compose installer E2E matrix, ReleaseFast encapsulation/FakeTLS/1-4-8-candidate benchmarks plus soak, and weekly/manual ThreadSanitizer, Valgrind Memcheck, plus extended fuzz checks.

@@ -29,6 +29,25 @@ handshake deduplication, retry exhaustion, capability absence and terminal BYE.
 This is an offline browser-contract check, not a live Telegram connectivity test.
 The existing GitHub CI WEB-bridge step runs it separately from Zig unit tests.
 
+## Handshake performance signals
+
+The standalone `mtproto-bench` program has two handshake-specific modes in
+addition to the encapsulation benchmark and soak test:
+
+```bash
+zig build -Doptimize=ReleaseFast bench -- handshake --iterations=500000
+zig build -Doptimize=ReleaseFast bench -- handshake-path --iterations=500000 --candidate-count=4
+```
+
+`handshake` validates a complete, authenticated and structurally valid FakeTLS
+ClientHello. `handshake-path` parses an obfuscated MTProto handshake and stages
+the requested number of route candidates through the production candidate-store
+implementation. Candidate counts 1 and 4 cover the allocation-free inline path;
+8 covers its heap fallback. CI records 1/4/8 results as artifacts without applying
+a hard timing threshold, because shared-runner timing is too noisy for a reliable
+pass/fail gate. A malformed benchmark vector, failed authentication, allocation
+failure or crash still fails the job.
+
 ## Tools
 
 - `capacity_connections_probe.py` — concurrent connection sweeps with RSS tracking.

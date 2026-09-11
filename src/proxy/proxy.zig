@@ -2156,6 +2156,31 @@ const ConnectionSlot = struct {
     }
 };
 
+/// Minimal production-path adapter used by the standalone handshake benchmark.
+/// Keeping candidate staging here makes the benchmark exercise the same
+/// inline/heap transition as a real connection without exposing ConnectionSlot.
+pub const BenchCandidatePath = struct {
+    slot: ConnectionSlot = .{},
+
+    pub fn deinit(self: *BenchCandidatePath, allocator: std.mem.Allocator) void {
+        self.slot.clearUpstreamCandidates(allocator);
+    }
+
+    pub fn apply(
+        self: *BenchCandidatePath,
+        allocator: std.mem.Allocator,
+        candidates: []const net.Address,
+    ) !usize {
+        if (candidates.len == 0) return error.BenchEmptyCandidates;
+
+        try self.slot.setUpstreamCandidates(allocator, candidates);
+        const prepared = self.slot.upstreamCandidates();
+        self.slot.upstream_candidate_next = 1;
+        self.slot.current_upstream_addr = prepared[0];
+        return prepared.len;
+    }
+};
+
 const DeadlineEntry = struct {
     deadline_ns: i128,
     slot_index: u32,

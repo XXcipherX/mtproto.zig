@@ -173,6 +173,17 @@ If `max_connections` exceeds the baseline RAM ceiling, startup auto-clamps it be
 
 `ProxyState.run` then applies a second, independent `RLIMIT_NOFILE` clamp before creating the event loop when the process soft fd limit cannot cover the effective connection cap. If the fd budget cannot support the minimum 32 slots (576 descriptors including overhead), startup fails instead of advertising an impossible capacity.
 
+## Handshake Performance Signals
+
+`src/bench.zig` keeps handshake measurements explicit and ReleaseFast-only. The
+`handshake` mode authenticates a complete structurally valid FakeTLS ClientHello;
+`handshake-path` combines obfuscated-nonce parsing with the production candidate
+staging path exposed through `BenchCandidatePath`. Counts 1 and 4 exercise inline
+storage, while 8 deliberately crosses into heap fallback. CI records all four
+signals (FakeTLS plus 1/4/8 candidates) as artifacts without hard timing gates,
+because shared-runner variance must not create false failures. Authentication,
+allocation, vector or process failures still fail the job.
+
 ## DPI Evasion Components
 
 - FakeTLS ServerHello template with runtime digest patching.
@@ -196,6 +207,6 @@ If `max_connections` exceeds the baseline RAM ceiling, startup auto-clamps it be
 - Timeout behavior remains controlled by config timers.
 - Graceful process shutdown disables new accepts on the first signal, preserves existing relay progress until the configured deadline, and force-closes only after another signal or timeout.
 - WEB carrier requests remain capability-gated, WELCOME stays alone in the first binary carrier message, trusted relay status cannot be forged through PROXY v2, and direct-obfuscated RDHUP follows the direct relay path rather than FakeTLS record parsing. WEB-only must continue to admit the trusted relay, mask every direct peer even with a valid secret, stay inert when WEB is disabled, and suppress ordinary connection links while active.
-- CI remains green across `zig fmt --check`, Debug/ReleaseSafe/ReleaseFast tests, daemon smoke with positive, bad-secret, and graceful-SIGTERM paths, production ReleaseSafe+PIE builds, cross-builds plus native ARM64 runtime checks, ShellCheck, Python syntax checks, Docker build plus safe-default smoke, the Debian/Ubuntu installer E2E matrix, genuine ReleaseFast bench/soak, bounded fuzzing with crash-artifact preservation, and scheduled/manual ThreadSanitizer, Valgrind Memcheck, plus extended fuzz checks.
+- CI remains green across `zig fmt --check`, Debug/ReleaseSafe/ReleaseFast tests, daemon smoke with positive, bad-secret, and graceful-SIGTERM paths, production ReleaseSafe+PIE builds, cross-builds plus native ARM64 runtime checks, ShellCheck, Python syntax checks, Docker build plus safe-default smoke, the Debian/Ubuntu installer E2E matrix, genuine ReleaseFast encapsulation/FakeTLS/1-4-8-candidate benchmarks plus soak, bounded fuzzing with crash-artifact preservation, and scheduled/manual ThreadSanitizer, Valgrind Memcheck, plus extended fuzz checks.
 - Deploy docs remain aligned with current tunnel/direct-mode behavior.
 - Docs remain aligned with code paths and log messages.

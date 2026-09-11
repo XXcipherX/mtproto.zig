@@ -3,10 +3,15 @@ const net = @import("net_compat.zig");
 const compat = @import("compat.zig");
 const crypto = @import("crypto/crypto.zig");
 const middleproxy = @import("protocol/middleproxy.zig");
+const obfuscation = @import("protocol/obfuscation.zig");
 const constants = @import("protocol/constants.zig");
+const tls = @import("protocol/tls.zig");
+const proxy = @import("proxy/proxy.zig");
 
 const Mode = enum {
     bench,
+    handshake,
+    handshake_path,
     soak,
 };
 
@@ -15,6 +20,8 @@ const Options = struct {
     seconds: u32 = 30,
     threads: usize = 0,
     max_payload: usize = 128 * 1024,
+    iterations: usize = 1_000_000,
+    candidate_count: usize = 4,
 };
 
 const SoakShared = struct {
@@ -48,6 +55,8 @@ pub fn main(init: std.process.Init) !void {
 
     switch (opts.mode) {
         .bench => try runBench(allocator),
+        .handshake => try runHandshakeBench(allocator, opts.iterations),
+        .handshake_path => try runHandshakePathBench(allocator, opts),
         .soak => try runSoak(allocator, opts),
     }
 }
@@ -105,10 +114,137 @@ fn runBench(allocator: std.mem.Allocator) !void {
     }
 }
 
+fn runHandshakeBench(allocator: std.mem.Allocator, iterations: usize) !void {
+    const bench_secret = [_]u8{0x42} ** 16;
+    const user_secrets = [_]tls.UserSecret{.{ .name = "bench", .secret = bench_secret }};
+    const handshake = buildTlsBenchmarkHandshake(&bench_secret, 0x11223344);
+
+    const warmup_iters = @min(iterations, @as(usize, 2000));
+    var warmup: usize = 0;
+    while (warmup < warmup_iters) : (warmup += 1) {
+        var validation = (try tls.validateTlsHandshake(
+            allocator,
+            &handshake,
+            &user_secrets,
+            true,
+        )) orelse return error.BenchmarkValidationFailed;
+        validation.wipe();
+    }
+
+    const start_ns = compat.monotonicNanoTimestamp();
+    var matched: usize = 0;
+    var checksum: u64 = 0;
+    var i: usize = 0;
+    while (i < iterations) : (i += 1) {
+        var validation = (try tls.validateTlsHandshake(
+            allocator,
+            &handshake,
+            &user_secrets,
+            true,
+        )) orelse return error.BenchmarkValidationFailed;
+        matched += 1;
+        checksum +%= @as(u64, validation.timestamp);
+        validation.wipe();
+    }
+
+    const elapsed_ns = positiveElapsedNs(start_ns);
+    std.debug.print("benchmark: validateTlsHandshake\n", .{});
+    std.debug.print("iterations matched ns_per_op ops_per_sec checksum\n", .{});
+    std.debug.print("{d} {d} {d} {d} {d}\n", .{
+        iterations,
+        matched,
+        elapsedNsPerOp(elapsed_ns, iterations),
+        operationsPerSecond(iterations, elapsed_ns),
+        checksum,
+    });
+}
+
+fn runHandshakePathBench(allocator: std.mem.Allocator, opts: Options) !void {
+    if (opts.candidate_count == 0 or opts.candidate_count > 16) return error.InvalidArgument;
+
+    const bench_secret = [_]u8{0x33} ** 16;
+    const user_secrets = [_]obfuscation.UserSecret{.{ .name = "bench", .secret = bench_secret }};
+
+    var handshakes: [8][constants.handshake_len]u8 = undefined;
+    for (&handshakes, 0..) |*handshake, idx| {
+        handshake.* = buildObfuscationHandshake(
+            &bench_secret,
+            .intermediate,
+            @intCast(idx + 1),
+            @intCast(23 + idx * 11),
+        );
+    }
+
+    var candidates: [16]net.Address = undefined;
+    fillBenchmarkCandidates(&candidates);
+    const windows = candidates.len - opts.candidate_count + 1;
+
+    var candidate_state = proxy.BenchCandidatePath{};
+    defer candidate_state.deinit(allocator);
+
+    const warmup_iters = @min(opts.iterations, @as(usize, 2000));
+    var warmup: usize = 0;
+    while (warmup < warmup_iters) : (warmup += 1) {
+        const handshake_idx = warmup % handshakes.len;
+        var parsed = obfuscation.ObfuscationParams.fromHandshake(
+            &handshakes[handshake_idx],
+            &user_secrets,
+        ) orelse return error.BenchmarkValidationFailed;
+        parsed.params.wipe();
+
+        const base = if (windows > 1) warmup % windows else 0;
+        _ = try candidate_state.apply(
+            allocator,
+            candidates[base .. base + opts.candidate_count],
+        );
+    }
+
+    const start_ns = compat.monotonicNanoTimestamp();
+    var matched: usize = 0;
+    var checksum: u64 = 0;
+    var i: usize = 0;
+    while (i < opts.iterations) : (i += 1) {
+        const handshake_idx = i % handshakes.len;
+        var parsed = obfuscation.ObfuscationParams.fromHandshake(
+            &handshakes[handshake_idx],
+            &user_secrets,
+        ) orelse return error.BenchmarkValidationFailed;
+        const dc_idx = parsed.params.dc_idx;
+        parsed.params.wipe();
+        matched += 1;
+
+        const base = if (windows > 1) i % windows else 0;
+        const candidate_slice = candidates[base .. base + opts.candidate_count];
+        const candidate_len = try candidate_state.apply(allocator, candidate_slice);
+
+        checksum +%= @as(u64, @intCast(candidate_len));
+        checksum +%= @as(u64, @intCast(@abs(dc_idx)));
+        checksum +%= std.mem.bigToNative(u16, candidate_slice[0].in.sa.port);
+    }
+
+    const elapsed_ns = positiveElapsedNs(start_ns);
+    std.debug.print("benchmark: obfuscated handshake and candidate staging\n", .{});
+    std.debug.print("iterations candidate_count matched ns_per_op ops_per_sec checksum\n", .{});
+    std.debug.print("{d} {d} {d} {d} {d} {d}\n", .{
+        opts.iterations,
+        opts.candidate_count,
+        matched,
+        elapsedNsPerOp(elapsed_ns, opts.iterations),
+        operationsPerSecond(opts.iterations, elapsed_ns),
+        checksum,
+    });
+}
+
 fn positiveElapsedNs(start_ns: i128) u64 {
     const elapsed_ns = compat.monotonicNanoTimestamp() - start_ns;
     if (elapsed_ns <= 0) return 1;
     return @intCast(elapsed_ns);
+}
+
+fn operationsPerSecond(iterations: usize, elapsed_ns: u64) u64 {
+    if (elapsed_ns == 0) return 0;
+    const numerator = @as(u128, iterations) * std.time.ns_per_s;
+    return @intCast(numerator / elapsed_ns);
 }
 
 fn runSoak(allocator: std.mem.Allocator, opts: Options) !void {
@@ -236,6 +372,89 @@ fn fillPayload(buf: []u8) void {
     }
 }
 
+fn buildTlsBenchmarkHandshake(
+    secret: *const [16]u8,
+    timestamp: u32,
+) [84]u8 {
+    var handshake = [_]u8{0} ** 84;
+    handshake[0] = constants.tls_record_handshake;
+    handshake[1] = 0x03;
+    handshake[2] = 0x01;
+    std.mem.writeInt(u16, handshake[3..5], @intCast(handshake.len - 5), .big);
+    handshake[5] = 0x01;
+    std.mem.writeInt(u24, handshake[6..9], @intCast(handshake.len - 9), .big);
+    handshake[9] = 0x03;
+    handshake[10] = 0x03;
+    handshake[43] = 32;
+    @memset(handshake[44..76], 0xaa);
+    std.mem.writeInt(u16, handshake[76..78], 2, .big);
+    std.mem.writeInt(u16, handshake[78..80], 0x1301, .big);
+    handshake[80] = 1;
+    handshake[81] = 0;
+    std.mem.writeInt(u16, handshake[82..84], 0, .big);
+
+    const canonical = crypto.sha256Hmac(secret, &handshake);
+    @memcpy(handshake[constants.tls_digest_pos..][0..28], canonical[0..28]);
+
+    var timestamp_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &timestamp_bytes, timestamp, .little);
+    for (timestamp_bytes, 0..) |byte, idx| {
+        handshake[constants.tls_digest_pos + 28 + idx] = canonical[28 + idx] ^ byte;
+    }
+    return handshake;
+}
+
+fn buildObfuscationHandshake(
+    secret: *const [16]u8,
+    proto_tag: constants.ProtoTag,
+    dc_idx: i16,
+    nonce_seed: u8,
+) [constants.handshake_len]u8 {
+    var nonce = [_]u8{0} ** constants.handshake_len;
+    for (&nonce, 0..) |*byte, idx| {
+        byte.* = @truncate((idx * 29 + nonce_seed) % 251);
+    }
+
+    const tag_bytes = proto_tag.toBytes();
+    @memcpy(nonce[constants.proto_tag_pos..][0..4], &tag_bytes);
+    std.mem.writeInt(i16, nonce[constants.dc_idx_pos..][0..2], dc_idx, .little);
+
+    var key_input: [constants.prekey_len + 16]u8 = undefined;
+    defer std.crypto.secureZero(u8, &key_input);
+    @memcpy(
+        key_input[0..constants.prekey_len],
+        nonce[constants.skip_len .. constants.skip_len + constants.prekey_len],
+    );
+    @memcpy(key_input[constants.prekey_len..], secret);
+
+    var decrypt_key = crypto.sha256(&key_input);
+    defer std.crypto.secureZero(u8, &decrypt_key);
+    var decrypt_iv = std.mem.readInt(
+        u128,
+        nonce[constants.skip_len + constants.prekey_len ..][0..constants.iv_len],
+        .big,
+    );
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&decrypt_iv));
+
+    var encrypted = nonce;
+    var encryptor = crypto.AesCtr.init(&decrypt_key, decrypt_iv);
+    defer encryptor.wipe();
+    encryptor.apply(&encrypted);
+
+    var handshake = nonce;
+    @memcpy(handshake[constants.proto_tag_pos..], encrypted[constants.proto_tag_pos..]);
+    return handshake;
+}
+
+fn fillBenchmarkCandidates(out: *[16]net.Address) void {
+    for (out, 0..) |*addr, idx| {
+        addr.* = net.Address.initIp4(
+            .{ 149, 154, 167, @intCast(100 + idx) },
+            constants.tg_datacenter_port + @as(u16, @intCast(idx)),
+        );
+    }
+}
+
 fn parseArgs(allocator: std.mem.Allocator, process_args: std.process.Args) !Options {
     var opts = Options{};
 
@@ -246,6 +465,14 @@ fn parseArgs(allocator: std.mem.Allocator, process_args: std.process.Args) !Opti
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "bench")) {
             opts.mode = .bench;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "handshake")) {
+            opts.mode = .handshake;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "handshake-path")) {
+            opts.mode = .handshake_path;
             continue;
         }
         if (std.mem.eql(u8, arg, "soak")) {
@@ -267,6 +494,14 @@ fn parseArgs(allocator: std.mem.Allocator, process_args: std.process.Args) !Opti
             opts.max_payload = try parsePositiveUsize(arg["--max-payload=".len..]);
             continue;
         }
+        if (std.mem.startsWith(u8, arg, "--iterations=")) {
+            opts.iterations = try parsePositiveUsize(arg["--iterations=".len..]);
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--candidate-count=")) {
+            opts.candidate_count = try parsePositiveUsize(arg["--candidate-count=".len..]);
+            continue;
+        }
 
         return error.InvalidArgument;
     }
@@ -277,6 +512,7 @@ fn parseArgs(allocator: std.mem.Allocator, process_args: std.process.Args) !Opti
     }
 
     if (opts.max_payload < 64) return error.InvalidArgument;
+    if (opts.candidate_count == 0 or opts.candidate_count > 16) return error.InvalidArgument;
 
     return opts;
 }
@@ -298,11 +534,18 @@ fn printUsage() void {
         \\Usage:
         \\  zig build bench
         \\  zig build bench -- --help
+        \\  zig build bench -- handshake --iterations=500000
+        \\  zig build bench -- handshake-path --iterations=500000 --candidate-count=4
         \\  zig build soak -- --seconds=30 --threads=8 --max-payload=131072
         \\
         \\Modes:
         \\  bench (default): microbenchmark for C2S encapsulation
+        \\  handshake: microbenchmark for structurally valid FakeTLS validation
+        \\  handshake-path: obfuscated handshake parsing + candidate staging
         \\  soak: multithreaded crash/stability stress test
+        \\Flags:
+        \\  --iterations=N       iterations for handshake and handshake-path
+        \\  --candidate-count=N  candidate list size for handshake-path (1..16)
         \\
     , .{});
 }
@@ -375,4 +618,34 @@ test "soak payload lengths stay aligned and in range" {
         try std.testing.expect(payload_len <= aligned_max);
         try std.testing.expectEqual(@as(usize, 0), payload_len % payload_alignment);
     }
+}
+
+test "FakeTLS benchmark handshake remains structurally valid" {
+    const secret = [_]u8{0x42} ** 16;
+    const users = [_]tls.UserSecret{.{ .name = "bench", .secret = secret }};
+    const handshake = buildTlsBenchmarkHandshake(&secret, 0x11223344);
+
+    var validation = (try tls.validateTlsHandshake(
+        std.testing.allocator,
+        &handshake,
+        &users,
+        true,
+    )) orelse return error.BenchmarkValidationFailed;
+    defer validation.wipe();
+
+    try std.testing.expectEqual(@as(u32, 0x11223344), validation.timestamp);
+}
+
+test "obfuscated benchmark handshake roundtrips" {
+    const secret = [_]u8{0x33} ** 16;
+    const users = [_]obfuscation.UserSecret{.{ .name = "bench", .secret = secret }};
+    const handshake = buildObfuscationHandshake(&secret, .intermediate, -4, 23);
+
+    var parsed = obfuscation.ObfuscationParams.fromHandshake(&handshake, &users) orelse {
+        return error.BenchmarkValidationFailed;
+    };
+    defer parsed.params.wipe();
+
+    try std.testing.expectEqual(constants.ProtoTag.intermediate, parsed.params.proto_tag);
+    try std.testing.expectEqual(@as(i16, -4), parsed.params.dc_idx);
 }

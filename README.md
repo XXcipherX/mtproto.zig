@@ -193,6 +193,15 @@ bash test/run_fuzz.sh 1M deep-fuzz-artifacts 40m
 # Fast microbenchmark for C2S encapsulation
 make bench
 
+# Structurally valid FakeTLS authentication benchmark
+zig build -Doptimize=ReleaseFast bench -- handshake --iterations=500000
+
+# Full obfuscated-handshake path; 1/4 use inline candidate storage,
+# while 8 deliberately measures the heap fallback
+zig build -Doptimize=ReleaseFast bench -- handshake-path --iterations=500000 --candidate-count=1
+zig build -Doptimize=ReleaseFast bench -- handshake-path --iterations=500000 --candidate-count=4
+zig build -Doptimize=ReleaseFast bench -- handshake-path --iterations=200000 --candidate-count=8
+
 # 30-second multithreaded soak (crash/stability guard)
 make soak
 
@@ -207,14 +216,18 @@ zig build -Doptimize=ReleaseFast soak -- --seconds=120 --threads=8 --max-payload
 
 The GitHub workflow additionally verifies the production safety policy, PIE output,
 Linux `x86_64`, deploy-target `x86_64_v3+aes`, Linux `aarch64`, Docker build smoke,
-and genuine `ReleaseFast` tests and bench/soak paths. The ARM64 job runs the unit
-tests, real daemon smoke and a short soak natively on GitHub's official
+and genuine `ReleaseFast` tests and benchmark/soak paths. The benchmark job records
+FakeTLS validation plus single, inline-four and heap-eight handshake candidate paths
+as downloadable artifacts; these are regression signals, not noisy shared-runner
+pass/fail thresholds. The ARM64 job runs the unit tests, real daemon smoke and a short soak natively on GitHub's official
 `ubuntu-24.04-arm` runner; the existing aarch64 cross-build remains as an
 independent portability check.
 
 `zig build test` runs the tests reachable from `src/main.zig` plus `src/bench.zig`. A normal `zig build` installs only `mtproto-proxy`; benchmark execution remains explicit through `bench`/`soak`, and `zig build install-bench` installs `mtproto-bench` when a standalone benchmark binary is needed.
 
 `bench` prints per-payload throughput (`in_mib_per_s`, `out_mib_per_s`) and `ns_per_op`.
+Its `handshake` and `handshake-path` modes additionally print match counts,
+operations per second and a checksum that keeps the measured work observable.
 `soak` prints aggregate `ops/s`, throughput, and `errors`; non-zero errors fail the step.
 
 <details>
@@ -227,7 +240,7 @@ independent portability check.
 | `make run CONFIG=<path>` | Run proxy (default: `config.toml`) |
 | `make test` | Run unit tests |
 | `make fuzz [FUZZ_ITERATIONS=100K]` | Run bounded ReleaseSafe security fuzzing (64-bit Linux) |
-| `make bench` | Run ReleaseFast encapsulation microbenchmarks |
+| `make bench` | Run the default ReleaseFast encapsulation microbenchmark; handshake modes are available through `zig build ... bench -- ...` |
 | `make soak` | Run ReleaseFast multithreaded soak stress test (30s default) |
 | `make capacity-probe-idle` | Run the idle-socket capacity profile; requires the external `/root/benchmarks` workspace described in `test/README.md` |
 | `make capacity-probe-active` | Run the TLS-auth capacity profile; requires the same external benchmark workspace |
