@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   test:
     name: Test & Build
@@ -35,6 +38,9 @@ jobs:
 
       - name: Run ReleaseSafe tests
         run: zig build -Doptimize=ReleaseSafe test
+
+      - name: Run ReleaseFast tests
+        run: zig build -Doptimize=ReleaseFast test
 
       - name: Debug build
         run: zig build
@@ -152,3 +158,27 @@ jobs:
             bench-output.txt
             soak-output.txt
           retention-days: 90
+
+  arm64:
+    name: Native ARM64 Runtime
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Run native ARM64 tests
+        run: zig build test
+
+      - name: Build native ARM64 daemon
+        run: zig build
+
+      - name: Run native ARM64 daemon smoke
+        run: python3 test/daemon_smoke.py --binary zig-out/bin/mtproto-proxy
+
+      - name: Run native ARM64 soak
+        run: zig build -Doptimize=ReleaseFast soak -- --seconds=10 --threads=4

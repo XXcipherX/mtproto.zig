@@ -138,4 +138,4 @@ processes after changing shared access settings.
 - Use error unions and avoid swallowing critical errors on control-path boundaries.
 - Keep tests close to protocol primitives and relay helpers.
 - For substantial behavior changes, update `README.md` and relevant `.agent` docs in the same change.
-- Keep CI expectations in mind: formatting, Debug tests, ReleaseSafe tests, bounded coverage-guided security fuzzing, real daemon smoke (valid FakeTLS, bad-secret rejection, and graceful SIGTERM drain), cross-builds, ShellCheck, Python harness syntax, Docker build plus safe-default smoke, the Debian/Ubuntu Docker Compose installer E2E matrix, bench, and soak.
+- Keep CI expectations in mind: formatting, Debug/ReleaseSafe/ReleaseFast tests, bounded coverage-guided security fuzzing, real daemon smoke (valid FakeTLS, bad-secret rejection, and graceful SIGTERM drain), cross-builds plus native ARM64 runtime coverage, ShellCheck, Python harness syntax, Docker build plus safe-default smoke, the Debian/Ubuntu Docker Compose installer E2E matrix, bench, and soak.

@@ -129,6 +129,7 @@ zig fmt --check build.zig src
 python3 -m py_compile test/*.py
 shellcheck --severity=error deploy/*.sh deploy/monitor/*.sh
 zig build -Doptimize=ReleaseSafe test
+zig build -Doptimize=ReleaseFast test
 ```
 
 On a 64-bit Linux development host, Zig 0.16 can drive the security parser
@@ -173,7 +174,10 @@ zig build -Doptimize=ReleaseFast soak -- --seconds=120 --threads=8 --max-payload
 
 The GitHub workflow additionally verifies the production safety policy, PIE output,
 Linux `x86_64`, deploy-target `x86_64_v3+aes`, Linux `aarch64`, Docker build smoke,
-and genuine `ReleaseFast` bench/soak paths.
+and genuine `ReleaseFast` tests and bench/soak paths. The ARM64 job runs the unit
+tests, real daemon smoke and a short soak natively on GitHub's official
+`ubuntu-24.04-arm` runner; the existing aarch64 cross-build remains as an
+independent portability check.
 
 `zig build test` runs the tests reachable from `src/main.zig` plus `src/bench.zig`. A normal `zig build` installs only `mtproto-proxy`; benchmark execution remains explicit through `bench`/`soak`, and `zig build install-bench` installs `mtproto-bench` when a standalone benchmark binary is needed.
 
