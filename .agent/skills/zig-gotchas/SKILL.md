@@ -47,6 +47,7 @@ Do not reintroduce thread-per-connection or blocking relay loops.
 - Bounded file helpers in `src/compat.zig` must read until actual EOF, not trust stat size. Zig 0.16 `allocRemaining` uses `Writer.Allocating.sendFile`, which treats zero stat size as EOF for procfs. Preserve the byte cap, accept exact-cap EOF, and reject larger input with `StreamTooLong`; cgroup membership/mount discovery depends on this.
 
 - Sockets are non-blocking and epoll-driven.
+- Ordinary relay reads share one 32 KiB `EventLoop` scratch buffer. Never retain a slice into it across an event callback; crypto must finish in place and queued/pipelined ownership must copy before the next read. Keep the pipelined-handshake initial allocation independently bounded at 4 KiB.
 - `SO_SNDTIMEO` and TCP keepalive are configured for relay sockets.
 - Handshake/idle behavior is driven by monotonic `timerfd` plus an indexed min-heap (`idle_timeout_sec`, `handshake_timeout_sec`); each active slot owns at most one heap entry.
 - Pre-first-byte admission has a separate fixed 10-second deadline, and unauthenticated sockets are capped concurrently per IPv4 `/24` or IPv6 `/48`.

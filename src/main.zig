@@ -596,6 +596,8 @@ fn estimateCapacity(cfg: *const config.Config, total_ram_bytes: u64) CapacityEst
     // Guaranteed per-connection baseline in the epoll model. Relay queue pages,
     // MiddleProxy growth, and shared scratch are charged to one runtime-enforced
     // managed budget instead of multiplying their rare maxima by every slot.
+    // Deliberately keep the admission estimate conservative even though relay
+    // reads now use one event-loop-wide scratch buffer rather than 4 KiB/slot.
     const tls_working_bytes: u64 = @intCast(6 * 1024);
     const requires_middle_proxy_runtime = cfg.requiresMiddleProxyRuntime();
     const managed_initial_per_conn_bytes: u64 = if (requires_middle_proxy_runtime)

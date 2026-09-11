@@ -50,7 +50,8 @@ const tunnel_mask_gateway_ip = "10.200.200.1";
 const min_nofile_soft: usize = 65535;
 const client_hello_inline_size: usize = 512;
 const mp_handshake_frame_buf_size: usize = 2048;
-const read_buf_size: usize = 4096;
+const relay_read_scratch_size: usize = 32 * 1024;
+const pipelined_initial_capacity: usize = 4096;
 const upstream_candidates_inline_cap: usize = 4;
 pub const default_managed_buffer_limit_bytes: u64 = 64 * 1024 * 1024;
 const pre_first_byte_timeout_ms: i64 = 10 * std.time.ms_per_s;
@@ -1914,8 +1915,6 @@ const ConnectionSlot = struct {
     c2s_bytes: u64 = 0,
     s2c_bytes: u64 = 0,
 
-    read_buf: ?[]u8 = null,
-
     // Non-blocking write queues (intrusive page-backed chains)
     client_queue: MessageQueue = .{ .allocator = std.heap.page_allocator },
     upstream_queue: MessageQueue = .{ .allocator = std.heap.page_allocator },
@@ -2028,9 +2027,6 @@ const ConnectionSlot = struct {
         self.upstream_connect_deadline_ms = 0;
         self.dc_abs = 0;
         self.is_media_path = false;
-
-        if (self.read_buf) |buf| secureFree(allocator, buf);
-        self.read_buf = null;
 
         if (self.mp_frame_buf) |buf| secureFree(allocator, buf);
         self.mp_frame_buf = null;
@@ -3158,6 +3154,7 @@ const EventLoop = struct {
     prev_mp_fallback: u64,
     prev_buffer_denials: u64,
     prev_web_only_masked: u64 = 0,
+    relay_read_scratch: [relay_read_scratch_size]u8,
     mp_c2s_scratch: ?[]u8,
     mp_s2c_scratch: ?[]u8,
     pending_close_fds: std.ArrayList(posix.fd_t),
@@ -3219,6 +3216,7 @@ const EventLoop = struct {
         loop.prev_mp_fallback = 0;
         loop.prev_buffer_denials = 0;
         loop.prev_web_only_masked = 0;
+        loop.relay_read_scratch = undefined;
         loop.mp_c2s_scratch = null;
         loop.mp_s2c_scratch = null;
         loop.pending_close_fds = .empty;
@@ -3243,6 +3241,7 @@ const EventLoop = struct {
         const managed_allocator = self.managed_buffers.allocator();
         if (self.mp_c2s_scratch) |buf| secureFree(managed_allocator, buf);
         if (self.mp_s2c_scratch) |buf| secureFree(managed_allocator, buf);
+        std.crypto.secureZero(u8, &self.relay_read_scratch);
 
         self.drainPendingCloses();
         self.pending_close_fds.deinit(self.state.allocator);
@@ -4312,10 +4311,7 @@ const EventLoop = struct {
                 continue;
             }
 
-            const read_buf = ensureReadBuf(slot, self.state.allocator) catch {
-                self.closeSlot(slot, "alloc read buffer failed");
-                return;
-            };
+            const read_buf = self.relay_read_scratch[0..];
             const want = @min(remaining, read_buf.len);
             const n = readSlotFd(slot, slot.client_fd, read_buf[0..want]) catch |err| {
                 if (err == error.WouldBlock) return;
@@ -5133,10 +5129,7 @@ const EventLoop = struct {
     }
 
     fn relayObfuscatedClientToUpstream(self: *EventLoop, slot: *ConnectionSlot) void {
-        const read_buf = ensureReadBuf(slot, self.state.allocator) catch {
-            self.closeSlot(slot, "direct obfuscated c2s buffer allocation failed");
-            return;
-        };
+        const read_buf = self.relay_read_scratch[0..];
         const n = readSlotFd(slot, slot.client_fd, read_buf) catch |err| {
             if (err == error.WouldBlock) return;
             self.closeSlot(slot, "direct obfuscated c2s read error");
@@ -5194,10 +5187,7 @@ const EventLoop = struct {
     }
 
     fn relayObfuscatedUpstreamToClient(self: *EventLoop, slot: *ConnectionSlot) void {
-        const read_buf = ensureReadBuf(slot, self.state.allocator) catch {
-            self.closeSlot(slot, "direct obfuscated s2c buffer allocation failed");
-            return;
-        };
+        const read_buf = self.relay_read_scratch[0..];
         const n = readSlotFd(slot, slot.upstream_fd, read_buf) catch |err| {
             if (err == error.WouldBlock) return;
             self.closeSlot(slot, "direct obfuscated s2c read error");
@@ -5251,10 +5241,7 @@ const EventLoop = struct {
     fn relayRawClientToUpstream(self: *EventLoop, slot: *ConnectionSlot) void {
         if (slot.hasUpstreamPending()) return;
 
-        const read_buf = ensureReadBuf(slot, self.state.allocator) catch {
-            self.closeSlot(slot, "mask read buffer alloc failed");
-            return;
-        };
+        const read_buf = self.relay_read_scratch[0..];
 
         const n = readSlotFd(slot, slot.client_fd, read_buf) catch |err| {
             if (err == error.WouldBlock) return;
@@ -5276,10 +5263,7 @@ const EventLoop = struct {
     fn relayRawUpstreamToClient(self: *EventLoop, slot: *ConnectionSlot) void {
         if (slot.hasClientPending()) return;
 
-        const read_buf = ensureReadBuf(slot, self.state.allocator) catch {
-            self.closeSlot(slot, "mask upstream read buffer alloc failed");
-            return;
-        };
+        const read_buf = self.relay_read_scratch[0..];
 
         const n = readSlotFd(slot, slot.upstream_fd, read_buf) catch |err| {
             if (err == error.WouldBlock) return;
@@ -6392,7 +6376,7 @@ const EventLoop = struct {
 
                 if (step == .none) break;
                 operations += 1;
-                processed_bytes += read_buf_size;
+                processed_bytes += relay_read_scratch_size;
                 const now_ms = compat.monotonicMilliTimestamp();
                 slot.last_activity_ms = now_ms;
                 if (from_client) {
@@ -6411,10 +6395,7 @@ const EventLoop = struct {
                 }
             }
         } else {
-            const read_buf = ensureReadBuf(slot, self.state.allocator) catch {
-                self.closeSlot(slot, "mask rdhup read buffer alloc failed");
-                return;
-            };
+            const read_buf = self.relay_read_scratch[0..];
             var operations: usize = 0;
             var processed_bytes: usize = 0;
             while (slot.phase == .mask_relaying and operations < event_io_operation_budget and processed_bytes < event_io_byte_budget) {
@@ -6673,7 +6654,7 @@ const EventLoop = struct {
 
 fn pipelinedCapacity(current_capacity: usize, required_len: usize) usize {
     var next = if (current_capacity == 0)
-        @min(@as(usize, read_buf_size), constants.max_tls_ciphertext_size)
+        @min(@as(usize, pipelined_initial_capacity), constants.max_tls_ciphertext_size)
     else
         current_capacity;
 
@@ -6685,8 +6666,7 @@ fn pipelinedCapacity(current_capacity: usize, required_len: usize) usize {
 }
 
 fn relayClientToUpstreamStep(self: *EventLoop, slot: *ConnectionSlot) !RelayProgress {
-    const allocator = self.state.allocator;
-    const read_buf = try ensureReadBuf(slot, allocator);
+    const read_buf = self.relay_read_scratch[0..];
     var consumed_any = false;
 
     while (true) {
@@ -6775,7 +6755,7 @@ fn relayClientToUpstreamStep(self: *EventLoop, slot: *ConnectionSlot) !RelayProg
 }
 
 fn relayUpstreamToClientStep(self: *EventLoop, slot: *ConnectionSlot) !RelayProgress {
-    const read_buf = try ensureReadBuf(slot, self.state.allocator);
+    const read_buf = self.relay_read_scratch[0..];
     const n = readSlotFd(slot, slot.upstream_fd, read_buf) catch |err| {
         if (err == error.WouldBlock) return .none;
         return err;
@@ -7032,13 +7012,6 @@ fn formatClientIp(addr: net.Address, buf: *[64]u8) []const u8 {
     }
 
     return "?";
-}
-
-fn ensureReadBuf(slot: *ConnectionSlot, allocator: std.mem.Allocator) ![]u8 {
-    if (slot.read_buf) |buf| return buf;
-    const buf = try allocator.alloc(u8, read_buf_size);
-    slot.read_buf = buf;
-    return buf;
 }
 
 fn ensureMpFrameBuf(slot: *ConnectionSlot, allocator: std.mem.Allocator) ![]u8 {
@@ -7871,6 +7844,7 @@ test "middle proxy nonce response failures fall back to direct path" {
         .prev_hs_timeout = 0,
         .prev_mp_fallback = 0,
         .prev_buffer_denials = 0,
+        .relay_read_scratch = undefined,
         .mp_c2s_scratch = null,
         .mp_s2c_scratch = null,
         .pending_close_fds = .empty,
@@ -7979,6 +7953,21 @@ test "connection slot stores common candidate sets inline" {
 
     try slot.setUpstreamCandidates(std.testing.allocator, &.{});
     try std.testing.expectEqual(@as(usize, 0), slot.upstreamCandidates().len);
+}
+
+test "pipelined handshake capacity stays independent of relay scratch size" {
+    try std.testing.expectEqual(
+        @as(usize, pipelined_initial_capacity),
+        pipelinedCapacity(0, 1),
+    );
+    try std.testing.expectEqual(
+        @as(usize, pipelined_initial_capacity * 2),
+        pipelinedCapacity(0, pipelined_initial_capacity + 1),
+    );
+    try std.testing.expectEqual(
+        @as(usize, constants.max_tls_ciphertext_size),
+        pipelinedCapacity(0, constants.max_tls_ciphertext_size),
+    );
 }
 
 fn initProxyStateAndDeinit(allocator: std.mem.Allocator, cfg: Config) !void {
@@ -8830,6 +8819,7 @@ test "handshake budget is charged once after the first client byte" {
         .prev_hs_timeout = 0,
         .prev_mp_fallback = 0,
         .prev_buffer_denials = 0,
+        .relay_read_scratch = undefined,
         .mp_c2s_scratch = null,
         .mp_s2c_scratch = null,
         .pending_close_fds = .empty,
