@@ -46,11 +46,11 @@ Before merging behavior changes, match the GitHub workflow as closely as practic
 ```bash
 zig fmt --check build.zig src
 python3 -m py_compile test/*.py
-shellcheck --severity=error docker-entrypoint.sh deploy/*.sh deploy/monitor/*.sh test/installer-e2e/run.sh test/installer-e2e/fake-*
+shellcheck --severity=error docker-entrypoint.sh deploy/*.sh deploy/monitor/*.sh test/run_fuzz.sh test/installer-e2e/run.sh test/installer-e2e/fake-*
 zig build test
 zig build -Doptimize=ReleaseSafe test
 zig build -Doptimize=ReleaseFast test
-zig build -Doptimize=ReleaseSafe fuzz --fuzz=100K
+bash test/run_fuzz.sh 100K fuzz-artifacts 12m
 zig build
 python3 test/daemon_smoke.py --binary zig-out/bin/mtproto-proxy
 zig build -Doptimize=ReleaseFast
@@ -75,6 +75,8 @@ The daemon smoke launches a real localhost proxy, verifies a valid FakeTLS hands
 The separate `.github/workflows/deep-ci.yml` workflow runs weekly and through `workflow_dispatch`. Its `-Dtsan=true` option applies ThreadSanitizer only to the `src/main.zig` and `src/bench.zig` test artifacts plus the benchmark executable used by soak; it never instruments the normal production proxy build. Keep `TSAN_OPTIONS=halt_on_error=1:exitcode=66` so a reported race fails the job instead of becoming advisory output.
 
 Deep CI also runs the real ReleaseSafe daemon smoke under Valgrind Memcheck. It deliberately builds with `-Dcpu=baseline`: GitHub hosts can expose SHA-NI while Ubuntu 24.04's Valgrind 3.22 cannot decode `SHA256RNDS2`, so a native-CPU build would die inside Valgrind despite being valid on the host. `--max-stackframe=8388608` classifies the proxy's roughly 3.6 MiB initialization frame as a normal Linux stack frame instead of producing false invalid-access reports. The harness's `--launcher` option consumes the remainder of the command line and must therefore be last; it prepends those arguments without a shell. Memcheck reports every leak category to an artifact and uses `--errors-for-leak-kinds=definite,indirect --error-exitcode=97`, so invalid accesses and actionable leaks fail without treating `possible` or `reachable` runtime allocations as proven project defects. Do not add suppressions without a reproduced and documented toolchain false positive.
+
+The third Deep CI job runs `bash test/run_fuzz.sh 1M deep-fuzz-artifacts 40m`. The wrapper exists because Zig 0.16 bounded fuzzing can leave `.zig-cache/f/crash` while returning a successful build status. It treats that file or the corresponding crash message as a failure, copies the crash input plus available fuzzer logs into a non-hidden artifact directory, and rejects a pre-existing crash instead of deleting evidence or misattributing it to a later campaign. Keep the inner 40-minute limit below the 50-minute job timeout so the artifact upload step can still run.
 
 Installer changes also require the separate `.github/workflows/installer-e2e.yml` matrix. It boots privileged systemd containers for Debian 12/13 and Ubuntu 24.04/26.04, runs the real Docker Compose installer twice, and checks the private config, Caddy-only topology, WEB relay, service health, HTTPS masking, external-only SYNFIX/NFQUEUE rules, disabled-by-default TCPMSS, and idempotent reinstall. Docker, Compose, Caddy, the proxy image, systemd, and iptables remain real; only public ACME and the external `nfqws` implementation use deterministic test substitutes. Run one case locally with:
 

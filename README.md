@@ -153,6 +153,10 @@ MiddleProxy stream framing, and the public WEB HTTP, WebSocket, PROXY-protocol
 and multiplexed-frame parsers without pulling the benchmark test binary into the
 campaign. CI runs 25K iterations per target for pull requests and 100K per target
 for pushes to `main`, in a separate parallel job with a 15-minute hard timeout.
+The shared `test/run_fuzz.sh` wrapper also detects Zig 0.16's bounded-fuzz crash
+file even when `zig build` returns success. `make fuzz` stores its evidence under
+`fuzz-artifacts/`; failed CI campaigns preserve the run log and crash input as a
+90-day artifact.
 
 The separate **Deep CI** workflow runs weekly and on demand. Its ThreadSanitizer
 job instruments only the unit-test and benchmark/soak artifacts; normal production
@@ -162,8 +166,10 @@ and definite/indirect leaks fail the job; all leak categories remain available i
 the uploaded report. Its ReleaseSafe build uses a baseline CPU so Ubuntu's
 Valgrind never has to emulate unsupported host-specific crypto instructions; an
 8 MiB stack-frame threshold covers the proxy's legitimate initialization frame
-without suppressing memory errors. The checks can be reproduced on supported
-Linux hosts:
+without suppressing memory errors. A third job runs a bounded
+1M-iteration-per-target fuzz campaign, with an internal 40-minute limit so
+failure evidence can be uploaded before the workflow's hard timeout. The checks
+can be reproduced on supported Linux hosts:
 
 ```bash
 zig build -Doptimize=ReleaseSafe -Dtsan=true test
@@ -177,6 +183,8 @@ python3 test/daemon_smoke.py --binary zig-out/bin/mtproto-proxy \
   --errors-for-leak-kinds=definite,indirect --track-origins=yes \
   --max-stackframe=8388608 \
   --error-exitcode=97 --log-file=valgrind.log
+
+bash test/run_fuzz.sh 1M deep-fuzz-artifacts 40m
 ```
 
 ### Performance & Stability Checks

@@ -27,8 +27,8 @@ jobs:
       - name: Check Python harness syntax
         run: python3 -m py_compile test/*.py test/web-bridge/*.py
 
-      - name: ShellCheck deploy scripts
-        run: shellcheck --severity=error docker-entrypoint.sh deploy/*.sh deploy/monitor/*.sh test/installer-e2e/run.sh test/installer-e2e/fake-*
+      - name: ShellCheck scripts
+        run: shellcheck --severity=error docker-entrypoint.sh deploy/*.sh deploy/monitor/*.sh test/run_fuzz.sh test/installer-e2e/run.sh test/installer-e2e/fake-*
 
       - name: Run tests
         run: zig build test
@@ -119,7 +119,16 @@ jobs:
             fuzz_iterations=100K
           fi
           echo "Running ${fuzz_iterations} iterations per fuzz target"
-          zig build -Doptimize=ReleaseSafe fuzz --fuzz="$fuzz_iterations"
+          bash test/run_fuzz.sh "$fuzz_iterations" fuzz-artifacts 12m
+
+      - name: Upload fuzz failure evidence
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: security-fuzz-failure
+          path: fuzz-artifacts/
+          if-no-files-found: warn
+          retention-days: 90
 
   bench:
     name: Bench & Soak

@@ -22,7 +22,7 @@ test:
 	zig build test
 
 fuzz:
-	zig build -Doptimize=ReleaseSafe fuzz --fuzz=$(FUZZ_ITERATIONS)
+	bash test/run_fuzz.sh "$(FUZZ_ITERATIONS)" fuzz-artifacts
 
 bench:
 	zig build -Doptimize=ReleaseFast bench
