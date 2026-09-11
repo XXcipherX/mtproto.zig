@@ -3499,6 +3499,10 @@ const EventLoop = struct {
                 }
             }
 
+            // Apply this before any FakeTLS response so Nagle cannot delay or
+            // coalesce the deliberate one-byte desync write.
+            setTcpNoDelay(cfd);
+
             slot.active_reserved = true;
             slot.hs_counted = false;
             slot.subnet_key = subnet_key;

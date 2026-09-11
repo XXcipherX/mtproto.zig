@@ -43,7 +43,7 @@ Code anchors:
 2. Proxy reads TLS record header/body and validates FakeTLS digest against configured user secrets. The current FakeTLS template requires a 32-byte ClientHello Session ID and echoes it in ServerHello.
 3. On valid auth:
 - Builds fake `ServerHello` from template.
-- Optional desync mode splits write into `1 byte + ~3ms + rest`.
+- Optional desync mode enables `TCP_NODELAY` immediately after admission, then splits the write into `1 byte + ~3ms + rest`.
 4. Proxy assembles 64-byte MTProto obfuscation handshake from TLS appdata records. Extra client appdata bytes pipelined after the nonce are buffered up to one max TLS ciphertext and forwarded after upstream setup.
 5. Proxy derives MTProto crypto params and chooses upstream strategy:
 - Direct DC path.

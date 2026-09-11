@@ -48,6 +48,7 @@ Do not reintroduce thread-per-connection or blocking relay loops.
 
 - Sockets are non-blocking and epoll-driven.
 - Ordinary relay reads share one 32 KiB `EventLoop` scratch buffer. Never retain a slice into it across an event callback; crypto must finish in place and queued/pipelined ownership must copy before the next read. Keep the pipelined-handshake initial allocation independently bounded at 4 KiB.
+- Set `TCP_NODELAY` on an admitted client before reading its handshake. Configuring relay sockets only after the DC connection is too late to guarantee the intentional one-byte FakeTLS desync boundary.
 - `SO_SNDTIMEO` and TCP keepalive are configured for relay sockets.
 - Handshake/idle behavior is driven by monotonic `timerfd` plus an indexed min-heap (`idle_timeout_sec`, `handshake_timeout_sec`); each active slot owns at most one heap entry.
 - Pre-first-byte admission has a separate fixed 10-second deadline, and unauthenticated sockets are capped concurrently per IPv4 `/24` or IPv6 `/48`.

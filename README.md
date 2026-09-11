@@ -48,7 +48,7 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 | **IPv6 Hopping** | DPI Evasion | Rotates IPv6 from a routed /64 and updates Cloudflare AAAA records; installers schedule a hop every 5 minutes, while `--auto` provides foreground ban-detection mode |
 | **Optional TCPMSS=88** | Legacy DPI fallback | Disabled by default; can force tiny ClientHello fragmentation on external traffic when explicitly enabled; loopback is always excluded |
 | **TCP Desync** | DPI Evasion | Integrated `zapret` (`nfqws`) OS-level desynchronization (fake packets + TTL spoofing); NFQUEUE queue-bypass preserves traffic while `nfqws` restarts, and loopback never enters the queue |
-| **Split-TLS** | DPI Evasion | Splits fake `ServerHello` write into `1 byte + short pause + rest` to desynchronize passive DPI |
+| **Split-TLS** | DPI Evasion | Enables `TCP_NODELAY` before handshake processing, then splits fake `ServerHello` into `1 byte + short pause + rest` so Nagle buffering does not delay or coalesce the deliberate small write |
 | **Zero-RTT** | DPI Evasion | Local self-domain Caddy 404 masking (`127.0.0.1:8443`, with tunnel netns auto-routing and PQ TLS groups) to defeat active probing timing analysis |
 | **0 deps** | Stdlib Only | No third-party Zig packages (proxy core uses Zig standard library only) |
 | **Explicit State** | Runtime Ownership | Proxy state is passed explicitly; runtime log level is the only mutable global knob |
