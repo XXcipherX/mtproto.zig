@@ -40,6 +40,7 @@ Do not reintroduce thread-per-connection or blocking relay loops.
 - AES-CTR processes aligned bulk in eight-block batches and then a `4/2/1` cascade before its partial-block tail. Keep cross-call keystream continuity and counter wraparound covered by the byte-at-a-time equivalence test; a plain `4` to `8` threshold change would regress 64–127-byte inputs to scalar AES.
 - Keep ownership boundaries explicit and wipe crypto material on teardown (`resetOwnedBuffers` paths).
 - Avoid hidden allocations inside event callbacks when possible.
+- Keep one-to-four DC/mask candidates in `ConnectionSlot` inline storage. Candidate replacement must free only an owned heap fallback, preserve allocation-failure cleanup, and continue supporting bounded larger DNS sets.
 
 ## Socket and I/O Realities
 

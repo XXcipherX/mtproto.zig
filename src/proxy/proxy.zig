@@ -51,6 +51,7 @@ const min_nofile_soft: usize = 65535;
 const client_hello_inline_size: usize = 512;
 const mp_handshake_frame_buf_size: usize = 2048;
 const read_buf_size: usize = 4096;
+const upstream_candidates_inline_cap: usize = 4;
 pub const default_managed_buffer_limit_bytes: u64 = 64 * 1024 * 1024;
 const pre_first_byte_timeout_ms: i64 = 10 * std.time.ms_per_s;
 const middle_proxy_stage_timeout_ms: i64 = 5 * std.time.ms_per_s;
@@ -1886,7 +1887,9 @@ const ConnectionSlot = struct {
     use_middle_proxy: bool = false,
     is_media_path: bool = false,
 
-    upstream_candidates: ?[]net.Address = null,
+    upstream_candidates_inline: [upstream_candidates_inline_cap]net.Address = undefined,
+    upstream_candidates_heap: ?[]net.Address = null,
+    upstream_candidate_count: usize = 0,
     upstream_candidate_next: u8 = 0,
     direct_fallback_addr: ?net.Address = null,
     direct_fallback_used: bool = false,
@@ -2017,9 +2020,7 @@ const ConnectionSlot = struct {
         if (self.middle_ctx) |*mp| mp.deinit();
         self.middle_ctx = null;
 
-        if (self.upstream_candidates) |buf| allocator.free(buf);
-        self.upstream_candidates = null;
-        self.upstream_candidate_next = 0;
+        self.clearUpstreamCandidates(allocator);
         self.direct_fallback_addr = null;
         self.direct_fallback_used = false;
         self.current_upstream_addr = null;
@@ -2086,9 +2087,7 @@ const ConnectionSlot = struct {
         if (self.server_hello) |buf| secureFree(allocator, buf);
         self.server_hello = null;
 
-        if (self.upstream_candidates) |buf| allocator.free(buf);
-        self.upstream_candidates = null;
-        self.upstream_candidate_next = 0;
+        self.clearUpstreamCandidates(allocator);
 
         if (self.mp_frame_buf) |buf| secureFree(allocator, buf);
         self.mp_frame_buf = null;
@@ -2117,6 +2116,47 @@ const ConnectionSlot = struct {
         self.handshake_pos = 0;
         self.mp_secret_version = 0;
         self.mp_nat_ip4 = null;
+    }
+
+    fn upstreamCandidates(self: *const ConnectionSlot) []const net.Address {
+        if (self.upstream_candidate_count == 0) return &.{};
+        if (self.upstream_candidates_heap) |candidates| {
+            std.debug.assert(candidates.len == self.upstream_candidate_count);
+            return candidates;
+        }
+        std.debug.assert(self.upstream_candidate_count <= self.upstream_candidates_inline.len);
+        return self.upstream_candidates_inline[0..self.upstream_candidate_count];
+    }
+
+    fn clearUpstreamCandidates(self: *ConnectionSlot, allocator: std.mem.Allocator) void {
+        if (self.upstream_candidates_heap) |candidates| allocator.free(candidates);
+        self.upstream_candidates_heap = null;
+        self.upstream_candidate_count = 0;
+        self.upstream_candidate_next = 0;
+    }
+
+    fn setUpstreamCandidates(
+        self: *ConnectionSlot,
+        allocator: std.mem.Allocator,
+        candidates: []const net.Address,
+    ) !void {
+        if (candidates.len <= self.upstream_candidates_inline.len) {
+            var inline_copy: [upstream_candidates_inline_cap]net.Address = undefined;
+            @memcpy(inline_copy[0..candidates.len], candidates);
+
+            if (self.upstream_candidates_heap) |old| allocator.free(old);
+            self.upstream_candidates_heap = null;
+            @memcpy(self.upstream_candidates_inline[0..candidates.len], inline_copy[0..candidates.len]);
+            self.upstream_candidate_count = candidates.len;
+            self.upstream_candidate_next = 0;
+            return;
+        }
+
+        const owned = try allocator.dupe(net.Address, candidates);
+        if (self.upstream_candidates_heap) |old| allocator.free(old);
+        self.upstream_candidates_heap = owned;
+        self.upstream_candidate_count = owned.len;
+        self.upstream_candidate_next = 0;
     }
 };
 
@@ -2298,11 +2338,6 @@ fn freeUserSecrets(allocator: std.mem.Allocator, secrets: []obfuscation.UserSecr
         allocator.free(secret.name);
     }
     allocator.free(secrets);
-}
-
-fn slotCandidateCount(slot: *const ConnectionSlot) usize {
-    if (slot.upstream_candidates) |c| return c.len;
-    return 0;
 }
 
 pub const ProxyState = struct {
@@ -4428,20 +4463,11 @@ const EventLoop = struct {
             });
         }
 
-        if (slot.upstream_candidates) |old| {
-            self.state.allocator.free(old);
-            slot.upstream_candidates = null;
-        }
-
-        slot.upstream_candidates = self.state.allocator.alloc(net.Address, plan.count) catch {
+        slot.setUpstreamCandidates(self.state.allocator, plan.candidates[0..plan.count]) catch {
             self.closeSlot(slot, "alloc upstream candidate list failed");
             return;
         };
-        const candidates = slot.upstream_candidates.?;
-        var idx: usize = 0;
-        while (idx < candidates.len) : (idx += 1) {
-            candidates[idx] = plan.candidates[idx];
-        }
+        const candidates = slot.upstreamCandidates();
         slot.upstream_candidate_next = 1;
         slot.current_upstream_addr = candidates[0];
 
@@ -4460,29 +4486,31 @@ const EventLoop = struct {
     ) !void {
         if (!self.state.config.mask) return error.MaskingDisabled;
         slot.mask_cause = cause;
-        const candidates = if (slot.web_carrier) blk: {
+        errdefer slot.clearUpstreamCandidates(self.state.allocator);
+
+        if (slot.web_carrier) {
             const cache = self.state.web_mask_dns orelse return error.NoMaskAddress;
             const snapshot = cache.snapshot(0);
-            const copy = try self.state.allocator.alloc(net.Address, snapshot.len);
-            errdefer self.state.allocator.free(copy);
-            for (snapshot.slice(), copy) |address, *destination| {
+            const snapshot_addresses = snapshot.slice();
+            var converted: [16]net.Address = undefined;
+            for (snapshot_addresses, converted[0..snapshot_addresses.len]) |address, *destination| {
                 destination.* = web_support.fromIo(address);
                 if (web_support.isLoopback(destination.*) and address.getPort() == self.state.config.port) {
                     return error.WebMaskBackendLoopsToProxy;
                 }
             }
-            break :blk copy;
-        } else blk: {
-            self.state.middle_proxy_lock.lock();
-            const copy = self.state.allocator.dupe(net.Address, self.state.mask_addrs) catch |err| {
-                self.state.middle_proxy_lock.unlock();
-                return err;
+            try slot.setUpstreamCandidates(self.state.allocator, converted[0..snapshot_addresses.len]);
+        } else {
+            const set_result = blk: {
+                self.state.middle_proxy_lock.lock();
+                defer self.state.middle_proxy_lock.unlock();
+                break :blk slot.setUpstreamCandidates(self.state.allocator, self.state.mask_addrs);
             };
-            self.state.middle_proxy_lock.unlock();
-            break :blk copy;
-        };
+            try set_result;
+        }
+
+        const candidates = slot.upstreamCandidates();
         if (candidates.len == 0) {
-            self.state.allocator.free(candidates);
             return error.NoMaskAddress;
         }
 
@@ -4493,18 +4521,14 @@ const EventLoop = struct {
             "";
         slot.mask_send_proxy_header = false;
 
-        const pre = self.state.allocator.alloc(u8, proxy_header.len + buffered.len) catch |err| {
-            self.state.allocator.free(candidates);
-            return err;
-        };
+        const pre = try self.state.allocator.alloc(u8, proxy_header.len + buffered.len);
         @memcpy(pre[0..proxy_header.len], proxy_header);
         @memcpy(pre[proxy_header.len..], buffered);
         slot.mask_prebuffer = pre;
         slot.mask_c2s_bytes += buffered.len;
 
-        slot.upstream_candidates = candidates;
         slot.upstream_candidate_next = 1;
-        const first = slot.upstream_candidates.?[0];
+        const first = candidates[0];
         self.startConnectUpstream(slot, first, .mask) catch |err| {
             if (self.tryNextMaskEndpoint(slot, err, first)) return;
             return err;
@@ -4514,7 +4538,8 @@ const EventLoop = struct {
     fn upstreamConnectDeadlineMs(self: *EventLoop, slot: *const ConnectionSlot, started_at_ms: i64) i64 {
         const configured_timeout_ms = secondsToMs(self.state.config.dc_connect_timeout_sec);
 
-        var candidate_count = if (slot.upstream_candidates) |candidates| blk: {
+        const candidates = slot.upstreamCandidates();
+        var candidate_count = if (candidates.len > 0) blk: {
             const next_index = @min(@as(usize, @intCast(slot.upstream_candidate_next)), candidates.len);
             break :blk candidates.len - next_index + 1;
         } else 1;
@@ -4645,8 +4670,9 @@ const EventLoop = struct {
     }
 
     fn tryNextDcEndpoint(self: *EventLoop, slot: *ConnectionSlot, err: anyerror, attempt_addr: ?net.Address) bool {
-        const candidates = slot.upstream_candidates orelse return false;
-        const candidate_count = slotCandidateCount(slot);
+        const candidates = slot.upstreamCandidates();
+        if (candidates.len == 0) return false;
+        const candidate_count = candidates.len;
 
         if (slot.use_middle_proxy) {
             if (attempt_addr) |addr| {
@@ -4700,17 +4726,11 @@ const EventLoop = struct {
             self.state.stats_mp_fallback +|= 1;
             slot.use_middle_proxy = false;
             const fallback = slot.direct_fallback_addr.?;
-            slot.upstream_candidate_next = 1;
-
-            if (slot.upstream_candidates) |old| {
-                self.state.allocator.free(old);
-                slot.upstream_candidates = null;
-            }
-            const one = self.state.allocator.alloc(net.Address, 1) catch {
+            const one = [_]net.Address{fallback};
+            slot.setUpstreamCandidates(self.state.allocator, &one) catch {
                 return false;
             };
-            one[0] = fallback;
-            slot.upstream_candidates = one;
+            slot.upstream_candidate_next = 1;
 
             self.startConnectUpstream(slot, fallback, .dc) catch |fallback_err| {
                 log.warn("[{d}] direct fallback connect failed: {any}", .{ slot.conn_id, fallback_err });
@@ -4736,7 +4756,8 @@ const EventLoop = struct {
     }
 
     fn tryNextMaskEndpoint(self: *EventLoop, slot: *ConnectionSlot, err: anyerror, attempt_addr: ?net.Address) bool {
-        const candidates = slot.upstream_candidates orelse return false;
+        const candidates = slot.upstreamCandidates();
+        if (candidates.len == 0) return false;
         if (slot.upstream_candidate_next >= candidates.len) return false;
 
         const next_idx = slot.upstream_candidate_next;
@@ -5630,17 +5651,11 @@ const EventLoop = struct {
 
         const fallback = slot.direct_fallback_addr.?;
         self.cleanupFailedUpstreamConnect(slot);
-        slot.upstream_candidate_next = 1;
-
-        if (slot.upstream_candidates) |old| {
-            self.state.allocator.free(old);
-            slot.upstream_candidates = null;
-        }
-        const one = self.state.allocator.alloc(net.Address, 1) catch {
+        const one = [_]net.Address{fallback};
+        slot.setUpstreamCandidates(self.state.allocator, &one) catch {
             return false;
         };
-        one[0] = fallback;
-        slot.upstream_candidates = one;
+        slot.upstream_candidate_next = 1;
 
         self.startConnectUpstream(slot, fallback, .dc) catch |err| {
             log.warn("[{d}] direct fallback connect start failed: {any}", .{ slot.conn_id, err });
@@ -7924,10 +7939,46 @@ test "middle proxy nonce response failures fall back to direct path" {
     try std.testing.expect(!slot.use_middle_proxy);
     try std.testing.expectEqual(MiddleProxyHandshakeStep.none, slot.mp_step);
     try std.testing.expectEqual(UpstreamKind.dc, slot.upstream_kind);
-    try std.testing.expect(slot.upstream_candidates != null);
+    try std.testing.expectEqual(@as(usize, 1), slot.upstreamCandidates().len);
     try std.testing.expect(slot.current_upstream_addr.?.eql(fallback_addr));
     try std.testing.expect(slot.phase == .connecting_upstream or slot.phase == .writing_dc_nonce);
     try std.testing.expectEqual(@as(u64, 1), state.stats_mp_fallback);
+}
+
+test "connection slot stores common candidate sets inline" {
+    var slot = ConnectionSlot{};
+    defer slot.clearUpstreamCandidates(std.testing.allocator);
+
+    var candidates: [5]net.Address = undefined;
+    for (&candidates, 0..) |*candidate, index| {
+        candidate.* = net.Address.initIp4(.{ 192, 0, 2, @intCast(index + 1) }, @intCast(443 + index));
+    }
+
+    try slot.setUpstreamCandidates(std.testing.allocator, candidates[0..1]);
+    try std.testing.expect(slot.upstream_candidates_heap == null);
+    try std.testing.expectEqual(@as(usize, 1), slot.upstreamCandidates().len);
+    try std.testing.expect(slot.upstreamCandidates()[0].eql(candidates[0]));
+
+    try slot.setUpstreamCandidates(std.testing.allocator, candidates[0..4]);
+    try std.testing.expect(slot.upstream_candidates_heap == null);
+    try std.testing.expectEqual(@as(usize, 4), slot.upstreamCandidates().len);
+    for (slot.upstreamCandidates(), candidates[0..4]) |actual, expected| {
+        try std.testing.expect(actual.eql(expected));
+    }
+
+    try slot.setUpstreamCandidates(std.testing.allocator, &candidates);
+    try std.testing.expect(slot.upstream_candidates_heap != null);
+    try std.testing.expectEqual(@as(usize, 5), slot.upstreamCandidates().len);
+    for (slot.upstreamCandidates(), candidates) |actual, expected| {
+        try std.testing.expect(actual.eql(expected));
+    }
+
+    try slot.setUpstreamCandidates(std.testing.allocator, candidates[0..1]);
+    try std.testing.expect(slot.upstream_candidates_heap == null);
+    try std.testing.expectEqual(@as(usize, 1), slot.upstreamCandidates().len);
+
+    try slot.setUpstreamCandidates(std.testing.allocator, &.{});
+    try std.testing.expectEqual(@as(usize, 0), slot.upstreamCandidates().len);
 }
 
 fn initProxyStateAndDeinit(allocator: std.mem.Allocator, cfg: Config) !void {
