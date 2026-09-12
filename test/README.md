@@ -67,6 +67,14 @@ a hard timing threshold, because shared-runner timing is too noisy for a reliabl
 pass/fail gate. A malformed benchmark vector, failed authentication, allocation
 failure or crash still fails the job.
 
+## Optimized-image AES assertion
+
+`bash test/check_hardware_aes.sh` extracts the actual `MTPROTO_CPU` argument from
+the amd64-v3 publishing workflow and compiles `hardware_aes_probe.zig` for that
+target. Its compile-time assertion requires Zig's hardware AES backend. This is
+stronger than checking that the CPU-profile text contains `aes`, while keeping the
+generic amd64/arm64 images free to target baseline-compatible CPUs.
+
 ## Tools
 
 - `capacity_connections_probe.py` — concurrent connection sweeps with RSS tracking.

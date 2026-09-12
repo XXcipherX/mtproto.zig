@@ -44,9 +44,9 @@ The capacity-probe targets expect the external `/root/benchmarks` layout used by
 Before merging behavior changes, match the GitHub workflow as closely as practical:
 
 ```bash
-zig fmt --check build.zig src
+zig fmt --check build.zig src test/hardware_aes_probe.zig
 python3 -m py_compile test/*.py
-shellcheck --severity=error docker-entrypoint.sh deploy/*.sh deploy/monitor/*.sh test/run_fuzz.sh test/installer-e2e/run.sh test/installer-e2e/fake-*
+shellcheck --severity=error docker-entrypoint.sh deploy/*.sh deploy/monitor/*.sh test/check_hardware_aes.sh test/run_fuzz.sh test/installer-e2e/run.sh test/installer-e2e/fake-*
 zig build test
 zig build -Doptimize=ReleaseSafe test
 zig build -Doptimize=ReleaseFast test
@@ -58,6 +58,7 @@ zig build -Doptimize=ReleaseFast e2e
 zig build -Doptimize=ReleaseFast
 zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux
 zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux -Dcpu=x86_64_v3+aes
+bash test/check_hardware_aes.sh
 zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux
 docker build --build-arg ZIG_VERSION=0.16.0 -t mtproto-zig-smoke .
 zig build -Doptimize=ReleaseFast bench
@@ -145,6 +146,12 @@ sudo env MTPROTO_DOCKER_INSTALL=1 bash /opt/mtproto-proxy/setup_web.sh --remove
 6. Starts service and prints status.
 
 This Make target is x86_64-only and uses `x86_64_v3` without an explicit `+aes`. The CI deploy-target check and optimized amd64 Docker image use `x86_64_v3+aes`; use those/manual commands when hardware AES must be guaranteed. Use the manual or Docker build paths for aarch64.
+
+`test/check_hardware_aes.sh` reads the optimized Docker build argument from the
+publishing workflow itself and compiles a target-specific assertion against
+`std.crypto.core.aes.has_hardware_support`. Keep that linkage intact: a hardcoded
+test profile could pass while the image workflow accidentally shipped another
+profile. Baseline generic images are intentionally outside this assertion.
 
 Why service stop is required:
 

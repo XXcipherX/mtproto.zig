@@ -125,7 +125,7 @@ make test
 CI also runs the stricter local checks below:
 
 ```bash
-zig fmt --check build.zig src
+zig fmt --check build.zig src test/hardware_aes_probe.zig
 python3 -m py_compile test/*.py
 shellcheck --severity=error deploy/*.sh deploy/monitor/*.sh
 zig build -Doptimize=ReleaseSafe test
@@ -368,6 +368,13 @@ ghcr.io/xxcipherx/mtproto.zig:latest
 ```
 
 The `*-amd64-v3` tags are built with `-Dcpu=x86_64_v3+aes` for modern x86_64 CPUs and enable Zig's hardware AES backend. The generic tags stay baseline-compatible. The workflow lowercases the repository path automatically because GHCR image names must be lowercase. If the package is private, log in on the server before pulling, or pass `GHCR_USER` and `GHCR_TOKEN` to the Compose installer below.
+
+CI derives the optimized CPU profile directly from the publishing workflow and
+compiles `test/hardware_aes_probe.zig` for that exact target. The probe fails at
+compile time unless Zig selects its hardware AES implementation, preventing an
+image-label or build-argument change from silently turning the optimized image
+into a software-AES build. Generic multi-architecture images deliberately remain
+baseline-compatible and are not covered by this hardware-only assertion.
 
 ### Run
 

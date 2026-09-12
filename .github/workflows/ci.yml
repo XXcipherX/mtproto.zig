@@ -22,13 +22,13 @@ jobs:
           version: 0.16.0
 
       - name: Check Zig formatting
-        run: zig fmt --check build.zig src
+        run: zig fmt --check build.zig src test/hardware_aes_probe.zig
 
       - name: Check Python harness syntax
         run: python3 -m py_compile test/*.py test/web-bridge/*.py
 
       - name: ShellCheck scripts
-        run: shellcheck --severity=error docker-entrypoint.sh deploy/*.sh deploy/monitor/*.sh test/run_fuzz.sh test/installer-e2e/run.sh test/installer-e2e/fake-*
+        run: shellcheck --severity=error docker-entrypoint.sh deploy/*.sh deploy/monitor/*.sh test/check_hardware_aes.sh test/run_fuzz.sh test/installer-e2e/run.sh test/installer-e2e/fake-*
 
       - name: Run tests
         run: zig build test
@@ -62,6 +62,9 @@ jobs:
 
       - name: Cross-compile deploy target
         run: zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux -Dcpu=x86_64_v3+aes
+
+      - name: Verify optimized Docker target enables hardware AES
+        run: bash test/check_hardware_aes.sh
 
       - name: Cross-compile for Linux aarch64
         run: zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux
