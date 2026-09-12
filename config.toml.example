@@ -146,6 +146,14 @@ port = 443
 # every other request receives the same empty 404 response.
 # domain = "web.example.com"
 
+# Optional carrier prefix, stored without leading/trailing slashes. Empty or
+# omitted preserves the historical root routes and v1 capability. A non-empty
+# value uses the v2 capability bound to domain + path and moves both bridge and
+# WebSocket routes under /<base_path>/. Segments must match
+# [A-Za-z0-9][A-Za-z0-9_-]*; the complete value is at most 128 bytes.
+# Fresh setup_web.sh installations generate a 16-character base32 value.
+# base_path = "phcf2vfe7zgbrslg"
+
 # Plain HTTP/WebSocket relay listener behind Caddy. IP literal only; keep local.
 # listen = "127.0.0.1"
 # port = 8081

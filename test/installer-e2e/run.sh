@@ -127,7 +127,16 @@ grep -F 'user = "00112233445566778899aabbccddeeff"' "$CONFIG_FILE" >/dev/null
 grep -F '[web]' "$CONFIG_FILE" >/dev/null
 grep -F 'enabled = true' "$CONFIG_FILE" >/dev/null
 grep -F 'domain = "web.example.test"' "$CONFIG_FILE" >/dev/null
+web_base_path="$(awk '
+    /^\[web\]/{inside=1; next}
+    /^\[/{inside=0}
+    inside && /^[[:space:]]*base_path[[:space:]]*=/ {
+        line=$0; sub(/^[^=]*=/,"",line); gsub(/^[[:space:]\"]+|[[:space:]\"]+$/,"",line); print line; exit
+    }
+' "$CONFIG_FILE")"
+[[ "$web_base_path" =~ ^[a-z2-7]{16}$ ]]
 grep -F 'COMPOSE_PROFILES=web' "$ENV_FILE" >/dev/null
+grep -F "WEB_BASE_PATH=$web_base_path" "$ENV_FILE" >/dev/null
 grep -F "MTPROTO_IMAGE=$INSTALL_IMAGE" "$ENV_FILE" >/dev/null
 grep -F 'command: ["web-relay", "/etc/mtproto-proxy/config.toml"]' "$COMPOSE_FILE" >/dev/null
 grep -F 'servers 127.0.0.1:8443 {' "$INSTALL_DIR/Caddyfile.mask" >/dev/null
@@ -145,9 +154,18 @@ if grep -Rqi -- 'nginx' "$INSTALL_DIR"; then
     exit 1
 fi
 
-for helper in setup_masking.sh setup_web.sh setup_nfqws.sh setup_synfix.sh setup_mask_monitor.sh; do
+for helper in setup_masking.sh setup_web.sh web_link.sh setup_nfqws.sh setup_synfix.sh setup_mask_monitor.sh; do
     cmp "/workspace/deploy/$helper" "$INSTALL_DIR/$helper"
 done
+
+# Root links stay hexadecimal. Base-path links percent-encode every slash and
+# wrap the complete dd secret in the official 0x70 marker.
+# shellcheck source=deploy/web_link.sh
+source "$INSTALL_DIR/web_link.sh"
+test "$(web_proxy_link_address web.example.test '')" = 'web.example.test'
+test "$(web_proxy_link_secret dd00112233445566778899aabbccddeeff '')" = 'dd00112233445566778899aabbccddeeff'
+test "$(web_proxy_link_address web.example.test 'one/two')" = 'web.example.test%2Fone%2Ftwo'
+test "$(web_proxy_link_secret dd000102030405060708090a0b0c0d0e0f path)" = 'cN0AAQIDBAUGBwgJCgsMDQ4P'
 
 docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" config >/dev/null
 for service in docker mtproto-proxy nfqws-mtproto mtproto-mask-health.timer; do

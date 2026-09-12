@@ -115,6 +115,15 @@ curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/in
 
 This preserves `config.toml` and user secrets, adds the `mtproto-web-relay` profile service, and extends the existing `mtproto-mask-caddy` container. Ordinary requests to both the WEB and MTProto masking hostnames receive the same bodyless 404. Caddy sends the whole WEB hostname to one relay handler without pre-routing carrier-looking URLs; the relay selects only exact canonical requests after capability authentication, and Caddy strips `Via` and maps relay failures to the common 404. The setup probe explicitly accepts that expected 404 as a healthy proxy-to-Caddy route. The local masking and WEB Caddy listeners enable only HTTP/1.1 and HTTP/2: HTTP/3 would advertise UDP `8443` or `8444`, but those ports are deliberately local and have no public QUIC path. Source/systemd installations use `sudo /opt/mtproto-proxy/setup_web.sh web.example.com`. In tunnel-netns mode, rerunning `setup_tunnel.sh` refreshes the WEB backend/listener addresses automatically.
 
+Fresh WEB enablement generates a lowercase RFC 4648 base32 path from 10 random
+bytes (16 characters). `WEB_BASE_PATH=<path>` pins a canonical value and
+`WEB_BASE_PATH=none` explicitly selects the historical root. An existing setup
+keeps its current value when the variable/flag is omitted; a config predating
+`base_path` therefore remains at root on update. The source helper accepts the
+equivalent `--base-path <path|none>`. Reissuing a different path requires
+`--force` or `WEB_FORCE_BASE_PATH_CHANGE=true`, because it changes capabilities,
+links and live carrier sessions.
+
 To make WEB the only admitted transport in Docker Compose, pass the explicit gate together with WEB enablement:
 
 ```bash
@@ -125,7 +134,8 @@ curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/in
 For source/systemd installs, use `sudo /opt/mtproto-proxy/setup_web.sh --only web.example.com`; restore the additive mode with `--no-only`. Reinstall preserves an already active gate unless explicitly disabled. A new gate stays disabled until Caddy, the main data plane, and `mtproto-web-relay` are running, the WEB HTTPS route returns its expected 404 with a valid certificate, and local relay `/metrics` responds. Setup then writes `only=true` and restarts only the main proxy. While active, formerly valid direct links are masked and output commands print only `tg://webproxy`; disabling WEB makes `only` inert.
 
 Changing an existing WEB domain requires `--force` or `WEB_FORCE_DOMAIN_CHANGE=true`
-because installed links keep the old hostname. WEB setup checks certificate expiry
+because installed links keep the old hostname; base-path changes use the separate
+guard above. WEB setup checks certificate expiry
 before reuse and gives Caddy read/traverse access to the HTTP-01 webroot. It validates
 the existing Caddy tree and backs up the WEB config/certificate pair and `config.toml`
 before replacement; failures before successful Caddy activation restore those files.
@@ -247,6 +257,11 @@ Self-domain masking notes:
 - `setup_masking.sh` requires Caddy 2.10+ for `x25519mlkem768`, uses public `:80` for ACME HTTP-01, and configures all non-ACME HTTP/HTTPS requests to return 404.
 - `setup_masking.sh` installs a Let's Encrypt renewal hook that reloads the host Caddy service or recreates the Compose Caddy service after certificate renewal.
 - `setup_web.sh` obtains a separate certificate for `[web].domain`, validates the combined Caddy configuration before replacement, and installs a renewal hook for the WEB certificate.
+- `setup_web.sh` preserves root v1 routing on pre-path updates and generates a
+  path only for a genuinely new WEB setup. It writes `[web].base_path`, prints a
+  percent-encoded `server=domain/path` address, and uses the `0x70`-marked secret
+  only for path links. Caddy continues forwarding the complete WEB hostname to
+  the relay in either mode.
 - `MASK_ALLOW_SELF_SIGNED=1` is available only as a dev/test fallback; the default flow fails closed when Let's Encrypt cannot issue a certificate.
 - `MASK_SET_PUBLIC_IP=0` skips rewriting `[server].public_ip`; otherwise `setup_masking.sh` sets it to the masking domain.
 - Cloudflare records for the proxy domain must be DNS-only, not proxied.

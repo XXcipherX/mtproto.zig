@@ -3,9 +3,9 @@
 //! ## What it is
 //!
 //! Desktop's WEB proxy type opens **no MTProto socket of its own**. A hidden native
-//! WebView navigates to `https://<domain>/?bridge=<capability>`, and the page we serve
-//! shuttles multiplexed frames over a same-origin WebSocket. On the wire the censor sees
-//! a genuine browser TLS handshake to an ordinary website — real fingerprint, real HTTP,
+//! WebView navigates to the configured root or `https://<domain>/<base_path>/?bridge=…`,
+//! and the page shuttles multiplexed frames over a same-origin WebSocket. On the wire the
+//! censor sees a genuine browser TLS handshake to an ordinary website — real fingerprint, real HTTP,
 //! real CA-chained certificate — because it *is* one.
 //!
 //! This process terminates that carrier and, for each logical stream the client opens,
@@ -121,6 +121,7 @@ pub const Error = error{
     WebProxyDisabled,
     MissingDomain,
     InvalidDomain,
+    InvalidBasePath,
     InvalidBackend,
     NoUsersConfigured,
 };
@@ -132,6 +133,8 @@ pub const Options = struct {
     /// Canonical A-label hostname, exactly as it appears in `tg://webproxy` links and in
     /// the capability HMAC.
     domain: []const u8,
+    /// Canonical optional prefix without leading or trailing slashes.
+    base_path: []const u8,
     listen_host: []const u8,
     listen_port: u16,
     ws_path: []const u8,
@@ -150,8 +153,11 @@ pub const Options = struct {
         if (cfg.users.count() == 0) return error.NoUsersConfigured;
         const raw_domain = cfg.web.domain orelse return error.MissingDomain;
         const domain = capability.normalizeHost(raw_domain, domain_buf) catch return error.InvalidDomain;
+        const base_path = cfg.web.effectiveBasePath();
+        capability.validateBasePath(base_path) catch return error.InvalidBasePath;
         return .{
             .domain = domain,
+            .base_path = base_path,
             .listen_host = cfg.web.effectiveHost(),
             .listen_port = cfg.web.port,
             .ws_path = cfg.web.effectiveWsPath(),
@@ -181,6 +187,15 @@ pub fn resolveBackend(allocator: std.mem.Allocator, cfg: *const config.Config) !
     return list.addrs[0];
 }
 
+/// Place one absolute carrier route under the canonical base path. The bridge
+/// passes `"/"`, producing either `/` or `/<base>/`; endpoint suffixes retain
+/// their leading slash and produce `/<base>/api/...` without normalization.
+fn prefixedPath(allocator: std.mem.Allocator, base_path: []const u8, suffix: []const u8) ![]u8 {
+    std.debug.assert(suffix.len > 0 and suffix[0] == '/');
+    if (base_path.len == 0) return allocator.dupe(u8, suffix);
+    return std.fmt.allocPrint(allocator, "/{s}{s}", .{ base_path, suffix });
+}
+
 // ── capabilities ──────────────────────────────────────────────────────────────
 
 const UserCapability = struct {
@@ -196,6 +211,7 @@ fn buildCapabilities(
     allocator: std.mem.Allocator,
     cfg: *const config.Config,
     domain: []const u8,
+    base_path: []const u8,
 ) ![]UserCapability {
     var list: std.ArrayList(UserCapability) = .empty;
     errdefer list.deinit(allocator);
@@ -203,11 +219,11 @@ fn buildCapabilities(
     while (it.next()) |entry| {
         const secret = entry.value_ptr.*;
         try list.append(allocator, .{
-            .value = capability.deriveForPaddedSecret(domain, secret),
+            .value = capability.deriveForPaddedSecret(domain, base_path, secret),
             .user = entry.key_ptr.*,
         });
         try list.append(allocator, .{
-            .value = capability.derive(domain, &secret),
+            .value = capability.derive(domain, base_path, &secret),
             .user = entry.key_ptr.*,
         });
     }
@@ -336,6 +352,8 @@ pub const Relay = struct {
     backend_dns_id: usize = 0,
     caps: []UserCapability,
     /// Pre-rendered responses; the bridge page carries no per-user bytes.
+    bridge_path: []u8,
+    websocket_path: []u8,
     bridge_page: []u8,
     bridge_headers: []u8,
 
@@ -368,10 +386,16 @@ pub const Relay = struct {
     read_buf: [read_buf_size]u8 = undefined,
 
     pub fn init(allocator: std.mem.Allocator, opts: Options, cfg: *const config.Config) !Relay {
-        const caps = try buildCapabilities(allocator, cfg, opts.domain);
+        const caps = try buildCapabilities(allocator, cfg, opts.domain, opts.base_path);
         errdefer allocator.free(caps);
 
-        const bridge_page = try page.renderBridge(allocator, opts.ws_path);
+        const bridge_path = try prefixedPath(allocator, opts.base_path, "/");
+        errdefer allocator.free(bridge_path);
+
+        const websocket_path = try prefixedPath(allocator, opts.base_path, opts.ws_path);
+        errdefer allocator.free(websocket_path);
+
+        const bridge_page = try page.renderBridge(allocator, websocket_path);
         errdefer allocator.free(bridge_page);
 
         // The bridge response must be framable by tdesktop's loopback fallback page,
@@ -419,6 +443,8 @@ pub const Relay = struct {
             .backend_dns = cache,
             .backend_dns_id = dns_id,
             .caps = caps,
+            .bridge_path = bridge_path,
+            .websocket_path = websocket_path,
             .bridge_page = bridge_page,
             .bridge_headers = bridge_headers,
             .epoll_fd = epoll_fd,
@@ -459,6 +485,8 @@ pub const Relay = struct {
         closeFd(self.listen_fd);
         closeFd(self.epoll_fd);
         self.allocator.free(self.caps);
+        self.allocator.free(self.bridge_path);
+        self.allocator.free(self.websocket_path);
         self.allocator.free(self.bridge_page);
         self.allocator.free(self.bridge_headers);
     }
@@ -467,11 +495,12 @@ pub const Relay = struct {
         try self.addFd(self.listen_fd, true, false);
         try self.addFd(self.signal_fd, true, false);
         var backend_buf: [64]u8 = undefined;
-        log.info("web relay listening on {s}:{d} for https://{s} (ws {s}, backend {s})", .{
+        log.info("web relay listening on {s}:{d} for https://{s}{s} (ws {s}, backend {s})", .{
             self.opts.listen_host,
             self.opts.listen_port,
             self.opts.domain,
-            self.opts.ws_path,
+            self.bridge_path,
+            self.websocket_path,
             socket_utils.formatAddress(self.opts.backend, &backend_buf),
         });
 
@@ -916,7 +945,7 @@ pub const Relay = struct {
         // Caddy sends every request for the WEB hostname through this handler. Select
         // the hidden carrier only after the complete request shape is canonical; every
         // other valid HTTP request receives one indistinguishable empty masking 404.
-        if (request.canonicalGetQuery("/", "bridge", capability.capability_len)) |presented| {
+        if (request.canonicalGetQuery(self.bridge_path, "bridge", capability.capability_len)) |presented| {
             if (self.matchCapability(presented) != null) {
                 self.respondPage(conn, "200 OK", self.bridge_headers, self.bridge_page, keep, false);
             } else {
@@ -925,7 +954,7 @@ pub const Relay = struct {
             return;
         }
 
-        if (request.canonicalGetQuery(self.opts.ws_path, "b", capability.capability_len)) |presented| {
+        if (request.canonicalGetQuery(self.websocket_path, "b", capability.capability_len)) |presented| {
             if (http.isWebSocketUpgrade(request)) {
                 if (self.matchCapability(presented)) |name| {
                     self.upgrade(conn, request, name);
@@ -1855,6 +1884,8 @@ fn testRelay(allocator: std.mem.Allocator, limit: usize) Relay {
         .allocator = allocator,
         .opts = options,
         .caps = &.{},
+        .bridge_path = "",
+        .websocket_path = "",
         .bridge_page = "",
         .bridge_headers = "",
         .epoll_fd = -1,
@@ -2015,6 +2046,8 @@ test "backend retry freezes candidates and preserves queued bytes while retiring
         .allocator = allocator,
         .opts = undefined,
         .caps = undefined,
+        .bridge_path = undefined,
+        .websocket_path = undefined,
         .bridge_page = undefined,
         .bridge_headers = undefined,
         .epoll_fd = try socket_utils.epollCreate(),
@@ -2133,6 +2166,8 @@ test "a burst of tiny websocket frames compacts the carrier buffer once, not onc
         .allocator = allocator,
         .opts = undefined,
         .caps = undefined,
+        .bridge_path = undefined,
+        .websocket_path = undefined,
         .bridge_page = undefined,
         .bridge_headers = undefined,
         .epoll_fd = -1,
@@ -2221,8 +2256,29 @@ test "options require an enabled section, a domain and at least one user" {
     cfg.web.domain = try std.testing.allocator.dupe(u8, "Proxy.Example.COM");
     const opts = try Options.fromConfig(&cfg, &buf);
     try std.testing.expectEqualStrings("proxy.example.com", opts.domain);
+    try std.testing.expectEqualStrings("", opts.base_path);
     try std.testing.expectEqualStrings("/api/v1/socket", opts.ws_path);
     try std.testing.expectEqualStrings("127.0.0.1", opts.listen_host);
+
+    cfg.web.base_path = try std.testing.allocator.dupe(u8, "relay/Path_1");
+    const prefixed = try Options.fromConfig(&cfg, &buf);
+    try std.testing.expectEqualStrings("relay/Path_1", prefixed.base_path);
+}
+
+test "carrier routes preserve root behavior and require a trailing base slash" {
+    const root_bridge = try prefixedPath(std.testing.allocator, "", "/");
+    defer std.testing.allocator.free(root_bridge);
+    const root_socket = try prefixedPath(std.testing.allocator, "", "/api/v1/socket");
+    defer std.testing.allocator.free(root_socket);
+    const path_bridge = try prefixedPath(std.testing.allocator, "relay/Path_1", "/");
+    defer std.testing.allocator.free(path_bridge);
+    const path_socket = try prefixedPath(std.testing.allocator, "relay/Path_1", "/api/v1/socket");
+    defer std.testing.allocator.free(path_socket);
+
+    try std.testing.expectEqualStrings("/", root_bridge);
+    try std.testing.expectEqualStrings("/api/v1/socket", root_socket);
+    try std.testing.expectEqualStrings("/relay/Path_1/", path_bridge);
+    try std.testing.expectEqualStrings("/relay/Path_1/api/v1/socket", path_socket);
 }
 
 test "capabilities cover both accepted secret encodings for every user" {
@@ -2234,7 +2290,7 @@ test "capabilities cover both accepted secret encodings for every user" {
     const secret = [_]u8{ 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f };
     try cfg.users.put(try std.testing.allocator.dupe(u8, "alice"), secret);
 
-    const caps = try buildCapabilities(std.testing.allocator, &cfg, "proxy.example.com");
+    const caps = try buildCapabilities(std.testing.allocator, &cfg, "proxy.example.com", "");
     defer std.testing.allocator.free(caps);
     try std.testing.expectEqual(@as(usize, 2), caps.len);
 
@@ -2246,4 +2302,14 @@ test "capabilities cover both accepted secret encodings for every user" {
         if (std.mem.eql(u8, &cap.value, "MHLEY5PmW1GWqJkSrlmJpvJUiLhBH_QKy6yKg8a0JPk")) saw_plain = true;
     }
     try std.testing.expect(saw_padded and saw_plain);
+
+    const path_caps = try buildCapabilities(std.testing.allocator, &cfg, "proxy.example.com", "dobry-cola-super-app");
+    defer std.testing.allocator.free(path_caps);
+    var saw_path_padded = false;
+    var saw_path_plain = false;
+    for (path_caps) |cap| {
+        if (std.mem.eql(u8, &cap.value, "TGUkZaevsavLbHvlNWipnRoYxgzZ51ioWvbxgGT3wHo")) saw_path_padded = true;
+        if (std.mem.eql(u8, &cap.value, "hHz99Xs93EN1j91G9gpNepXwGNNt5YdAFkEVk_LlqdQ")) saw_path_plain = true;
+    }
+    try std.testing.expect(saw_path_padded and saw_path_plain);
 }

@@ -423,6 +423,7 @@ Useful environment variables:
 | `ENABLE_MASKING` | `true` | Install Caddy/certbot masking and set `mask = true`; Docker installs run Caddy in Compose |
 | `ENABLE_WEB` | `false` | Enable the Telegram Desktop WEB relay alongside ordinary MTProto; an existing enabled WEB setup is preserved when this variable is omitted |
 | `WEB_DOMAIN` | _(required with `ENABLE_WEB=true`)_ | Separate public DNS hostname used by `tg://webproxy` links; it must differ from `TLS_DOMAIN` |
+| `WEB_BASE_PATH` | generated on first enable | Optional canonical carrier prefix without surrounding slashes. Omit it to generate a 16-character lowercase base32 path on a new WEB setup and preserve the current path on updates; use `none` for the historical host root |
 | `WEB_ONLY` | `false` | With `ENABLE_WEB=true`, mask all direct MTProto clients and serve only the trusted WEB relay; an existing value is preserved when omitted |
 | `ENABLE_TCPMSS` | `false` | Enable legacy `TCPMSS=88` ClientHello fragmentation fallback for external traffic; disabled by default with PQ-capable Caddy masking |
 | `ENABLE_SYNFIX` | `false` | Install inbound SYN pacing rules for external Android/Desktop routes that need it; loopback is excluded |
@@ -469,7 +470,9 @@ Telegram Desktop WEB ─▶ mtproto-proxy :443 ─▶ Caddy :8444
 
 The deployment uses the existing `mtproto-mask-caddy` instance only. Caddy's built-in PROXY-protocol listener wrapper preserves the real browser address across the proxy-to-Caddy hop; the relay then prefixes every backend MTProto stream with PROXY v2. No additional public port is opened: Caddy `8444` and relay `8081` remain local. Both local Caddy TLS listeners are restricted to HTTP/1.1 and HTTP/2 so responses do not advertise unreachable public HTTP/3 endpoints on UDP `8443` or `8444`. Host SYN pacing, NFQUEUE desync, and optional TCPMSS rules explicitly exclude loopback, so internal WEB streams never consume external-client limits or DPI processing.
 
-An ordinary request to the WEB hostname receives the same bodyless `404` as the MTProto masking hostname. The post-setup HTTPS probe treats that expected `404` as a healthy proxy-to-Caddy route instead of relying on curl's generic 2xx success policy. Caddy forwards the whole WEB hostname to one relay handler and removes its reverse-proxy `Via` header; it never selects a backend merely because an unauthenticated URL resembles a carrier route. The relay exposes the bridge only for the exact `GET /?bridge=<capability>` request and upgrades only the exact `GET /api/v1/socket?b=<capability>` WebSocket shape. Random, duplicated, misplaced or otherwise noncanonical credentials receive the same empty `404`, and Caddy maps a relay outage to that response on every path.
+An ordinary request to the WEB hostname receives the same bodyless `404` as the MTProto masking hostname. The post-setup HTTPS probe treats that expected `404` as a healthy proxy-to-Caddy route instead of relying on curl's generic 2xx success policy. Caddy forwards the whole WEB hostname to one relay handler and removes its reverse-proxy `Via` header; it never selects a backend merely because an unauthenticated URL resembles a carrier route. At the historical root, the relay exposes only exact `GET /?bridge=<capability>` and `GET /api/v1/socket?b=<capability>` routes. With `[web].base_path = "P"`, both move to exact `GET /P/?bridge=…` and `GET /P/api/v1/socket?b=…`; `/P` without the trailing slash is deliberately not redirected. Random, duplicated, misplaced or otherwise noncanonical credentials receive the same empty `404`, and Caddy maps a relay outage to that response on every path.
+
+Base paths follow the official WEB-proxy contract. Empty/omitted `base_path` keeps the frozen v1 HMAC context byte-for-byte. A non-empty path selects v2 and binds the capability to both the normalized hostname and the exact case-sensitive path, so a token minted for the root or another prefix cannot authenticate. Segments must match `[A-Za-z0-9][A-Za-z0-9_-]*`, joined by `/`, with a 128-byte total limit and no leading/trailing slash, escapes, dot segments or empty segments. The link address is `domain%2Fpath`; its secret is unpadded base64url of `0x70 || <complete decoded MTProxy secret>`. The marker makes clients without path parsing reject the new secret type instead of silently accepting an empty/pathless host. Root links retain their existing `dd<secret>` representation.
 
 Requirements:
 
@@ -485,7 +488,21 @@ curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/in
   | sudo env ENABLE_WEB=true WEB_DOMAIN=web.example.com bash
 ```
 
-The installer preserves the existing proxy config and user secrets, updates the image and Compose definition, adds `mtproto-web-relay`, extends `mtproto-mask-caddy`, obtains the certificate, and restarts the affected containers. On a fresh Docker install, add `TLS_DOMAIN=proxy.example.com` to the same command.
+The installer preserves the existing proxy config and user secrets, updates the image and Compose definition, adds `mtproto-web-relay`, extends `mtproto-mask-caddy`, obtains the certificate, and restarts the affected containers. A newly enabled WEB setup receives a random 16-character base32 path. Reinstalling an existing setup preserves its path; configurations created before path support therefore remain at the root. Set `WEB_BASE_PATH=none` to choose the root explicitly or provide a canonical value such as `WEB_BASE_PATH=phcf2vfe7zgbrslg`. On a fresh Docker install, add `TLS_DOMAIN=proxy.example.com` to the same command.
+
+To migrate an existing root deployment intentionally, generate one stable path and
+authorize the link-invalidating change:
+
+```bash
+WEB_PATH="$(head -c 10 /dev/urandom | base32 | tr 'A-Z' 'a-z')"
+curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/install_docker_compose.sh \
+  | sudo env ENABLE_WEB=true WEB_DOMAIN=web.example.com \
+      WEB_BASE_PATH="$WEB_PATH" WEB_FORCE_BASE_PATH_CHANGE=true bash
+```
+
+Save the new printed link before closing the terminal. The old root WEB link stops
+authenticating after the switch. A source/systemd deployment uses the same generated
+value with `sudo /opt/mtproto-proxy/setup_web.sh --force --base-path "$WEB_PATH" web.example.com`.
 
 For an updated source/systemd installation:
 
@@ -510,7 +527,7 @@ docker exec -it mtproto-proxy \
   --print-links
 ```
 
-WEB links use the same 16-byte `[access.users]` secret encoded as `dd<secret>`; FakeTLS links keep their existing `ee<secret><hex-domain>` encoding. The public proxy still rejects direct-obfuscated traffic from untrusted Internet peers: only loopback and explicit `[web].relay_sources` may carry WEB streams into that path.
+WEB links use the same 16-byte `[access.users]` secret. Root links encode it as `dd<secret>`; base-path links wrap those complete 17 decoded bytes with the `0x70` marker described above. FakeTLS links keep their existing `ee<secret><hex-domain>` encoding. The public proxy still rejects direct-obfuscated traffic from untrusted Internet peers: only loopback and explicit `[web].relay_sources` may carry WEB streams into that path.
 
 WEB relay hardening is adapted from upstream PR #408. Backend queues now accommodate
 the protocol's full 4 MiB receive window, and WebSocket messages can carry one maximum
@@ -549,9 +566,10 @@ Existing Docker/source configurations need no new parameters for these changes.
 Re-running WEB setup preserves an existing WEB-only gate. Activating a new gate
 requires successful HTTPS and loopback relay checks. Setup validates Caddy before
 replacing its WEB files and restores the previous files/config if candidate validation
-fails. It also checks certificate expiry. Changing an existing WEB domain invalidates
-distributed links and requires explicit `--force` for `setup_web.sh`, or
-`WEB_FORCE_DOMAIN_CHANGE=true` in the install environment.
+fails. It also checks certificate expiry. Changing an existing WEB domain or base
+path invalidates distributed links and live carrier capabilities. `setup_web.sh`
+therefore requires `--force`; installers can use `WEB_FORCE_DOMAIN_CHANGE=true`
+or `WEB_FORCE_BASE_PATH_CHANGE=true` for the corresponding explicit change.
 
 ### WEB-only mode
 
@@ -1039,6 +1057,7 @@ rate_limit_per_subnet = 30                # Max new connections/sec per /24 subn
 # enabled = true
 # only = false                              # Mask direct MTProto and serve only the trusted WEB relay
 # domain = "web.example.com"               # Must differ from censorship.tls_domain
+# base_path = "phcf2vfe7zgbrslg"           # Empty/omitted = root v1; non-empty = path-bound v2
 # Ordinary requests receive the same empty 404 as the masking domain
 # listen = "127.0.0.1"                     # Plain HTTP/WebSocket relay, local only
 # port = 8081
@@ -1103,6 +1122,7 @@ alice = true   # direct where possible; CDN DC203 still requires MiddleProxy
 | `[web]` | `enabled` | `false` | Enable the separate Telegram Desktop WEB relay process and the trusted relay path in the data plane |
 | `[web]` | `only` / `web_only` | `false` | When WEB is enabled, mask direct MTProto for every non-relay peer. Existing `tg://proxy` links stop working; relay trust comes only from the address returned by `accept()` |
 | `[web]` | `domain` | _(none)_ | Public ASCII DNS hostname placed in `tg://webproxy` links. It must differ from `censorship.tls_domain`; changing it invalidates existing WEB capabilities/links |
+| `[web]` | `base_path` | `""` | Optional case-sensitive carrier prefix without surrounding slashes. Empty keeps root v1 routes; non-empty moves bridge/WebSocket below `/<base_path>/`, uses a path-bound v2 capability, and requires a `0x70`-marked link secret. Changing it invalidates existing WEB links and sessions |
 | `[web]` | `listen` / `host` | `"127.0.0.1"` | Plain HTTP/WebSocket relay bind address behind Caddy. Keep it on loopback for the bundled deployment |
 | `[web]` | `port` | `8081` | Local relay listener port |
 | `[web]` | `backend` | `127.0.0.1:<server.port>` | MTProto data-plane endpoint opened for each logical WEB stream. Tunnel-netns installs use `10.200.200.2:443` |

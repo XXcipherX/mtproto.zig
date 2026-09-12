@@ -550,7 +550,11 @@ PORT="${PORT:-443}"
 TLS_DOMAIN="$(get_config_value "$INSTALL_DIR/config.toml" "censorship" "tls_domain" "$TLS_DOMAIN")"
 WEB_ENABLED="$(get_config_value "$INSTALL_DIR/config.toml" "web" "enabled" "false")"
 WEB_DOMAIN="$(get_config_value "$INSTALL_DIR/config.toml" "web" "domain" "")"
+WEB_BASE_PATH="$(get_config_value "$INSTALL_DIR/config.toml" "web" "base_path" "")"
 WEB_ONLY="$(get_config_value "$INSTALL_DIR/config.toml" "web" "only" "false")"
+
+# shellcheck source=deploy/web_link.sh
+source "$INSTALL_DIR/web_link.sh"
 
 # Build ee-secret: ee + hex(secret) + hex(tls_domain)
 DOMAIN_HEX=$(echo -n "$TLS_DOMAIN" | xxd -p | tr -d '\n')
@@ -583,10 +587,12 @@ echo ""
 echo -e "  ${DIM}t.me/proxy?server=${PUBLIC_IP}&port=${PORT}&secret=${EE_SECRET}${RESET}"
 fi
 if is_true "$WEB_ENABLED" && [[ -n "$WEB_DOMAIN" ]]; then
+WEB_LINK_ADDRESS="$(web_proxy_link_address "$WEB_DOMAIN" "$WEB_BASE_PATH")"
+WEB_LINK_SECRET="$(web_proxy_link_secret "dd${SECRET}" "$WEB_BASE_PATH")"
 echo ""
 echo -e "  ${BOLD}WEB connection link:${RESET}"
-echo -e "  ${CYAN}tg://webproxy?server=${WEB_DOMAIN}&secret=${GREEN}dd${SECRET}${RESET}"
-echo -e "  ${DIM}t.me/webproxy?server=${WEB_DOMAIN}&secret=dd${SECRET}${RESET}"
+echo -e "  ${CYAN}tg://webproxy?server=${WEB_LINK_ADDRESS}&secret=${GREEN}${WEB_LINK_SECRET}${RESET}"
+echo -e "  ${DIM}t.me/webproxy?server=${WEB_LINK_ADDRESS}&secret=${WEB_LINK_SECRET}${RESET}"
 fi
 else
 echo -e "  ${RED}Unable to build link:${RESET} no valid 32-hex secret found in [access.users]"

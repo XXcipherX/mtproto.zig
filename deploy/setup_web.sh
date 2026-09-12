@@ -13,7 +13,10 @@ CADDYFILE="${CADDYFILE:-/etc/caddy/mtproto-mask.Caddyfile}"
 WEB_PORT="${WEB_PORT:-8081}"
 WEB_TLS_PORT="${WEB_TLS_PORT:-8444}"
 WEB_DOMAIN="${WEB_DOMAIN:-}"
+if [[ -v WEB_BASE_PATH ]]; then WEB_BASE_PATH_EXPLICIT=true; else WEB_BASE_PATH_EXPLICIT=false; fi
+WEB_BASE_PATH="${WEB_BASE_PATH:-}"
 WEB_FORCE_DOMAIN_CHANGE="${WEB_FORCE_DOMAIN_CHANGE:-false}"
+WEB_FORCE_BASE_PATH_CHANGE="${WEB_FORCE_BASE_PATH_CHANGE:-false}"
 if [[ -v WEB_ONLY ]]; then WEB_ONLY_EXPLICIT=true; else WEB_ONLY_EXPLICIT=false; fi
 WEB_ONLY="${WEB_ONLY:-false}"
 REMOVE=false
@@ -45,9 +48,16 @@ while (($# > 0)); do
             ;;
         --force)
             WEB_FORCE_DOMAIN_CHANGE=true
+            WEB_FORCE_BASE_PATH_CHANGE=true
+            ;;
+        --base-path)
+            shift
+            (($# > 0)) || fail "--base-path requires a path or 'none'"
+            WEB_BASE_PATH="$1"
+            WEB_BASE_PATH_EXPLICIT=true
             ;;
         -h|--help)
-            printf 'Usage: setup_web.sh [--only|--no-only] [--force] web.example.com\n'
+            printf 'Usage: setup_web.sh [--only|--no-only] [--base-path PATH|none] [--force] web.example.com\n'
             printf '       setup_web.sh --remove\n'
             exit 0
             ;;
@@ -254,6 +264,14 @@ if $REMOVE; then
     exit 0
 fi
 
+WEB_LINK_HELPER="${INSTALL_DIR}/web_link.sh"
+if [[ ! -r "$WEB_LINK_HELPER" ]]; then
+    WEB_LINK_HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/web_link.sh"
+fi
+[[ -r "$WEB_LINK_HELPER" ]] || fail "WEB link helper not found; update web_link.sh together with setup_web.sh"
+# shellcheck source=deploy/web_link.sh
+source "$WEB_LINK_HELPER"
+
 ensure_caddy_imports
 
 [[ "$WEB_DOMAIN" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || fail "Pass a valid WEB domain: setup_web.sh web.example.com"
@@ -268,10 +286,35 @@ done
 [[ ! "${WEB_LABELS[-1]}" =~ ^0[xX][0-9A-Fa-f]+$ ]] || fail "WEB domain must not end in an IP-like hexadecimal label"
 WEB_DOMAIN="${WEB_DOMAIN,,}"
 EXISTING_WEB_DOMAIN="$(get_config_value web domain "")"
+EXISTING_WEB_BASE_PATH="$(get_config_value web base_path "")"
 if [[ -n "$EXISTING_WEB_DOMAIN" && "${EXISTING_WEB_DOMAIN,,}" != "$WEB_DOMAIN" ]] &&
     ! is_true "$WEB_FORCE_DOMAIN_CHANGE"
 then
     fail "Changing [web].domain invalidates existing WEB links. Use --force or WEB_FORCE_DOMAIN_CHANGE=true to change it explicitly."
+fi
+
+# A fresh WEB deployment follows the reference server and gets an 80-bit,
+# 16-character lowercase RFC 4648 base32 prefix. Re-running an existing setup
+# preserves its configured path; a pre-path config therefore remains at root.
+if $WEB_BASE_PATH_EXPLICIT; then
+    if [[ "$WEB_BASE_PATH" == "none" ]]; then WEB_BASE_PATH=""; fi
+elif [[ -n "$EXISTING_WEB_DOMAIN" ]]; then
+    WEB_BASE_PATH="$EXISTING_WEB_BASE_PATH"
+else
+    command -v base32 >/dev/null 2>&1 \
+        || fail "base32 (coreutils) is required to generate WEB_BASE_PATH; set WEB_BASE_PATH explicitly"
+    WEB_BASE_PATH="$(head -c 10 /dev/urandom | base32 | tr 'A-Z' 'a-z' | tr -d '\n')"
+fi
+
+if [[ -n "$WEB_BASE_PATH" ]]; then
+    [[ ${#WEB_BASE_PATH} -le 128 ]] || fail "WEB base path must be at most 128 characters"
+    [[ "$WEB_BASE_PATH" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*(/[A-Za-z0-9][A-Za-z0-9_-]*)*$ ]] \
+        || fail "WEB base path segments must match [A-Za-z0-9][A-Za-z0-9_-]* and be joined by /"
+fi
+if [[ -n "$EXISTING_WEB_DOMAIN" && "$EXISTING_WEB_BASE_PATH" != "$WEB_BASE_PATH" ]] &&
+    ! is_true "$WEB_FORCE_BASE_PATH_CHANGE"
+then
+    fail "Changing [web].base_path invalidates existing WEB links. Use --force or WEB_FORCE_BASE_PATH_CHANGE=true to change it explicitly."
 fi
 
 for port_value in "$WEB_PORT" "$WEB_TLS_PORT"; do
@@ -381,6 +424,7 @@ else
 fi
 remove_config_key web web_only
 set_config_value web domain "\"${WEB_DOMAIN}\""
+set_config_value web base_path "\"${WEB_BASE_PATH}\""
 set_config_value web listen '"127.0.0.1"'
 set_config_value web port "$WEB_PORT"
 set_config_value web backend "\"${BACKEND}\""
@@ -494,6 +538,7 @@ if is_docker_install; then
         || fail "Compose file lacks WEB relay; rerun the latest install_docker_compose.sh, then setup_web.sh"
     set_env_value COMPOSE_PROFILES web
     set_env_value WEB_DOMAIN "$WEB_DOMAIN"
+    set_env_value WEB_BASE_PATH "${WEB_BASE_PATH:-none}"
     set_env_value WEB_ONLY "$WEB_ONLY"
     docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" pull mtproto-proxy mtproto-web-relay mtproto-mask-caddy
     reload_caddy
@@ -598,12 +643,15 @@ else
     info "WEB HTTPS probe failed before receiving the expected 404; inspect the proxy and Caddy logs"
 fi
 
+WEB_LINK_ADDRESS="$(web_proxy_link_address "$WEB_DOMAIN" "$WEB_BASE_PATH")"
+WEB_LINK_SECRET="$(web_proxy_link_secret "dd${SECRET}" "$WEB_BASE_PATH")" \
+    || fail "Could not encode the WEB link secret"
 if is_true "$WEB_ONLY"; then
     ok "WEB proxy enabled in WEB-only mode, using the existing Caddy instance"
 else
     ok "WEB proxy enabled alongside ordinary MTProto, using the existing Caddy instance"
 fi
-printf '  WEB:      tg://webproxy?server=%s&secret=dd%s\n' "$WEB_DOMAIN" "$SECRET"
+printf '  WEB:      tg://webproxy?server=%s&secret=%s\n' "$WEB_LINK_ADDRESS" "$WEB_LINK_SECRET"
 if is_true "$WEB_ONLY"; then
     printf '  MTProto:  direct links are masked; only the trusted WEB relay is served\n'
 else

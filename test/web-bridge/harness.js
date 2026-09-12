@@ -97,7 +97,7 @@ function boot(opts) {
       hash: opts.native ? '#android=' + NONCE : '',
       host: 'relay.example.com',
       protocol: 'https:',
-      pathname: '/',
+      pathname: '/relay/Path_1/',
     },
     history: { replaceState: () => {} },
     ArrayBuffer,
@@ -136,7 +136,7 @@ cases['native handshake'] = (t) => {
   t.ok(p.initReceiverReady(), 'onmessage was live at the instant init was sent');
 
   t.eq(p.sockets.length, 1, 'exactly one carrier socket');
-  t.eq(p.sockets[0].url, 'wss://relay.example.com/api/v1/socket?b=' + CAP, 'same-origin carrier url');
+  t.eq(p.sockets[0].url, 'wss://relay.example.com/relay/Path_1/api/v1/socket?b=' + CAP, 'same-origin base-path carrier url');
 
   // HELLO arrives before the socket opens, so it has to be queued rather than dropped.
   t.eq(p.sockets[0].sent.length, 0, 'nothing sent before the socket opened');

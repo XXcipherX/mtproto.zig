@@ -4,9 +4,12 @@
 //! domain-separated bearer token from `(hostname, secret)` and puts *that* in the page
 //! URL it navigates the hidden WebView to:
 //!
-//!     context = "tdesktop-web-proxy-bridge-v1\n" + host
+//!     context = base_path.len == 0
+//!         ? "tdesktop-web-proxy-bridge-v1\n" + host
+//!         : "tdesktop-web-proxy-bridge-v2\n" + host + "\n" + base_path
 //!     bridge  = base64url-no-padding(HMAC-SHA256(key = secret_bytes, message = context))
-//!     url     = "https://" + host + "/?bridge=" + bridge
+//!     base    = base_path.len == 0 ? "/" : "/" + base_path + "/"
+//!     url     = "https://" + host + base + "?bridge=" + bridge
 //!
 //! `secret_bytes` is the decoded MTProxy secret *including* its leading `dd` byte when
 //! the link used the random-padding form — which ours always does, because tdesktop
@@ -27,8 +30,9 @@
 
 const std = @import("std");
 
-/// Domain-separation prefix. The trailing newline is part of the context.
-pub const context_prefix = "tdesktop-web-proxy-bridge-v1\n";
+/// Domain-separation prefixes. The trailing newlines are part of the contexts.
+pub const context_prefix_v1 = "tdesktop-web-proxy-bridge-v1\n";
+pub const context_prefix_v2 = "tdesktop-web-proxy-bridge-v2\n";
 
 /// base64url of a 32-byte HMAC with padding omitted.
 pub const capability_len: usize = 43;
@@ -37,17 +41,62 @@ pub const capability_len: usize = 43;
 /// bare 16-byte secret); `ee` FakeTLS secrets are reported as `Status::Unsupported`.
 pub const padded_marker: u8 = 0xdd;
 
+/// Marks a base-path WEB-link secret. Clients that understand the marker strip it
+/// and retain the complete following MTProxy secret. Older clients reject the
+/// otherwise non-canonical length instead of accepting a pathless empty host.
+pub const path_secret_marker: u8 = 0x70;
+
+/// Longest canonical WEB base path, excluding its surrounding slashes.
+pub const max_base_path_len: usize = 128;
+
 /// Longest hostname `NormalizeWebProxyHost` will accept.
 pub const max_host_len: usize = 253;
 
 pub const Capability = [capability_len]u8;
 
-/// Derive the bridge capability for `host` (already normalized) and raw `secret` bytes.
-pub fn derive(host: []const u8, secret: []const u8) Capability {
+pub const BasePathError = error{
+    TooLong,
+    NonCanonical,
+};
+
+/// Validate the exact client/server base-path grammar. The empty string means the
+/// historical host root. Non-empty paths contain slash-separated segments matching
+/// `[A-Za-z0-9][A-Za-z0-9_-]*`, with no leading or trailing slash.
+pub fn validateBasePath(path: []const u8) BasePathError!void {
+    if (path.len == 0) return;
+    if (path.len > max_base_path_len) return error.TooLong;
+    if (path[0] == '/' or path[path.len - 1] == '/') return error.NonCanonical;
+
+    var segment_start = true;
+    for (path) |byte| {
+        if (byte == '/') {
+            if (segment_start) return error.NonCanonical;
+            segment_start = true;
+            continue;
+        }
+        const alpha_num = std.ascii.isAlphanumeric(byte);
+        if (!alpha_num and (segment_start or (byte != '-' and byte != '_'))) {
+            return error.NonCanonical;
+        }
+        segment_start = false;
+    }
+}
+
+/// Derive the bridge capability for a normalized `host`, canonical `base_path`, and
+/// raw `secret` bytes. The empty path preserves the frozen v1 context byte-for-byte.
+pub fn derive(host: []const u8, base_path: []const u8, secret: []const u8) Capability {
     var mac_state = std.crypto.auth.hmac.sha2.HmacSha256.init(secret);
-    mac_state.update(context_prefix);
-    mac_state.update(host);
+    if (base_path.len == 0) {
+        mac_state.update(context_prefix_v1);
+        mac_state.update(host);
+    } else {
+        mac_state.update(context_prefix_v2);
+        mac_state.update(host);
+        mac_state.update("\n");
+        mac_state.update(base_path);
+    }
     var mac: [32]u8 = undefined;
+    defer std.crypto.secureZero(u8, &mac);
     mac_state.final(&mac);
 
     var out: Capability = undefined;
@@ -57,11 +106,27 @@ pub fn derive(host: []const u8, secret: []const u8) Capability {
 }
 
 /// Derive the capability for a 16-byte user secret carried in a `dd…` WEB link.
-pub fn deriveForPaddedSecret(host: []const u8, secret: [16]u8) Capability {
+pub fn deriveForPaddedSecret(host: []const u8, base_path: []const u8, secret: [16]u8) Capability {
     var key: [17]u8 = undefined;
+    defer std.crypto.secureZero(u8, &key);
     key[0] = padded_marker;
     @memcpy(key[1..], &secret);
-    return derive(host, &key);
+    return derive(host, base_path, &key);
+}
+
+/// Encode `0x70 || 0xdd || secret` for a base-path `tg://webproxy` link.
+/// Eighteen input bytes encode to exactly 24 unpadded base64url characters.
+pub fn encodeMarkedPaddedSecret(secret: [16]u8) [24]u8 {
+    var marked: [18]u8 = undefined;
+    defer std.crypto.secureZero(u8, &marked);
+    marked[0] = path_secret_marker;
+    marked[1] = padded_marker;
+    @memcpy(marked[2..], &secret);
+
+    var out: [24]u8 = undefined;
+    const encoded = std.base64.url_safe_no_pad.Encoder.encode(&out, &marked);
+    std.debug.assert(encoded.len == out.len);
+    return out;
 }
 
 /// Constant-time comparison of a presented capability against an expected one.
@@ -150,21 +215,45 @@ fn lastLabelIsNumeric(host: []const u8) bool {
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 test "bridge capability matches the normative tdesktop vectors" {
-    // docs/web-proxy-plan.md §10, asserted in tdesktop's own debug build.
+    // tproxy-server BASE_PATH.md §1 and Telegram Desktop's own tests.
     const plain = [_]u8{ 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f };
     try std.testing.expectEqualStrings(
         "MHLEY5PmW1GWqJkSrlmJpvJUiLhBH_QKy6yKg8a0JPk",
-        &derive("proxy.example.com", &plain),
+        &derive("proxy.example.com", "", &plain),
     );
     try std.testing.expectEqualStrings(
         "IpJrt3e7sKtzPyoXy6w-Zj6GGEvsvclN66JzQEfPYLA",
-        &deriveForPaddedSecret("proxy.example.com", plain),
+        &deriveForPaddedSecret("proxy.example.com", "", plain),
     );
+    try std.testing.expectEqualStrings(
+        "hHz99Xs93EN1j91G9gpNepXwGNNt5YdAFkEVk_LlqdQ",
+        &derive("proxy.example.com", "dobry-cola-super-app", &plain),
+    );
+    try std.testing.expectEqualStrings(
+        "TGUkZaevsavLbHvlNWipnRoYxgzZ51ioWvbxgGT3wHo",
+        &deriveForPaddedSecret("proxy.example.com", "dobry-cola-super-app", plain),
+    );
+}
+
+test "base path validation accepts only the canonical shared grammar" {
+    for ([_][]const u8{ "", "a", "MixedCase", "two/segments", "a/b/c9_x-y" }) |path| {
+        try validateBasePath(path);
+    }
+    for ([_][]const u8{ "/leading", "trailing/", "empty//segment", "-lead", "_lead", "a/-lead", "dot.ted", "..", "with space", "per%20cent", "unicode-é" }) |path| {
+        try std.testing.expectError(error.NonCanonical, validateBasePath(path));
+    }
+    try validateBasePath("a" ** max_base_path_len);
+    try std.testing.expectError(error.TooLong, validateBasePath("a" ** (max_base_path_len + 1)));
+}
+
+test "base path link marker wraps the complete padded MTProxy secret" {
+    const plain = [_]u8{ 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f };
+    try std.testing.expectEqualStrings("cN0AAQIDBAUGBwgJCgsMDQ4P", &encodeMarkedPaddedSecret(plain));
 }
 
 test "capability comparison is length-checked" {
     const secret = [_]u8{0xab} ** 16;
-    const cap = deriveForPaddedSecret("proxy.example.com", secret);
+    const cap = deriveForPaddedSecret("proxy.example.com", "", secret);
     try std.testing.expect(matches(&cap, cap));
     try std.testing.expect(!matches(cap[0 .. capability_len - 1], cap));
     try std.testing.expect(!matches("", cap));
@@ -210,7 +299,16 @@ test "host normalization keeps a hex-looking label that is not last" {
 
 test "capability changes with the hostname" {
     const secret = [_]u8{0x11} ** 16;
-    const a = deriveForPaddedSecret("a.example", secret);
-    const b = deriveForPaddedSecret("b.example", secret);
+    const a = deriveForPaddedSecret("a.example", "", secret);
+    const b = deriveForPaddedSecret("b.example", "", secret);
     try std.testing.expect(!std.mem.eql(u8, &a, &b));
+}
+
+test "capability changes with the base path" {
+    const secret = [_]u8{0x22} ** 16;
+    const root = deriveForPaddedSecret("proxy.example", "", secret);
+    const one = deriveForPaddedSecret("proxy.example", "one", secret);
+    const two = deriveForPaddedSecret("proxy.example", "two", secret);
+    try std.testing.expect(!std.mem.eql(u8, &root, &one));
+    try std.testing.expect(!std.mem.eql(u8, &one, &two));
 }

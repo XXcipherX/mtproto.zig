@@ -16,6 +16,7 @@
 #   USE_MIDDLE_PROXY=true|false
 #   ENABLE_MASKING=true|false
 #   ENABLE_WEB=true|false WEB_DOMAIN=web.example.com WEB_ONLY=true|false
+#   WEB_BASE_PATH=<canonical path>|none  # omitted: generate on first enable, preserve on update
 #   ENABLE_TCPMSS=true|false
 #   ENABLE_SYNFIX=true|false
 #   SYNFIX_RATE=30/minute
@@ -39,6 +40,8 @@ ENABLE_MASKING="${ENABLE_MASKING:-true}"
 if [[ -v ENABLE_WEB ]]; then ENABLE_WEB_EXPLICIT=true; else ENABLE_WEB_EXPLICIT=false; fi
 ENABLE_WEB="${ENABLE_WEB:-false}"
 WEB_DOMAIN="${WEB_DOMAIN:-}"
+if [[ -v WEB_BASE_PATH ]]; then WEB_BASE_PATH_EXPLICIT=true; else WEB_BASE_PATH_EXPLICIT=false; fi
+WEB_BASE_PATH="${WEB_BASE_PATH:-}"
 if [[ -v WEB_ONLY ]]; then WEB_ONLY_EXPLICIT=true; else WEB_ONLY_EXPLICIT=false; fi
 WEB_ONLY="${WEB_ONLY:-false}"
 ENABLE_TCPMSS="${ENABLE_TCPMSS:-false}"
@@ -265,7 +268,7 @@ install_packages() {
 fetch_helper_scripts() {
     info "Fetching deployment helper scripts..."
     local file
-    for file in setup_masking.sh setup_web.sh setup_nfqws.sh setup_synfix.sh setup_mask_monitor.sh ipv6-hop.sh update_dns.sh; do
+    for file in setup_masking.sh setup_web.sh web_link.sh setup_nfqws.sh setup_synfix.sh setup_mask_monitor.sh ipv6-hop.sh update_dns.sh; do
         curl -fsSL "${REPO_RAW_URL}/deploy/${file}" -o "${INSTALL_DIR}/${file}" \
             || fail "Failed to download deploy/${file}"
         chmod 0755 "${INSTALL_DIR}/${file}"
@@ -640,9 +643,11 @@ setup_web_proxy() {
     is_true "$ENABLE_MASKING" || fail "WEB proxy requires ENABLE_MASKING=true for ACME and SNI routing"
     info "Setting up Telegram WEB proxy on ${WEB_DOMAIN}..."
     local only_arg="--no-only"
+    local base_path_args=()
     if is_true "$WEB_ONLY"; then only_arg="--only"; fi
+    if $WEB_BASE_PATH_EXPLICIT; then base_path_args=(--base-path "$WEB_BASE_PATH"); fi
     MTPROTO_DOCKER_INSTALL=1 INSTALL_DIR="$INSTALL_DIR" COMPOSE_FILE="$COMPOSE_FILE" ENV_FILE="$ENV_FILE" \
-        WEB_DOMAIN="$WEB_DOMAIN" bash "${INSTALL_DIR}/setup_web.sh" "$only_arg" "$WEB_DOMAIN" < /dev/null
+        WEB_DOMAIN="$WEB_DOMAIN" bash "${INSTALL_DIR}/setup_web.sh" "$only_arg" "${base_path_args[@]}" "$WEB_DOMAIN" < /dev/null
 }
 
 validate_masking() {
@@ -676,13 +681,17 @@ validate_masking() {
 }
 
 print_summary() {
-    local link_secret domain_hex web_only
+    local link_secret domain_hex web_only web_base_path web_link_address web_link_secret_value
     TLS_DOMAIN="$(get_config_value "$CONFIG_FILE" "censorship" "tls_domain" "$TLS_DOMAIN")"
     PUBLIC_IP="$(get_config_value "$CONFIG_FILE" "server" "public_ip" "$PUBLIC_IP")"
     PORT="$(get_config_value "$CONFIG_FILE" "server" "port" "$PORT")"
     SECRET="$(get_first_user_secret "$CONFIG_FILE")"
     web_only="$(get_config_value "$CONFIG_FILE" "web" "only" "false")"
+    web_base_path="$(get_config_value "$CONFIG_FILE" "web" "base_path" "")"
     domain_hex="$(domain_to_hex "$TLS_DOMAIN")"
+
+    # shellcheck source=deploy/web_link.sh
+    source "${INSTALL_DIR}/web_link.sh"
 
     echo ""
     echo -e "${BOLD}${CYAN}Docker Compose install complete${RESET}"
@@ -704,10 +713,12 @@ print_summary() {
             echo -e "  ${DIM}t.me/proxy?server=${PUBLIC_IP}&port=${PORT}&secret=${link_secret}${RESET}"
         fi
         if is_true "$ENABLE_WEB" && [[ -n "$WEB_DOMAIN" ]]; then
+            web_link_address="$(web_proxy_link_address "$WEB_DOMAIN" "$web_base_path")"
+            web_link_secret_value="$(web_proxy_link_secret "dd${SECRET}" "$web_base_path")"
             echo ""
             echo -e "  ${BOLD}WEB connection link:${RESET}"
-            echo -e "  ${CYAN}tg://webproxy?server=${WEB_DOMAIN}&secret=${GREEN}dd${SECRET}${RESET}"
-            echo -e "  ${DIM}t.me/webproxy?server=${WEB_DOMAIN}&secret=dd${SECRET}${RESET}"
+            echo -e "  ${CYAN}tg://webproxy?server=${web_link_address}&secret=${GREEN}${web_link_secret_value}${RESET}"
+            echo -e "  ${DIM}t.me/webproxy?server=${web_link_address}&secret=${web_link_secret_value}${RESET}"
         fi
     else
         warn "Unable to build link: no valid 32-hex secret found in [access.users]"

@@ -1,6 +1,7 @@
 //! The capability-gated bridge page served to Telegram Desktop.
 //!
-//! Telegram Desktop navigates to `https://<host>/?bridge=<capability>`. A visitor who
+//! Telegram Desktop navigates to the configured root or
+//! `https://<host>/<base_path>/?bridge=<capability>`. A visitor who
 //! cannot present a capability derived from a configured user secret receives the same
 //! bodyless 404 as the ordinary MTProto masking domain, so no public cover page or
 //! generic placeholder is exposed. The authenticated bridge itself is deliberately
@@ -198,7 +199,8 @@ const script_body =
     \\</body></html>
 ;
 
-/// Render the bridge page with `ws_path` baked into its script.
+/// Render the bridge page with its complete, base-prefixed `ws_path` baked into
+/// the script.
 ///
 /// The page is otherwise byte-identical for every user: the capability is read from
 /// `location.search` by the script rather than templated into the body, so the response
@@ -256,6 +258,12 @@ test "bridge page embeds the websocket path and closes its tags" {
     try std.testing.expect(std.mem.endsWith(u8, html, "</body></html>"));
     try std.testing.expect(std.mem.containsAtLeast(u8, html, 1, "tproxy-android-init"));
     try std.testing.expect(std.mem.containsAtLeast(u8, html, 1, "tproxy-init"));
+}
+
+test "bridge page keeps a base-prefixed websocket route intact" {
+    const html = try renderBridge(std.testing.allocator, "/relay/Path_1/api/v1/socket");
+    defer std.testing.allocator.free(html);
+    try std.testing.expect(std.mem.containsAtLeast(u8, html, 1, "var WS_PATH=\"/relay/Path_1/api/v1/socket\";"));
 }
 
 test "the bridge page carries no per-user bytes" {

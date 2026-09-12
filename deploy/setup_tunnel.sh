@@ -457,6 +457,7 @@ fi
 # addresses and keeps ordinary MTProto enabled on the same public listener.
 WEB_ENABLED="$(get_config_value "$INSTALL_DIR/config.toml" "web" "enabled" "false")"
 WEB_DOMAIN="$(get_config_value "$INSTALL_DIR/config.toml" "web" "domain" "")"
+WEB_BASE_PATH="$(get_config_value "$INSTALL_DIR/config.toml" "web" "base_path" "")"
 WEB_ONLY="$(get_config_value "$INSTALL_DIR/config.toml" "web" "only" "false")"
 case "${WEB_ENABLED,,}" in
     1|true|yes|on)
@@ -526,10 +527,19 @@ fi
 case "${WEB_ENABLED,,}" in
     1|true|yes|on)
         if [[ -n "$WEB_DOMAIN" ]]; then
+            WEB_LINK_HELPER="${INSTALL_DIR}/web_link.sh"
+            if [[ ! -r "$WEB_LINK_HELPER" ]]; then
+                WEB_LINK_HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/web_link.sh"
+            fi
+            [[ -r "$WEB_LINK_HELPER" ]] || fail "WEB link helper not found; update web_link.sh together with setup_tunnel.sh"
+            # shellcheck source=deploy/web_link.sh
+            source "$WEB_LINK_HELPER"
+            WEB_LINK_ADDRESS="$(web_proxy_link_address "$WEB_DOMAIN" "$WEB_BASE_PATH")"
+            WEB_LINK_SECRET="$(web_proxy_link_secret "dd${SECRET}" "$WEB_BASE_PATH")"
             echo ""
             echo -e "  ${BOLD}WEB connection link:${RESET}"
-            echo -e "  ${CYAN}tg://webproxy?server=${WEB_DOMAIN}&secret=${GREEN}dd${SECRET}${RESET}"
-            echo -e "  ${DIM}t.me/webproxy?server=${WEB_DOMAIN}&secret=dd${SECRET}${RESET}"
+            echo -e "  ${CYAN}tg://webproxy?server=${WEB_LINK_ADDRESS}&secret=${GREEN}${WEB_LINK_SECRET}${RESET}"
+            echo -e "  ${DIM}t.me/webproxy?server=${WEB_LINK_ADDRESS}&secret=${WEB_LINK_SECRET}${RESET}"
         fi
         ;;
 esac

@@ -57,7 +57,7 @@ Code anchors:
 1. Telegram Desktop opens a browser HTTPS carrier to `[web].domain` on public `:443`; with the default `[web].only=false`, ordinary FakeTLS clients continue to use the same listener with `censorship.tls_domain`.
 2. The proxy recognizes the WEB SNI with a bounds-checked routing parser that is independent of FakeTLS key-share/cipher policy, then relays the untouched TLS connection to `[web].mask_backend`, prefixing PROXY v2 with the kernel-reported browser address.
 3. The existing Caddy service terminates TLS and sends the entire WEB hostname through one loopback relay handler; it does not route on unauthenticated carrier-looking paths and removes the reverse-proxy `Via` header.
-4. The relay selects only exact canonical bridge/WebSocket requests after authenticating the secret-derived capability. Every other valid HTTP request receives the same bodyless 404, and Caddy maps relay failures to that response on every path.
+4. The relay selects only exact canonical bridge/WebSocket requests after authenticating the secret-derived capability. Empty `[web].base_path` keeps root v1 routes; a non-empty path moves both routes below `/<base_path>/` and uses the v2 HMAC context bound to hostname + exact case-sensitive path. Every other valid HTTP request receives the same bodyless 404, and Caddy maps relay failures to that response on every path.
 5. Every logical stream connects back to `[web].backend`, prefixes PROXY v2 with the browser address, and carries the client's `dd` direct-obfuscated MTProto stream into the normal DC/MiddleProxy routing path.
 
 Trust is fixed from the kernel-reported peer at `accept()`: only loopback plus explicit `[web].relay_sources` may enter the direct-obfuscated path. A PROXY header may replace the diagnostic/client address but must never grant trust. When both `[web].enabled` and `[web].only` are true, every untrusted peer reaching the ordinary FakeTLS SNI is sent to the normal Caddy masking backend before secret validation, including clients holding a formerly valid direct link; the trusted relay remains admitted. `only` is inert when WEB is disabled. WEB-domain masking carriers are deliberately exempt from `mask_relay_max_secs`; ordinary masking/probe relays retain that lifetime cap.
@@ -91,9 +91,16 @@ Trust is fixed from the kernel-reported peer at `accept()`: only loopback plus e
   upstream cover pages.
 - Caddy must proxy the whole WEB hostname to the relay rather than selecting
   carrier-looking paths before authentication. Strip its outer `Via` header, map relay
-  failures to the common empty 404, and accept only exact `GET /?bridge=<43>` and exact
-  WebSocket `GET <ws_path>?b=<43>` request shapes. Random or noncanonical credentials
-  must stay indistinguishable from any other public miss.
+  failures to the common empty 404, and accept only the exact root or base-prefixed
+  `GET <base>/?bridge=<43>` and WebSocket `GET <base><ws_path>?b=<43>` request shapes.
+  `/<base_path>` without the trailing slash is not redirected. Random or noncanonical
+  credentials must stay indistinguishable from any other public miss.
+- WEB base paths use the shared maximum-128-byte segment grammar
+  `[A-Za-z0-9][A-Za-z0-9_-]*` joined by `/`, stored without surrounding slashes.
+  Root capabilities retain the frozen `tdesktop-web-proxy-bridge-v1\nH` context;
+  non-root capabilities use `tdesktop-web-proxy-bridge-v2\nH\nP`. Path links encode
+  `server=H%2FP` and unpadded base64url `secret=0x70 || complete decoded secret`;
+  never substitute `0xdd` for this link-version marker.
 - Relay `/metrics` is restricted to direct loopback GET/HEAD requests with a loopback
   Host and without forwarding/Origin headers; never publish it through Caddy.
 - WEB capabilities/config are startup snapshots. Restart both processes for access

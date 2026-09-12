@@ -98,6 +98,7 @@ pub const Config = struct {
         InvalidWebBackend,
         InvalidWebListenHost,
         WebListenerPortCollision,
+        InvalidWebBasePath,
         InvalidWebSocketPath,
         InvalidWebClientIpHeader,
         InvalidWebRelaySource,
@@ -116,6 +117,9 @@ pub const Config = struct {
         /// peers and send every direct client to the masking backend.
         only: bool = false,
         domain: ?[]const u8 = null,
+        /// Optional carrier prefix stored without surrounding slashes. Empty keeps
+        /// the historical root deployment and v1 capability derivation.
+        base_path: ?[]const u8 = null,
         host: ?[]const u8 = null,
         port: u16 = 8081,
         backend: ?[]const u8 = null,
@@ -133,6 +137,10 @@ pub const Config = struct {
 
         pub fn effectiveHost(self: *const Web) []const u8 {
             return self.host orelse "127.0.0.1";
+        }
+
+        pub fn effectiveBasePath(self: *const Web) []const u8 {
+            return self.base_path orelse "";
         }
 
         pub fn effectiveWsPath(self: *const Web) []const u8 {
@@ -298,6 +306,7 @@ pub const Config = struct {
             error.InvalidWebBackend => "[web].backend must be a valid host:port endpoint",
             error.InvalidWebListenHost => "[web].host must be a valid IP literal",
             error.WebListenerPortCollision => "[web].port must not collide with the proxy or masking port",
+            error.InvalidWebBasePath => "[web].base_path must be empty or contain canonical [A-Za-z0-9][A-Za-z0-9_-]* segments joined by / (maximum 128 bytes)",
             error.InvalidWebSocketPath => "[web].ws_path must be an absolute path without whitespace, query, or fragment",
             error.InvalidWebClientIpHeader => "[web].client_ip_header must be a valid HTTP field name",
             error.InvalidWebRelaySource => "every [web].relay_sources entry must be an IP literal",
@@ -343,6 +352,7 @@ pub const Config = struct {
         if (self.web.port == self.port or self.web.port == self.mask_port) {
             return error.WebListenerPortCollision;
         }
+        web_capability.validateBasePath(self.web.effectiveBasePath()) catch return error.InvalidWebBasePath;
         if (!isValidWsPath(self.web.effectiveWsPath())) return error.InvalidWebSocketPath;
         if (!isValidHttpToken(self.web.effectiveClientIpHeader())) return error.InvalidWebClientIpHeader;
         for (self.web.relay_sources) |source| {
@@ -812,6 +822,8 @@ pub const Config = struct {
                         if (parseBoolSetting(key, value)) |parsed| cfg.web.only = parsed;
                     } else if (std.mem.eql(u8, key, "domain")) {
                         try replaceOwnedOptionalString(allocator, &cfg.web.domain, value);
+                    } else if (std.mem.eql(u8, key, "base_path")) {
+                        try replaceOwnedOptionalString(allocator, &cfg.web.base_path, value);
                     } else if (std.mem.eql(u8, key, "listen") or std.mem.eql(u8, key, "host")) {
                         try replaceOwnedOptionalString(allocator, &cfg.web.host, value);
                     } else if (std.mem.eql(u8, key, "port")) {
@@ -886,6 +898,7 @@ pub const Config = struct {
             allocator.free(ip);
         }
         if (self.web.domain) |value| allocator.free(value);
+        if (self.web.base_path) |value| allocator.free(value);
         if (self.web.host) |value| allocator.free(value);
         if (self.web.backend) |value| allocator.free(value);
         if (self.web.mask_backend) |value| allocator.free(value);
@@ -1773,6 +1786,7 @@ test "parse config - WEB relay settings" {
         \\enabled = true
         \\only = true
         \\domain = "web.example.com"
+        \\base_path = "relay/Primary_1"
         \\listen = "127.0.0.1"
         \\port = 8081
         \\backend = "127.0.0.1:443"
@@ -1795,6 +1809,7 @@ test "parse config - WEB relay settings" {
     try std.testing.expect(cfg.web.enabled);
     try std.testing.expect(cfg.web.onlyActive());
     try std.testing.expectEqualStrings("web.example.com", cfg.web.domain.?);
+    try std.testing.expectEqualStrings("relay/Primary_1", cfg.web.effectiveBasePath());
     try std.testing.expectEqualStrings("127.0.0.1", cfg.web.effectiveHost());
     try std.testing.expectEqual(@as(u16, 8081), cfg.web.port);
     try std.testing.expectEqualStrings("127.0.0.1:443", cfg.web.backend.?);
@@ -1857,6 +1872,7 @@ test "config validation accepts ordinary and WEB deployments" {
         \\[web]
         \\enabled = true
         \\domain = "web.example.com"
+        \\base_path = "relay/path_1"
         \\host = "127.0.0.1"
         \\port = 8081
         \\backend = "127.0.0.1:443"
@@ -1907,6 +1923,19 @@ test "config validation rejects unusable core settings" {
 }
 
 test "config validation rejects unsafe WEB relationships" {
+    try expectValidationError(error.InvalidWebBasePath,
+        \\[web]
+        \\enabled = true
+        \\domain = "web.example.com"
+        \\base_path = "bad//path"
+        \\mask_backend = "127.0.0.1:8444"
+        \\[censorship]
+        \\tls_domain = "proxy.example.com"
+        \\mask = true
+        \\mask_port = 8443
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    );
     try expectValidationError(error.MissingWebDomain,
         \\[web]
         \\enabled = true

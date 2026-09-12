@@ -58,6 +58,11 @@ Do not reintroduce thread-per-connection or blocking relay loops.
 - `EPOLLRDHUP` is only a hint to drain until `read()==0`; do not detach that fd while its write half is still carrying the reverse relay. Track both directions separately, flush the destination queue before `shutdown(SHUT_WR)`, and accept graceful EOF only at FakeTLS/MiddleProxy frame boundaries.
 - FakeTLS validation requires a 32-byte ClientHello Session ID. Authentication, TLS 1.3 cipher, and PQ key-share detection share one strict parser. WEB-host routing deliberately uses a separate bounds-checked SNI walker: unrelated extension policy must not hide a valid SNI and route the browser to the ordinary masking certificate. The Session ID is stored by value and echoed into the fixed browser-like ServerHello template; the complete ClientHello is securely zeroed/freed immediately after response construction.
 - WEB relay trust is fixed from the kernel-reported address at accept time. PROXY v2 may replace the client address for accounting but must never grant direct-obfuscated access. Keep WEB RDHUP reads on the direct-obfuscated crypto/framing path; the ordinary relay-step helpers expect FakeTLS records. `[web].only` is active only together with `[web].enabled`; in that mode apply the gate to the accepted peer before FakeTLS secret validation so every direct peer is masked while the trusted relay still reaches direct-obfuscated handling.
+- Keep WEB root and path derivation separate: empty `[web].base_path` must remain
+  byte-identical v1, while a canonical non-empty path uses v2 with `H + "\n" + P`.
+  Serve only the trailing-slash bridge base and prefix the configured `ws_path`
+  without URL normalization. A path link must wrap the complete decoded `dd`
+  secret with byte `0x70` before unpadded base64url encoding; root links stay hex.
 - Extra TLS appdata bytes after the 64-byte MTProto obfuscation nonce are buffered as `pipelined_data` and flushed after the DC/MiddleProxy path is ready.
 
 ## Queueing and Partial Write Model

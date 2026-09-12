@@ -108,6 +108,26 @@ fn writeHexByte(byte: u8) void {
     writeStdoutBytes(&out);
 }
 
+fn writeWebServerParameter(domain: []const u8, base_path: []const u8) void {
+    writeRaw(domain);
+    if (base_path.len == 0) return;
+    writeRaw("%2F");
+    for (base_path) |byte| {
+        if (byte == '/') writeRaw("%2F") else writeStdoutBytes(&.{byte});
+    }
+}
+
+fn writeWebLinkSecret(secret: [16]u8, base_path: []const u8) void {
+    if (base_path.len == 0) {
+        writeRaw("dd");
+        for (secret) |byte| writeHexByte(byte);
+        return;
+    }
+    var marked = web_capability.encodeMarkedPaddedSecret(secret);
+    defer std.crypto.secureZero(u8, &marked);
+    writeStdoutBytes(&marked);
+}
+
 /// Write raw string to stdout.
 fn writeRaw(s: []const u8) void {
     writeStdoutBytes(s);
@@ -775,12 +795,17 @@ fn writeConnectionLinkEntries(cfg: config.Config) void {
         }
 
         if (web_domain) |domain| {
-            writeStdout("      " ++ cyan ++ "tg://" ++ R ++ "webproxy?server={s}&secret=" ++ green ++ "dd", .{domain});
-            for (entry.value_ptr.*) |byte| writeHexByte(byte);
+            const base_path = cfg.web.effectiveBasePath();
+            writeRaw("      " ++ cyan ++ "tg://" ++ R ++ "webproxy?server=");
+            writeWebServerParameter(domain, base_path);
+            writeRaw("&secret=" ++ green);
+            writeWebLinkSecret(entry.value_ptr.*, base_path);
             writeRaw(R ++ "\n");
 
-            writeStdout("      " ++ D ++ "t.me/webproxy?server={s}&secret=dd", .{domain});
-            for (entry.value_ptr.*) |byte| writeHexByte(byte);
+            writeRaw("      " ++ D ++ "t.me/webproxy?server=");
+            writeWebServerParameter(domain, base_path);
+            writeRaw("&secret=");
+            writeWebLinkSecret(entry.value_ptr.*, base_path);
             writeRaw(R ++ "\n");
         }
     }
@@ -793,6 +818,7 @@ fn runWebRelay(allocator: std.mem.Allocator, cfg: *const config.Config) !void {
             error.WebProxyDisabled => "set [web].enabled = true",
             error.MissingDomain => "set [web].domain to the public WEB hostname",
             error.InvalidDomain => "[web].domain must be an ASCII DNS hostname, not an IP",
+            error.InvalidBasePath => "[web].base_path must use canonical slash-separated segments",
             error.InvalidBackend => "[web].backend must be host:port",
             error.NoUsersConfigured => "add at least one [access.users] entry",
         };
