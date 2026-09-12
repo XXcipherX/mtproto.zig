@@ -39,6 +39,11 @@ DC override exists only in that dedicated executable; normal builds cannot accep
 the test-only command-line option. This Linux-only scenario needs Python 3 but no
 Telegram connectivity or elevated privileges.
 
+CI executes both `zig build e2e` and `zig build -Doptimize=ReleaseFast e2e`.
+The latter applies the repository's actual shipping policy (`ReleaseSafe` for the
+internet-facing data plane by default), catching runtime-only release defects that
+a cross-compile or binary-exists check cannot detect.
+
 ## Handshake performance signals
 
 The standalone `mtproto-bench` program has two handshake-specific modes in

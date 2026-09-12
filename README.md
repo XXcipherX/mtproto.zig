@@ -213,6 +213,9 @@ python3 test/daemon_smoke.py --binary zig-out/bin/mtproto-proxy
 # Full real-process path through a deterministic loopback DC
 zig build e2e
 
+# The same process path under the shipping optimization/safety policy
+zig build -Doptimize=ReleaseFast e2e
+
 # Custom soak shape
 zig build -Doptimize=ReleaseFast soak -- --seconds=120 --threads=8 --max-payload=131072
 ```
@@ -222,6 +225,8 @@ override, then drives the real listener through FakeTLS, the 64-byte obfuscated
 handshake, direct-DC setup, and bidirectional relay. Its fake DC checks that the
 proxy's own nonce and the complete client payload arrive before returning a
 response through the S2C TLS path; no Telegram endpoint or public network is used.
+CI runs this scenario in both Debug and the shipping build mode, so the installed
+optimization/safety combination must execute successfully rather than merely link.
 
 The GitHub workflow additionally verifies the production safety policy, PIE output,
 Linux `x86_64`, deploy-target `x86_64_v3+aes`, Linux `aarch64`, Docker build smoke,

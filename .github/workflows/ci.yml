@@ -51,6 +51,9 @@ jobs:
       - name: Real-process relay E2E
         run: zig build e2e
 
+      - name: Shipping-build real-process relay E2E
+        run: zig build -Doptimize=ReleaseFast e2e
+
       - name: Release build (native)
         run: zig build -Doptimize=ReleaseFast
 
