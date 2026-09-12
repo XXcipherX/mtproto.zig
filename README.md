@@ -127,6 +127,7 @@ CI also runs the stricter local checks below:
 ```bash
 zig fmt --check build.zig src test/hardware_aes_probe.zig
 python3 -m py_compile test/*.py
+python3 -m unittest discover -s test -p 'test_probe_helpers.py'
 shellcheck --severity=error deploy/*.sh deploy/monitor/*.sh
 zig build -Doptimize=ReleaseSafe test
 zig build -Doptimize=ReleaseFast test
@@ -227,6 +228,12 @@ proxy's own nonce and the complete client payload arrive before returning a
 response through the S2C TLS path; no Telegram endpoint or public network is used.
 CI runs this scenario in both Debug and the shipping build mode, so the installed
 optimization/safety combination must execute successfully rather than merely link.
+
+Small offline unit tests also protect the Python measurement layer itself. They
+reject partial `/proc` snapshots as valid evidence, ensure local FD exhaustion
+terminates an idle-load attempt, require per-connection payload factories during
+churn, and verify reuse of the expensive realistic ClientHello template. This
+keeps a broken probe from reporting a misleading proxy result.
 
 The GitHub workflow additionally verifies the production safety policy, PIE output,
 Linux `x86_64`, deploy-target `x86_64_v3+aes`, Linux `aarch64`, Docker build smoke,

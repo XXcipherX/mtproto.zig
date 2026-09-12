@@ -81,6 +81,19 @@ generic amd64/arm64 images free to target baseline-compatible CPUs.
 - `connection_stability_check.py` — churn + idle-pool stability harness (leak/regression detector).
 - `daemon_smoke.py` — Linux-only real-daemon FakeTLS smoke used by CI; validates a good secret and rejects the same SNI with a bad secret.
 
+## Probe-helper unit tests
+
+Run the offline helper regressions with:
+
+```bash
+python3 -m unittest discover -s test -p 'test_probe_helpers.py'
+```
+
+They require neither a proxy process nor network access. The cases guard complete
+`/proc` snapshots, immediate EMFILE/ENFILE termination, a fresh payload from a
+callable for every churn connection, and hostname-keyed caching of realistic TLS
+ClientHello templates.
+
 ## What We Measure
 
 The capacity probe reports, per target level:

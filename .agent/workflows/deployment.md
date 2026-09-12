@@ -46,6 +46,7 @@ Before merging behavior changes, match the GitHub workflow as closely as practic
 ```bash
 zig fmt --check build.zig src test/hardware_aes_probe.zig
 python3 -m py_compile test/*.py
+python3 -m unittest discover -s test -p 'test_probe_helpers.py'
 shellcheck --severity=error docker-entrypoint.sh deploy/*.sh deploy/monitor/*.sh test/check_hardware_aes.sh test/run_fuzz.sh test/installer-e2e/run.sh test/installer-e2e/fake-*
 zig build test
 zig build -Doptimize=ReleaseSafe test
@@ -72,6 +73,12 @@ benchmark opt-out and must not be used for an exposed production service. The pr
 ELF is always PIE.
 
 The default install graph contains only `mtproto-proxy`. Use `zig build install-bench` only when the standalone `mtproto-bench` binary is required; `bench` and `soak` build it explicitly without coupling `run` to the global install step.
+
+The offline `test_probe_helpers.py` suite validates the measurement code before
+expensive load jobs use it. Keep incomplete process snapshots non-authoritative,
+stop immediately on process/system FD exhaustion, resolve callable churn payloads
+inside each connection attempt, and retain the bounded hostname cache for the
+realistic TLS template.
 
 The daemon smoke launches a real localhost proxy, verifies a valid FakeTLS handshake, checks that the same SNI with a bad secret does not receive a valid FakeTLS response, and holds an authenticated connection across `SIGTERM` until the configured graceful-shutdown deadline forces a clean exit. `zig build e2e` goes further: a compile-time test-only loopback DC override drives the real daemon through FakeTLS, the obfuscated MTProto nonce, upstream setup, and C2S/S2C relay without exposing that override in the installed binary. CI repeats that process scenario with `-Doptimize=ReleaseFast`, which exercises the effective shipping data-plane mode (`ReleaseSafe` unless explicitly opted out) rather than treating a successful release link as runtime evidence. CI uses a shorter soak for pull requests and a longer soak on pushes. In addition to the aarch64 cross-build, the official `ubuntu-24.04-arm` runner executes unit tests, this daemon smoke and a short four-worker soak natively so architecture-specific runtime defects cannot hide behind successful cross-compilation.
 

@@ -18,7 +18,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 
 
 @dataclass
@@ -99,7 +99,7 @@ def print_snapshot(label: str, pid: Optional[int], port: int) -> Dict[str, objec
 
 
 def has_stats(stats: ProcStats) -> bool:
-    return any(
+    return all(
         v is not None for v in (stats.rss_kb, stats.vms_kb, stats.threads, stats.fds)
     )
 
@@ -116,7 +116,7 @@ def open_idle_connections(
             conns.append(s)
         except OSError as err:
             failed += 1
-            if err.errno == errno.EMFILE:
+            if err.errno in (errno.EMFILE, errno.ENFILE):
                 failed += count - i - 1
                 break
 
@@ -137,7 +137,7 @@ def run_churn(
     total: int,
     concurrency: int,
     timeout: float,
-    payload: bytes,
+    payload: bytes | Callable[[], bytes],
 ) -> tuple[int, int, float]:
     idx = 0
     lock = threading.Lock()
@@ -155,15 +155,15 @@ def run_churn(
                 idx += 1
 
             try:
-                s = socket.create_connection((host, port), timeout=timeout)
-                if payload:
-                    s.sendall(payload)
-                    s.settimeout(0.3)
-                    try:
-                        _ = s.recv(128)
-                    except OSError:
-                        pass
-                s.close()
+                with socket.create_connection((host, port), timeout=timeout) as s:
+                    wire_payload = payload() if callable(payload) else payload
+                    if wire_payload:
+                        s.sendall(wire_payload)
+                        s.settimeout(0.3)
+                        try:
+                            _ = s.recv(128)
+                        except OSError:
+                            pass
                 with ok_fail_lock:
                     ok += 1
             except OSError:

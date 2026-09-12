@@ -27,6 +27,9 @@ jobs:
       - name: Check Python harness syntax
         run: python3 -m py_compile test/*.py test/web-bridge/*.py
 
+      - name: Test benchmark and probe helpers
+        run: python3 -m unittest discover -s test -p 'test_probe_helpers.py'
+
       - name: ShellCheck scripts
         run: shellcheck --severity=error docker-entrypoint.sh deploy/*.sh deploy/monitor/*.sh test/check_hardware_aes.sh test/run_fuzz.sh test/installer-e2e/run.sh test/installer-e2e/fake-*
 

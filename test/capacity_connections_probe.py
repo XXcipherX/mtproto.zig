@@ -14,6 +14,7 @@ Default profile paths are tuned for the benchmark host layout used in README:
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import hmac
 import json
@@ -502,10 +503,12 @@ def build_tls_auth_client_hello(secret: bytes, hostname: str) -> bytes:
     return bytes(packet)
 
 
+@functools.lru_cache(maxsize=32)
 def build_realistic_client_hello(hostname: str) -> bytes:
     """Build a realistic TLS ClientHello with SNI using stdlib ssl."""
 
     client_sock, server_sock = socket.socketpair()
+    tls_client = None
     try:
         client_sock.setblocking(False)
         server_sock.setblocking(False)
@@ -542,6 +545,8 @@ def build_realistic_client_hello(hostname: str) -> bytes:
             raise RuntimeError("failed to synthesize TLS ClientHello")
         return payload
     finally:
+        if tls_client is not None:
+            tls_client.close()
         try:
             server_sock.close()
         except OSError:
