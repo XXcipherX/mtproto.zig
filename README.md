@@ -237,6 +237,15 @@ pass/fail thresholds. The ARM64 job runs the unit tests, real daemon smoke and a
 `ubuntu-24.04-arm` runner; the existing aarch64 cross-build remains as an
 independent portability check.
 
+The separate Debian/Ubuntu installer matrix builds the proxy image from the
+checked-out commit, publishes it only to a registry inside the isolated test host,
+and verifies that both installed proxy containers run that exact image ID. This
+prevents a green installer result from actually exercising an older published
+`latest` image. Source, build, entrypoint, and image-definition changes therefore
+also trigger the installer matrix. It also requires SYNFIX/NFQUEUE rules to be
+saved and `netfilter-persistent` to be enabled, so a live-only firewall setup
+cannot pass as a complete installation.
+
 `zig build test` runs the tests reachable from `src/main.zig` plus `src/bench.zig`. A normal `zig build` installs only `mtproto-proxy`; benchmark execution remains explicit through `bench`/`soak`, and `zig build install-bench` installs `mtproto-bench` when a standalone benchmark binary is needed.
 
 `bench` prints per-payload throughput (`in_mib_per_s`, `out_mib_per_s`) and `ns_per_op`.

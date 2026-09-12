@@ -6,6 +6,9 @@ BASE_IMAGE="${MTPROTO_INSTALLER_E2E_IMAGE:-debian:12}"
 LOG_DIR="${MTPROTO_INSTALLER_E2E_LOG_DIR:-$ROOT/test/installer-e2e/logs}"
 SAFE_IMAGE="$(printf '%s' "$BASE_IMAGE" | tr '/:.' '---' | tr -cd 'A-Za-z0-9_-')"
 TEST_IMAGE="mtproto-compose-installer-e2e:${SAFE_IMAGE}"
+CURRENT_IMAGE="mtproto-compose-current:${SAFE_IMAGE}"
+INSTALL_IMAGE="127.0.0.1:5000/mtproto-proxy:current"
+REGISTRY_CONTAINER=mtproto-installer-e2e-registry
 CONTAINER="mtproto-compose-installer-e2e-${SAFE_IMAGE}-$$"
 INSTALL_DIR=/opt/mtproto-proxy
 COMPOSE_FILE="$INSTALL_DIR/compose.yml"
@@ -56,7 +59,7 @@ run_installer() {
         -e DEBIAN_FRONTEND=noninteractive \
         -e REPO_RAW_URL=file:///workspace \
         -e INSTALL_DIR="$INSTALL_DIR" \
-        -e IMAGE=ghcr.io/xxcipherx/mtproto.zig:latest \
+        -e IMAGE="$INSTALL_IMAGE" \
         -e AUTO_IMAGE_CPU_VARIANT=false \
         -e TLS_DOMAIN="$TLS_DOMAIN" \
         -e PUBLIC_IP=127.0.0.1 \
@@ -100,11 +103,15 @@ assert_no_alt_svc() {
 }
 
 verify_install() {
+    local expected_image_id
+    expected_image_id="$(docker exec "$CONTAINER" docker image inspect -f '{{.Id}}' "$INSTALL_IMAGE")"
     docker exec \
         -e INSTALL_DIR="$INSTALL_DIR" \
         -e COMPOSE_FILE="$COMPOSE_FILE" \
         -e ENV_FILE="$ENV_FILE" \
         -e CONFIG_FILE="$CONFIG_FILE" \
+        -e INSTALL_IMAGE="$INSTALL_IMAGE" \
+        -e EXPECTED_IMAGE_ID="$expected_image_id" \
         "$CONTAINER" bash -s <<'CONTAINER_TEST'
 set -Eeuo pipefail
 
@@ -121,6 +128,7 @@ grep -F '[web]' "$CONFIG_FILE" >/dev/null
 grep -F 'enabled = true' "$CONFIG_FILE" >/dev/null
 grep -F 'domain = "web.example.test"' "$CONFIG_FILE" >/dev/null
 grep -F 'COMPOSE_PROFILES=web' "$ENV_FILE" >/dev/null
+grep -F "MTPROTO_IMAGE=$INSTALL_IMAGE" "$ENV_FILE" >/dev/null
 grep -F 'command: ["web-relay", "/etc/mtproto-proxy/config.toml"]' "$COMPOSE_FILE" >/dev/null
 grep -F 'servers 127.0.0.1:8443 {' "$INSTALL_DIR/Caddyfile.mask" >/dev/null
 grep -F 'protocols h1 h2' "$INSTALL_DIR/Caddyfile.mask" >/dev/null
@@ -145,8 +153,12 @@ docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" config >/dev/null
 for service in docker mtproto-proxy nfqws-mtproto mtproto-mask-health.timer; do
     systemctl is-active --quiet "$service"
 done
+systemctl is-enabled --quiet netfilter-persistent.service
 for container in mtproto-proxy mtproto-web-relay mtproto-mask-caddy; do
     test "$(docker inspect -f '{{.State.Running}}' "$container")" = true
+done
+for container in mtproto-proxy mtproto-web-relay; do
+    test "$(docker inspect -f '{{.Image}}' "$container")" = "$EXPECTED_IMAGE_ID"
 done
 for caddy_file in /etc/caddy/Caddyfile /etc/caddy/web/global.caddy /etc/caddy/web/site.caddy; do
     docker exec mtproto-mask-caddy caddy fmt --diff "$caddy_file" >/dev/null
@@ -157,6 +169,8 @@ iptables -S INPUT | grep -F -- '-A INPUT ! -i lo -p tcp' | grep -F -- '--dport 4
 iptables -t mangle -S PREROUTING | grep -F -- '! -i lo' | grep -F -- '--set-xmark 0x400/' >/dev/null
 test "$(iptables -t mangle -S OUTPUT | grep -c -- '--queue-num 200')" = 1
 iptables -t mangle -S OUTPUT | grep -F -- '-A OUTPUT ! -o lo -p tcp' | grep -F -- '--sport 443' | grep -F -- '--queue-num 200' >/dev/null
+grep -F -- '-j MTPR_SYNFIX' /etc/iptables/rules.v4 >/dev/null
+grep -F -- '--queue-num 200' /etc/iptables/rules.v4 >/dev/null
 if iptables -t mangle -S OUTPUT | grep -F -- '--sport 443' | grep -q -- '-j TCPMSS'; then
     echo "TCPMSS must stay disabled by default" >&2
     exit 1
@@ -173,6 +187,10 @@ echo "::group::Build isolated ${BASE_IMAGE} host"
 docker build --build-arg "BASE_IMAGE=$BASE_IMAGE" -t "$TEST_IMAGE" "$ROOT/test/installer-e2e"
 echo "::endgroup::"
 
+echo "::group::Build proxy image from current checkout"
+docker build --build-arg ZIG_VERSION=0.16.0 -t "$CURRENT_IMAGE" "$ROOT"
+echo "::endgroup::"
+
 echo "::group::Boot isolated systemd + Docker host"
 docker run -d \
     --name "$CONTAINER" \
@@ -184,11 +202,49 @@ docker run -d \
     -v "$ROOT:/workspace:ro" \
     "$TEST_IMAGE" >/dev/null
 wait_for_systemd
+docker exec "$CONTAINER" systemctl start docker
+docker_ready=false
+for _ in $(seq 1 90); do
+    if docker exec "$CONTAINER" docker info >/dev/null 2>&1; then
+        docker_ready=true
+        break
+    fi
+    sleep 0.2
+done
+if ! $docker_ready; then
+    echo "isolated Docker daemon did not become ready" >&2
+    exit 1
+fi
+echo "::endgroup::"
+
+echo "::group::Publish current proxy image to isolated host"
+docker save "$CURRENT_IMAGE" | docker exec -i "$CONTAINER" docker load >/dev/null
+docker exec "$CONTAINER" docker run -d \
+    --name "$REGISTRY_CONTAINER" \
+    --restart unless-stopped \
+    -p 127.0.0.1:5000:5000 \
+    registry:2 >/dev/null
+registry_ready=false
+for _ in $(seq 1 30); do
+    if docker exec "$CONTAINER" curl -fsS http://127.0.0.1:5000/v2/ >/dev/null; then
+        registry_ready=true
+        break
+    fi
+    sleep 0.2
+done
+if ! $registry_ready; then
+    echo "isolated Docker registry did not become ready" >&2
+    exit 1
+fi
+docker exec "$CONTAINER" docker tag "$CURRENT_IMAGE" "$INSTALL_IMAGE"
+docker exec "$CONTAINER" docker push "$INSTALL_IMAGE" >/dev/null
 echo "::endgroup::"
 
 echo "::group::Fresh Docker Compose install"
 run_installer 2>&1 | tee "$LOG_DIR/${SAFE_IMAGE}.install.log"
 grep -F 'WEB HTTPS probe returned expected HTTP 404' "$LOG_DIR/${SAFE_IMAGE}.install.log" >/dev/null
+grep -F 'nfqws service started' "$LOG_DIR/${SAFE_IMAGE}.install.log" >/dev/null
+! grep -Eq 'Cannot enable firewall restoration|nfqws setup failed' "$LOG_DIR/${SAFE_IMAGE}.install.log"
 ! grep -Eq 'Unnecessary header_up X-Forwarded-For|Caddyfile input is not formatted' \
     "$LOG_DIR/${SAFE_IMAGE}.install.log"
 verify_install 2>&1 | tee "$LOG_DIR/${SAFE_IMAGE}.verify.log"
@@ -198,6 +254,8 @@ echo "::group::Idempotent reinstall"
 before_hash="$(docker exec "$CONTAINER" sha256sum "$CONFIG_FILE" | awk '{print $1}')"
 run_installer 2>&1 | tee "$LOG_DIR/${SAFE_IMAGE}.reinstall.log"
 grep -F 'WEB HTTPS probe returned expected HTTP 404' "$LOG_DIR/${SAFE_IMAGE}.reinstall.log" >/dev/null
+grep -F 'nfqws service started' "$LOG_DIR/${SAFE_IMAGE}.reinstall.log" >/dev/null
+! grep -Eq 'Cannot enable firewall restoration|nfqws setup failed' "$LOG_DIR/${SAFE_IMAGE}.reinstall.log"
 ! grep -Eq 'Unnecessary header_up X-Forwarded-For|Caddyfile input is not formatted' \
     "$LOG_DIR/${SAFE_IMAGE}.reinstall.log"
 after_hash="$(docker exec "$CONTAINER" sha256sum "$CONFIG_FILE" | awk '{print $1}')"

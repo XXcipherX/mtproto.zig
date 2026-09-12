@@ -7,13 +7,17 @@ This folder contains practical tools to validate **capacity**, **stability**, an
 `installer-e2e/run.sh` boots a privileged, isolated systemd container with its
 own Docker daemon, runs the real Docker Compose installer twice, and verifies
 the generated config, Caddy-only topology, WEB relay, service health, HTTPS
-masking, SYN pacing, NFQUEUE loopback exclusions, and reinstall idempotency.
+masking, SYN pacing, NFQUEUE loopback exclusions, persisted boot rules, and
+reinstall idempotency.
 GitHub Actions runs the scenario on Debian 12/13 and Ubuntu 24.04/26.04.
 
 The test uses a local short-lived certificate issuer and a sleeping `nfqws`
 stand-in so it does not depend on public DNS, Let's Encrypt, or a source build
 of zapret. Caddy, the proxy image, Docker Compose, systemd, and iptables remain
-real. Run one image locally with:
+real. The proxy image is built from the current checkout, loaded into an isolated
+registry, pulled by the real installer, and compared by image ID for both proxy
+services. It never substitutes a previously published `latest` image for the code
+under test. Run one image locally with:
 
 ```bash
 MTPROTO_INSTALLER_E2E_IMAGE=debian:12 test/installer-e2e/run.sh
