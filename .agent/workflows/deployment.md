@@ -53,6 +53,7 @@ zig build -Doptimize=ReleaseFast test
 bash test/run_fuzz.sh 100K fuzz-artifacts 12m
 zig build
 python3 test/daemon_smoke.py --binary zig-out/bin/mtproto-proxy
+zig build e2e
 zig build -Doptimize=ReleaseFast
 zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux
 zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux -Dcpu=x86_64_v3+aes
@@ -70,7 +71,7 @@ ELF is always PIE.
 
 The default install graph contains only `mtproto-proxy`. Use `zig build install-bench` only when the standalone `mtproto-bench` binary is required; `bench` and `soak` build it explicitly without coupling `run` to the global install step.
 
-The daemon smoke launches a real localhost proxy, verifies a valid FakeTLS handshake, checks that the same SNI with a bad secret does not receive a valid FakeTLS response, and holds an authenticated connection across `SIGTERM` until the configured graceful-shutdown deadline forces a clean exit. CI uses a shorter soak for pull requests and a longer soak on pushes. In addition to the aarch64 cross-build, the official `ubuntu-24.04-arm` runner executes unit tests, this daemon smoke and a short four-worker soak natively so architecture-specific runtime defects cannot hide behind successful cross-compilation.
+The daemon smoke launches a real localhost proxy, verifies a valid FakeTLS handshake, checks that the same SNI with a bad secret does not receive a valid FakeTLS response, and holds an authenticated connection across `SIGTERM` until the configured graceful-shutdown deadline forces a clean exit. `zig build e2e` goes further: a compile-time test-only loopback DC override drives the real daemon through FakeTLS, the obfuscated MTProto nonce, upstream setup, and C2S/S2C relay without exposing that override in the installed binary. CI uses a shorter soak for pull requests and a longer soak on pushes. In addition to the aarch64 cross-build, the official `ubuntu-24.04-arm` runner executes unit tests, this daemon smoke and a short four-worker soak natively so architecture-specific runtime defects cannot hide behind successful cross-compilation.
 
 The separate `.github/workflows/deep-ci.yml` workflow runs weekly and through `workflow_dispatch`. Its `-Dtsan=true` option applies ThreadSanitizer only to the `src/main.zig` and `src/bench.zig` test artifacts plus the benchmark executable used by soak; it never instruments the normal production proxy build. Keep `TSAN_OPTIONS=halt_on_error=1:exitcode=66` so a reported race fails the job instead of becoming advisory output.
 

@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const posix = std.posix;
 const linux = std.os.linux;
 const constants = @import("protocol/constants.zig");
@@ -13,6 +14,7 @@ const compat = @import("compat.zig");
 const obfuscation = @import("protocol/obfuscation.zig");
 const tls = @import("protocol/tls.zig");
 const config = @import("config.zig");
+const net = @import("net_compat.zig");
 const proxy = @import("proxy/proxy.zig");
 const web_capability = @import("web/capability.zig");
 const web_relay = @import("web/relay.zig");
@@ -975,6 +977,7 @@ pub fn main(init: std.process.Init) !void {
     var print_links = false;
     var check_config = false;
     var web_relay_mode = false;
+    var e2e_dc_port: ?u16 = null;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "web-relay") and !config_path_set and !web_relay_mode) {
             web_relay_mode = true;
@@ -984,6 +987,17 @@ pub fn main(init: std.process.Init) !void {
             print_links = true;
         } else if (std.mem.eql(u8, arg, "--check-config")) {
             check_config = true;
+        } else if (build_options.e2e_test_hooks and std.mem.startsWith(u8, arg, "--e2e-dc-port=")) {
+            const value = arg["--e2e-dc-port=".len..];
+            const parsed = std.fmt.parseInt(u16, value, 10) catch {
+                writeUsage();
+                return error.InvalidArguments;
+            };
+            if (parsed == 0) {
+                writeUsage();
+                return error.InvalidArguments;
+            }
+            e2e_dc_port = parsed;
         } else if (!config_path_set) {
             config_path = arg;
             config_path_set = true;
@@ -1007,6 +1021,12 @@ pub fn main(init: std.process.Init) !void {
         return err;
     };
     defer cfg.deinit(allocator);
+
+    if (build_options.e2e_test_hooks) {
+        if (e2e_dc_port) |port| {
+            cfg.datacenter_override = net.Address.initIp4(.{ 127, 0, 0, 1 }, port);
+        }
+    }
 
     // Apply runtime log level from config
     runtime_log_level = cfg.log_level;

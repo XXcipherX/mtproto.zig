@@ -29,6 +29,16 @@ handshake deduplication, retry exhaustion, capability absence and terminal BYE.
 This is an offline browser-contract check, not a live Telegram connectivity test.
 The existing GitHub CI WEB-bridge step runs it separately from Zig unit tests.
 
+## Real-process relay E2E
+
+`zig build e2e` builds a dedicated non-shipping proxy executable and a small
+obfuscated-handshake generator. The Python harness starts both the real proxy and
+a deterministic loopback DC, authenticates with FakeTLS, supplies a valid
+64-byte MTProto nonce, and checks complete C2S and S2C relay progress. The local
+DC override exists only in that dedicated executable; normal builds cannot accept
+the test-only command-line option. This Linux-only scenario needs Python 3 but no
+Telegram connectivity or elevated privileges.
+
 ## Handshake performance signals
 
 The standalone `mtproto-bench` program has two handshake-specific modes in
