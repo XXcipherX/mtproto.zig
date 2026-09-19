@@ -201,6 +201,46 @@ CONTAINER_TEST
     assert_no_alt_svc "$WEB_DOMAIN" 443
 }
 
+verify_masking_maintenance_lock() {
+    docker exec "$CONTAINER" bash -s <<'CONTAINER_TEST'
+set -Eeuo pipefail
+
+lock_file=/run/mtproto-mask-caddy.lock
+container=mtproto-mask-caddy
+
+exec 9>"$lock_file"
+flock 9
+
+restore_caddy() {
+    flock -u 9 >/dev/null 2>&1 || true
+    docker start "$container" >/dev/null 2>&1 || true
+}
+trap restore_caddy EXIT
+
+before_id="$(docker inspect -f '{{.Id}}' "$container")"
+docker stop "$container" >/dev/null
+
+# A timer firing inside an installer/reload critical section must succeed
+# without starting or recreating Caddy. The next timer tick will probe again.
+/usr/local/bin/mtproto-mask-health.sh
+test "$(docker inspect -f '{{.State.Running}}' "$container")" = false
+test "$(docker inspect -f '{{.Id}}' "$container")" = "$before_id"
+
+flock -u 9
+docker start "$container" >/dev/null
+trap - EXIT
+
+for _ in $(seq 1 10); do
+    if [[ "$(docker inspect -f '{{.State.Running}}' "$container")" == true ]]; then
+        exit 0
+    fi
+    sleep 1
+done
+echo "Caddy did not recover after the maintenance-lock test" >&2
+exit 1
+CONTAINER_TEST
+}
+
 echo "::group::Build isolated ${BASE_IMAGE} host"
 docker build --build-arg "BASE_IMAGE=$BASE_IMAGE" -t "$TEST_IMAGE" "$ROOT/test/installer-e2e"
 echo "::endgroup::"
@@ -266,6 +306,7 @@ grep -F 'nfqws service started' "$LOG_DIR/${SAFE_IMAGE}.install.log" >/dev/null
 ! grep -Eq 'Unnecessary header_up X-Forwarded-For|Caddyfile input is not formatted' \
     "$LOG_DIR/${SAFE_IMAGE}.install.log"
 verify_install 2>&1 | tee "$LOG_DIR/${SAFE_IMAGE}.verify.log"
+verify_masking_maintenance_lock 2>&1 | tee "$LOG_DIR/${SAFE_IMAGE}.maintenance-lock.log"
 echo "::endgroup::"
 
 echo "::group::Idempotent reinstall"

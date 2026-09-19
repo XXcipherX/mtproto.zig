@@ -258,6 +258,7 @@ Self-domain masking notes:
 - `setup_masking.sh` requires Caddy 2.10+ for `x25519mlkem768`, uses public `:80` for ACME HTTP-01, and configures all non-ACME HTTP/HTTPS requests to return 404.
 - `setup_masking.sh` installs a Let's Encrypt renewal hook that reloads the host Caddy service or recreates the Compose Caddy service after certificate renewal.
 - `setup_web.sh` obtains a separate certificate for `[web].domain`, validates the combined Caddy configuration before replacement, and installs a renewal hook for the WEB certificate.
+- Masking setup, WEB setup, monitor installation, and both renewal hooks serialize Caddy mutations through `/run/mtproto-mask-caddy.lock`. The periodic health process takes the same lock without waiting and treats a busy lock as an intentional maintenance window, preventing concurrent Compose recreations while preserving installer-owned image/config updates.
 - `setup_web.sh` preserves root v1 routing on pre-path updates and generates a
   path only for a genuinely new WEB setup. It writes `[web].base_path`, prints a
   percent-encoded `server=domain/path` address, and uses the `0x70`-marked secret

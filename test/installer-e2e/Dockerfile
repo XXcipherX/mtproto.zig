@@ -28,6 +28,7 @@ RUN set -eux; \
         procps \
         systemd \
         systemd-sysv \
+        util-linux \
         xxd; \
     apt-get clean; \
     rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*

@@ -44,6 +44,7 @@ ACME_ROOT="${MASK_ACME_ROOT:-${MASK_SITE_ROOT:-/var/www/certbot}}"
 CADDY_SERVICE="mtproto-mask-caddy.service"
 COMPOSE_FILE="${COMPOSE_FILE:-${INSTALL_DIR}/compose.yml}"
 ENV_FILE="${ENV_FILE:-${INSTALL_DIR}/.env}"
+CADDY_LOCK_FILE="/run/mtproto-mask-caddy.lock"
 case "${MTPROTO_DOCKER_INSTALL:-0}" in
     1|true|yes|on) CADDY_RUNTIME="docker" ;;
     *) CADDY_RUNTIME="host" ;;
@@ -144,6 +145,39 @@ info()  { echo -e "${CYAN}>${RESET} $*"; }
 ok()    { echo -e "${GREEN}OK${RESET} $*"; }
 warn()  { echo -e "${RED}WARN${RESET} $*"; }
 fail()  { echo -e "${RED}FAIL${RESET} $*" >&2; exit 1; }
+
+acquire_caddy_operation_lock() {
+    command -v flock >/dev/null 2>&1 || fail "flock is required; install util-linux"
+    exec 9>"$CADDY_LOCK_FILE"
+    flock 9
+}
+
+release_caddy_operation_lock() {
+    flock -u 9
+    exec 9>&-
+}
+
+MASK_HEALTH_TIMER_WAS_ACTIVE=false
+pause_mask_health_monitor() {
+    command -v systemctl >/dev/null 2>&1 || return 0
+    if systemctl is-active --quiet mtproto-mask-health.timer; then
+        MASK_HEALTH_TIMER_WAS_ACTIVE=true
+    fi
+    systemctl stop mtproto-mask-health.timer >/dev/null 2>&1 || true
+    for _ in {1..30}; do
+        if ! systemctl is-active --quiet mtproto-mask-health.service; then
+            return 0
+        fi
+        sleep 1
+    done
+    fail "masking health check did not quiesce before Caddy maintenance"
+}
+
+resume_mask_health_monitor() {
+    if $MASK_HEALTH_TIMER_WAS_ACTIVE && command -v systemctl >/dev/null 2>&1; then
+        systemctl start mtproto-mask-health.timer >/dev/null 2>&1 || true
+    fi
+}
 
 is_true() {
     case "${1,,}" in
@@ -296,7 +330,7 @@ install_caddy() {
     if [[ "$CADDY_RUNTIME" == "docker" ]]; then
         info "Preparing Docker Caddy masking backend..."
         apt-get update -qq < /dev/null || true
-        apt-get install -y ca-certificates curl certbot openssl < /dev/null >/dev/null 2>&1 || true
+        apt-get install -y ca-certificates curl certbot openssl util-linux < /dev/null >/dev/null 2>&1 || true
         command -v docker >/dev/null 2>&1 || fail "docker command not found"
         docker compose version >/dev/null 2>&1 || fail "Docker Compose v2 plugin is not installed"
         command -v certbot >/dev/null 2>&1 || fail "certbot command not found after installation"
@@ -307,7 +341,7 @@ install_caddy() {
 
     info "Installing Caddy and certbot..."
     apt-get update -qq < /dev/null || true
-    apt-get install -y debian-keyring debian-archive-keyring apt-transport-https ca-certificates curl gnupg certbot openssl < /dev/null >/dev/null 2>&1 || true
+    apt-get install -y debian-keyring debian-archive-keyring apt-transport-https ca-certificates curl gnupg certbot openssl util-linux < /dev/null >/dev/null 2>&1 || true
 
     if command -v caddy >/dev/null 2>&1; then
         caddy_version="$(caddy version 2>/dev/null | awk '{print $1}' | head -1)"
@@ -523,8 +557,13 @@ DOMAIN="${TLS_DOMAIN}"
 CERT_DIR="${CERT_DIR}"
 COMPOSE_FILE="${COMPOSE_FILE}"
 ENV_FILE="${ENV_FILE}"
+CADDY_LOCK_FILE="${CADDY_LOCK_FILE}"
 LE_CERT="/etc/letsencrypt/live/\${DOMAIN}/fullchain.pem"
 LE_KEY="/etc/letsencrypt/live/\${DOMAIN}/privkey.pem"
+
+command -v flock >/dev/null 2>&1 || exit 1
+exec 9>"\$CADDY_LOCK_FILE"
+flock 9
 
 if [[ -f "\$LE_CERT" && -f "\$LE_KEY" ]]; then
     install -m 0644 "\$LE_CERT" "\${CERT_DIR}/cert.pem"
@@ -540,8 +579,13 @@ set -euo pipefail
 DOMAIN="${TLS_DOMAIN}"
 CERT_DIR="${CERT_DIR}"
 CADDY_SERVICE="${CADDY_SERVICE}"
+CADDY_LOCK_FILE="${CADDY_LOCK_FILE}"
 LE_CERT="/etc/letsencrypt/live/\${DOMAIN}/fullchain.pem"
 LE_KEY="/etc/letsencrypt/live/\${DOMAIN}/privkey.pem"
+
+command -v flock >/dev/null 2>&1 || exit 1
+exec 9>"\$CADDY_LOCK_FILE"
+flock 9
 
 if [[ -f "\$LE_CERT" && -f "\$LE_KEY" ]]; then
     install -m 0644 "\$LE_CERT" "\${CERT_DIR}/cert.pem"
@@ -555,6 +599,9 @@ HOOKEOF
 }
 
 install_caddy
+trap resume_mask_health_monitor EXIT
+pause_mask_health_monitor
+acquire_caddy_operation_lock
 mkdir -p "$ACME_ROOT/.well-known/acme-challenge" "$CERT_DIR"
 if [[ "$CADDY_RUNTIME" == "host" ]]; then
     chown -R caddy:caddy "$ACME_ROOT" "$CERT_DIR" 2>/dev/null || true
@@ -644,6 +691,10 @@ else
     warn "Config file not found at ${CONFIG_FILE}"
     info "Set [server].public_ip, [censorship].tls_domain, mask=true, and mask_port=${MASK_PORT} manually"
 fi
+
+# All Caddy/config mutations above are complete. Let the monitor installer take
+# the same lock itself so standalone and nested invocations follow one path.
+release_caddy_operation_lock
 
 MASK_MONITOR_SCRIPT="${INSTALL_DIR}/setup_mask_monitor.sh"
 if [[ ! -x "$MASK_MONITOR_SCRIPT" ]]; then

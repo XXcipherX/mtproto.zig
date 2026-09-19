@@ -16,6 +16,7 @@ CONFIG_FILE="${INSTALL_DIR}/config.toml"
 MASK_CADDY_SERVICE="mtproto-mask-caddy.service"
 COMPOSE_FILE="${INSTALL_DIR}/compose.yml"
 ENV_FILE="${INSTALL_DIR}/.env"
+CADDY_LOCK_FILE="/run/mtproto-mask-caddy.lock"
 MASK_HEALTH_SCRIPT="/usr/local/bin/mtproto-mask-health.sh"
 MASK_HEALTH_SERVICE="/etc/systemd/system/mtproto-mask-health.service"
 MASK_HEALTH_TIMER="/etc/systemd/system/mtproto-mask-health.timer"
@@ -32,6 +33,10 @@ warn()  { echo -e "${RED}!${RESET} $*"; }
 fail()  { echo -e "${RED}x${RESET} $*" >&2; exit 1; }
 
 [[ $EUID -eq 0 ]] || fail "Run as root: sudo bash setup_mask_monitor.sh"
+
+command -v flock >/dev/null 2>&1 || fail "flock is required; install util-linux"
+exec 9>"$CADDY_LOCK_FILE"
+flock 9
 
 docker_compose_has_caddy_service() {
     [[ -f "$COMPOSE_FILE" ]] || return 1
@@ -92,6 +97,7 @@ CONFIG_FILE="/opt/mtproto-proxy/config.toml"
 MASK_CADDY_SERVICE="mtproto-mask-caddy.service"
 COMPOSE_FILE="/opt/mtproto-proxy/compose.yml"
 ENV_FILE="/opt/mtproto-proxy/.env"
+CADDY_LOCK_FILE="/run/mtproto-mask-caddy.lock"
 CADDY_CONTAINER="mtproto-mask-caddy"
 NS_NAME="tg_proxy_ns"
 NS_HOST_IP="10.200.200.1"
@@ -237,6 +243,16 @@ if [[ "$mask_port" == "443" ]]; then
     exit 0
 fi
 
+if ! command -v flock >/dev/null 2>&1; then
+    logger -t mtproto-mask-health "flock is unavailable; refusing an unsynchronized Caddy recovery"
+    exit 1
+fi
+exec 9>"$CADDY_LOCK_FILE"
+if ! flock -n 9; then
+    logger -t mtproto-mask-health "Caddy maintenance is in progress; skipping this health check"
+    exit 0
+fi
+
 use_netns=0
 target_host="$LOCAL_HOST_IP"
 if ip netns list 2>/dev/null | grep -qw "$NS_NAME"; then
@@ -328,6 +344,8 @@ elif systemctl is-active --quiet "$MASK_CADDY_SERVICE"; then
     systemctl try-reload-or-restart "$MASK_CADDY_SERVICE" >/dev/null 2>&1 || true
 fi
 
+flock -u 9
+exec 9>&-
 systemctl start mtproto-mask-health.service >/dev/null 2>&1 || true
 
 if systemctl is-active --quiet mtproto-mask-health.timer; then

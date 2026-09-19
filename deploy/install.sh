@@ -212,7 +212,7 @@ get_first_user_secret() {
 # NOTE: All apt-get calls use < /dev/null to prevent dpkg hooks from
 # consuming stdin when this script is run via 'curl | bash'.
 apt-get update -qq < /dev/null || true
-DEBIAN_FRONTEND=noninteractive apt-get install -y iptables iptables-persistent netfilter-persistent xxd git curl jq openssl python3 tar xz-utils < /dev/null >/dev/null 2>&1 || true
+DEBIAN_FRONTEND=noninteractive apt-get install -y iptables iptables-persistent netfilter-persistent util-linux xxd git curl jq openssl python3 tar xz-utils < /dev/null >/dev/null 2>&1 || true
 
 # ── Install Zig ─────────────────────────────────────────────
 if command -v zig &>/dev/null && zig version 2>/dev/null | grep -q "$ZIG_VERSION"; then

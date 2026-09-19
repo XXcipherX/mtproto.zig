@@ -250,7 +250,7 @@ docker_install() {
 install_packages() {
     info "Installing Docker and required tools..."
     apt-get update -qq < /dev/null || true
-    DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl openssl iptables iptables-persistent netfilter-persistent xxd jq git python3 < /dev/null
+    DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl openssl iptables iptables-persistent netfilter-persistent util-linux xxd jq git python3 < /dev/null
 
     if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>&1; then
         info "Installing Docker Engine and Compose plugin from get.docker.com..."

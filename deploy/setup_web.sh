@@ -8,6 +8,7 @@ INSTALL_DIR="${INSTALL_DIR:-/opt/mtproto-proxy}"
 CONFIG_FILE="${CONFIG_FILE:-${INSTALL_DIR}/config.toml}"
 COMPOSE_FILE="${COMPOSE_FILE:-${INSTALL_DIR}/compose.yml}"
 ENV_FILE="${ENV_FILE:-${INSTALL_DIR}/.env}"
+CADDY_LOCK_FILE="/run/mtproto-mask-caddy.lock"
 ACME_ROOT="${MASK_ACME_ROOT:-/var/www/certbot}"
 CADDYFILE="${CADDYFILE:-/etc/caddy/mtproto-mask.Caddyfile}"
 WEB_PORT="${WEB_PORT:-8081}"
@@ -24,6 +25,34 @@ REMOVE=false
 info() { printf '> %s\n' "$*"; }
 ok() { printf '+ %s\n' "$*"; }
 fail() { printf 'x %s\n' "$*" >&2; exit 1; }
+
+acquire_caddy_operation_lock() {
+    command -v flock >/dev/null 2>&1 || fail "flock is required; install util-linux"
+    exec 9>"$CADDY_LOCK_FILE"
+    flock 9
+}
+
+MASK_HEALTH_TIMER_WAS_ACTIVE=false
+pause_mask_health_monitor() {
+    command -v systemctl >/dev/null 2>&1 || return 0
+    if systemctl is-active --quiet mtproto-mask-health.timer; then
+        MASK_HEALTH_TIMER_WAS_ACTIVE=true
+    fi
+    systemctl stop mtproto-mask-health.timer >/dev/null 2>&1 || true
+    for _ in {1..30}; do
+        if ! systemctl is-active --quiet mtproto-mask-health.service; then
+            return 0
+        fi
+        sleep 1
+    done
+    fail "masking health check did not quiesce before Caddy maintenance"
+}
+
+resume_mask_health_monitor() {
+    if $MASK_HEALTH_TIMER_WAS_ACTIVE && command -v systemctl >/dev/null 2>&1; then
+        systemctl start mtproto-mask-health.timer >/dev/null 2>&1 || true
+    fi
+}
 
 is_true() {
     case "${1,,}" in
@@ -89,6 +118,10 @@ if is_docker_install; then
 else
     CADDY_WEB_DIR="/etc/caddy/web"
 fi
+
+trap resume_mask_health_monitor EXIT
+pause_mask_health_monitor
+acquire_caddy_operation_lock
 
 set_env_value() {
     local key="$1" value="$2" tmp
@@ -404,6 +437,7 @@ cleanup_web_candidate() {
         info "Restored the previous WEB configuration after setup failed"
     fi
     rm -rf -- "$WEB_BACKUP"
+    resume_mask_health_monitor
     return "$status"
 }
 trap cleanup_web_candidate EXIT
@@ -632,6 +666,9 @@ mkdir -p /etc/letsencrypt/renewal-hooks/deploy
 cat > /etc/letsencrypt/renewal-hooks/deploy/mtproto-web-caddy-reload.sh <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
+command -v flock >/dev/null 2>&1 || exit 1
+exec 9>${CADDY_LOCK_FILE}
+flock 9
 install -m 0644 /etc/letsencrypt/live/${WEB_DOMAIN}/fullchain.pem ${CADDY_WEB_DIR}/cert/fullchain.pem
 install -m 0600 /etc/letsencrypt/live/${WEB_DOMAIN}/privkey.pem ${CADDY_WEB_DIR}/cert/privkey.pem
 if [[ -f ${COMPOSE_FILE} ]] && grep -q 'mtproto-mask-caddy:' ${COMPOSE_FILE}; then
