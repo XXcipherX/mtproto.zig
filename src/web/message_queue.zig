@@ -10,6 +10,16 @@ const MsgBlock = struct {
     data: [msg_block_size]u8,
 };
 
+pub const block_payload_bytes: usize = msg_block_size;
+pub const block_allocation_bytes: usize = @sizeOf(MsgBlock);
+pub const block_pointer_bytes: usize = @sizeOf(*MsgBlock);
+pub const retained_free_blocks: usize = msg_free_cap_per_queue;
+
+pub const AppendReservation = struct {
+    block_items: usize,
+    retained_growth: usize,
+};
+
 pub const MessageQueue = struct {
     allocator: std.mem.Allocator,
     free: std.ArrayListUnmanaged(*MsgBlock) = .empty,
@@ -39,6 +49,41 @@ pub const MessageQueue = struct {
 
     pub fn isEmpty(self: *const MessageQueue) bool {
         return self.total_len == 0;
+    }
+
+    /// Retained queue allocations charged to the relay-wide buffer budget.
+    pub fn retainedBytes(self: *const MessageQueue) usize {
+        const active_blocks = self.blocks.items.len - self.head_idx;
+        return (active_blocks + self.free.items.len) * block_allocation_bytes +
+            (self.blocks.capacity + self.free.capacity) * block_pointer_bytes;
+    }
+
+    /// Plan allocation growth without allocating it. Keeping this calculation beside
+    /// the queue makes its block and freelist policy a single source of truth.
+    pub fn planAppend(self: *const MessageQueue, additional: usize) !AppendReservation {
+        const active_blocks = self.blocks.items.len - self.head_idx;
+        const tail_space = if (active_blocks == 0)
+            0
+        else
+            block_payload_bytes - self.blocks.items[self.blocks.items.len - 1].len;
+        const after_tail = additional - @min(additional, tail_space);
+        const required_blocks = std.math.divCeil(usize, after_tail, block_payload_bytes) catch unreachable;
+        const new_blocks = required_blocks -| self.free.items.len;
+        const block_items = try std.math.add(usize, self.blocks.items.len, required_blocks);
+        const blocks_growth = block_items -| self.blocks.capacity;
+        const free_growth = retained_free_blocks -| self.free.capacity;
+        const pointer_growth = try std.math.add(usize, blocks_growth, free_growth);
+        const pointer_bytes = try std.math.mul(usize, pointer_growth, block_pointer_bytes);
+        const block_bytes = try std.math.mul(usize, new_blocks, block_allocation_bytes);
+        return .{
+            .block_items = block_items,
+            .retained_growth = try std.math.add(usize, pointer_bytes, block_bytes),
+        };
+    }
+
+    pub fn reserveAppend(self: *MessageQueue, reservation: AppendReservation) !void {
+        try self.blocks.ensureTotalCapacityPrecise(self.allocator, reservation.block_items);
+        try self.free.ensureTotalCapacityPrecise(self.allocator, retained_free_blocks);
     }
 
     pub fn appendCopy(self: *MessageQueue, data: []const u8) !void {
@@ -193,4 +238,16 @@ test "message queue append fills tail block" {
     try std.testing.expectEqual(@as(usize, 10), q.total_len);
     try std.testing.expectEqual(@as(usize, 1), q.blocks.items.len);
     try std.testing.expectEqual(@as(usize, 10), q.blocks.items[0].len);
+}
+
+test "message queue owns retained-allocation accounting policy" {
+    var q = MessageQueue{ .allocator = std.testing.allocator };
+    defer q.deinit();
+
+    const reservation = try q.planAppend(1);
+    try q.reserveAppend(reservation);
+    try q.appendCopy("x");
+
+    try std.testing.expectEqual(reservation.retained_growth, q.retainedBytes());
+    try std.testing.expectEqual(retained_free_blocks, q.free.capacity);
 }

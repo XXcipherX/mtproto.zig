@@ -212,7 +212,7 @@ get_first_user_secret() {
 # NOTE: All apt-get calls use < /dev/null to prevent dpkg hooks from
 # consuming stdin when this script is run via 'curl | bash'.
 apt-get update -qq < /dev/null || true
-DEBIAN_FRONTEND=noninteractive apt-get install -y iptables iptables-persistent netfilter-persistent xxd git curl jq openssl tar xz-utils < /dev/null >/dev/null 2>&1 || true
+DEBIAN_FRONTEND=noninteractive apt-get install -y iptables iptables-persistent netfilter-persistent xxd git curl jq openssl python3 tar xz-utils < /dev/null >/dev/null 2>&1 || true
 
 # ── Install Zig ─────────────────────────────────────────────
 if command -v zig &>/dev/null && zig version 2>/dev/null | grep -q "$ZIG_VERSION"; then
@@ -259,6 +259,7 @@ chmod +x "$INSTALL_DIR/mtproto-proxy"
 # Keep helper scripts locally for future maintenance/update operations
 cp "$TMPBUILD/deploy"/*.sh "$INSTALL_DIR/"
 cp "$TMPBUILD/deploy/capture_template.py" "$INSTALL_DIR/"
+cp "$TMPBUILD/deploy/web_probe.py" "$INSTALL_DIR/"
 mkdir -p "$INSTALL_DIR/monitor/static"
 cp "$TMPBUILD/deploy/monitor/install.sh" "$INSTALL_DIR/monitor/"
 cp "$TMPBUILD/deploy/monitor/server.py" "$INSTALL_DIR/monitor/"

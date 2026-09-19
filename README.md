@@ -126,8 +126,9 @@ CI also runs the stricter local checks below:
 
 ```bash
 zig fmt --check build.zig src test/hardware_aes_probe.zig
-python3 -m py_compile test/*.py
+python3 -m py_compile deploy/web_probe.py test/*.py test/web-bridge/*.py
 python3 -m unittest discover -s test -p 'test_probe_helpers.py'
+python3 -m unittest discover -s test -p 'test_web_setup_probe.py'
 shellcheck --severity=error deploy/*.sh deploy/monitor/*.sh
 zig build -Doptimize=ReleaseSafe test
 zig build -Doptimize=ReleaseFast test
@@ -470,7 +471,9 @@ Telegram Desktop WEB ─▶ mtproto-proxy :443 ─▶ Caddy :8444
 
 The deployment uses the existing `mtproto-mask-caddy` instance only. Caddy's built-in PROXY-protocol listener wrapper preserves the real browser address across the proxy-to-Caddy hop; the relay then prefixes every backend MTProto stream with PROXY v2. No additional public port is opened: Caddy `8444` and relay `8081` remain local. Both local Caddy TLS listeners are restricted to HTTP/1.1 and HTTP/2 so responses do not advertise unreachable public HTTP/3 endpoints on UDP `8443` or `8444`. Host SYN pacing, NFQUEUE desync, and optional TCPMSS rules explicitly exclude loopback, so internal WEB streams never consume external-client limits or DPI processing.
 
-An ordinary request to the WEB hostname receives the same bodyless `404` as the MTProto masking hostname. The post-setup HTTPS probe treats that expected `404` as a healthy proxy-to-Caddy route instead of relying on curl's generic 2xx success policy. Caddy forwards the whole WEB hostname to one relay handler and removes its reverse-proxy `Via` header; it never selects a backend merely because an unauthenticated URL resembles a carrier route. At the historical root, the relay exposes only exact `GET /?bridge=<capability>` and `GET /api/v1/socket?b=<capability>` routes. With `[web].base_path = "P"`, both move to exact `GET /P/?bridge=…` and `GET /P/api/v1/socket?b=…`; `/P` without the trailing slash is deliberately not redirected. Random, duplicated, misplaced or otherwise noncanonical credentials receive the same empty `404`, and Caddy maps a relay outage to that response on every path.
+Without `[web].public_dir`, an ordinary request to the WEB hostname receives the same bodyless `404` as the MTProto masking hostname. An optional operator-owned public directory is loaded once at relay startup and served as exact static routes with MIME types and ETags; dotfiles, symlinks and traversal forms are excluded and file/count/total-size limits are enforced. The path is resolved in the relay process's filesystem namespace and must be readable at startup (mount it into the relay container when using a custom Docker site). Caddy forwards the whole WEB hostname to one relay handler and removes its reverse-proxy `Via` header; it never selects a backend merely because an unauthenticated URL resembles a carrier route.
+
+The permanent HMAC capability authenticates only the exact origin-form bootstrap `GET /?bridge=<capability>` (or `GET /P/?bridge=…` with `[web].base_path = "P"`). Each successful bootstrap mints a random 32-byte, 43-character carrier token valid for about two minutes. The WebSocket then uses the exact path `/api/v1/socket` (or `/P/api/v1/socket`) with no bearer in its URI and sends the token only as `Sec-WebSocket-Protocol: tproxy-v1.<token>`. Tokens are bounded, single-attach credentials: a failed pre-WELCOME carrier may retry, while an adopted carrier consumes its token. Random invalid capabilities behave like ordinary public traffic, but a genuine capability in a malformed/duplicated request fails closed instead of selecting public content. `/P` without the trailing slash is deliberately not redirected.
 
 Base paths follow the official WEB-proxy contract. Empty/omitted `base_path` keeps the frozen v1 HMAC context byte-for-byte. A non-empty path selects v2 and binds the capability to both the normalized hostname and the exact case-sensitive path, so a token minted for the root or another prefix cannot authenticate. Segments must match `[A-Za-z0-9][A-Za-z0-9_-]*`, joined by `/`, with a 128-byte total limit and no leading/trailing slash, escapes, dot segments or empty segments. The link address is `domain%2Fpath`; its secret is unpadded base64url of `0x70 || <complete decoded MTProxy secret>`. The marker makes clients without path parsing reject the new secret type instead of silently accepting an empty/pathless host. Root links retain their existing `dd<secret>` representation.
 
@@ -529,22 +532,32 @@ docker exec -it mtproto-proxy \
 
 WEB links use the same 16-byte `[access.users]` secret. Root links encode it as `dd<secret>`; base-path links wrap those complete 17 decoded bytes with the `0x70` marker described above. FakeTLS links keep their existing `ee<secret><hex-domain>` encoding. The public proxy still rejects direct-obfuscated traffic from untrusted Internet peers: only loopback and explicit `[web].relay_sources` may carry WEB streams into that path.
 
-WEB relay hardening is adapted from upstream PR #408. Backend queues now accommodate
+WEB relay hardening includes the semantic fixes from upstream PR #429. Backend queues accommodate
 the protocol's full 4 MiB receive window, and WebSocket messages can carry one maximum
 1 MiB relay payload plus its header. Outbound DATA/WINDOW frames are batched within an
 event-loop pass; input frames are consumed with one buffer compaction per pass.
-Pre-adoption browser reconnects replay the initial handshake only once, and the bridge
-always uses same-origin WSS. Forwarded client addresses are accepted only from a
-loopback terminator, using the right-most value of the last matching header line.
-The bridge itself never attempts a cross-origin request. Its WebView policy isolates
-off-origin response data, but does not claim that every browser engine is incapable
-of emitting such a request before cancellation.
+Every inbound relay message is validated completely before its first stream/window
+mutation; client control frames are restricted to HELLO before adoption and PONG after
+it, and 4096 deduplicated closed-stream tombstones make valid late DATA/WINDOW/CLOSE
+races harmless without permitting stream-id reuse. Pre-adoption browser reconnects
+replay the initial handshake only once. The nonce-CSP bridge validates/splits downlink
+batches, bounds both bytes and outstanding items, closes on `pagehide`, and strictly
+validates native and loopback-iframe initialization. A missing WebSocket `Origin` is
+accepted for native WebViews; if supplied it must be the exact same origin and may not
+be duplicated.
 
-`[web].max_buffer_mb` limits buffered payload across HTTP/WebSocket input, fragmented
-messages, outbound batches, and socket queues at every append. It is **not** a process
-RSS limit: retained allocation capacity, queue freelists, metadata and kernel socket
-buffers are separate. Soft throttling stops backend reads and new credit before the
-payload ceiling; reaching the hard ceiling closes the affected path.
+`[web].max_buffer_mb` limits retained userspace buffer memory across HTTP/WebSocket
+input, fragmented messages, outbound batches, queue blocks, queue freelists and pointer
+capacity. Growth is reserved against the budget before allocation, while drained idle
+capacity is reclaimed so throttling can clear. It is still **not** a whole-process RSS
+limit and excludes metadata outside these queues and kernel socket buffers.
+
+Forwarded browser identity is accepted only from loopback or explicit IP literals in
+`[web].trusted_http_sources`, using the right-most value of the last matching header
+line. This HTTP-terminator trust is separate from `[web].relay_sources`, which alone can
+grant data-plane relay privilege. The bundled Caddy configuration enables no request
+access log. A custom terminator must likewise avoid logging request URIs and WebSocket
+subprotocol headers, because those fields carry bootstrap or short-lived credentials.
 
 Hostname-based `[web].backend` and `mask_backend` addresses refresh every minute,
 retain the last successful DNS answer, and provide up to 16 candidates per connect
@@ -559,17 +572,26 @@ WEB metrics are available only by directly querying the loopback relay:
 curl -sS http://127.0.0.1:8081/metrics
 ```
 
-They report sessions, streams, refused streams/accepts, throttling, buffered payload
-and outgoing bytes. The public Caddy routes do not expose this endpoint.
+They report sessions, streams, refused streams/accepts, throttling, retained userspace
+buffer capacity and outgoing bytes. The public Caddy routes do not expose this endpoint.
 Existing Docker/source configurations need no new parameters for these changes.
 
 Re-running WEB setup preserves an existing WEB-only gate. Activating a new gate
-requires successful HTTPS and loopback relay checks. Setup validates Caddy before
+requires a certificate-verified end-to-end probe: authenticated bridge metadata,
+short-lived-token WSS, HELLO/WELCOME, a logical stream, and a real MTProto
+`req_pq`/`resPQ` with the probe nonce echoed by Telegram. The probe has one absolute
+deadline, uses only Python's standard library, receives probe material over stdin,
+and never places a permanent secret or bearer URL in argv/logs. Production installers
+ensure Python 3 is present; no pip package is used. Setup validates Caddy before
 replacing its WEB files and restores the previous files/config if candidate validation
 fails. It also checks certificate expiry. Changing an existing WEB domain or base
 path invalidates distributed links and live carrier capabilities. `setup_web.sh`
 therefore requires `--force`; installers can use `WEB_FORCE_DOMAIN_CHANGE=true`
 or `WEB_FORCE_BASE_PATH_CHANGE=true` for the corresponding explicit change.
+
+Additive WEB setup runs the same full probe as a non-fatal diagnostic. If it fails,
+ordinary direct MTProto remains available and setup reports the WEB path as unhealthy;
+a new WEB-only gate is never written until the probe succeeds.
 
 ### WEB-only mode
 
@@ -588,7 +610,7 @@ For a source/systemd installation:
 sudo /opt/mtproto-proxy/setup_web.sh --only web.example.com
 ```
 
-For first activation, setup keeps direct MTProto available until Caddy and `mtproto-web-relay` pass their checks, then activates the gate in a final proxy-only restart. Reinstall preserves an already active gate. `--print-links` and installer summaries emit only `tg://webproxy` links while the gate is active. To restore ordinary MTProto without removing WEB support, run `setup_web.sh --no-only web.example.com` (or rerun the Docker installer with `ENABLE_WEB=true WEB_ONLY=false`).
+For first activation, setup keeps direct MTProto available until Caddy and `mtproto-web-relay` pass the full `req_pq`/`resPQ` probe, then activates the gate in a final proxy-only restart. A failed probe leaves direct MTProto available. Reinstall preserves an already active gate. `--print-links` and installer summaries emit only `tg://webproxy` links while the gate is active. To restore ordinary MTProto without removing WEB support, run `setup_web.sh --no-only web.example.com` (or rerun the Docker installer with `ENABLE_WEB=true WEB_ONLY=false`).
 
 WEB-only requires Caddy masking and an enabled WEB relay. It is ignored if `[web].enabled=false`, so removing WEB support cannot leave an unreachable all-masked proxy. Existing ordinary `tg://proxy` links do not work until WEB-only is disabled, and `[web].max_sessions` becomes the effective desktop-session ceiling.
 
@@ -1057,6 +1079,7 @@ rate_limit_per_subnet = 30                # Max new connections/sec per /24 subn
 # enabled = true
 # only = false                              # Mask direct MTProto and serve only the trusted WEB relay
 # domain = "web.example.com"               # Must differ from censorship.tls_domain
+# public_dir = "/srv/web.example.com"       # Optional bounded static site; unset keeps bodyless 404
 # base_path = "phcf2vfe7zgbrslg"           # Empty/omitted = root v1; non-empty = path-bound v2
 # Ordinary requests receive the same empty 404 as the masking domain
 # listen = "127.0.0.1"                     # Plain HTTP/WebSocket relay, local only
@@ -1066,10 +1089,11 @@ rate_limit_per_subnet = 30                # Max new connections/sec per /24 subn
 # ws_path = "/api/v1/socket"
 # trust_forwarded_for = true
 # client_ip_header = "x-forwarded-for"
-# check_origin = true
+# trusted_http_sources = []                 # HTTP terminator IPs only; loopback is implicit
+# check_origin = true                       # Missing is allowed; supplied Origin must match exactly
 # max_sessions = 8
 # max_streams = 32
-# max_buffer_mb = 128
+# max_buffer_mb = 128                       # Retained queue/list allocation budget
 # relay_sources = []                       # Extra trusted relay IP literals; loopback is implicit
 
 [censorship]
@@ -1122,18 +1146,20 @@ alice = true   # direct where possible; CDN DC203 still requires MiddleProxy
 | `[web]` | `enabled` | `false` | Enable the separate Telegram Desktop WEB relay process and the trusted relay path in the data plane |
 | `[web]` | `only` / `web_only` | `false` | When WEB is enabled, mask direct MTProto for every non-relay peer. Existing `tg://proxy` links stop working; relay trust comes only from the address returned by `accept()` |
 | `[web]` | `domain` | _(none)_ | Public ASCII DNS hostname placed in `tg://webproxy` links. It must differ from `censorship.tls_domain`; changing it invalidates existing WEB capabilities/links |
+| `[web]` | `public_dir` | _(none)_ | Optional operator-owned static directory loaded once at relay startup. The path is inside the relay/container filesystem and must be readable. Exact routes support MIME/ETag; hidden files, symlinks, traversal and oversized trees are excluded. Unset preserves bodyless ordinary 404s |
 | `[web]` | `base_path` | `""` | Optional case-sensitive carrier prefix without surrounding slashes. Empty keeps root v1 routes; non-empty moves bridge/WebSocket below `/<base_path>/`, uses a path-bound v2 capability, and requires a `0x70`-marked link secret. Changing it invalidates existing WEB links and sessions |
 | `[web]` | `listen` / `host` | `"127.0.0.1"` | Plain HTTP/WebSocket relay bind address behind Caddy. Keep it on loopback for the bundled deployment |
 | `[web]` | `port` | `8081` | Local relay listener port |
 | `[web]` | `backend` | `127.0.0.1:<server.port>` | MTProto data-plane endpoint opened for each logical WEB stream. Tunnel-netns installs use `10.200.200.2:443` |
 | `[web]` | `mask_backend` | _(none)_ | Local Caddy TLS listener that accepts PROXY v2 for WEB-domain SNI, normally `127.0.0.1:8444` or `10.200.200.1:8444` from the tunnel namespace |
-| `[web]` | `ws_path` | `"/api/v1/socket"` | Same-origin WebSocket endpoint embedded in the bridge page |
-| `[web]` | `trust_forwarded_for` | `true` | Read the real browser address from the configured forwarded header; the right-most entry is used |
+| `[web]` | `ws_path` | `"/api/v1/socket"` | Same-origin WebSocket endpoint embedded in the bridge page. It has no bearer query; the short-lived token is carried only in `Sec-WebSocket-Protocol` |
+| `[web]` | `trust_forwarded_for` | `true` | Read the real browser address from the configured forwarded header, but only from loopback or `trusted_http_sources`; the right-most entry of the last field line is used |
 | `[web]` | `client_ip_header` | `"x-forwarded-for"` | Header Caddy uses to pass the real browser address to the relay |
-| `[web]` | `check_origin` | `true` | Require the WebSocket `Origin` to equal `https://<web.domain>` |
+| `[web]` | `trusted_http_sources` | `[]` | Extra IP literals trusted only as HTTP terminators for forwarded client identity. This does not grant data-plane relay trust; loopback is implicit |
+| `[web]` | `check_origin` | `true` | Permit a missing `Origin` for native WebViews; if supplied, require one exact `https://<web.domain>` value |
 | `[web]` | `max_sessions` | `8` | Concurrent WEB desktop sessions; the default is sized for the repository's 512-slot small-VPS profile |
 | `[web]` | `max_streams` | `32` | Logical MTProto streams per WEB session; each consumes one data-plane connection |
-| `[web]` | `max_buffer_mb` | `128` | Aggregate hard ceiling for queued WEB-relay data |
+| `[web]` | `max_buffer_mb` | `128` | Aggregate hard ceiling for retained WEB-relay list capacities, queue blocks/freelists and queue pointer capacity |
 | `[web]` | `relay_sources` | `[]` | Extra IP literals trusted to send PROXY-prefixed direct-obfuscated WEB streams; loopback is implicit while WEB is enabled |
 | `[censorship]` | `tls_domain` | `"google.com"` | FakeTLS SNI domain. With `mask_port=443`, unauthenticated clients are forwarded to this domain directly. For self-domain masking, set it to your own domain and point its DNS A record to the VPS. Since June 2026, the real masking endpoint should negotiate X25519MLKEM768 (`0x11ec`) in one round; classical-x25519-only domains can be a passive marker |
 | `[censorship]` | `mask` | `true` | Forward unauthenticated connections to the configured masking target to defeat active probing |

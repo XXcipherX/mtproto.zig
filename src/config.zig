@@ -63,11 +63,18 @@ fn isValidIpv4Literal(value: []const u8) bool {
 }
 
 fn isValidWsPath(value: []const u8) bool {
-    if (value.len == 0 or value.len > 2048 or value[0] != '/') return false;
+    if (value.len == 0 or value.len > 2048 or value[0] != '/' or std.mem.startsWith(u8, value, "//")) return false;
     for (value) |byte| {
-        if (byte <= ' ' or byte == 0x7f or byte == '?' or byte == '#') return false;
+        if (byte <= ' ' or byte == 0x7f or byte == '?' or byte == '#' or byte == '\\') return false;
     }
     return true;
+}
+
+test "WEB websocket paths match bridge renderer constraints" {
+    try std.testing.expect(!isValidWsPath("//socket"));
+    try std.testing.expect(!isValidWsPath("/api\\socket"));
+    try std.testing.expect(isValidWsPath("/api/v1/socket"));
+    try std.testing.expect(isValidWsPath("/relay/Path_1/api/v1/socket"));
 }
 
 fn isValidHttpToken(value: []const u8) bool {
@@ -102,6 +109,7 @@ pub const Config = struct {
         InvalidWebSocketPath,
         InvalidWebClientIpHeader,
         InvalidWebRelaySource,
+        InvalidWebHttpSource,
         ClientSilenceTimeoutTooShort,
         ClientSilenceTimeoutNotBeforeIdle,
     };
@@ -117,6 +125,9 @@ pub const Config = struct {
         /// peers and send every direct client to the masking backend.
         only: bool = false,
         domain: ?[]const u8 = null,
+        /// Optional operator-owned static site loaded once by the relay. When unset,
+        /// ordinary HTTP keeps the fork's bodyless 404 behaviour.
+        public_dir: ?[]const u8 = null,
         /// Optional carrier prefix stored without surrounding slashes. Empty keeps
         /// the historical root deployment and v1 capability derivation.
         base_path: ?[]const u8 = null,
@@ -134,6 +145,10 @@ pub const Config = struct {
         /// Extra relay source IP literals. Loopback is trusted automatically while
         /// WEB mode is enabled; ports are ignored when matching these entries.
         relay_sources: []const []const u8 = &.{},
+        /// TLS terminators allowed to supply the configured forwarded-client header.
+        /// This trust domain is deliberately separate from data-plane relay_sources.
+        /// Loopback is trusted automatically.
+        trusted_http_sources: []const []const u8 = &.{},
 
         pub fn effectiveHost(self: *const Web) []const u8 {
             return self.host orelse "127.0.0.1";
@@ -307,9 +322,10 @@ pub const Config = struct {
             error.InvalidWebListenHost => "[web].host must be a valid IP literal",
             error.WebListenerPortCollision => "[web].port must not collide with the proxy or masking port",
             error.InvalidWebBasePath => "[web].base_path must be empty or contain canonical [A-Za-z0-9][A-Za-z0-9_-]* segments joined by / (maximum 128 bytes)",
-            error.InvalidWebSocketPath => "[web].ws_path must be an absolute path without whitespace, query, or fragment",
+            error.InvalidWebSocketPath => "[web].ws_path must be a single-slash absolute path without backslashes, whitespace, query, or fragment",
             error.InvalidWebClientIpHeader => "[web].client_ip_header must be a valid HTTP field name",
             error.InvalidWebRelaySource => "every [web].relay_sources entry must be an IP literal",
+            error.InvalidWebHttpSource => "every [web].trusted_http_sources entry must be an IP literal",
             error.ClientSilenceTimeoutTooShort => "server.client_silence_close_sec must be 0 or at least 10 seconds",
             error.ClientSilenceTimeoutNotBeforeIdle => "server.client_silence_close_sec must be lower than server.idle_timeout_sec",
         };
@@ -358,6 +374,9 @@ pub const Config = struct {
         for (self.web.relay_sources) |source| {
             _ = std.Io.net.IpAddress.parse(source, 0) catch return error.InvalidWebRelaySource;
         }
+        for (self.web.trusted_http_sources) |source| {
+            _ = std.Io.net.IpAddress.parse(source, 0) catch return error.InvalidWebHttpSource;
+        }
     }
 
     /// Emit startup warnings for configuration values known to cause issues.
@@ -388,6 +407,12 @@ pub const Config = struct {
             for (self.web.relay_sources) |source| {
                 _ = std.Io.net.IpAddress.parse(source, 0) catch {
                     log.warn("[web].relay_sources entry '{s}' is not an IP literal and will be ignored", .{source});
+                    continue;
+                };
+            }
+            for (self.web.trusted_http_sources) |source| {
+                _ = std.Io.net.IpAddress.parse(source, 0) catch {
+                    log.warn("[web].trusted_http_sources entry '{s}' is not an IP literal and will be ignored", .{source});
                     continue;
                 };
             }
@@ -822,6 +847,8 @@ pub const Config = struct {
                         if (parseBoolSetting(key, value)) |parsed| cfg.web.only = parsed;
                     } else if (std.mem.eql(u8, key, "domain")) {
                         try replaceOwnedOptionalString(allocator, &cfg.web.domain, value);
+                    } else if (std.mem.eql(u8, key, "public_dir")) {
+                        try replaceOwnedOptionalString(allocator, &cfg.web.public_dir, value);
                     } else if (std.mem.eql(u8, key, "base_path")) {
                         try replaceOwnedOptionalString(allocator, &cfg.web.base_path, value);
                     } else if (std.mem.eql(u8, key, "listen") or std.mem.eql(u8, key, "host")) {
@@ -854,6 +881,12 @@ pub const Config = struct {
                         };
                         freeOwnedStringSlice(allocator, cfg.web.relay_sources);
                         cfg.web.relay_sources = parsed;
+                    } else if (std.mem.eql(u8, key, "trusted_http_sources")) {
+                        const parsed = parseStringArraySetting(allocator, value) catch {
+                            return failConfigLine(error.InvalidStringArray, line_number, line);
+                        };
+                        freeOwnedStringSlice(allocator, cfg.web.trusted_http_sources);
+                        cfg.web.trusted_http_sources = parsed;
                     } else {
                         return failConfigLine(error.UnknownConfigKey, line_number, line);
                     }
@@ -898,6 +931,7 @@ pub const Config = struct {
             allocator.free(ip);
         }
         if (self.web.domain) |value| allocator.free(value);
+        if (self.web.public_dir) |value| allocator.free(value);
         if (self.web.base_path) |value| allocator.free(value);
         if (self.web.host) |value| allocator.free(value);
         if (self.web.backend) |value| allocator.free(value);
@@ -905,6 +939,7 @@ pub const Config = struct {
         if (self.web.ws_path) |value| allocator.free(value);
         if (self.web.client_ip_header) |value| allocator.free(value);
         freeOwnedStringSlice(allocator, self.web.relay_sources);
+        freeOwnedStringSlice(allocator, self.web.trusted_http_sources);
     }
 
     /// Get user secrets as a flat caller-owned slice for handshake validation.
@@ -1786,6 +1821,7 @@ test "parse config - WEB relay settings" {
         \\enabled = true
         \\only = true
         \\domain = "web.example.com"
+        \\public_dir = "/srv/web.example.com"
         \\base_path = "relay/Primary_1"
         \\listen = "127.0.0.1"
         \\port = 8081
@@ -1799,6 +1835,7 @@ test "parse config - WEB relay settings" {
         \\max_streams = 32
         \\max_buffer_mb = 96
         \\relay_sources = ["10.200.200.1", "2001:db8::1"]
+        \\trusted_http_sources = ["127.0.0.1", "10.200.200.2"]
         \\[access.users]
         \\alice = "00112233445566778899aabbccddeeff"
     ;
@@ -1809,6 +1846,7 @@ test "parse config - WEB relay settings" {
     try std.testing.expect(cfg.web.enabled);
     try std.testing.expect(cfg.web.onlyActive());
     try std.testing.expectEqualStrings("web.example.com", cfg.web.domain.?);
+    try std.testing.expectEqualStrings("/srv/web.example.com", cfg.web.public_dir.?);
     try std.testing.expectEqualStrings("relay/Primary_1", cfg.web.effectiveBasePath());
     try std.testing.expectEqualStrings("127.0.0.1", cfg.web.effectiveHost());
     try std.testing.expectEqual(@as(u16, 8081), cfg.web.port);
@@ -1820,6 +1858,9 @@ test "parse config - WEB relay settings" {
     try std.testing.expectEqual(@as(usize, 2), cfg.web.relay_sources.len);
     try std.testing.expectEqualStrings("10.200.200.1", cfg.web.relay_sources[0]);
     try std.testing.expectEqualStrings("2001:db8::1", cfg.web.relay_sources[1]);
+    try std.testing.expectEqual(@as(usize, 2), cfg.web.trusted_http_sources.len);
+    try std.testing.expectEqualStrings("127.0.0.1", cfg.web.trusted_http_sources[0]);
+    try std.testing.expectEqualStrings("10.200.200.2", cfg.web.trusted_http_sources[1]);
 }
 
 test "parse config - WEB-only is inert while WEB relay is disabled" {
@@ -1880,6 +1921,7 @@ test "config validation accepts ordinary and WEB deployments" {
         \\ws_path = "/api/v1/socket"
         \\client_ip_header = "x-forwarded-for"
         \\relay_sources = ["127.0.0.1", "2001:db8::1"]
+        \\trusted_http_sources = ["127.0.0.1", "10.200.200.2"]
         \\[censorship]
         \\tls_domain = "proxy.example.com"
         \\mask = true
@@ -2013,6 +2055,19 @@ test "config validation rejects unsafe WEB relationships" {
         \\domain = "web.example.com"
         \\mask_backend = "127.0.0.1:8444"
         \\relay_sources = ["relay.example.com"]
+        \\[censorship]
+        \\tls_domain = "proxy.example.com"
+        \\mask = true
+        \\mask_port = 8443
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    );
+    try expectValidationError(error.InvalidWebHttpSource,
+        \\[web]
+        \\enabled = true
+        \\domain = "web.example.com"
+        \\mask_backend = "127.0.0.1:8444"
+        \\trusted_http_sources = ["terminator.example.com"]
         \\[censorship]
         \\tls_domain = "proxy.example.com"
         \\mask = true

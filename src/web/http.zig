@@ -1,7 +1,8 @@
 //! Minimal HTTP/1.1 request parsing for the WEB proxy relay.
 //!
-//! The relay serves one capability-gated bridge page and its WebSocket upgrade; every
-//! unauthenticated HTTP route is a bodyless 404. It never proxies HTTP, never reads a
+//! The relay serves one capability-gated bridge page, its token-authenticated WebSocket
+//! upgrade, and an optional startup-loaded public site. Without that site, ordinary
+//! HTTP routes retain the fork's bodyless 404. It never proxies HTTP, never reads a
 //! request body, and only ever answers `GET`/`HEAD`. Body-bearing requests force
 //! Connection: close and cannot upgrade or become a second request. Ambiguous framing
 //! (Transfer-Encoding with Content-Length or duplicate length headers) is rejected.
@@ -38,6 +39,9 @@ pub const Request = struct {
     method: Method,
     /// Request target as sent, e.g. `/?bridge=abc`.
     target: []const u8,
+    /// Authentication selectors accept only the canonical origin-form request target.
+    /// Absolute-form targets remain parseable as ordinary HTTP but cannot authenticate.
+    origin_form: bool = true,
     /// Bytes the complete head occupies, including the terminating blank line.
     head_len: usize,
     /// HTTP/1.0 request — different keep-alive default.
@@ -103,29 +107,6 @@ pub const Request = struct {
     /// Raw (still percent-encoded) value of query parameter `key`, or null.
     pub fn query(self: *const Request, key: []const u8) ?[]const u8 {
         return queryValue(self.target, key);
-    }
-
-    /// Return the value only for the exact browser carrier request
-    /// `GET <expected_path>?<key>=<value>`, with no body or alternate query spelling.
-    ///
-    /// Generic query parsing is intentionally insufficient for authentication: accepting
-    /// duplicate parameters, extra parameters, another path, or HEAD would create more
-    /// externally distinguishable carrier shapes than the protocol defines.
-    pub fn canonicalGetQuery(
-        self: *const Request,
-        expected_path: []const u8,
-        key: []const u8,
-        value_len: usize,
-    ) ?[]const u8 {
-        if (self.method != .get or self.has_body) return null;
-        if (!std.mem.startsWith(u8, self.target, expected_path)) return null;
-
-        const rest = self.target[expected_path.len..];
-        const prefix_len = 1 + key.len + 1; // `?`, key, `=`
-        if (rest.len != prefix_len + value_len or rest[0] != '?') return null;
-        if (!std.mem.eql(u8, rest[1 .. 1 + key.len], key)) return null;
-        if (rest[1 + key.len] != '=') return null;
-        return rest[prefix_len..];
     }
 
     /// Whether the connection may be reused after this response. HTTP/1.1 defaults to
@@ -209,6 +190,7 @@ pub fn parse(buf: []const u8) ParseError!Request {
     var request = Request{
         .method = method,
         .target = target,
+        .origin_form = raw_target.len > 0 and raw_target[0] == '/',
         .head_len = end,
         .http_1_0 = http_1_0,
         .headers_buf = undefined,
@@ -248,16 +230,23 @@ pub fn parse(buf: []const u8) ParseError!Request {
     return request;
 }
 
-/// True when the request is a well-formed RFC 6455 upgrade handshake.
-pub fn isWebSocketUpgrade(req: *const Request) bool {
+/// Upgrade envelope authenticated before the WebSocket key is interpreted. Keeping the
+/// key out of this predicate lets a valid short-lived token receive a truthful 400 for a
+/// missing or malformed key without exposing that distinction to unauthenticated traffic.
+fn hasWebSocketUpgradeEnvelope(req: *const Request) bool {
     if (req.method != .get or req.has_body) return false;
     if (req.headerCount("upgrade") != 1 or req.headerCount("connection") != 1) return false;
-    if (req.headerCount("sec-websocket-version") != 1 or req.headerCount("sec-websocket-key") != 1) return false;
+    if (req.headerCount("sec-websocket-version") != 1) return false;
     if (!req.headerHasToken("upgrade", "websocket")) return false;
     if (!req.headerHasToken("connection", "upgrade")) return false;
     const version = req.header("sec-websocket-version") orelse return false;
-    if (!std.mem.eql(u8, version, "13")) return false;
-    return req.header("sec-websocket-key") != null;
+    return std.mem.eql(u8, version, "13");
+}
+
+/// True when the request carries the complete canonical RFC 6455 upgrade envelope.
+/// Key syntax itself is checked by the WebSocket implementation after token matching.
+pub fn isWebSocketUpgrade(req: *const Request) bool {
+    return hasWebSocketUpgradeEnvelope(req) and req.headerCount("sec-websocket-key") == 1;
 }
 
 /// The **right-most** entry of a forwarded-for list.
@@ -318,7 +307,7 @@ test "head boundary detection ignores an incomplete head" {
 
 test "recognises a WebSocket upgrade and its variations" {
     const upgrade =
-        "GET /api/v1/socket?b=cap HTTP/1.1\r\n" ++
+        "GET /api/v1/socket HTTP/1.1\r\n" ++
         "Host: proxy.example.com\r\n" ++
         "Connection: keep-alive, Upgrade\r\n" ++
         "Upgrade: WebSocket\r\n" ++
@@ -329,43 +318,7 @@ test "recognises a WebSocket upgrade and its variations" {
     const req = try parse(upgrade);
     try std.testing.expect(isWebSocketUpgrade(&req));
     try std.testing.expectEqualStrings("/api/v1/socket", req.path());
-    try std.testing.expectEqualStrings("cap", req.query("b").?);
     try std.testing.expectEqualStrings("dGhlIHNhbXBsZSBub25jZQ==", req.header("sec-websocket-key").?);
-}
-
-test "canonical carrier queries reject alternate request shapes" {
-    const token = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-
-    var storage: [512]u8 = undefined;
-    const page_text = try std.fmt.bufPrint(&storage, "GET /?bridge={s} HTTP/1.1\r\nHost: proxy.example.com\r\n\r\n", .{token});
-    const page = try parse(page_text);
-    try std.testing.expectEqualStrings(token, page.canonicalGetQuery("/", "bridge", token.len).?);
-    try std.testing.expect(page.canonicalGetQuery("/", "b", token.len) == null);
-
-    const socket_text = try std.fmt.bufPrint(&storage, "GET /api/v1/socket?b={s} HTTP/1.1\r\nHost: proxy.example.com\r\n\r\n", .{token});
-    const socket = try parse(socket_text);
-    try std.testing.expectEqualStrings(token, socket.canonicalGetQuery("/api/v1/socket", "b", token.len).?);
-    try std.testing.expect(socket.canonicalGetQuery("/api/v1/socket", "bridge", token.len) == null);
-
-    const alternatives = [_][]const u8{
-        "HEAD /?bridge=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA HTTP/1.1\r\nHost: proxy.example.com\r\n\r\n",
-        "POST /?bridge=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA HTTP/1.1\r\nHost: proxy.example.com\r\n\r\n",
-        "GET /?bridge=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&x=1 HTTP/1.1\r\nHost: proxy.example.com\r\n\r\n",
-        "GET /?x=1&bridge=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA HTTP/1.1\r\nHost: proxy.example.com\r\n\r\n",
-        "GET /?bridge=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&bridge=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA HTTP/1.1\r\nHost: proxy.example.com\r\n\r\n",
-        "GET /wrong?bridge=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA HTTP/1.1\r\nHost: proxy.example.com\r\n\r\n",
-        "GET /?bridge=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA HTTP/1.1\r\nHost: proxy.example.com\r\nContent-Length: 1\r\n\r\n",
-    };
-    for (alternatives) |text| {
-        const request = try parse(text);
-        try std.testing.expect(request.canonicalGetQuery("/", "bridge", token.len) == null);
-    }
-
-    const alternate_socket = try parse(
-        "GET /api/v1/socket?b=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&x=1 HTTP/1.1\r\n" ++
-            "Host: proxy.example.com\r\n\r\n",
-    );
-    try std.testing.expect(alternate_socket.canonicalGetQuery("/api/v1/socket", "b", token.len) == null);
 }
 
 test "an upgrade missing version 13 is not an upgrade" {
@@ -378,7 +331,7 @@ test "an upgrade missing version 13 is not an upgrade" {
 
 test "duplicate WebSocket handshake fields are not canonical" {
     const duplicate_key = try parse(
-        "GET /api/v1/socket?b=cap HTTP/1.1\r\n" ++
+        "GET /api/v1/socket HTTP/1.1\r\n" ++
             "Host: proxy.example.com\r\n" ++
             "Connection: Upgrade\r\n" ++
             "Upgrade: websocket\r\n" ++
@@ -478,6 +431,116 @@ test "token list matching is case-insensitive and comma aware" {
     try std.testing.expect(listHasToken("keep-alive, Upgrade", "upgrade"));
     try std.testing.expect(listHasToken("Upgrade", "UPGRADE"));
     try std.testing.expect(!listHasToken("upgraded", "upgrade"));
+}
+
+/// Only the exact origin-form bridge GET is authenticated. `bridge_path` is `/` for
+/// root deployments and the effective `/<base_path>/` route otherwise.
+pub fn bridgeValue(request: *const Request, bridge_path: []const u8, host: []const u8) ?[]const u8 {
+    if (request.method != .get or request.has_body or !request.origin_form or !hostMatches(request, host)) return null;
+    if (!std.mem.startsWith(u8, request.target, bridge_path)) return null;
+    const rest = request.target[bridge_path.len..];
+    const prefix = "?bridge=";
+    if (rest.len != prefix.len + 43 or !std.mem.startsWith(u8, rest, prefix)) return null;
+    const value = rest[prefix.len..];
+    if (!canonicalToken(value)) return null;
+    return value;
+}
+
+pub fn singleHeader(request: *const Request, name: []const u8) ?[]const u8 {
+    var result: ?[]const u8 = null;
+    for (request.headers()) |h| {
+        if (!std.ascii.eqlIgnoreCase(h.name, name)) continue;
+        if (result != null) return null;
+        result = h.value;
+    }
+    return result;
+}
+
+pub fn hostMatches(request: *const Request, expected: []const u8) bool {
+    const host = singleHeader(request, "host") orelse return false;
+    return std.mem.eql(u8, host, expected) or
+        (host.len == expected.len + 4 and std.mem.startsWith(u8, host, expected) and std.mem.endsWith(u8, host, ":443"));
+}
+
+/// Return the short-lived carrier token only for the exact carrier route, upgrade
+/// envelope and single canonical subprotocol value. No query string is accepted.
+/// Sec-WebSocket-Key is deliberately validated after token authentication.
+pub fn carrierToken(request: *const Request, path: []const u8, host: []const u8) ?[]const u8 {
+    if (!request.origin_form or !std.mem.eql(u8, request.target, path) or !hostMatches(request, host) or !hasWebSocketUpgradeEnvelope(request)) return null;
+    const protocol = singleHeader(request, "sec-websocket-protocol") orelse return null;
+    const prefix = "tproxy-v1.";
+    if (protocol.len != prefix.len + 43 or !std.mem.startsWith(u8, protocol, prefix)) return null;
+    const token = protocol[prefix.len..];
+    if (!canonicalToken(token)) return null;
+    return token;
+}
+
+fn canonicalToken(value: []const u8) bool {
+    if (value.len != 43) return false;
+    for (value) |c| if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_') return false;
+    // 32 bytes encode to 43 base64url characters. The last symbol contains only four
+    // significant bits, so its two unused low bits must be zero.
+    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const last = std.mem.indexOfScalar(u8, alphabet, value[42]) orelse return false;
+    return (last & 3) == 0;
+}
+
+test "canonical bridge selector supports root and base path and rejects aliases" {
+    const token = "IpJrt3e7sKtzPyoXy6w-Zj6GGEvsvclN66JzQEfPYLA";
+    const root = try parse("GET /?bridge=" ++ token ++ " HTTP/1.1\r\nHost: proxy.example.com\r\n\r\n");
+    try std.testing.expectEqualStrings(token, bridgeValue(&root, "/", "proxy.example.com").?);
+    const based = try parse("GET /relay/Path_1/?bridge=" ++ token ++ " HTTP/1.1\r\nHost: proxy.example.com:443\r\n\r\n");
+    try std.testing.expectEqualStrings(token, bridgeValue(&based, "/relay/Path_1/", "proxy.example.com").?);
+
+    const cases = [_][]const u8{
+        "GET /?bridge=" ++ token ++ "&x=1 HTTP/1.1\r\nHost: proxy.example.com\r\n\r\n",
+        "GET /?bridge=" ++ token ++ "&bridge=" ++ token ++ " HTTP/1.1\r\nHost: proxy.example.com\r\n\r\n",
+        "HEAD /?bridge=" ++ token ++ " HTTP/1.1\r\nHost: proxy.example.com\r\n\r\n",
+        "GET /?b=" ++ token ++ " HTTP/1.1\r\nHost: proxy.example.com\r\n\r\n",
+        "GET /?bridge=" ++ token ++ " HTTP/1.1\r\nHost: other.example.com\r\n\r\n",
+        "GET /?bridge=" ++ token ++ " HTTP/1.1\r\nHost: proxy.example.com\r\nHost: proxy.example.com\r\n\r\n",
+        "GET https://proxy.example.com/?bridge=" ++ token ++ " HTTP/1.1\r\nHost: proxy.example.com\r\n\r\n",
+        "GET /?bridge=" ++ token ++ " HTTP/1.1\r\nHost: proxy.example.com\r\nContent-Length: 1\r\n\r\n",
+    };
+    for (cases) |raw| {
+        const req = try parse(raw);
+        try std.testing.expect(bridgeValue(&req, "/", "proxy.example.com") == null);
+    }
+}
+
+test "carrier selector requires exact path host and unique canonical subprotocol" {
+    const token = "IpJrt3e7sKtzPyoXy6w-Zj6GGEvsvclN66JzQEfPYLA";
+    const headers =
+        " HTTP/1.1\r\nHost: proxy.example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n" ++
+        "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n";
+    const valid = try parse("GET /relay/api/v1/socket" ++ headers ++ "Sec-WebSocket-Protocol: tproxy-v1." ++ token ++ "\r\n\r\n");
+    try std.testing.expectEqualStrings(token, carrierToken(&valid, "/relay/api/v1/socket", "proxy.example.com").?);
+
+    const no_key_headers =
+        " HTTP/1.1\r\nHost: proxy.example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n" ++
+        "Sec-WebSocket-Version: 13\r\n";
+    const missing_key = try parse("GET /relay/api/v1/socket" ++ no_key_headers ++ "Sec-WebSocket-Protocol: tproxy-v1." ++ token ++ "\r\n\r\n");
+    try std.testing.expect(!isWebSocketUpgrade(&missing_key));
+    try std.testing.expectEqualStrings(token, carrierToken(&missing_key, "/relay/api/v1/socket", "proxy.example.com").?);
+    const invalid_key = try parse("GET /relay/api/v1/socket" ++ no_key_headers ++ "Sec-WebSocket-Key: invalid\r\nSec-WebSocket-Protocol: tproxy-v1." ++ token ++ "\r\n\r\n");
+    try std.testing.expectEqualStrings(token, carrierToken(&invalid_key, "/relay/api/v1/socket", "proxy.example.com").?);
+
+    const old_query = try parse("GET /relay/api/v1/socket?b=" ++ token ++ headers ++ "Sec-WebSocket-Protocol: tproxy-v1." ++ token ++ "\r\n\r\n");
+    try std.testing.expect(carrierToken(&old_query, "/relay/api/v1/socket", "proxy.example.com") == null);
+    const extra_query = try parse("GET /relay/api/v1/socket?x=1" ++ headers ++ "Sec-WebSocket-Protocol: tproxy-v1." ++ token ++ "\r\n\r\n");
+    try std.testing.expect(carrierToken(&extra_query, "/relay/api/v1/socket", "proxy.example.com") == null);
+    const wrong_path = try parse("GET /relay/api/v1/other" ++ headers ++ "Sec-WebSocket-Protocol: tproxy-v1." ++ token ++ "\r\n\r\n");
+    try std.testing.expect(carrierToken(&wrong_path, "/relay/api/v1/socket", "proxy.example.com") == null);
+    const duplicate = try parse("GET /relay/api/v1/socket" ++ headers ++ "Sec-WebSocket-Protocol: tproxy-v1." ++ token ++ "\r\nSec-WebSocket-Protocol: tproxy-v1." ++ token ++ "\r\n\r\n");
+    try std.testing.expect(carrierToken(&duplicate, "/relay/api/v1/socket", "proxy.example.com") == null);
+    const bad_host = try parse("GET /relay/api/v1/socket HTTP/1.1\r\nHost: other.example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Protocol: tproxy-v1." ++ token ++ "\r\n\r\n");
+    try std.testing.expect(carrierToken(&bad_host, "/relay/api/v1/socket", "proxy.example.com") == null);
+    const duplicate_host = try parse("GET /relay/api/v1/socket" ++ headers ++ "Host: proxy.example.com\r\nSec-WebSocket-Protocol: tproxy-v1." ++ token ++ "\r\n\r\n");
+    try std.testing.expect(carrierToken(&duplicate_host, "/relay/api/v1/socket", "proxy.example.com") == null);
+    const malformed = try parse("GET /relay/api/v1/socket" ++ headers ++ "Sec-WebSocket-Protocol: tproxy-v1." ++ "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" ++ "\r\n\r\n");
+    try std.testing.expect(carrierToken(&malformed, "/relay/api/v1/socket", "proxy.example.com") == null);
+    const absolute = try parse("GET https://proxy.example.com/relay/api/v1/socket" ++ headers ++ "Sec-WebSocket-Protocol: tproxy-v1." ++ token ++ "\r\n\r\n");
+    try std.testing.expect(carrierToken(&absolute, "/relay/api/v1/socket", "proxy.example.com") == null);
 }
 
 test "fuzz HTTP request parsing" {

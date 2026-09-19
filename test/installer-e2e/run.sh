@@ -154,7 +154,7 @@ if grep -Rqi -- 'nginx' "$INSTALL_DIR"; then
     exit 1
 fi
 
-for helper in setup_masking.sh setup_web.sh web_link.sh setup_nfqws.sh setup_synfix.sh setup_mask_monitor.sh; do
+for helper in setup_masking.sh setup_web.sh web_link.sh web_probe.py setup_nfqws.sh setup_synfix.sh setup_mask_monitor.sh; do
     cmp "/workspace/deploy/$helper" "$INSTALL_DIR/$helper"
 done
 
@@ -260,7 +260,7 @@ echo "::endgroup::"
 
 echo "::group::Fresh Docker Compose install"
 run_installer 2>&1 | tee "$LOG_DIR/${SAFE_IMAGE}.install.log"
-grep -F 'WEB HTTPS probe returned expected HTTP 404' "$LOG_DIR/${SAFE_IMAGE}.install.log" >/dev/null
+grep -F 'Authenticated WEB path reached Telegram (req_pq/resPQ)' "$LOG_DIR/${SAFE_IMAGE}.install.log" >/dev/null
 grep -F 'nfqws service started' "$LOG_DIR/${SAFE_IMAGE}.install.log" >/dev/null
 ! grep -Eq 'Cannot enable firewall restoration|nfqws setup failed' "$LOG_DIR/${SAFE_IMAGE}.install.log"
 ! grep -Eq 'Unnecessary header_up X-Forwarded-For|Caddyfile input is not formatted' \
@@ -271,7 +271,7 @@ echo "::endgroup::"
 echo "::group::Idempotent reinstall"
 before_hash="$(docker exec "$CONTAINER" sha256sum "$CONFIG_FILE" | awk '{print $1}')"
 run_installer 2>&1 | tee "$LOG_DIR/${SAFE_IMAGE}.reinstall.log"
-grep -F 'WEB HTTPS probe returned expected HTTP 404' "$LOG_DIR/${SAFE_IMAGE}.reinstall.log" >/dev/null
+grep -F 'Authenticated WEB path reached Telegram (req_pq/resPQ)' "$LOG_DIR/${SAFE_IMAGE}.reinstall.log" >/dev/null
 grep -F 'nfqws service started' "$LOG_DIR/${SAFE_IMAGE}.reinstall.log" >/dev/null
 ! grep -Eq 'Cannot enable firewall restoration|nfqws setup failed' "$LOG_DIR/${SAFE_IMAGE}.reinstall.log"
 ! grep -Eq 'Unnecessary header_up X-Forwarded-For|Caddyfile input is not formatted' \

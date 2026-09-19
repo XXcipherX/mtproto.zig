@@ -25,10 +25,13 @@ jobs:
         run: zig fmt --check build.zig src test/hardware_aes_probe.zig
 
       - name: Check Python harness syntax
-        run: python3 -m py_compile test/*.py test/web-bridge/*.py
+        run: python3 -m py_compile deploy/web_probe.py test/*.py test/web-bridge/*.py
 
       - name: Test benchmark and probe helpers
         run: python3 -m unittest discover -s test -p 'test_probe_helpers.py'
+
+      - name: Test WEB setup end-to-end probe fixtures
+        run: python3 -m unittest discover -s test -p 'test_web_setup_probe.py'
 
       - name: ShellCheck scripts
         run: shellcheck --severity=error docker-entrypoint.sh deploy/*.sh deploy/monitor/*.sh test/check_hardware_aes.sh test/run_fuzz.sh test/installer-e2e/run.sh test/installer-e2e/fake-*

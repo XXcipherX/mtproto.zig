@@ -272,6 +272,11 @@ fi
 # shellcheck source=deploy/web_link.sh
 source "$WEB_LINK_HELPER"
 
+WEB_PROBE_HELPER="${INSTALL_DIR}/web_probe.py"
+if [[ ! -r "$WEB_PROBE_HELPER" ]]; then
+    WEB_PROBE_HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/web_probe.py"
+fi
+
 ensure_caddy_imports
 
 [[ "$WEB_DOMAIN" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || fail "Pass a valid WEB domain: setup_web.sh web.example.com"
@@ -516,14 +521,26 @@ EOF
 fi
 
 verify_web_path() {
-    local probe_ip="${TUNNEL_HOST_IP:+10.200.200.2}" status attempt
+    local probe_ip="${TUNNEL_HOST_IP:+10.200.200.2}" probe_result attempt
     probe_ip="${probe_ip:-127.0.0.1}"
+    command -v python3 >/dev/null 2>&1 || return 1
+    [[ -r "$WEB_PROBE_HELPER" ]] || return 1
     for attempt in 1 2 3 4 5 6; do
-        if status="$(curl -sS --max-time 5 --resolve "${WEB_DOMAIN}:443:${probe_ip}" \
-            --output /dev/null --write-out '%{http_code}' "https://${WEB_DOMAIN}/")" &&
-            [[ "$status" == "404" ]] &&
-            curl -fsS --max-time 5 "http://127.0.0.1:${WEB_PORT}/metrics" --output /dev/null
-        then
+        if is_docker_install; then
+            probe_result="$(
+                docker exec -i mtproto-proxy /usr/local/bin/mtproto-proxy \
+                    web-probe-material /etc/mtproto-proxy/config.toml |
+                    env WEB_PROBE_ADDRESS="$probe_ip" WEB_PROBE_PORT=443 \
+                        python3 "$WEB_PROBE_HELPER" 2>/dev/null
+            )" || probe_result=""
+        else
+            probe_result="$(
+                "${INSTALL_DIR}/mtproto-proxy" web-probe-material "$CONFIG_FILE" |
+                    env WEB_PROBE_ADDRESS="$probe_ip" WEB_PROBE_PORT=443 \
+                        python3 "$WEB_PROBE_HELPER" 2>/dev/null
+            )" || probe_result=""
+        fi
+        if [[ "$probe_result" == "WEB_PROBE_OK" ]]; then
             return 0
         fi
         sleep 1
@@ -531,6 +548,7 @@ verify_web_path() {
     return 1
 }
 
+WEB_PATH_VERIFIED=false
 if is_docker_install; then
     command -v docker >/dev/null 2>&1 || fail "Docker is not installed"
     docker compose version >/dev/null 2>&1 || fail "Docker Compose v2 is required"
@@ -558,7 +576,8 @@ if is_docker_install; then
         || fail "WEB relay did not stay running; WEB-only was not activated"
 
     if is_true "$WEB_ONLY"; then
-        verify_web_path || fail "WEB HTTPS/relay checks failed; a new WEB-only gate was not activated"
+        verify_web_path || fail "WEB TLS/WSS/MTProto req_pq probe failed; a new WEB-only gate was not activated"
+        WEB_PATH_VERIFIED=true
         set_config_value web only true
         docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" up -d --force-recreate --no-deps mtproto-proxy
         sleep 1
@@ -599,7 +618,8 @@ EOF
         || fail "WEB relay did not stay running; WEB-only was not activated"
 
     if is_true "$WEB_ONLY"; then
-        verify_web_path || fail "WEB HTTPS/relay checks failed; a new WEB-only gate was not activated"
+        verify_web_path || fail "WEB TLS/WSS/MTProto req_pq probe failed; a new WEB-only gate was not activated"
+        WEB_PATH_VERIFIED=true
         set_config_value web only true
         systemctl restart mtproto-proxy
         sleep 1
@@ -624,23 +644,10 @@ EOF
 chmod 0755 /etc/letsencrypt/renewal-hooks/deploy/mtproto-web-caddy-reload.sh
 
 sleep 1
-PROBE_IP="${TUNNEL_HOST_IP:+10.200.200.2}"
-PROBE_IP="${PROBE_IP:-127.0.0.1}"
-PROBE_STATUS=""
-if PROBE_STATUS="$(
-    curl -sS --max-time 5 \
-        --resolve "${WEB_DOMAIN}:443:${PROBE_IP}" \
-        --output /dev/null \
-        --write-out '%{http_code}' \
-        "https://${WEB_DOMAIN}/"
-)"; then
-    if [[ "$PROBE_STATUS" == "404" ]]; then
-        ok "WEB HTTPS probe returned expected HTTP 404"
-    else
-        info "WEB HTTPS probe returned HTTP ${PROBE_STATUS}, expected 404; inspect the proxy and Caddy logs"
-    fi
+if $WEB_PATH_VERIFIED || verify_web_path; then
+    ok "Authenticated WEB path reached Telegram (req_pq/resPQ)"
 else
-    info "WEB HTTPS probe failed before receiving the expected 404; inspect the proxy and Caddy logs"
+    info "Full WEB TLS/WSS/MTProto probe failed; direct MTProto remains available, inspect the proxy and Caddy logs"
 fi
 
 WEB_LINK_ADDRESS="$(web_proxy_link_address "$WEB_DOMAIN" "$WEB_BASE_PATH")"

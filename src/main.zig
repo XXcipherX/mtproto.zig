@@ -18,6 +18,7 @@ const net = @import("net_compat.zig");
 const proxy = @import("proxy/proxy.zig");
 const web_capability = @import("web/capability.zig");
 const web_relay = @import("web/relay.zig");
+const web_probe_material = @import("web/probe_material.zig");
 
 // Custom lock-free log function: formats into a stack buffer and writes
 // to stderr in a single write() syscall. On Linux, write() is atomic for
@@ -137,7 +138,8 @@ fn writeUsage() void {
     writeStderr(
         "\n  Usage: mtproto-proxy [config.toml] [--show-secrets | --print-links]\n" ++
             "         mtproto-proxy --check-config [config.toml]\n" ++
-            "         mtproto-proxy web-relay [config.toml]\n\n",
+            "         mtproto-proxy web-relay [config.toml]\n" ++
+            "         mtproto-proxy web-probe-material [config.toml]\n\n",
         .{},
     );
 }
@@ -1003,10 +1005,13 @@ pub fn main(init: std.process.Init) !void {
     var print_links = false;
     var check_config = false;
     var web_relay_mode = false;
+    var web_probe_material_mode = false;
     var e2e_dc_port: ?u16 = null;
     while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "web-relay") and !config_path_set and !web_relay_mode) {
+        if (std.mem.eql(u8, arg, "web-relay") and !config_path_set and !web_relay_mode and !web_probe_material_mode) {
             web_relay_mode = true;
+        } else if (std.mem.eql(u8, arg, "web-probe-material") and !config_path_set and !web_relay_mode and !web_probe_material_mode) {
+            web_probe_material_mode = true;
         } else if (std.mem.eql(u8, arg, "--show-secrets")) {
             show_secrets = true;
         } else if (std.mem.eql(u8, arg, "--print-links")) {
@@ -1034,7 +1039,8 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if ((show_secrets and print_links) or
-        (check_config and (show_secrets or print_links or web_relay_mode)))
+        (check_config and (show_secrets or print_links or web_relay_mode or web_probe_material_mode)) or
+        (web_probe_material_mode and (show_secrets or print_links)))
     {
         writeUsage();
         return error.InvalidArguments;
@@ -1074,6 +1080,16 @@ pub fn main(init: std.process.Init) !void {
         if (show_secrets or print_links) return error.InvalidArguments;
         cfg.emitWarnings();
         return runWebRelay(allocator, &cfg);
+    }
+
+    if (web_probe_material_mode) {
+        const material = try web_probe_material.render(allocator, &cfg);
+        defer {
+            std.crypto.secureZero(u8, material);
+            allocator.free(material);
+        }
+        writeStdoutBytes(material);
+        return;
     }
 
     if (print_links) {
@@ -1138,6 +1154,9 @@ test {
     _ = @import("web/ws.zig");
     _ = @import("web/http.zig");
     _ = @import("web/page.zig");
+    _ = @import("web/tokens.zig");
+    _ = @import("web/site.zig");
+    _ = web_probe_material;
     _ = web_relay;
 }
 

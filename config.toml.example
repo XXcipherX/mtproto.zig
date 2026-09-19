@@ -141,10 +141,18 @@ port = 443
 # Public DNS name in tg://webproxy links. Use a second DNS-only A record that
 # points to this VPS. It MUST differ from censorship.tls_domain, because the two
 # names select different Caddy paths behind the same public :443 listener.
-# Caddy sends every request for this host through one relay handler. Only exact
-# canonical bridge/WebSocket requests with a valid capability are selected;
-# every other request receives the same empty 404 response.
+# Caddy sends every request for this host through one relay handler. A permanent
+# secret-derived capability authenticates only the exact canonical bridge bootstrap.
+# That response mints a short-lived token carried only in Sec-WebSocket-Protocol on
+# the query-free WSS route. Ordinary requests serve public_dir when configured;
+# without it, every successfully parsed unauthenticated request gets a bodyless 404.
 # domain = "web.example.com"
+
+# Optional operator-owned static site. The path is in the relay process/container
+# filesystem and must be readable at startup. Files are loaded once; dotfiles,
+# symlinks and traversal forms are never served. Without this setting, ordinary
+# WEB-host requests retain the bodyless 404 default.
+# public_dir = "/srv/web.example.com"
 
 # Optional carrier prefix, stored without leading/trailing slashes. Empty or
 # omitted preserves the historical root routes and v1 capability. A non-empty
@@ -168,15 +176,20 @@ port = 443
 # setup_web.sh writes 127.0.0.1:8444 (or 10.200.200.1:8444 in tunnel mode).
 # mask_backend = "127.0.0.1:8444"
 
-# Same-origin WebSocket path embedded in the authenticated bridge page.
+# Same-origin WebSocket path embedded in the authenticated bridge page. The
+# permanent capability authenticates only the bridge GET; WSS has no bearer in
+# its URL and uses a short-lived token in Sec-WebSocket-Protocol instead. Use a
+# single leading slash; backslashes, whitespace, query and fragment are rejected.
 # ws_path = "/api/v1/socket"
 
 # Caddy supplies X-Forwarded-For from the trusted PROXY v2 address. The relay
-# trusts only a loopback peer and reads the right-most value of the last header line.
+# trusts loopback plus explicit trusted_http_sources and reads the right-most
+# value of the last header line. This never grants data-plane relay privilege.
 # trust_forwarded_for = true
 # client_ip_header = "x-forwarded-for"
+# trusted_http_sources = []
 
-# Require Origin: https://<domain> on WebSocket upgrades.
+# If Origin is supplied, require exactly https://<domain>. Native WebViews may omit it.
 # check_origin = true
 
 # Resource limits. Every session occupies one front/masking connection plus up
@@ -184,8 +197,8 @@ port = 443
 # at most 264 of the default 512 connection slots.
 # max_sessions = 8
 # max_streams = 32
-# Hard aggregate buffered-payload limit (input, fragments, batches and queues).
-# This is not RSS: retained allocator capacity and kernel socket memory are separate.
+# Hard aggregate retained-buffer limit (input/list capacities, queue blocks,
+# freelists and pointer capacities). It is not whole-process RSS or kernel memory.
 # max_buffer_mb = 128
 
 # Additional relay source IP literals trusted to send the direct-obfuscated

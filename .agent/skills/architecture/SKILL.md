@@ -57,21 +57,23 @@ Code anchors:
 1. Telegram Desktop opens a browser HTTPS carrier to `[web].domain` on public `:443`; with the default `[web].only=false`, ordinary FakeTLS clients continue to use the same listener with `censorship.tls_domain`.
 2. The proxy recognizes the WEB SNI with a bounds-checked routing parser that is independent of FakeTLS key-share/cipher policy, then relays the untouched TLS connection to `[web].mask_backend`, prefixing PROXY v2 with the kernel-reported browser address.
 3. The existing Caddy service terminates TLS and sends the entire WEB hostname through one loopback relay handler; it does not route on unauthenticated carrier-looking paths and removes the reverse-proxy `Via` header.
-4. The relay selects only exact canonical bridge/WebSocket requests after authenticating the secret-derived capability. Empty `[web].base_path` keeps root v1 routes; a non-empty path moves both routes below `/<base_path>/` and uses the v2 HMAC context bound to hostname + exact case-sensitive path. Every other valid HTTP request receives the same bodyless 404, and Caddy maps relay failures to that response on every path.
+4. The permanent secret-derived capability authenticates only the exact canonical bridge bootstrap. That response mints a bounded, short-lived token carried solely as `Sec-WebSocket-Protocol: tproxy-v1.<token>` on the exact WebSocket path, never in its URL. Empty `[web].base_path` keeps root v1 routes; a non-empty path moves both routes below `/<base_path>/` and uses the v2 HMAC context bound to hostname + exact case-sensitive path. Ordinary requests use the optional startup-loaded `[web].public_dir` or the fork's bodyless 404; a genuine capability in a malformed request always fails closed.
 5. Every logical stream connects back to `[web].backend`, prefixes PROXY v2 with the browser address, and carries the client's `dd` direct-obfuscated MTProto stream into the normal DC/MiddleProxy routing path.
 
 Trust is fixed from the kernel-reported peer at `accept()`: only loopback plus explicit `[web].relay_sources` may enter the direct-obfuscated path. A PROXY header may replace the diagnostic/client address but must never grant trust. When both `[web].enabled` and `[web].only` are true, every untrusted peer reaching the ordinary FakeTLS SNI is sent to the normal Caddy masking backend before secret validation, including clients holding a formerly valid direct link; the trusted relay remains admitted. `only` is inert when WEB is disabled. WEB-domain masking carriers are deliberately exempt from `mask_relay_max_secs`; ordinary masking/probe relays retain that lifetime cap.
 
-## WEB Relay Invariants (upstream PR #408 adaptation)
+## WEB Relay Invariants (upstream PR #429 adaptation)
 
 - WEB backend queues fit the full 4 MiB granted stream window plus PROXY-v2 metadata.
   Incoming WebSocket messages fit a maximum 1 MiB relay payload plus its frame header.
-- The relay accounts buffered payload on every input, fragment, batch and queue
-  mutation. `web.max_buffer_mb` is a hard payload budget, not RSS or allocated capacity;
-  retained buffers/freelists, connection metadata and kernel sockets remain outside it.
+- The relay accounts retained input, fragment, batch and queue allocations, including
+  queue blocks, freelists and pointer capacities. Growth is reserved before allocation
+  and drained idle capacity is reclaimed. `web.max_buffer_mb` is not a whole-process RSS
+  limit; unrelated metadata and kernel socket buffers remain outside it.
 - DATA/WINDOW frames batch within an event-loop pass; timer-generated frames flush
   before waiting again. WebSocket input compacts once per read pass and processing
-  stops after CLOSE. Recently closed stream history scales with `max_streams`.
+  stops after CLOSE. Recently closed stream IDs use a fixed 4096-entry bounded circular
+  history; duplicate IDs do not evict other tombstones.
 - Deferred fd/object teardown capacity is reserved before publishing a connection,
   so OOM cannot cause an fd reuse or free inside the current epoll batch.
 - `src/web/dns_cache.zig` refreshes hostname backends and WEB Caddy targets every
@@ -81,20 +83,24 @@ Trust is fixed from the kernel-reported peer at `accept()`: only loopback plus e
 - Each connect freezes up to 16 candidates. Failed backend connects retain queued
   PROXY and MTProto bytes; established streams are never replayed to another backend.
   WEB Caddy candidates use the data plane's existing mask-connect retry machinery.
-- Only loopback HTTP peers may supply forwarded client IPs; use the last matching
-  field line and its right-most value. Explicit data-plane relay trust remains fixed
-  at accept time. IPv6 trusted-peer comparison includes the interface scope.
-- The hidden bridge always uses same-origin WSS and deduplicates the initial handshake
-  on pre-adoption reconnect. It must not attempt cross-origin requests; client WebView
-  isolation limits access to off-origin response data but is not a promise that every
-  browser engine emits no off-origin packet. Keep the fork's empty Caddy 404, not
-  upstream cover pages.
+- Only loopback and explicit `[web].trusted_http_sources` peers may supply forwarded
+  client IPs; use the last matching field line and its right-most value. This HTTP
+  terminator trust never grants data-plane relay privilege, which remains fixed at
+  accept time. IPv6 trusted-peer comparison includes the interface scope.
+- The hidden bridge always uses same-origin WSS, validates complete downlink batches,
+  and retries only before adoption. It must not attempt cross-origin requests; client
+  WebView isolation limits access to off-origin response data but is not a promise that
+  every browser engine emits no off-origin packet. Keep the fork's empty Caddy 404 when
+  no operator public directory is configured, not an upstream generated cover page.
 - Caddy must proxy the whole WEB hostname to the relay rather than selecting
   carrier-looking paths before authentication. Strip its outer `Via` header, map relay
   failures to the common empty 404, and accept only the exact root or base-prefixed
-  `GET <base>/?bridge=<43>` and WebSocket `GET <base><ws_path>?b=<43>` request shapes.
-  `/<base_path>` without the trailing slash is not redirected. Random or noncanonical
-  credentials must stay indistinguishable from any other public miss.
+  `GET <base>/?bridge=<43>` bootstrap plus a query-free WebSocket
+  `GET <base><ws_path>` carrying one canonical token subprotocol. `/<base_path>` without
+  the trailing slash is not redirected. Random invalid capabilities behave like public
+  traffic; a genuine capability in any noncanonical request must fail closed.
+- The bundled Caddy vhost has no request access log. Any replacement terminator must not
+  log bridge request URIs or WebSocket subprotocol headers, which contain credentials.
 - WEB base paths use the shared maximum-128-byte segment grammar
   `[A-Za-z0-9][A-Za-z0-9_-]*` joined by `/`, stored without surrounding slashes.
   Root capabilities retain the frozen `tdesktop-web-proxy-bridge-v1\nH` context;
@@ -213,7 +219,7 @@ allocation, vector or process failures still fail the job.
 - MiddleProxy buffer changes preserve 16 KiB initial allocation, on-demand growth, and the 3840 KiB effective cap derived from the 4 MiB relay queue minus framing headroom.
 - Timeout behavior remains controlled by config timers.
 - Graceful process shutdown disables new accepts on the first signal, preserves existing relay progress until the configured deadline, and force-closes only after another signal or timeout.
-- WEB carrier requests remain capability-gated, WELCOME stays alone in the first binary carrier message, trusted relay status cannot be forged through PROXY v2, and direct-obfuscated RDHUP follows the direct relay path rather than FakeTLS record parsing. WEB-only must continue to admit the trusted relay, mask every direct peer even with a valid secret, stay inert when WEB is disabled, and suppress ordinary connection links while active.
-- CI remains green across `zig fmt --check`, Debug/ReleaseSafe/ReleaseFast tests, daemon smoke with positive, bad-secret, and graceful-SIGTERM paths, Debug plus shipping-policy real-process FakeTLS/obfuscation/direct-relay E2E against a compile-time-only loopback DC, production ReleaseSafe+PIE builds, cross-builds plus native ARM64 runtime checks, a compile-time hardware-AES assertion tied to the optimized Docker workflow profile, ShellCheck, Python syntax and offline probe-helper tests, Docker build plus safe-default smoke, the Debian/Ubuntu installer E2E matrix pulling and verifying an image built from the current checkout, genuine ReleaseFast encapsulation/FakeTLS/1-4-8-candidate benchmarks plus soak, bounded fuzzing with crash-artifact preservation, and scheduled/manual ThreadSanitizer, Valgrind Memcheck, plus extended fuzz checks.
+- Permanent WEB capabilities gate only canonical bridge bootstrap requests; carrier URLs remain bearer-free and one bounded, expiring token subprotocol can attach only one pre-adoption carrier. WELCOME stays alone in the first binary carrier message, supplied Origin must match exactly, trusted relay status cannot be forged through PROXY v2, and direct-obfuscated RDHUP follows the direct relay path rather than FakeTLS record parsing. WEB-only must continue to admit the trusted relay, mask every direct peer even with a valid secret, stay inert when WEB is disabled, and suppress ordinary connection links while active.
+- CI remains green across `zig fmt --check`, Debug/ReleaseSafe/ReleaseFast tests, daemon smoke with positive, bad-secret, and graceful-SIGTERM paths, Debug plus shipping-policy real-process FakeTLS/obfuscation/direct-relay E2E against a compile-time-only loopback DC, production ReleaseSafe+PIE builds, cross-builds plus native ARM64 runtime checks, a compile-time hardware-AES assertion tied to the optimized Docker workflow profile, ShellCheck, Python syntax, offline probe-helper tests, WEB bridge contract tests, and local TLS/WSS full-probe fixtures, Docker build plus safe-default smoke, the Debian/Ubuntu installer E2E matrix pulling and verifying an image built from the current checkout, genuine ReleaseFast encapsulation/FakeTLS/1-4-8-candidate benchmarks plus soak, bounded fuzzing with crash-artifact preservation, and scheduled/manual ThreadSanitizer, Valgrind Memcheck, plus extended fuzz checks.
 - Deploy docs remain aligned with current tunnel/direct-mode behavior.
 - Docs remain aligned with code paths and log messages.

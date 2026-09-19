@@ -45,8 +45,9 @@ Before merging behavior changes, match the GitHub workflow as closely as practic
 
 ```bash
 zig fmt --check build.zig src test/hardware_aes_probe.zig
-python3 -m py_compile test/*.py
+python3 -m py_compile deploy/web_probe.py test/*.py test/web-bridge/*.py
 python3 -m unittest discover -s test -p 'test_probe_helpers.py'
+python3 -m unittest discover -s test -p 'test_web_setup_probe.py'
 shellcheck --severity=error docker-entrypoint.sh deploy/*.sh deploy/monitor/*.sh test/check_hardware_aes.sh test/run_fuzz.sh test/installer-e2e/run.sh test/installer-e2e/fake-*
 zig build test
 zig build -Doptimize=ReleaseSafe test
@@ -113,7 +114,7 @@ curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/in
   | sudo env ENABLE_WEB=true WEB_DOMAIN=web.example.com bash
 ```
 
-This preserves `config.toml` and user secrets, adds the `mtproto-web-relay` profile service, and extends the existing `mtproto-mask-caddy` container. Ordinary requests to both the WEB and MTProto masking hostnames receive the same bodyless 404. Caddy sends the whole WEB hostname to one relay handler without pre-routing carrier-looking URLs; the relay selects only exact canonical requests after capability authentication, and Caddy strips `Via` and maps relay failures to the common 404. The setup probe explicitly accepts that expected 404 as a healthy proxy-to-Caddy route. The local masking and WEB Caddy listeners enable only HTTP/1.1 and HTTP/2: HTTP/3 would advertise UDP `8443` or `8444`, but those ports are deliberately local and have no public QUIC path. Source/systemd installations use `sudo /opt/mtproto-proxy/setup_web.sh web.example.com`. In tunnel-netns mode, rerunning `setup_tunnel.sh` refreshes the WEB backend/listener addresses automatically.
+This preserves `config.toml` and user secrets, adds the `mtproto-web-relay` profile service, and extends the existing `mtproto-mask-caddy` container. Without `[web].public_dir`, ordinary requests to both the WEB and MTProto masking hostnames receive the same bodyless 404; an optional operator directory is loaded once and served only as bounded exact public routes. The directory path is evaluated inside the relay process/container and must be readable there. Caddy sends the whole WEB hostname to one relay handler without pre-routing carrier-looking URLs, strips `Via`, maps relay failures to the common 404, and has no request access-log directive that could record credential-bearing URIs or subprotocols. The permanent capability authenticates only the exact bridge bootstrap; the query-free WebSocket carries a newly minted two-minute token in one `tproxy-v1.<token>` subprotocol value. The local masking and WEB Caddy listeners enable only HTTP/1.1 and HTTP/2: HTTP/3 would advertise UDP `8443` or `8444`, but those ports are deliberately local and have no public QUIC path. Source/systemd installations use `sudo /opt/mtproto-proxy/setup_web.sh web.example.com`. In tunnel-netns mode, rerunning `setup_tunnel.sh` refreshes the WEB backend/listener addresses automatically.
 
 Fresh WEB enablement generates a lowercase RFC 4648 base32 path from 10 random
 bytes (16 characters). `WEB_BASE_PATH=<path>` pins a canonical value and
@@ -131,7 +132,7 @@ curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/in
   | sudo env ENABLE_WEB=true WEB_ONLY=true WEB_DOMAIN=web.example.com bash
 ```
 
-For source/systemd installs, use `sudo /opt/mtproto-proxy/setup_web.sh --only web.example.com`; restore the additive mode with `--no-only`. Reinstall preserves an already active gate unless explicitly disabled. A new gate stays disabled until Caddy, the main data plane, and `mtproto-web-relay` are running, the WEB HTTPS route returns its expected 404 with a valid certificate, and local relay `/metrics` responds. Setup then writes `only=true` and restarts only the main proxy. While active, formerly valid direct links are masked and output commands print only `tg://webproxy`; disabling WEB makes `only` inert.
+For source/systemd installs, use `sudo /opt/mtproto-proxy/setup_web.sh --only web.example.com`; restore the additive mode with `--no-only`. Reinstall preserves an already active gate unless explicitly disabled. A new gate stays disabled while setup runs a certificate- and hostname-verified end-to-end probe through Caddy: canonical bootstrap metadata, token subprotocol upgrade, HELLO/WELCOME, logical OPEN/DATA, and a real MTProto `req_pq` whose `resPQ` echoes the nonce. Probe material is generated internally and piped over stdin, so permanent and short-lived credentials never appear in argv or failure output. Only after success does setup write `only=true` and restart the main proxy; failure leaves direct MTProto available. Additive setup runs the same probe as a non-fatal diagnostic. While active, formerly valid direct links are masked and output commands print only `tg://webproxy`; disabling WEB makes `only` inert.
 
 Changing an existing WEB domain requires `--force` or `WEB_FORCE_DOMAIN_CHANGE=true`
 because installed links keep the old hostname; base-path changes use the separate

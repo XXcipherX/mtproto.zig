@@ -250,7 +250,7 @@ docker_install() {
 install_packages() {
     info "Installing Docker and required tools..."
     apt-get update -qq < /dev/null || true
-    DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl openssl iptables iptables-persistent netfilter-persistent xxd jq git < /dev/null
+    DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl openssl iptables iptables-persistent netfilter-persistent xxd jq git python3 < /dev/null
 
     if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>&1; then
         info "Installing Docker Engine and Compose plugin from get.docker.com..."
@@ -275,6 +275,9 @@ fetch_helper_scripts() {
     done
     curl -fsSL "${REPO_RAW_URL}/deploy/capture_template.py" -o "${INSTALL_DIR}/capture_template.py" \
         || true
+    curl -fsSL "${REPO_RAW_URL}/deploy/web_probe.py" -o "${INSTALL_DIR}/web_probe.py" \
+        || fail "Failed to download deploy/web_probe.py"
+    chmod 0755 "${INSTALL_DIR}/web_probe.py"
     ok "Deployment helpers installed to ${INSTALL_DIR}"
 }
 

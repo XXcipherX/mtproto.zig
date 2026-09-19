@@ -68,10 +68,11 @@ Do not reintroduce thread-per-connection or blocking relay loops.
 ## Queueing and Partial Write Model
 
 The following block-pool rules describe the ordinary proxy. The separate WEB relay
-uses `src/web/message_queue.zig` and accounts pending payload lengths (input,
-fragments, frame batches, and output queues), not allocated capacity, against
-`web.max_buffer_mb`. Update accounting on every mutation and before releasing a
-connection. Reserve deferred-close/free list capacity before exposing a new fd to
+uses `src/web/message_queue.zig` and accounts retained input/fragment/batch capacities,
+queue blocks, free blocks, and queue pointer capacities against `web.max_buffer_mb`.
+Reserve growth against that budget before allocating, keep accounting synchronized on
+every mutation, release empty queues, and reclaim idle capacity so throttling can clear.
+Reserve deferred-close/free list capacity before exposing a new fd to
 epoll; OOM must not force immediate teardown inside an event batch. A connecting
 WEB backend must queue the PROXY header and payload until `SO_ERROR` succeeds, and
 retain those bytes across candidate retries. Never retry an established stream.

@@ -28,10 +28,17 @@ MTPROTO_INSTALLER_E2E_IMAGE=debian:12 test/installer-e2e/run.sh
 `zig build web-bridge` needs Python 3, Node.js and the configured Zig compiler. It
 runs `web-bridge/render.zig` to render the production bridge and HELLO/WELCOME
 vectors, then passes the actual script to the Node harness. Missing tools fail the
-step. The harness checks native WebView startup, MessagePort transfer, reconnect
-handshake deduplication, retry exhaustion, capability absence and terminal BYE.
+step. The harness checks native WebView startup, strict Android/MessagePort boundaries,
+short-lived-token subprotocol use with no bearer URL, reconnect/adoption behavior,
+downlink frame validation/splitting, byte/item bounds, `pagehide`, and terminal BYE.
 This is an offline browser-contract check, not a live Telegram connectivity test.
 The existing GitHub CI WEB-bridge step runs it separately from Zig unit tests.
+
+`python3 -m unittest discover -s test -p 'test_web_setup_probe.py'` exercises the installer gate against
+local TLS/WSS fixtures. It proves that an ordinary HTTP 200, a wrong subprotocol,
+WELCOME with a dead backend, an untrusted certificate, a wrong `resPQ` nonce and a
+trickling response all fail, while root and `base_path` flows with a matching nonce
+succeed. It never contacts Telegram.
 
 ## Real-process relay E2E
 

@@ -4,7 +4,12 @@ const frame = @import("frame");
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
-    const html = try page.renderBridge(allocator, "/relay/Path_1/api/v1/socket");
+    const html = try page.renderSessionBridge(
+        allocator,
+        "/relay/Path_1/api/v1/socket",
+        "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT",
+        "NNNNNNNNNNNNNNNNNNNNNNNN",
+    );
     defer allocator.free(html);
     var frame_buf: [16]u8 = undefined;
     const hello = try frame.serialize(&frame_buf, .hello, 0, &.{1});

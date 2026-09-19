@@ -24,6 +24,7 @@ RUN set -eux; \
         jq \
         kmod \
         openssl \
+        python3 \
         procps \
         systemd \
         systemd-sysv \
