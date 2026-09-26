@@ -10,11 +10,12 @@ const posix = std.posix;
 const linux = std.os.linux;
 const constants = @import("protocol/constants.zig");
 const crypto = @import("crypto/crypto.zig");
-const compat = @import("compat.zig");
+const runtime_io = @import("runtime/io.zig");
+const linux_fs = @import("runtime/linux_fs.zig");
 const obfuscation = @import("protocol/obfuscation.zig");
 const tls = @import("protocol/tls.zig");
 const config = @import("config.zig");
-const net = @import("net_compat.zig");
+const net = @import("net_helpers.zig");
 const proxy = @import("proxy/proxy.zig");
 const web_capability = @import("web/capability.zig");
 const web_relay = @import("web/relay.zig");
@@ -71,12 +72,12 @@ fn lockFreeLog(
     var buf: [4096]u8 = undefined;
     const prefix = formatLogPrefix(message_level, scope, &buf);
     const body = std.fmt.bufPrint(buf[prefix.len..], format ++ "\n", args) catch return;
-    compat.writeStderr(buf[0 .. prefix.len + body.len]);
+    runtime_io.writeStderr(buf[0 .. prefix.len + body.len]);
 }
 
 const log = std.log.scoped(.mtproto);
 
-// ============= Output Helpers (Zig 0.16 compatible) =============
+// ============= Output Helpers =============
 
 threadlocal var stdout_accumulator: ?*std.Io.Writer = null;
 
@@ -85,7 +86,7 @@ fn writeStdoutBytes(bytes: []const u8) void {
         writer.writeAll(bytes) catch {};
         return;
     }
-    compat.writeStdout(bytes);
+    runtime_io.writeStdout(bytes);
 }
 
 /// Write a formatted string to stdout via posix write.
@@ -99,7 +100,7 @@ fn writeStdout(comptime fmt: []const u8, args: anytype) void {
 fn writeStderr(comptime fmt: []const u8, args: anytype) void {
     var buf: [4096]u8 = undefined;
     const slice = std.fmt.bufPrint(&buf, fmt, args) catch return;
-    compat.writeStderr(slice);
+    runtime_io.writeStderr(slice);
 }
 
 /// Write a hex byte to stdout.
@@ -248,7 +249,7 @@ fn detectTotalRamBytes(allocator: std.mem.Allocator) ?u64 {
         return total;
     }
 
-    const content = compat.readFileAbsoluteAlloc(allocator, "/proc/meminfo", 16 * 1024) catch return null;
+    const content = linux_fs.readPseudoFileAlloc(allocator, "/proc/meminfo", 16 * 1024) catch return null;
     defer allocator.free(content);
 
     const key = "MemTotal:";
@@ -312,7 +313,7 @@ fn readCgroupMemoryLimitFile(
     version: CgroupVersion,
     path: []const u8,
 ) ?u64 {
-    const content = compat.readFileAbsoluteAlloc(allocator, path, 256) catch return null;
+    const content = linux_fs.readPseudoFileAlloc(allocator, path, 256) catch return null;
     defer allocator.free(content);
     return parseCgroupMemoryLimit(version, content);
 }
@@ -544,7 +545,7 @@ fn scanConventionalCgroupMounts(
 fn detectCgroupMemoryLimitBytes(allocator: std.mem.Allocator) ?u64 {
     if (builtin.os.tag != .linux) return null;
 
-    const membership = compat.readFileAbsoluteAlloc(
+    const membership = linux_fs.readPseudoFileAlloc(
         allocator,
         "/proc/self/cgroup",
         64 * 1024,
@@ -570,7 +571,7 @@ fn detectCgroupMemoryLimitBytes(allocator: std.mem.Allocator) ?u64 {
         }
     }
 
-    const mountinfo = compat.readFileAbsoluteAlloc(
+    const mountinfo = linux_fs.readPseudoFileAlloc(
         allocator,
         "/proc/self/mountinfo",
         1024 * 1024,
@@ -857,7 +858,7 @@ fn printConnectionLinks(cfg: config.Config) void {
     writeRaw("  " ++ yellow ++ "Links contain access secrets; keep this terminal private." ++ R ++ "\n\n");
 
     stdout_accumulator = null;
-    compat.writeStdout(output.written());
+    runtime_io.writeStdout(output.written());
 }
 
 /// Print a stylish startup banner with config summary.
@@ -986,7 +987,7 @@ fn printBanner(
     writeRaw("  " ++ B ++ cyan ++ "⏳ Waiting for connections..." ++ R ++ "\n\n");
 
     stdout_accumulator = null;
-    compat.writeStdout(output.written());
+    runtime_io.writeStdout(output.written());
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -1057,7 +1058,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (build_options.e2e_test_hooks) {
         if (e2e_dc_port) |port| {
-            cfg.datacenter_override = net.Address.initIp4(.{ 127, 0, 0, 1 }, port);
+            cfg.datacenter_override = net.ip4(.{ 127, 0, 0, 1 }, port);
         }
     }
 

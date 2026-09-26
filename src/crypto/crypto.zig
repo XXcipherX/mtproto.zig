@@ -7,7 +7,7 @@
 //! - MD5, SHA-1 (protocol-mandated for middle proxy KDF — not replaceable)
 
 const std = @import("std");
-const compat = @import("../compat.zig");
+const runtime_random = @import("../runtime/random.zig");
 const Aes256 = std.crypto.core.aes.Aes256;
 
 // ============= AES-256-CTR =============
@@ -324,17 +324,17 @@ pub fn md5(data: []const u8) [16]u8 {
 
 /// Fill buffer with cryptographically secure random bytes.
 pub fn randomBytes(buf: []u8) void {
-    compat.randomBytes(buf);
+    runtime_random.bytes(buf);
 }
 
 /// Generate a random integer.
 pub fn randomInt(comptime T: type) T {
-    return compat.randomInt(T);
+    return runtime_random.int(T);
 }
 
 /// Generate a random integer in [0, max).
 pub fn randomRange(comptime T: type, max: T) T {
-    return compat.randomRange(T, max);
+    return runtime_random.range(T, max);
 }
 
 // ============= Tests =============

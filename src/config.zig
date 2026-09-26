@@ -4,8 +4,7 @@
 //! Format is compatible with the Rust telemt config.toml.
 
 const std = @import("std");
-const net = @import("net_compat.zig");
-const compat = @import("compat.zig");
+const net = @import("net_helpers.zig");
 const web_capability = @import("web/capability.zig");
 
 fn hasAsciiSpaceOrControl(value: []const u8) bool {
@@ -477,11 +476,22 @@ pub const Config = struct {
     }
 
     pub fn loadFromFile(allocator: std.mem.Allocator, path: []const u8) !Config {
-        const content = try compat.readFileAlloc(allocator, path, 1024 * 1024);
+        // A regular config file has a meaningful stat size, so use Zig 0.16's
+        // native bounded file API. Allow the exact historical 1 MiB limit.
+        const max_bytes = 1024 * 1024;
+        var threaded_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer threaded_io.deinit();
+        const content = try std.Io.Dir.cwd().readFileAlloc(
+            threaded_io.io(),
+            path,
+            allocator,
+            .limited(max_bytes + 1),
+        );
         defer {
             std.crypto.secureZero(u8, content);
             allocator.free(content);
         }
+        if (content.len > max_bytes) return error.StreamTooLong;
         return parse(allocator, content);
     }
 
@@ -1162,7 +1172,7 @@ test "middle proxy runtime remains available for mandatory CDN routing" {
     try std.testing.expectEqual(@as(usize, 1024 * 1024 + Config.middle_proxy_c2s_scratch_headroom), cfg.middleProxyC2sScratchBytes());
     try std.testing.expectEqual(@as(usize, 2 * 1024 * 1024 + Config.middle_proxy_c2s_scratch_headroom), cfg.middleProxySharedScratchBytes());
 
-    cfg.datacenter_override = net.Address.initIp4(.{ 127, 0, 0, 1 }, 443);
+    cfg.datacenter_override = net.ip4(.{ 127, 0, 0, 1 }, 443);
     try std.testing.expect(!cfg.requiresMiddleProxyRuntime());
 }
 

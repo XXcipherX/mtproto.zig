@@ -1,6 +1,5 @@
 const std = @import("std");
-const compat = @import("compat.zig");
-const net = @import("net_compat.zig");
+const net = @import("net_helpers.zig");
 
 const log = std.log.scoped(.http_fetch);
 
@@ -24,7 +23,7 @@ pub fn fetchUrlBytes(allocator: std.mem.Allocator, url: []const u8, options: Fet
         if (stop.load(.acquire)) return error.UpdateCancelled;
     }
 
-    var threaded_io = compat.initThreadedIo();
+    var threaded_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer threaded_io.deinit();
     const io = threaded_io.io();
 

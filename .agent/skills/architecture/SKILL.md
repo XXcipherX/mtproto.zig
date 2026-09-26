@@ -10,7 +10,8 @@ Production MTProto proxy implemented in Zig with FakeTLS entry, obfuscated MTPro
 ## Tech Stack
 
 - Language: Zig 0.16.0
-- Networking: Linux sockets + `epoll` via a local Zig 0.16 `net_compat` facade
+- Networking: canonical Zig 0.16 `std.Io.net.IpAddress`; `src/net_helpers.zig` contains DNS policy and the narrow Linux sockaddr/listener boundary, while the proxy data plane retains epoll/timerfd/eventfd.
+- Runtime: scoped `std.Io.Threaded` for file/DNS work; `src/runtime/` isolates intentional synchronous Linux clocks, bounded pseudo-file reads, futex locking, direct daemon output, and the thread-local secure DRBG.
 - Cryptography: `std.crypto` primitives (SHA256/HMAC/AES-CTR/AES-CBC) plus project protocol layers
 - Optional WEB carrier: a separate `mtproto-proxy web-relay` process behind the existing Caddy service; ordinary FakeTLS and WEB links share the public proxy listener and user secrets by default, while `[web].only=true` can mask the direct door and retain only the relay path
 - HTTP metadata fetch: `src/http_fetch.zig` wraps `std.http` with bounded response sizes, whole-request timeout behavior, redirect-by-redirect resolver preflight, and owner-thread cancellation

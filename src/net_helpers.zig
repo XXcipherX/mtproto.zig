@@ -1,119 +1,106 @@
-//! Small Zig 0.15-style networking facade for Zig 0.16.
-//!
-//! The proxy's hot path intentionally works with OS sockaddr layout. Zig 0.16
-//! moved high-level networking to std.Io.net, so this file preserves the old
-//! Address shape used by the codebase while delegating parsing and lookup to
-//! the current stdlib where possible.
+//! Canonical Zig 0.16 IP addresses, hostname resolution, and Linux socket boundary.
 
 const builtin = @import("builtin");
 const std = @import("std");
-const compat = @import("compat.zig");
 const posix = std.posix;
 
-pub const Address = extern union {
-    any: posix.sockaddr,
-    in: Ip4Address,
-    in6: Ip6Address,
+pub const Address = std.Io.net.IpAddress;
 
-    pub const Ip4Address = extern struct {
-        sa: posix.sockaddr.in,
+pub fn ip4(bytes: [4]u8, port: u16) Address {
+    return .{ .ip4 = .{ .bytes = bytes, .port = port } };
+}
+
+pub fn ip6(bytes: [16]u8, port: u16, flow: u32, scope_id: u32) Address {
+    return .{ .ip6 = .{
+        .bytes = bytes,
+        .port = port,
+        .flow = flow,
+        .interface = .{ .index = scope_id },
+    } };
+}
+
+fn family(addr: Address) u32 {
+    return switch (addr) {
+        .ip4 => posix.AF.INET,
+        .ip6 => posix.AF.INET6,
     };
+}
 
-    pub const Ip6Address = extern struct {
-        sa: posix.sockaddr.in6,
+/// Resolver snapshot comparison also includes IPv6 routing metadata. Zig's
+/// IpAddress.eql intentionally compares only port and IP bytes.
+pub fn exactAddressEql(a: Address, b: Address) bool {
+    return switch (a) {
+        .ip4 => |v4| switch (b) {
+            .ip4 => |other| v4.eql(other),
+            .ip6 => false,
+        },
+        .ip6 => |v6| switch (b) {
+            .ip4 => false,
+            .ip6 => |other| v6.eql(other) and v6.flow == other.flow and
+                v6.interface.index == other.interface.index,
+        },
     };
+}
 
-    pub const ListenOptions = struct {
-        reuse_address: bool = false,
-        reuse_port: bool = false,
-        kernel_backlog: u31 = std.Io.net.default_kernel_backlog,
-    };
+/// The only persistent address value is IpAddress. This temporary storage is
+/// constructed at the Linux syscall boundary, with no allocation or parsing.
+const Sockaddr = union(enum) {
+    ip4: posix.sockaddr.in,
+    ip6: posix.sockaddr.in6,
 
-    pub fn initIp4(ip: [4]u8, port: u16) Address {
-        return .{
-            .in = .{
-                .sa = .{
-                    .port = std.mem.nativeToBig(u16, port),
-                    // sockaddr stores the address in network byte order in memory.
-                    // Interpret the byte array as a native integer so its memory bytes
-                    // remain identical on both little- and big-endian targets.
-                    .addr = std.mem.bytesToValue(u32, &ip),
-                },
-            },
+    fn init(addr: Address) Sockaddr {
+        return switch (addr) {
+            .ip4 => |value| .{ .ip4 = .{
+                .family = posix.AF.INET,
+                .port = std.mem.nativeToBig(u16, value.port),
+                .addr = @bitCast(value.bytes),
+                .zero = [_]u8{0} ** 8,
+            } },
+            .ip6 => |value| .{ .ip6 = .{
+                .family = posix.AF.INET6,
+                .port = std.mem.nativeToBig(u16, value.port),
+                .flowinfo = value.flow,
+                .addr = value.bytes,
+                .scope_id = value.interface.index,
+            } },
         };
     }
 
-    pub fn initIp6(ip: [16]u8, port: u16, flowinfo: u32, scope_id: u32) Address {
-        return .{ .in6 = .{ .sa = .{
-            .port = std.mem.nativeToBig(u16, port),
-            .flowinfo = flowinfo,
-            .addr = ip,
-            .scope_id = scope_id,
-        } } };
+    fn ptr(self: *const Sockaddr) *const posix.sockaddr {
+        return switch (self.*) {
+            .ip4 => @ptrCast(&self.ip4),
+            .ip6 => @ptrCast(&self.ip6),
+        };
     }
 
-    pub fn parseIp6(text: []const u8, port: u16) !Address {
-        const parsed = try std.Io.net.IpAddress.parseIp6(text, port);
-        return fromIoAddress(parsed);
+    fn len(self: *const Sockaddr) posix.socklen_t {
+        return switch (self.*) {
+            .ip4 => @sizeOf(posix.sockaddr.in),
+            .ip6 => @sizeOf(posix.sockaddr.in6),
+        };
     }
+};
 
-    pub fn parseIpAndPort(text: []const u8) !Address {
-        const parsed = try std.Io.net.IpAddress.parseLiteral(text);
-        return fromIoAddress(parsed);
-    }
+pub fn addressFromSockaddr(storage: *const posix.sockaddr.storage, len: posix.socklen_t) ?Address {
+    return switch (storage.family) {
+        posix.AF.INET => blk: {
+            if (len < @sizeOf(posix.sockaddr.in)) break :blk null;
+            const sa: *const posix.sockaddr.in = @ptrCast(storage);
+            break :blk ip4(@bitCast(sa.addr), std.mem.bigToNative(u16, sa.port));
+        },
+        posix.AF.INET6 => blk: {
+            if (len < @sizeOf(posix.sockaddr.in6)) break :blk null;
+            const sa: *const posix.sockaddr.in6 = @ptrCast(storage);
+            break :blk ip6(sa.addr, std.mem.bigToNative(u16, sa.port), sa.flowinfo, sa.scope_id);
+        },
+        else => null,
+    };
+}
 
-    pub fn eql(a: Address, b: Address) bool {
-        if (a.any.family != b.any.family) return false;
-        if (a.any.family == posix.AF.INET) {
-            return a.in.sa.port == b.in.sa.port and a.in.sa.addr == b.in.sa.addr;
-        }
-        if (a.any.family == posix.AF.INET6) {
-            return a.in6.sa.port == b.in6.sa.port and
-                a.in6.sa.flowinfo == b.in6.sa.flowinfo and
-                a.in6.sa.scope_id == b.in6.sa.scope_id and
-                std.mem.eql(u8, &a.in6.sa.addr, &b.in6.sa.addr);
-        }
-        return false;
-    }
-
-    pub fn getOsSockLen(a: Address) posix.socklen_t {
-        return if (a.any.family == posix.AF.INET6)
-            @intCast(@sizeOf(posix.sockaddr.in6))
-        else
-            @intCast(@sizeOf(posix.sockaddr.in));
-    }
-
-    pub fn listen(a: Address, options: ListenOptions) ListenError!Server {
-        if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
-        return linuxListen(a, options);
-    }
-
-    pub fn format(a: Address, w: *std.Io.Writer) std.Io.Writer.Error!void {
-        if (a.any.family == posix.AF.INET) {
-            const bytes = std.mem.asBytes(&a.in.sa.addr);
-            try w.print("{d}.{d}.{d}.{d}:{d}", .{
-                bytes[0],
-                bytes[1],
-                bytes[2],
-                bytes[3],
-                std.mem.bigToNative(u16, a.in.sa.port),
-            });
-            return;
-        }
-
-        if (a.any.family == posix.AF.INET6) {
-            const ip: std.Io.net.IpAddress = .{ .ip6 = .{
-                .port = std.mem.bigToNative(u16, a.in6.sa.port),
-                .bytes = a.in6.sa.addr,
-                .flow = a.in6.sa.flowinfo,
-                .interface = .{ .index = a.in6.sa.scope_id },
-            } };
-            try ip.format(w);
-            return;
-        }
-
-        try w.print("(unsupported address family {d})", .{a.any.family});
-    }
+pub const ListenOptions = struct {
+    reuse_address: bool = false,
+    reuse_port: bool = false,
+    kernel_backlog: u31 = std.Io.net.default_kernel_backlog,
 };
 
 pub const AddressList = struct {
@@ -137,7 +124,7 @@ const AddressLookupEvent = union(enum) {
 pub fn getAddressList(allocator: std.mem.Allocator, host: []const u8, port: u16) !AddressList {
     if (try addressListForLiteral(allocator, host, port)) |list| return list;
 
-    var threaded_io = compat.initThreadedIo();
+    var threaded_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer threaded_io.deinit();
     const io = threaded_io.io();
     return getAddressListWithIo(allocator, host, port, io);
@@ -164,7 +151,7 @@ pub fn getAddressListCancelable(
         return list;
     }
 
-    var threaded_io = compat.initThreadedIo();
+    var threaded_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer threaded_io.deinit();
     const io = threaded_io.io();
 
@@ -227,7 +214,7 @@ fn getAddressListWithIo(
 
     while (lookup_queue.getOneUncancelable(io)) |result| {
         switch (result) {
-            .address => |addr| try list.append(allocator, fromIoAddress(addr)),
+            .address => |addr| try list.append(allocator, addr),
             .canonical_name => {},
         }
     } else |err| switch (err) {
@@ -246,7 +233,7 @@ fn addressListForLiteral(
     const parsed = std.Io.net.IpAddress.parse(host, port) catch return null;
     const addrs = try allocator.alloc(Address, 1);
     errdefer allocator.free(addrs);
-    addrs[0] = fromIoAddress(parsed);
+    addrs[0] = parsed;
     return .{ .allocator = allocator, .addrs = addrs };
 }
 
@@ -380,24 +367,13 @@ fn validateResolverConfigurationForHost(content: []const u8, host: []const u8) !
     }
 }
 
-fn fromIoAddress(addr: std.Io.net.IpAddress) Address {
-    return switch (addr) {
-        .ip4 => |ip4| Address.initIp4(ip4.bytes, ip4.port),
-        .ip6 => |ip6| Address.initIp6(ip6.bytes, ip6.port, ip6.flow, ip6.interface.index),
-    };
-}
-
-pub const Stream = struct {
+/// Worker-owned, nonblocking SO_REUSEPORT listener. The std.Io.net.Server
+/// lifecycle requires an Io context, while this epoll data plane owns raw fds.
+pub const Listener = struct {
     handle: posix.fd_t,
-};
 
-pub const Server = struct {
-    stream: Stream,
-
-    pub fn deinit(self: *Server) void {
-        if (builtin.os.tag == .linux) {
-            _ = std.os.linux.close(self.stream.handle);
-        }
+    pub fn deinit(self: *Listener) void {
+        if (builtin.os.tag == .linux) _ = std.os.linux.close(self.handle);
         self.* = undefined;
     }
 };
@@ -414,10 +390,11 @@ pub const ListenError = error{
     Unexpected,
 };
 
-fn linuxListen(a: Address, options: Address.ListenOptions) ListenError!Server {
+pub fn listen(a: Address, options: ListenOptions) ListenError!Listener {
+    if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
     const linux = std.os.linux;
     const socket_rc = linux.socket(
-        @intCast(a.any.family),
+        family(a),
         linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK,
         0,
     );
@@ -434,11 +411,12 @@ fn linuxListen(a: Address, options: Address.ListenOptions) ListenError!Server {
 
     if (options.reuse_address) try linuxSetSockOptInt(fd, linux.SO.REUSEADDR, 1);
     if (options.reuse_port) try linuxSetSockOptInt(fd, linux.SO.REUSEPORT, 1);
-    if (a.any.family == posix.AF.INET6) {
+    if (a == .ip6) {
         try linuxSetSockOptIntAtLevel(fd, linux.SOL.IPV6, linux.IPV6.V6ONLY, 0);
     }
 
-    const bind_rc = linux.bind(fd, &a.any, a.getOsSockLen());
+    const sa = Sockaddr.init(a);
+    const bind_rc = linux.bind(fd, sa.ptr(), sa.len());
     switch (linux.errno(bind_rc)) {
         .SUCCESS => {},
         .ACCES, .PERM => return error.PermissionDenied,
@@ -461,7 +439,91 @@ fn linuxListen(a: Address, options: Address.ListenOptions) ListenError!Server {
         else => return error.Unexpected,
     }
 
-    return .{ .stream = .{ .handle = fd } };
+    return .{ .handle = fd };
+}
+
+pub const Accepted = struct {
+    fd: posix.fd_t,
+    peer: Address,
+};
+
+pub fn acceptFd(fd: posix.fd_t) !Accepted {
+    if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
+    const linux = std.os.linux;
+    var storage: posix.sockaddr.storage = undefined;
+    var len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+    const rc = linux.accept4(fd, @ptrCast(&storage), &len, linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK);
+    const accepted_fd: posix.fd_t = switch (linux.errno(rc)) {
+        .SUCCESS => @intCast(rc),
+        .AGAIN => return error.WouldBlock,
+        .CONNABORTED => return error.ConnectionAborted,
+        .CONNRESET => return error.ConnectionResetByPeer,
+        .MFILE => return error.ProcessFdQuotaExceeded,
+        .NFILE => return error.SystemFdQuotaExceeded,
+        .NOBUFS, .NOMEM => return error.SystemResources,
+        else => return error.Unexpected,
+    };
+    const peer = addressFromSockaddr(&storage, len) orelse {
+        _ = linux.close(accepted_fd);
+        return error.UnsupportedAddressFamily;
+    };
+    return .{ .fd = accepted_fd, .peer = peer };
+}
+
+pub fn socketTcpNonblocking(addr: Address) !posix.fd_t {
+    if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
+    const linux = std.os.linux;
+    const rc = linux.socket(
+        family(addr),
+        linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC,
+        linux.IPPROTO.TCP,
+    );
+    return switch (linux.errno(rc)) {
+        .SUCCESS => @intCast(rc),
+        .ACCES, .PERM => error.PermissionDenied,
+        .AFNOSUPPORT => error.AddressFamilyNotSupported,
+        .MFILE => error.ProcessFdQuotaExceeded,
+        .NFILE => error.SystemFdQuotaExceeded,
+        .NOBUFS, .NOMEM => error.SystemResources,
+        else => error.Unexpected,
+    };
+}
+
+pub fn connectFd(fd: posix.fd_t, addr: Address) !void {
+    if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
+    const linux = std.os.linux;
+    const sa = Sockaddr.init(addr);
+    const rc = linux.connect(fd, sa.ptr(), sa.len());
+    switch (linux.errno(rc)) {
+        .SUCCESS, .ISCONN => {},
+        .AGAIN => return error.WouldBlock,
+        .INPROGRESS, .ALREADY => return error.ConnectionPending,
+        .CONNREFUSED => return error.ConnectionRefused,
+        .HOSTUNREACH, .NETUNREACH => return error.NetworkUnreachable,
+        .TIMEDOUT => return error.ConnectionTimedOut,
+        else => return error.Unexpected,
+    }
+}
+
+fn namedAddress(fd: posix.fd_t, comptime peer: bool) !Address {
+    if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
+    const linux = std.os.linux;
+    var storage: posix.sockaddr.storage = undefined;
+    var len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+    const rc = if (peer)
+        linux.getpeername(fd, @ptrCast(&storage), &len)
+    else
+        linux.getsockname(fd, @ptrCast(&storage), &len);
+    if (linux.errno(rc) != .SUCCESS) return error.Unexpected;
+    return addressFromSockaddr(&storage, len) orelse error.UnsupportedAddressFamily;
+}
+
+pub fn peerAddress(fd: posix.fd_t) !Address {
+    return namedAddress(fd, true);
+}
+
+pub fn localAddress(fd: posix.fd_t) !Address {
+    return namedAddress(fd, false);
 }
 
 fn linuxSetSockOptInt(fd: posix.fd_t, optname: u32, value: i32) ListenError!void {
@@ -486,10 +548,76 @@ fn linuxSetSockOptIntAtLevel(fd: posix.fd_t, level: i32, optname: u32, value: i3
     }
 }
 
-test "initIp4 preserves network-order address bytes" {
+test "IpAddress IPv4 sockaddr conversion preserves bytes and port endian" {
     const ip = [4]u8{ 203, 0, 113, 42 };
-    const addr = Address.initIp4(ip, 443);
-    try std.testing.expectEqualSlices(u8, &ip, std.mem.asBytes(&addr.in.sa.addr));
+    const addr = ip4(ip, 443);
+    const sa = Sockaddr.init(addr);
+    try std.testing.expectEqualSlices(u8, &ip, std.mem.asBytes(&sa.ip4.addr));
+    try std.testing.expectEqual(std.mem.nativeToBig(u16, 443), sa.ip4.port);
+
+    var storage: posix.sockaddr.storage = undefined;
+    @memcpy(std.mem.asBytes(&storage)[0..sa.len()], std.mem.asBytes(&sa.ip4));
+    const decoded = addressFromSockaddr(&storage, sa.len()) orelse return error.TestExpectedEqual;
+    try std.testing.expect(exactAddressEql(addr, decoded));
+}
+
+test "IpAddress IPv6 sockaddr conversion preserves bytes flow scope and port" {
+    const bytes = [16]u8{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7 };
+    const addr = ip6(bytes, 54321, 0x1234, 3);
+    const sa = Sockaddr.init(addr);
+    try std.testing.expectEqualSlices(u8, &bytes, &sa.ip6.addr);
+    try std.testing.expectEqual(std.mem.nativeToBig(u16, 54321), sa.ip6.port);
+    try std.testing.expectEqual(@as(u32, 0x1234), sa.ip6.flowinfo);
+    try std.testing.expectEqual(@as(u32, 3), sa.ip6.scope_id);
+
+    var storage: posix.sockaddr.storage = undefined;
+    @memcpy(std.mem.asBytes(&storage)[0..sa.len()], std.mem.asBytes(&sa.ip6));
+    const decoded = addressFromSockaddr(&storage, sa.len()) orelse return error.TestExpectedEqual;
+    try std.testing.expect(exactAddressEql(addr, decoded));
+    try std.testing.expect(!exactAddressEql(addr, ip6(bytes, 54321, 0x1234, 4)));
+    try std.testing.expect(!exactAddressEql(addr, ip6(bytes, 54321, 0x1235, 3)));
+}
+
+test "sockaddr conversion rejects truncated addresses and retains mapped IPv6" {
+    const mapped = ip6(
+        [_]u8{0} ** 10 ++ [_]u8{ 0xff, 0xff, 192, 0, 2, 9 },
+        1234,
+        0,
+        0,
+    );
+    const sa = Sockaddr.init(mapped);
+    var storage: posix.sockaddr.storage = undefined;
+    @memcpy(std.mem.asBytes(&storage)[0..sa.len()], std.mem.asBytes(&sa.ip6));
+    try std.testing.expect(addressFromSockaddr(&storage, sa.len() - 1) == null);
+    const decoded = addressFromSockaddr(&storage, sa.len()) orelse return error.TestExpectedEqual;
+    try std.testing.expect(decoded == .ip6);
+    try std.testing.expect(exactAddressEql(mapped, decoded));
+    const normalized = Address.fromIp6(decoded.ip6);
+    try std.testing.expect(exactAddressEql(normalized, ip4(.{ 192, 0, 2, 9 }, 1234)));
+}
+
+test "Linux socket boundary preserves accept peer and local and remote names" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const linux = std.os.linux;
+
+    var listener = try listen(ip4(.{ 127, 0, 0, 1 }, 0), .{});
+    defer listener.deinit();
+    const bound = try localAddress(listener.handle);
+
+    const client_rc = linux.socket(family(bound), linux.SOCK.STREAM | linux.SOCK.CLOEXEC, linux.IPPROTO.TCP);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(client_rc));
+    const client_fd: posix.fd_t = @intCast(client_rc);
+    defer _ = linux.close(client_fd);
+
+    try connectFd(client_fd, bound);
+    const accepted = try acceptFd(listener.handle);
+    defer _ = linux.close(accepted.fd);
+
+    const client_local = try localAddress(client_fd);
+    try std.testing.expect(exactAddressEql(accepted.peer, client_local));
+    try std.testing.expect(exactAddressEql(try peerAddress(accepted.fd), client_local));
+    try std.testing.expect(exactAddressEql(try peerAddress(client_fd), bound));
+    try std.testing.expect(exactAddressEql(try localAddress(accepted.fd), bound));
 }
 
 test "resolver guard rejects zero attempts after last override" {

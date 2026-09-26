@@ -44,7 +44,7 @@ Do not reintroduce thread-per-connection or blocking relay loops.
 
 ## Socket and I/O Realities
 
-- Bounded file helpers in `src/compat.zig` must read until actual EOF, not trust stat size. Zig 0.16 `allocRemaining` uses `Writer.Allocating.sendFile`, which treats zero stat size as EOF for procfs. Preserve the byte cap, accept exact-cap EOF, and reject larger input with `StreamTooLong`; cgroup membership/mount discovery depends on this.
+- `src/runtime/linux_fs.zig` reads procfs/cgroup pseudo-files until actual EOF rather than trusting stat size. Zig 0.16 `allocRemaining` can treat zero stat size as EOF. Preserve the byte cap, accept exact-cap EOF, and reject larger input with `StreamTooLong`; cgroup membership/mount discovery depends on this.
 
 - Sockets are non-blocking and epoll-driven.
 - Ordinary relay reads share one 32 KiB `EventLoop` scratch buffer. Never retain a slice into it across an event callback; crypto must finish in place and queued/pipelined ownership must copy before the next read. Keep the pipelined-handshake initial allocation independently bounded at 4 KiB.

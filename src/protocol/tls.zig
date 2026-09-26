@@ -4,7 +4,7 @@
 //! builds fake ServerHello responses for domain fronting.
 
 const std = @import("std");
-const compat = @import("../compat.zig");
+const runtime_time = @import("../runtime/time.zig");
 const constants = @import("constants.zig");
 const crypto = @import("../crypto/crypto.zig");
 const obfuscation = @import("obfuscation.zig");
@@ -226,7 +226,7 @@ pub fn validateTlsHandshakeDetailed(
     const zero_digest = [_]u8{0} ** constants.tls_digest_len;
 
     const now: i64 = if (!ignore_time_skew)
-        compat.timestamp()
+        runtime_time.realtimeSeconds()
     else
         0;
 

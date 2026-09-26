@@ -1,26 +1,26 @@
 //! Protocol constants and datacenter addresses for MTProto proxy.
 
 const std = @import("std");
-const net = @import("../net_compat.zig");
+const net = @import("../net_helpers.zig");
 
 // ============= Telegram Datacenters =============
 
 pub const tg_datacenter_port: u16 = 443;
 
 pub const tg_datacenters_v4 = [5]net.Address{
-    net.Address.initIp4(.{ 149, 154, 175, 50 }, tg_datacenter_port),
-    net.Address.initIp4(.{ 149, 154, 167, 51 }, tg_datacenter_port),
-    net.Address.initIp4(.{ 149, 154, 175, 100 }, tg_datacenter_port),
-    net.Address.initIp4(.{ 149, 154, 167, 91 }, tg_datacenter_port),
-    net.Address.initIp4(.{ 149, 154, 171, 5 }, tg_datacenter_port),
+    net.ip4(.{ 149, 154, 175, 50 }, tg_datacenter_port),
+    net.ip4(.{ 149, 154, 167, 51 }, tg_datacenter_port),
+    net.ip4(.{ 149, 154, 175, 100 }, tg_datacenter_port),
+    net.ip4(.{ 149, 154, 167, 91 }, tg_datacenter_port),
+    net.ip4(.{ 149, 154, 171, 5 }, tg_datacenter_port),
 };
 
 pub const tg_datacenters_v6 = [5]net.Address{
-    net.Address.initIp6(.{ 0x20, 0x01, 0x0b, 0x28, 0xf2, 0x3d, 0xf0, 0x01, 0, 0, 0, 0, 0, 0, 0, 0x0a }, tg_datacenter_port, 0, 0),
-    net.Address.initIp6(.{ 0x20, 0x01, 0x06, 0x7c, 0x04, 0xe8, 0xf0, 0x02, 0, 0, 0, 0, 0, 0, 0, 0x0a }, tg_datacenter_port, 0, 0),
-    net.Address.initIp6(.{ 0x20, 0x01, 0x0b, 0x28, 0xf2, 0x3d, 0xf0, 0x03, 0, 0, 0, 0, 0, 0, 0, 0x0a }, tg_datacenter_port, 0, 0),
-    net.Address.initIp6(.{ 0x20, 0x01, 0x06, 0x7c, 0x04, 0xe8, 0xf0, 0x04, 0, 0, 0, 0, 0, 0, 0, 0x0a }, tg_datacenter_port, 0, 0),
-    net.Address.initIp6(.{ 0x20, 0x01, 0x0b, 0x28, 0xf2, 0x3f, 0xf0, 0x05, 0, 0, 0, 0, 0, 0, 0, 0x0a }, tg_datacenter_port, 0, 0),
+    net.ip6(.{ 0x20, 0x01, 0x0b, 0x28, 0xf2, 0x3d, 0xf0, 0x01, 0, 0, 0, 0, 0, 0, 0, 0x0a }, tg_datacenter_port, 0, 0),
+    net.ip6(.{ 0x20, 0x01, 0x06, 0x7c, 0x04, 0xe8, 0xf0, 0x02, 0, 0, 0, 0, 0, 0, 0, 0x0a }, tg_datacenter_port, 0, 0),
+    net.ip6(.{ 0x20, 0x01, 0x0b, 0x28, 0xf2, 0x3d, 0xf0, 0x03, 0, 0, 0, 0, 0, 0, 0, 0x0a }, tg_datacenter_port, 0, 0),
+    net.ip6(.{ 0x20, 0x01, 0x06, 0x7c, 0x04, 0xe8, 0xf0, 0x04, 0, 0, 0, 0, 0, 0, 0, 0x0a }, tg_datacenter_port, 0, 0),
+    net.ip6(.{ 0x20, 0x01, 0x0b, 0x28, 0xf2, 0x3f, 0xf0, 0x05, 0, 0, 0, 0, 0, 0, 0, 0x0a }, tg_datacenter_port, 0, 0),
 };
 
 pub const tg_middle_proxy_port: u16 = 8888;
@@ -28,27 +28,27 @@ pub const tg_middle_proxy_port: u16 = 8888;
 /// Default MiddleProxy endpoints per primary DC (1..5), regular (non-media) path.
 /// Refreshed at runtime from getProxyConfig when available.
 pub const tg_middle_proxies_v4 = [5]net.Address{
-    net.Address.initIp4(.{ 149, 154, 175, 50 }, tg_middle_proxy_port),
-    net.Address.initIp4(.{ 149, 154, 161, 144 }, tg_middle_proxy_port),
-    net.Address.initIp4(.{ 149, 154, 175, 100 }, tg_middle_proxy_port),
-    net.Address.initIp4(.{ 91, 108, 4, 140 }, tg_middle_proxy_port),
-    net.Address.initIp4(.{ 91, 108, 56, 163 }, tg_middle_proxy_port),
+    net.ip4(.{ 149, 154, 175, 50 }, tg_middle_proxy_port),
+    net.ip4(.{ 149, 154, 161, 144 }, tg_middle_proxy_port),
+    net.ip4(.{ 149, 154, 175, 100 }, tg_middle_proxy_port),
+    net.ip4(.{ 91, 108, 4, 140 }, tg_middle_proxy_port),
+    net.ip4(.{ 91, 108, 56, 163 }, tg_middle_proxy_port),
 };
 
 /// Default MiddleProxy endpoints per primary DC (1..5), media path (dc_idx < 0).
 /// Refreshed at runtime from getProxyConfig when available.
 pub const tg_media_middle_proxies_v4 = [5]net.Address{
-    net.Address.initIp4(.{ 149, 154, 175, 50 }, tg_middle_proxy_port),
-    net.Address.initIp4(.{ 149, 154, 161, 184 }, tg_middle_proxy_port),
-    net.Address.initIp4(.{ 149, 154, 175, 100 }, tg_middle_proxy_port),
-    net.Address.initIp4(.{ 149, 154, 166, 120 }, tg_middle_proxy_port),
-    net.Address.initIp4(.{ 91, 108, 56, 163 }, tg_middle_proxy_port),
+    net.ip4(.{ 149, 154, 175, 50 }, tg_middle_proxy_port),
+    net.ip4(.{ 149, 154, 161, 184 }, tg_middle_proxy_port),
+    net.ip4(.{ 149, 154, 175, 100 }, tg_middle_proxy_port),
+    net.ip4(.{ 149, 154, 166, 120 }, tg_middle_proxy_port),
+    net.ip4(.{ 91, 108, 56, 163 }, tg_middle_proxy_port),
 };
 
 /// Bundled fallback for Telegram's `proxy_for 203` route. Despite using port
 /// 443, this endpoint speaks the MiddleProxy RPC transport and must never
 /// receive a raw obfuscated client stream.
-pub const tg_cdn_middle_proxy_v4 = net.Address.initIp4(.{ 91, 105, 192, 110 }, tg_datacenter_port);
+pub const tg_cdn_middle_proxy_v4 = net.ip4(.{ 91, 105, 192, 110 }, tg_datacenter_port);
 
 /// Resolves a real direct Telegram datacenter endpoint. CDN DC 203 is
 /// intentionally excluded because it is reachable only through MiddleProxy.
@@ -176,8 +176,8 @@ test "invalid proto tag" {
 }
 
 test "direct DC lookup excludes CDN MiddleProxy routes" {
-    try std.testing.expect(getDirectDcAddressV4(1).?.eql(tg_datacenters_v4[0]));
-    try std.testing.expect(getDirectDcAddressV4(5).?.eql(tg_datacenters_v4[4]));
+    try std.testing.expect(net.exactAddressEql(getDirectDcAddressV4(1).?, tg_datacenters_v4[0]));
+    try std.testing.expect(net.exactAddressEql(getDirectDcAddressV4(5).?, tg_datacenters_v4[4]));
     try std.testing.expect(getDirectDcAddressV4(0) == null);
     try std.testing.expect(getDirectDcAddressV4(6) == null);
     try std.testing.expect(getDirectDcAddressV4(203) == null);

@@ -131,7 +131,10 @@ const LookupProducer = struct {
 
 fn lookupViaStd(allocator: std.mem.Allocator, host: []const u8, port: u16) !AddressList {
     const host_name = try net.HostName.init(host);
-    const io_ctx = std.Io.Threaded.global_single_threaded.io();
+    // The producer and queue consumer both use this context until join.
+    var io_instance = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_instance.deinit();
+    const io_ctx = io_instance.io();
 
     var results_buf: [32]net.HostName.LookupResult = undefined;
     var results: std.Io.Queue(net.HostName.LookupResult) = .init(&results_buf);
@@ -253,7 +256,9 @@ const SyntheticLookupProducer = struct {
 };
 
 test "DNS queue drains more answers than its fixed capacity" {
-    const io_ctx = std.Io.Threaded.global_single_threaded.io();
+    var io_instance = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_instance.deinit();
+    const io_ctx = io_instance.io();
     var storage: [32]net.HostName.LookupResult = undefined;
     var queue: std.Io.Queue(net.HostName.LookupResult) = .init(&storage);
     const producer = try std.Thread.spawn(.{}, SyntheticLookupProducer.run, .{ &queue, io_ctx });
@@ -266,7 +271,9 @@ test "DNS queue drains more answers than its fixed capacity" {
 }
 
 test "DNS queue still drains its producer after allocation failure" {
-    const io_ctx = std.Io.Threaded.global_single_threaded.io();
+    var io_instance = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_instance.deinit();
+    const io_ctx = io_instance.io();
     var storage: [32]net.HostName.LookupResult = undefined;
     var queue: std.Io.Queue(net.HostName.LookupResult) = .init(&storage);
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });

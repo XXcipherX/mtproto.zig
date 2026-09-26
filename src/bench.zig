@@ -1,6 +1,6 @@
 const std = @import("std");
-const net = @import("net_compat.zig");
-const compat = @import("compat.zig");
+const net = @import("net_helpers.zig");
+const runtime_time = @import("runtime/time.zig");
 const crypto = @import("crypto/crypto.zig");
 const middleproxy = @import("protocol/middleproxy.zig");
 const obfuscation = @import("protocol/obfuscation.zig");
@@ -90,7 +90,7 @@ fn runBench(allocator: std.mem.Allocator) !void {
             _ = try ctx.encapsulateSingleMessageC2S(payload, (w & 1) == 1, out_buf);
         }
 
-        const start_ns = compat.monotonicNanoTimestamp();
+        const start_ns = runtime_time.monotonicNano();
 
         var produced_out_bytes: u64 = 0;
         var i: usize = 0;
@@ -131,7 +131,7 @@ fn runHandshakeBench(allocator: std.mem.Allocator, iterations: usize) !void {
         validation.wipe();
     }
 
-    const start_ns = compat.monotonicNanoTimestamp();
+    const start_ns = runtime_time.monotonicNano();
     var matched: usize = 0;
     var checksum: u64 = 0;
     var i: usize = 0;
@@ -199,7 +199,7 @@ fn runHandshakePathBench(allocator: std.mem.Allocator, opts: Options) !void {
         );
     }
 
-    const start_ns = compat.monotonicNanoTimestamp();
+    const start_ns = runtime_time.monotonicNano();
     var matched: usize = 0;
     var checksum: u64 = 0;
     var i: usize = 0;
@@ -219,7 +219,7 @@ fn runHandshakePathBench(allocator: std.mem.Allocator, opts: Options) !void {
 
         checksum +%= @as(u64, @intCast(candidate_len));
         checksum +%= @as(u64, @intCast(@abs(dc_idx)));
-        checksum +%= std.mem.bigToNative(u16, candidate_slice[0].in.sa.port);
+        checksum +%= candidate_slice[0].getPort();
     }
 
     const elapsed_ns = positiveElapsedNs(start_ns);
@@ -236,7 +236,7 @@ fn runHandshakePathBench(allocator: std.mem.Allocator, opts: Options) !void {
 }
 
 fn positiveElapsedNs(start_ns: i128) u64 {
-    const elapsed_ns = compat.monotonicNanoTimestamp() - start_ns;
+    const elapsed_ns = runtime_time.monotonicNano() - start_ns;
     if (elapsed_ns <= 0) return 1;
     return @intCast(elapsed_ns);
 }
@@ -248,7 +248,7 @@ fn operationsPerSecond(iterations: usize, elapsed_ns: u64) u64 {
 }
 
 fn runSoak(allocator: std.mem.Allocator, opts: Options) !void {
-    const start_ms = compat.monotonicMilliTimestamp();
+    const start_ms = runtime_time.monotonicMilli();
     const duration_ms = @as(i64, @intCast(opts.seconds)) * 1000;
 
     var shared = SoakShared{
@@ -287,7 +287,7 @@ fn runSoak(allocator: std.mem.Allocator, opts: Options) !void {
     }
     joined = true;
 
-    const end_ms = compat.monotonicMilliTimestamp();
+    const end_ms = runtime_time.monotonicMilli();
     const elapsed_ms_i64 = @max(@as(i64, 1), end_ms - start_ms);
     const elapsed_ms: u64 = @intCast(elapsed_ms_i64);
 
@@ -333,7 +333,7 @@ fn soakWorker(args: WorkerArgs) void {
 
     var rng_state = makeSeed(args.worker_id);
 
-    while (!args.shared.stop.load(.acquire) and compat.monotonicMilliTimestamp() < args.shared.deadline_ms) {
+    while (!args.shared.stop.load(.acquire) and runtime_time.monotonicMilli() < args.shared.deadline_ms) {
         const payload_len = nextPayloadLen(&rng_state, args.max_payload);
         payload_buf[0] +%= 1;
         const quickack = (nextRand(&rng_state) & 1) == 1;
@@ -359,8 +359,8 @@ fn initContext(allocator: std.mem.Allocator, proto_tag: constants.ProtoTag) !mid
         crypto.AesCbcDecryptor.init(&key, &iv),
         [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 },
         -2,
-        net.Address.initIp4(.{ 10, 20, 30, 40 }, 12345),
-        net.Address.initIp4(.{ 91, 105, 192, 110 }, 443),
+        net.ip4(.{ 10, 20, 30, 40 }, 12345),
+        net.ip4(.{ 91, 105, 192, 110 }, 443),
         proto_tag,
         null,
     );
@@ -448,7 +448,7 @@ fn buildObfuscationHandshake(
 
 fn fillBenchmarkCandidates(out: *[16]net.Address) void {
     for (out, 0..) |*addr, idx| {
-        addr.* = net.Address.initIp4(
+        addr.* = net.ip4(
             .{ 149, 154, 167, @intCast(100 + idx) },
             constants.tg_datacenter_port + @as(u16, @intCast(idx)),
         );
@@ -576,7 +576,7 @@ fn bytesPerSecToMiBMs(bytes: u64, elapsed_ms: u64) u64 {
 }
 
 fn makeSeed(worker_id: usize) u64 {
-    const now_ms = compat.monotonicMilliTimestamp();
+    const now_ms = runtime_time.monotonicMilli();
     const base: u64 = if (now_ms >= 0)
         @intCast(now_ms)
     else

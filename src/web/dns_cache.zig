@@ -1,13 +1,14 @@
 //! Owned background DNS refresh. Event loops only copy bounded snapshots.
 const std = @import("std");
 const builtin = @import("builtin");
-const compat = @import("../compat.zig");
+const runtime_time = @import("../runtime/time.zig");
+const runtime_sync = @import("../runtime/sync.zig");
 const net = @import("net_helpers.zig");
 
 pub const Cache = struct {
     allocator: std.mem.Allocator,
     entries: std.ArrayList(Entry) = .empty,
-    mutex: compat.BlockingMutex = .{},
+    mutex: runtime_sync.BlockingMutex = .{},
     stopping: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
     const Entry = struct { host: []const u8, port: u16, addresses: net.AddressCandidates, literal: bool };
@@ -82,7 +83,7 @@ pub const Cache = struct {
         while (!self.stopping.load(.acquire)) {
             for (0..600) |_| {
                 if (self.stopping.load(.acquire)) return;
-                compat.sleep(100 * std.time.ns_per_ms);
+                runtime_time.sleep(100 * std.time.ns_per_ms);
             }
             self.refresh(resolve);
         }
