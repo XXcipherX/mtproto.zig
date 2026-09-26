@@ -40,7 +40,7 @@ Code anchors:
 - `src/proxy/message_queue.zig`, `managed_buffer_allocator.zig`, `relay_io.zig` (worker-local queue pages, managed accounting, budgeted relay reads/writes and frame-aligned half-close checks)
 - `src/proxy/security_state.zig`, `wedge_recovery.zig` (process-shared admission tables/gate and per-slot recovery tracker)
 - `src/proxy/middle_proxy_nat.zig`, `middle_proxy_routing.zig`, `timeout_policy.zig` (egress discovery, route/cooldown policy, connection timeout calculations)
-- `src/proxy/socket_ops.zig`, `src/runtime/linux_events.zig` (proxy-specific socket error/option semantics and shared epoll/timerfd/eventfd primitives)
+- `src/proxy/socket_ops.zig`, `src/runtime/tcp_options.zig`, `src/runtime/linux_events.zig` (proxy-specific socket errors, shared best-effort TCP tuning, and epoll/timerfd/eventfd primitives)
 - `src/main.zig` (startup banner, capacity estimate, lock-free logger, public-IP detection)
 - `src/http_fetch.zig` (bounded HTTPS fetch helper for background public-IPv4 and MiddleProxy metadata discovery)
 - `deploy/setup_tunnel.sh` (namespace + AmneziaWG deployment path)
@@ -82,9 +82,12 @@ route/cooldown selection live in the proxy modules named above, while
 wrapping, and frame-boundary checks without new locks or packet-path
 allocations. `EventLoop` keeps the actual phase transitions, FIN propagation,
 epoll interest updates, and timeout actions. The proxy and WEB relay share
-only the identical `epollCreate` mechanism in `runtime/linux_events.zig`;
-their connect-error mapping, address formatting, and relay policy remain
-separate. Dependencies point from runtime/protocol/config through queue,
+`epollCreate` in `runtime/linux_events.zig` and TCP_NODELAY/keepalive/
+TCP_USER_TIMEOUT values in `runtime/tcp_options.zig`. Socket tuning remains
+best-effort: proxy keeps trying keepalive options after one failure, while WEB
+stops that keepalive sequence; both still attempt TCP_USER_TIMEOUT. Their
+connect-error mapping, address formatting, and relay policy remain separate.
+Dependencies point from runtime/protocol/config through queue,
 security, connection and routing components toward `proxy.zig`, never back
 from a low-level module into `EventLoop`.
 

@@ -4,6 +4,7 @@ const linux = std.os.linux;
 const net = std.Io.net;
 const Address = net.IpAddress;
 const linux_events = @import("../runtime/linux_events.zig");
+const tcp_options = @import("../runtime/tcp_options.zig");
 
 pub const AcceptError = error{
     ConnectionAborted,
@@ -186,35 +187,16 @@ pub fn secondsToMs(sec: u32) i64 {
     return @as(i64, @intCast(sec)) * std.time.ms_per_s;
 }
 
-/// Bound how long unacknowledged transmit data may stay outstanding before the connection
-/// is failed. Unlike SO_SNDTIMEO (which only affects BLOCKING send and is therefore inert
-/// on our non-blocking relay sockets), TCP_USER_TIMEOUT works regardless of blocking mode.
 pub fn setTcpUserTimeout(fd: posix.fd_t, timeout_ms: u32) void {
-    const sol_tcp: i32 = 6; // IPPROTO_TCP
-    const tcp_user_timeout: u32 = 18; // TCP_USER_TIMEOUT
-    const val: c_uint = timeout_ms;
-    posix.setsockopt(fd, sol_tcp, tcp_user_timeout, std.mem.asBytes(&val)) catch return;
+    tcp_options.setTcpUserTimeout(fd, timeout_ms, .web_posix);
 }
 
 pub fn setTcpKeepalive(fd: posix.fd_t) void {
-    const sol_tcp: i32 = 6;
-
-    const enable: c_int = 1;
-    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.KEEPALIVE, std.mem.asBytes(&enable)) catch return;
-
-    const idle: c_int = 60;
-    posix.setsockopt(fd, sol_tcp, 4, std.mem.asBytes(&idle)) catch return;
-
-    const interval: c_int = 10;
-    posix.setsockopt(fd, sol_tcp, 5, std.mem.asBytes(&interval)) catch return;
-
-    const count: c_int = 3;
-    posix.setsockopt(fd, sol_tcp, 6, std.mem.asBytes(&count)) catch return;
+    tcp_options.setTcpKeepalive(fd, .web_posix);
 }
 
 pub fn setTcpNoDelay(fd: posix.fd_t) void {
-    const enable: c_int = 1;
-    posix.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.NODELAY, std.mem.asBytes(&enable)) catch return;
+    tcp_options.setTcpNoDelay(fd, .web_posix);
 }
 
 /// Force a TCP RST on close instead of a graceful FIN, via SO_LINGER with a zero
@@ -229,10 +211,7 @@ pub fn setLingerReset(fd: posix.fd_t) void {
 }
 
 pub fn configureRelaySocket(fd: posix.fd_t) void {
-    setTcpNoDelay(fd);
-    setTcpKeepalive(fd);
-    // 30s cap on unacknowledged data (effective on non-blocking sockets, unlike SO_SNDTIMEO).
-    setTcpUserTimeout(fd, 30_000);
+    tcp_options.configureRelaySocket(fd, .web_posix);
 }
 
 pub fn formatAddress(addr: Address, buf: *[64]u8) []const u8 {

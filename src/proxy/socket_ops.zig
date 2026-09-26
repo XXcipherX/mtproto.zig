@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const net = @import("../net_helpers.zig");
+const tcp_options = @import("../runtime/tcp_options.zig");
 const posix = std.posix;
 const linux = std.os.linux;
 
@@ -62,16 +63,6 @@ pub fn writevFd(fd: posix.fd_t, iovecs: []const posix.iovec_const) !usize {
     }
 }
 
-fn setSockOptBytes(fd: posix.fd_t, level: i32, optname: u32, bytes: []const u8) void {
-    if (builtin.os.tag != .linux) return;
-
-    const rc = linux.setsockopt(fd, level, optname, bytes.ptr, @intCast(bytes.len));
-    switch (linux.errno(rc)) {
-        .SUCCESS => {},
-        else => return,
-    }
-}
-
 pub fn seekFdToStart(fd: posix.fd_t) !void {
     if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
 
@@ -84,35 +75,19 @@ pub fn seekFdToStart(fd: posix.fd_t) !void {
 }
 
 pub fn setTcpUserTimeout(fd: posix.fd_t, timeout_ms: u32) void {
-    const value: c_int = @intCast(timeout_ms);
-    setSockOptBytes(fd, linux.IPPROTO.TCP, linux.TCP.USER_TIMEOUT, std.mem.asBytes(&value));
+    tcp_options.setTcpUserTimeout(fd, timeout_ms, .proxy_raw);
 }
 
 pub fn setTcpKeepalive(fd: posix.fd_t) void {
-    const sol_tcp: i32 = 6;
-
-    const enable: c_int = 1;
-    setSockOptBytes(fd, linux.SOL.SOCKET, linux.SO.KEEPALIVE, std.mem.asBytes(&enable));
-
-    const idle: c_int = 60;
-    setSockOptBytes(fd, sol_tcp, 4, std.mem.asBytes(&idle));
-
-    const interval: c_int = 10;
-    setSockOptBytes(fd, sol_tcp, 5, std.mem.asBytes(&interval));
-
-    const count: c_int = 3;
-    setSockOptBytes(fd, sol_tcp, 6, std.mem.asBytes(&count));
+    tcp_options.setTcpKeepalive(fd, .proxy_raw);
 }
 
 pub fn setTcpNoDelay(fd: posix.fd_t) void {
-    const enable: c_int = 1;
-    setSockOptBytes(fd, linux.IPPROTO.TCP, linux.TCP.NODELAY, std.mem.asBytes(&enable));
+    tcp_options.setTcpNoDelay(fd, .proxy_raw);
 }
 
 pub fn configureRelaySocket(fd: posix.fd_t) void {
-    setTcpNoDelay(fd);
-    setTcpKeepalive(fd);
-    setTcpUserTimeout(fd, 30 * std.time.ms_per_s);
+    tcp_options.configureRelaySocket(fd, .proxy_raw);
 }
 
 pub fn formatAddress(addr: net.Address, buf: *[64]u8) []const u8 {

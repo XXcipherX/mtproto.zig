@@ -68,6 +68,7 @@ Connection-capacity methodology and command profiles: `test/README.md`.
 - Unauthenticated sockets share a per-/24 or per-/48 concurrent allowance (`clamp(max_connections / 8, 16, 128)`). The global handshake-inflight budget is charged after the first byte and released after authentication.
 - Graceful `EPOLLRDHUP` is treated as a read-side hint and drained to actual EOF. Client and upstream read/write halves remain independent: queued data is flushed before `shutdown(SHUT_WR)` propagates FIN, while the reverse relay direction stays active.
 - The first frame-aligned relay EOF is recorded as client- or upstream-initiated without changing half-close behavior. Debug close diagnostics show `first_eof` and monotonic `lifetime_ms`; worker 0 alone reports process-wide first-EOF counters.
+- Proxy and WEB relay sockets share best-effort TCP_NODELAY, keepalive (60-second idle, 10-second probes, three probes), and a 30-second TCP_USER_TIMEOUT policy; these options do not change non-blocking operation or make socket tuning fatal.
 - Failed non-blocking upstream connects are reclaimed immediately on fatal hangup events; the relay loop should not spin on dead upstream sockets.
 - The timerfd wakes only for the earliest connection/admission deadline or the 10-second aggregated `conn stats` report; timer maintenance does not scan the slot pool.
 - Client payload bytes pipelined after the 64-byte MTProto obfuscation nonce are buffered and forwarded once the upstream path is ready.
