@@ -14,7 +14,7 @@ pub fn getsockoptErrorFd(fd: posix.fd_t) !void {
     const rc = linux.getsockopt(fd, linux.SOL.SOCKET, linux.SO.ERROR, err_bytes.ptr, &err_len);
     switch (linux.errno(rc)) {
         .SUCCESS => {},
-        else => return error.Unexpected,
+        else => |err| return posix.unexpectedErrno(err),
     }
     if (err_code == 0) return;
 
@@ -23,7 +23,7 @@ pub fn getsockoptErrorFd(fd: posix.fd_t) !void {
         .CONNREFUSED => return error.ConnectionRefused,
         .HOSTUNREACH, .NETUNREACH => return error.NetworkUnreachable,
         .TIMEDOUT => return error.ConnectionTimedOut,
-        else => return error.Unexpected,
+        else => return posix.unexpectedErrno(err),
     }
 }
 
@@ -40,7 +40,7 @@ pub fn writeFd(fd: posix.fd_t, data: []const u8) !usize {
             .CONNRESET => return error.ConnectionResetByPeer,
             .PIPE => return error.BrokenPipe,
             .NOBUFS, .NOMEM => return error.SystemResources,
-            else => return error.Unexpected,
+            else => |err| return posix.unexpectedErrno(err),
         }
     }
 }
@@ -58,7 +58,7 @@ pub fn writevFd(fd: posix.fd_t, iovecs: []const posix.iovec_const) !usize {
             .CONNRESET => return error.ConnectionResetByPeer,
             .PIPE => return error.BrokenPipe,
             .NOBUFS, .NOMEM => return error.SystemResources,
-            else => return error.Unexpected,
+            else => |err| return posix.unexpectedErrno(err),
         }
     }
 }
@@ -70,7 +70,7 @@ pub fn seekFdToStart(fd: posix.fd_t) !void {
     switch (linux.errno(rc)) {
         .SUCCESS => {},
         .SPIPE => return error.Unseekable,
-        else => return error.Unexpected,
+        else => |err| return posix.unexpectedErrno(err),
     }
 }
 

@@ -398,7 +398,7 @@ pub fn listen(a: Address, options: ListenOptions) ListenError!Listener {
         .MFILE => return error.ProcessFdQuotaExceeded,
         .NFILE => return error.SystemFdQuotaExceeded,
         .NOBUFS, .NOMEM => return error.SystemResources,
-        else => return error.Unexpected,
+        else => |err| return posix.unexpectedErrno(err),
     };
     errdefer _ = linux.close(fd);
 
@@ -419,7 +419,7 @@ pub fn listen(a: Address, options: ListenOptions) ListenError!Listener {
         .MFILE => return error.ProcessFdQuotaExceeded,
         .NFILE => return error.SystemFdQuotaExceeded,
         .NOBUFS, .NOMEM => return error.SystemResources,
-        else => return error.Unexpected,
+        else => |err| return posix.unexpectedErrno(err),
     }
 
     const listen_rc = linux.listen(fd, options.kernel_backlog);
@@ -429,7 +429,7 @@ pub fn listen(a: Address, options: ListenOptions) ListenError!Listener {
         .MFILE => return error.ProcessFdQuotaExceeded,
         .NFILE => return error.SystemFdQuotaExceeded,
         .NOBUFS, .NOMEM => return error.SystemResources,
-        else => return error.Unexpected,
+        else => |err| return posix.unexpectedErrno(err),
     }
 
     return .{ .handle = fd };
@@ -454,7 +454,7 @@ pub fn acceptFd(fd: posix.fd_t) !Accepted {
         .MFILE => return error.ProcessFdQuotaExceeded,
         .NFILE => return error.SystemFdQuotaExceeded,
         .NOBUFS, .NOMEM => return error.SystemResources,
-        else => return error.Unexpected,
+        else => |err| return posix.unexpectedErrno(err),
     };
     const peer = addressFromSockaddr(&storage, len) orelse {
         _ = linux.close(accepted_fd);
@@ -478,7 +478,7 @@ pub fn socketTcpNonblocking(addr: Address) !posix.fd_t {
         .MFILE => error.ProcessFdQuotaExceeded,
         .NFILE => error.SystemFdQuotaExceeded,
         .NOBUFS, .NOMEM => error.SystemResources,
-        else => error.Unexpected,
+        else => |err| posix.unexpectedErrno(err),
     };
 }
 
@@ -494,7 +494,7 @@ pub fn connectFd(fd: posix.fd_t, addr: Address) !void {
         .CONNREFUSED => return error.ConnectionRefused,
         .HOSTUNREACH, .NETUNREACH => return error.NetworkUnreachable,
         .TIMEDOUT => return error.ConnectionTimedOut,
-        else => return error.Unexpected,
+        else => |err| return posix.unexpectedErrno(err),
     }
 }
 
@@ -507,7 +507,8 @@ fn namedAddress(fd: posix.fd_t, comptime peer: bool) !Address {
         linux.getpeername(fd, @ptrCast(&storage), &len)
     else
         linux.getsockname(fd, @ptrCast(&storage), &len);
-    if (linux.errno(rc) != .SUCCESS) return error.Unexpected;
+    const err = linux.errno(rc);
+    if (err != .SUCCESS) return posix.unexpectedErrno(err);
     return addressFromSockaddr(&storage, len) orelse error.UnsupportedAddressFamily;
 }
 
@@ -537,7 +538,7 @@ fn linuxSetSockOptIntAtLevel(fd: posix.fd_t, level: i32, optname: u32, value: i3
         .SUCCESS => {},
         .ACCES, .PERM => return error.PermissionDenied,
         .NOBUFS, .NOMEM => return error.SystemResources,
-        else => return error.Unexpected,
+        else => |err| return posix.unexpectedErrno(err),
     }
 }
 

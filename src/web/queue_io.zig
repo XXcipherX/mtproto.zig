@@ -13,7 +13,7 @@ fn writeFd(fd: posix.fd_t, data: []const u8) !usize {
             .INTR => continue,
             .AGAIN => return error.WouldBlock,
             .CONNRESET, .PIPE => return error.ConnectionReset,
-            else => return error.UnexpectedWrite,
+            else => |err| return posix.unexpectedErrno(err),
         }
     }
 }
@@ -26,7 +26,7 @@ fn writevFd(fd: posix.fd_t, iovecs: []const posix.iovec_const) !usize {
             .INTR => continue,
             .AGAIN => return error.WouldBlock,
             .CONNRESET, .PIPE => return error.ConnectionReset,
-            else => return error.UnexpectedWritev,
+            else => |err| return posix.unexpectedErrno(err),
         }
     }
 }

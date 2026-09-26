@@ -94,21 +94,26 @@ pub fn connectSockaddr(fd: posix.fd_t, addr: *const posix.sockaddr, addr_len: po
 pub fn checkSocketConnectError(fd: posix.fd_t) !void {
     var so_error: i32 = 0;
     var opt_len: linux.socklen_t = @sizeOf(i32);
-    const so_error_opt: u32 = 4; // SO_ERROR
-    const rc = linux.getsockopt(fd, posix.SOL.SOCKET, so_error_opt, std.mem.asBytes(&so_error).ptr, &opt_len);
-    if (linux.errno(rc) != .SUCCESS) return error.Unexpected;
+    const rc = linux.getsockopt(fd, posix.SOL.SOCKET, linux.SO.ERROR, std.mem.asBytes(&so_error).ptr, &opt_len);
+    const syscall_err = linux.errno(rc);
+    if (syscall_err != .SUCCESS) return posix.unexpectedErrno(syscall_err);
+    return checkSocketErrorCode(so_error);
+}
+
+fn checkSocketErrorCode(so_error: i32) !void {
     if (so_error == 0) return;
     // Map SO_ERROR to a specific error so failover logs distinguish DPI blackholing/
     // throttling (ETIMEDOUT/EHOSTUNREACH/ENETUNREACH) from a genuine refusal — the old code
     // collapsed every cause into ConnectionRefused, hiding exactly what an operator needs.
-    return switch (@as(posix.E, @enumFromInt(so_error))) {
-        .TIMEDOUT => error.Timeout,
-        .CONNREFUSED => error.ConnectionRefused,
-        .HOSTUNREACH => error.HostUnreachable,
-        .NETUNREACH => error.NetworkUnreachable,
-        .CONNRESET => error.ConnectionResetByPeer,
-        else => error.ConnectionRefused,
-    };
+    const err: posix.E = @enumFromInt(so_error);
+    switch (err) {
+        .TIMEDOUT => return error.Timeout,
+        .CONNREFUSED => return error.ConnectionRefused,
+        .HOSTUNREACH => return error.HostUnreachable,
+        .NETUNREACH => return error.NetworkUnreachable,
+        .CONNRESET => return error.ConnectionResetByPeer,
+        else => |unexpected| return posix.unexpectedErrno(unexpected),
+    }
 }
 
 pub fn addressFromSockaddrStorage(storage: *const posix.sockaddr.storage) ?Address {
@@ -158,7 +163,13 @@ pub fn acceptClient(listen_fd: posix.fd_t) AcceptError!?AcceptResult {
             .MFILE => return error.ProcessFdQuotaExceeded,
             .NFILE => return error.SystemFdQuotaExceeded,
             .NOBUFS, .NOMEM => return error.SystemResources,
-            else => return error.UnexpectedAccept,
+            else => |err| {
+                // Keep the operation-specific error while retaining std's
+                // optional unexpected-errno trace.
+                return switch (posix.unexpectedErrno(err)) {
+                    error.Unexpected => error.UnexpectedAccept,
+                };
+            },
         }
     }
 }
@@ -171,7 +182,11 @@ pub fn localSocketAddress(fd: posix.fd_t) !Address {
         switch (posix.errno(rc)) {
             .SUCCESS => return addressFromSockaddrStorage(&storage) orelse error.UnsupportedAddressFamily,
             .INTR => continue,
-            else => return error.GetSockNameFailed,
+            else => |err| {
+                return switch (posix.unexpectedErrno(err)) {
+                    error.Unexpected => error.GetSockNameFailed,
+                };
+            },
         }
     }
 }
@@ -227,4 +242,13 @@ pub fn formatAddress(addr: Address, buf: *[64]u8) []const u8 {
             break :blk std.fmt.bufPrint(buf, "[ipv6]:{d}", .{ip6_addr.port}) catch "?";
         },
     };
+}
+
+test "SO_ERROR code preserves known connect failures" {
+    try checkSocketErrorCode(0);
+    try std.testing.expectError(error.Timeout, checkSocketErrorCode(@intFromEnum(posix.E.TIMEDOUT)));
+    try std.testing.expectError(error.ConnectionRefused, checkSocketErrorCode(@intFromEnum(posix.E.CONNREFUSED)));
+    try std.testing.expectError(error.HostUnreachable, checkSocketErrorCode(@intFromEnum(posix.E.HOSTUNREACH)));
+    try std.testing.expectError(error.NetworkUnreachable, checkSocketErrorCode(@intFromEnum(posix.E.NETUNREACH)));
+    try std.testing.expectError(error.ConnectionResetByPeer, checkSocketErrorCode(@intFromEnum(posix.E.CONNRESET)));
 }
