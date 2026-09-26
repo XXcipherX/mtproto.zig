@@ -535,6 +535,12 @@ pub fn secureFree(allocator: std.mem.Allocator, buf: []u8) void {
     allocator.free(buf);
 }
 
+comptime {
+    // Every worker can retain one slot per accepted connection. Leave ABI
+    // headroom, but reject a large accidental inline-buffer expansion.
+    if (@sizeOf(ConnectionSlot) > 6144) @compileError("ConnectionSlot exceeded its per-connection size budget");
+}
+
 test "MiddleProxyHandshakeStep.awaitingMiddleProxy gates reactive refresh" {
     try std.testing.expect(!MiddleProxyHandshakeStep.none.awaitingMiddleProxy());
     try std.testing.expect(MiddleProxyHandshakeStep.sending_rpc_nonce.awaitingMiddleProxy());

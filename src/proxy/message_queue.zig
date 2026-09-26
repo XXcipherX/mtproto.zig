@@ -261,6 +261,13 @@ pub fn queueMemoryBudget(runtime_page_size: usize) QueueMemoryBudget {
     };
 }
 
+comptime {
+    // Two queue headers live inline in each ConnectionSlot; page data remains
+    // out of line and is already guarded by MsgBlock's exact page invariant.
+    if (@sizeOf(MessageQueue) > 96) @compileError("MessageQueue exceeded its per-connection size budget");
+    if (@sizeOf(MessageBlockPool) > 64) @compileError("MessageBlockPool exceeded its per-worker size budget");
+}
+
 test "message queue consume is stable" {
     var q = MessageQueue{ .allocator = std.testing.allocator };
     defer q.deinit();

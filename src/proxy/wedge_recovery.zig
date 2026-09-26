@@ -415,6 +415,12 @@ pub const WedgeTracker = struct {
     }
 };
 
+comptime {
+    // This tracker is embedded in every ConnectionSlot, not allocated only
+    // for connections that enter recovery.
+    if (@sizeOf(WedgeTracker) > 128) @compileError("WedgeTracker exceeded its per-connection size budget");
+}
+
 test "wedge tracker measures response from delivered client request" {
     var tracker = WedgeTracker{};
     try std.testing.expect(!tracker.noteClientPayload(1_000, 900));
