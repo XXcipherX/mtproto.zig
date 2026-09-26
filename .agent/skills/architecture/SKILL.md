@@ -34,10 +34,58 @@ Production MTProto proxy implemented in Zig with FakeTLS entry, obfuscated MTPro
 
 Code anchors:
 
-- `src/proxy/proxy.zig` (`EventLoop`, `ConnectionSlot`, `runTimers`, `logPeriodicStats`, `requiredFdsForConnections`, `buildDcConnectPlan`)
+- `src/proxy/proxy.zig` (`ProxyState`, worker startup/shutdown, `EventLoop` dispatch, timeout actions, MiddleProxy metadata publication)
+- `src/proxy/connection.zig`, `connection_pool.zig`, `deadline_queue.zig` (slot ownership and wiping, generation-tagged fd roles, indexed deadlines)
+- `src/proxy/message_queue.zig`, `managed_buffer_allocator.zig`, `relay_io.zig` (worker-local queue pages, managed accounting, budgeted relay reads/writes and frame-aligned half-close checks)
+- `src/proxy/security_state.zig`, `wedge_recovery.zig` (process-shared admission tables/gate and per-slot recovery tracker)
+- `src/proxy/middle_proxy_nat.zig`, `middle_proxy_routing.zig`, `timeout_policy.zig` (egress discovery, route/cooldown policy, connection timeout calculations)
+- `src/proxy/socket_ops.zig`, `src/runtime/linux_events.zig` (proxy-specific socket error/option semantics and shared epoll/timerfd/eventfd primitives)
 - `src/main.zig` (startup banner, capacity estimate, lock-free logger, public-IP detection)
 - `src/http_fetch.zig` (bounded HTTPS fetch helper for background public-IPv4 and MiddleProxy metadata discovery)
 - `deploy/setup_tunnel.sh` (namespace + AmneziaWG deployment path)
+
+## Proxy Module Ownership
+
+`proxy.zig` is the orchestration layer, not the owner of every data structure it
+operates on. `ProxyState` owns the immutable configuration and secrets, shared
+security allocation, mutable MiddleProxy metadata and updater, and workers. It
+outlives every worker and joins them before stopping discovery or freeing shared
+state. Its security pointer is allocated once for the process: subnet rate,
+unauthenticated-slot and replay tables must never be copied per worker. The
+optional group-wide wedge gate lives behind its own shared lock; the
+`WedgeTracker` embedded in each connection remains worker-local.
+
+Each worker exclusively owns its `EventLoop`, reuseport listener, control fd,
+`ConnectionPool`, `DeadlineQueue`, `MessageBlockPool`, managed allocator
+partition, and relay scratch. The pool heap-creates `ConnectionSlot` objects on
+demand and destroys them after `resetOwnedBuffers()`; slot close removes its
+single indexed deadline before pool release. The deadline queue borrows the
+worker's slot pointers only during insert/update/remove and never retains an
+`EventLoop` or pool-field pointer. `EventLoop` chooses deadline policy and arms
+the monotonic `timerfd`; the heap only maintains order and slot indices.
+
+Both per-slot queues own their intrusive page chains; the worker block pool may
+retain wiped pages until teardown. Queue pages, retained free pages, MiddleProxy
+stream buffers, and scratch charge the worker's `ManagedBufferAllocator`
+partition. `ConnectionSlot.releaseHandshakeOnly()` drops temporary handshake
+storage at relay start, while `resetOwnedBuffers()` wipes all remaining owned
+secrets and buffers at close. Candidate addresses are inline for up to four
+entries or owned heap fallback; `ProxyState` copies the selected route into a
+local snapshot under the MiddleProxy metadata lock, then the slot copies its
+candidate list from that snapshot. The protocol wire/crypto
+implementation remains in `src/protocol/middleproxy.zig`; NAT detection and
+route/cooldown selection live in the proxy modules named above, while
+`ProxyState` still owns refresh and publication.
+
+`relay_io.zig` performs bounded fd operations, queue writes/flushes, TLS record
+wrapping, and frame-boundary checks without new locks or packet-path
+allocations. `EventLoop` keeps the actual phase transitions, FIN propagation,
+epoll interest updates, and timeout actions. The proxy and WEB relay share
+only the identical `epollCreate` mechanism in `runtime/linux_events.zig`;
+their connect-error mapping, address formatting, and relay policy remain
+separate. Dependencies point from runtime/protocol/config through queue,
+security, connection and routing components toward `proxy.zig`, never back
+from a low-level module into `EventLoop`.
 
 ## Connection Flow
 

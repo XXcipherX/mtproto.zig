@@ -10,7 +10,8 @@ This file tracks practical pitfalls and current runtime constraints for `mtproto
 ## Current Architecture Baseline
 
 - Relay core is Linux `epoll`, worker-local and single-threaded on each hot path. Default `workers=1`; optional workers use distinct reuseport listeners and epoll/timer/control fds.
-- The large `EventLoop` container is heap-allocated and initialized in place; shared fixed subnet/replay tables live in one process allocation. Returning either by value can overflow the Debug daemon stack. Worker connection pools divide the global slot index and deadline-heap capacity, while `ConnectionSlot` objects are heap-created on demand. Epoll payloads carry index/generation/role directly; do not reintroduce an fd hash map.
+- The large `EventLoop` container is heap-allocated and initialized in place; shared fixed subnet/replay tables live in one process allocation. Returning either by value can overflow the Debug daemon stack. Worker connection pools partition the process slot/deadline capacity, but slot indices are worker-local; `ConnectionSlot` objects are heap-created on demand. Epoll payloads carry index/generation/role directly; do not reintroduce an fd hash map.
+- `src/proxy/proxy.zig` owns orchestration; `connection.zig` owns slot reset/wipe paths, `connection_pool.zig` owns generation tokens, and `deadline_queue.zig` owns only heap ordering/index updates. Do not put timerfd policy into the heap or import `EventLoop` from those modules.
 - The Valgrind profile must use a baseline-CPU ReleaseSafe build plus `--max-stackframe=8388608`. Native GitHub CPUs can select SHA-NI instructions unsupported by Ubuntu 24.04's Valgrind 3.22, while the proxy's legitimate multi-MiB initialization frame otherwise looks like a stack switch and creates false invalid-access reports.
 - Non-blocking writes are queue-based (`MessageQueue`) and flushed with `writev`.
 - `MessageQueue` has intrusive page-sized storage blocks from a capped worker-local pool and a 4 MiB pending-byte cap; aggregate managed memory remains bounded by the original process limit. Queue overflow is a close-worthy backpressure signal.
@@ -39,6 +40,7 @@ Do not reintroduce thread-per-connection or blocking relay loops.
 - Runtime uses `std.heap.page_allocator` to avoid allocator mutex contention seen with GPA under heavy connection churn.
 - AES-CTR processes aligned bulk in eight-block batches and then a `4/2/1` cascade before its partial-block tail. Keep cross-call keystream continuity and counter wraparound covered by the byte-at-a-time equivalence test; a plain `4` to `8` threshold change would regress 64–127-byte inputs to scalar AES.
 - Keep ownership boundaries explicit and wipe crypto material on teardown (`resetOwnedBuffers` paths).
+- `releaseHandshakeOnly()` and `resetOwnedBuffers()` live with `ConnectionSlot`; do not copy a slot to move it between modules or lengthen secret lifetime while editing the event loop. `message_queue.zig` retains the exact one-page block invariant and size ceilings guard the embedded slot/queue/wedge structures.
 - Avoid hidden allocations inside event callbacks when possible.
 - Keep one-to-four DC/mask candidates in `ConnectionSlot` inline storage. Candidate replacement must free only an owned heap fallback, preserve allocation-failure cleanup, and continue supporting bounded larger DNS sets.
 
