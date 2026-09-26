@@ -43,7 +43,6 @@ const connection = @import("connection.zig");
 const tls_header_len = connection.tls_header_len;
 const event_io_byte_budget = connection.event_io_byte_budget;
 const event_io_operation_budget = connection.event_io_operation_budget;
-const no_timer_heap_index = connection.no_timer_heap_index;
 const invalid_fd = connection.invalid_fd;
 const UpstreamKind = connection.UpstreamKind;
 const MaskCause = connection.MaskCause;
@@ -63,6 +62,7 @@ const nextSlotGeneration = connection_pool.nextSlotGeneration;
 const encodeSlotEventToken = connection_pool.encodeSlotEventToken;
 const decodeSlotEventToken = connection_pool.decodeSlotEventToken;
 const ConnectionPool = connection_pool.ConnectionPool;
+const DeadlineQueue = @import("deadline_queue.zig").DeadlineQueue;
 
 const log = std.log.scoped(.proxy);
 
@@ -355,11 +355,6 @@ const MiddleProxyCooldown = struct {
     active: bool = false,
     addr: net.Address = undefined,
     until_ms: i64 = 0,
-};
-
-const DeadlineEntry = struct {
-    deadline_ns: i128,
-    slot_index: u32,
 };
 
 fn readSlotFd(slot: *ConnectionSlot, fd: posix.fd_t, buffer: []u8) !usize {
@@ -1530,7 +1525,7 @@ const EventLoop = struct {
     saturation_paused: bool,
     shutting_down: bool,
     shutdown_deadline_ns: i128,
-    deadline_heap: std.ArrayList(DeadlineEntry),
+    deadline_heap: DeadlineQueue,
     armed_deadline_ns: i128,
     stats_next_log_ns: i128,
     accepted_since_log: u64,
@@ -4282,78 +4277,14 @@ const EventLoop = struct {
         return deadline;
     }
 
-    fn deadlineLess(self: *const EventLoop, lhs: usize, rhs: usize) bool {
-        return self.deadline_heap.items[lhs].deadline_ns < self.deadline_heap.items[rhs].deadline_ns;
-    }
-
-    fn swapDeadlines(self: *EventLoop, lhs: usize, rhs: usize) void {
-        if (lhs == rhs) return;
-        std.mem.swap(DeadlineEntry, &self.deadline_heap.items[lhs], &self.deadline_heap.items[rhs]);
-        self.pool.slots[@as(usize, self.deadline_heap.items[lhs].slot_index)].?.timer_heap_index = @intCast(lhs);
-        self.pool.slots[@as(usize, self.deadline_heap.items[rhs].slot_index)].?.timer_heap_index = @intCast(rhs);
-    }
-
-    fn siftDeadlineUp(self: *EventLoop, start: usize) void {
-        var index = start;
-        while (index > 0) {
-            const parent = (index - 1) / 2;
-            if (!self.deadlineLess(index, parent)) break;
-            self.swapDeadlines(index, parent);
-            index = parent;
-        }
-    }
-
-    fn siftDeadlineDown(self: *EventLoop, start: usize) void {
-        var index = start;
-        while (true) {
-            const left = index * 2 + 1;
-            if (left >= self.deadline_heap.items.len) break;
-            const right = left + 1;
-            const child = if (right < self.deadline_heap.items.len and self.deadlineLess(right, left)) right else left;
-            if (!self.deadlineLess(child, index)) break;
-            self.swapDeadlines(index, child);
-            index = child;
-        }
-    }
-
-    fn removeDeadlineAt(self: *EventLoop, index: usize) void {
-        const removed = self.deadline_heap.items[index];
-        self.pool.slots[@as(usize, removed.slot_index)].?.timer_heap_index = no_timer_heap_index;
-        const last = self.deadline_heap.pop().?;
-        if (index == self.deadline_heap.items.len) return;
-
-        self.deadline_heap.items[index] = last;
-        self.pool.slots[@as(usize, last.slot_index)].?.timer_heap_index = @intCast(index);
-        if (index > 0 and self.deadlineLess(index, (index - 1) / 2)) {
-            self.siftDeadlineUp(index);
-        } else {
-            self.siftDeadlineDown(index);
-        }
-    }
-
-    fn removeSlotDeadline(self: *EventLoop, slot: *ConnectionSlot) void {
-        if (slot.timer_heap_index == no_timer_heap_index) return;
-        self.removeDeadlineAt(@as(usize, slot.timer_heap_index));
-    }
-
     fn refreshSlotDeadline(self: *EventLoop, slot: *ConnectionSlot) void {
         const next = self.nextSlotDeadlineNs(slot) orelse {
-            self.removeSlotDeadline(slot);
+            self.deadline_heap.remove(self.pool.slots, slot);
             self.rearmTimer() catch |err| log.err("failed to rearm deadline timer: {any}", .{err});
             return;
         };
 
-        if (slot.timer_heap_index == no_timer_heap_index) {
-            std.debug.assert(self.deadline_heap.items.len < self.deadline_heap.capacity);
-            slot.timer_heap_index = @intCast(self.deadline_heap.items.len);
-            self.deadline_heap.appendAssumeCapacity(.{ .deadline_ns = next, .slot_index = slot.index });
-            self.siftDeadlineUp(@as(usize, slot.timer_heap_index));
-        } else {
-            const index = @as(usize, slot.timer_heap_index);
-            const previous = self.deadline_heap.items[index].deadline_ns;
-            self.deadline_heap.items[index].deadline_ns = next;
-            if (next < previous) self.siftDeadlineUp(index) else self.siftDeadlineDown(index);
-        }
+        self.deadline_heap.update(self.pool.slots, slot, next);
         self.rearmTimer() catch |err| log.err("failed to rearm deadline timer: {any}", .{err});
     }
 
@@ -4365,8 +4296,8 @@ const EventLoop = struct {
         if (self.accept_paused and self.accept_resume_ns > 0) {
             next = earlierDeadline(next, self.accept_resume_ns);
         }
-        if (self.deadline_heap.items.len > 0) {
-            next = earlierDeadline(next, self.deadline_heap.items[0].deadline_ns);
+        if (self.deadline_heap.peek()) |entry| {
+            next = earlierDeadline(next, entry.deadline_ns);
         }
 
         const deadline = next orelse 0;
@@ -4377,9 +4308,7 @@ const EventLoop = struct {
 
     fn runTimers(self: *EventLoop, now_ns: i128) void {
         const now_ms: i64 = @intCast(@divTrunc(now_ns, std.time.ns_per_ms));
-        while (self.deadline_heap.items.len > 0 and self.deadline_heap.items[0].deadline_ns <= now_ns) {
-            const slot_index = self.deadline_heap.items[0].slot_index;
-            self.removeDeadlineAt(0);
+        while (self.deadline_heap.popExpired(self.pool.slots, now_ns)) |slot_index| {
             const slot = self.pool.slots[@as(usize, slot_index)] orelse continue;
             if (slot.phase == .idle) continue;
             self.runSlotTimer(slot, now_ms, now_ns);
@@ -4872,7 +4801,7 @@ const EventLoop = struct {
                 client_ip,
             });
         }
-        self.removeSlotDeadline(slot);
+        self.deadline_heap.remove(self.pool.slots, slot);
 
         if (!isInvalidFd(slot.client_fd)) {
             _ = self.delSlotFd(slot, .client) catch {};
@@ -6207,7 +6136,7 @@ test "middle proxy nonce response failures fall back to direct path" {
     defer closeFd(epoll_fd);
     const timer_fd = try createTimerFd();
     defer closeFd(timer_fd);
-    var deadlines: std.ArrayList(DeadlineEntry) = .empty;
+    var deadlines: DeadlineQueue = .empty;
     try deadlines.ensureTotalCapacity(std.testing.allocator, 4);
 
     var loop = EventLoop{
