@@ -3,6 +3,7 @@ const posix = std.posix;
 const linux = std.os.linux;
 const net = std.Io.net;
 const Address = net.IpAddress;
+const linux_events = @import("../runtime/linux_events.zig");
 
 pub const AcceptError = error{
     ConnectionAborted,
@@ -18,13 +19,7 @@ pub const AcceptResult = struct {
     addr: Address,
 };
 
-pub fn epollCreate() !posix.fd_t {
-    const rc = linux.epoll_create1(linux.EPOLL.CLOEXEC);
-    switch (linux.errno(rc)) {
-        .SUCCESS => return @intCast(rc),
-        else => |err| return posix.unexpectedErrno(err),
-    }
-}
+pub const epollCreate = linux_events.epollCreate;
 
 pub fn realtimeSeconds() i64 {
     var ts: posix.timespec = undefined;
