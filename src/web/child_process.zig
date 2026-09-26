@@ -24,6 +24,8 @@ test "child runner clears inherited signalfd signal mask" {
     var old: std.posix.sigset_t = undefined;
     std.posix.sigprocmask(std.posix.SIG.BLOCK, &mask, &old);
     defer std.posix.sigprocmask(std.posix.SIG.SETMASK, &old, null);
+    // Initialize after blocking TERM so any backend worker inherits the same
+    // mask that the production signalfd owner passes through exec.
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
     const result = try run(std.testing.allocator, threaded.io(), .{ .argv = &.{ "/bin/sh", "-c", "kill -TERM $$; exit 99" } });

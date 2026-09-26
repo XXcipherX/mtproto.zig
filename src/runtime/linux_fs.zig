@@ -7,13 +7,11 @@ const builtin = @import("builtin");
 
 pub fn readPseudoFileAlloc(
     allocator: std.mem.Allocator,
+    io: std.Io,
     path: []const u8,
     max_bytes: usize,
 ) ![]u8 {
     if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
-    var threaded_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer threaded_io.deinit();
-    const io = threaded_io.io();
     const file = try std.Io.Dir.openFileAbsolute(io, path, .{});
     defer file.close(io);
 
@@ -53,7 +51,7 @@ test "bounded pseudo-file reading handles empty exact and oversized input" {
 
 test "procfs status is not empty despite zero stat size" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
-    const content = try readPseudoFileAlloc(std.testing.allocator, "/proc/self/status", 64 * 1024);
+    const content = try readPseudoFileAlloc(std.testing.allocator, std.testing.io, "/proc/self/status", 64 * 1024);
     defer std.testing.allocator.free(content);
     try std.testing.expect(std.mem.indexOf(u8, content, "Name:") != null);
 }

@@ -253,6 +253,9 @@ fn workerHeartbeatStale(now_ms: i64, last_ms: i64) bool {
 
 pub const ProxyState = struct {
     allocator: std.mem.Allocator,
+    /// Borrowed from main for startup discovery and the joined updater only.
+    /// EventLoop and its Linux data plane do not use this Io backend.
+    io: std.Io,
     config: Config,
     managed_buffer_limit_bytes: u64,
     user_secrets: []obfuscation.UserSecret,
@@ -298,9 +301,10 @@ pub const ProxyState = struct {
     middle_proxy_refresh_requested: std.atomic.Value(bool),
     middle_proxy_updater_thread: ?std.Thread,
 
-    pub fn init(allocator: std.mem.Allocator, cfg: Config) !ProxyState {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, cfg: Config) !ProxyState {
         return initWithManagedBufferLimit(
             allocator,
+            io,
             cfg,
             default_managed_buffer_limit_bytes,
         );
@@ -308,6 +312,7 @@ pub const ProxyState = struct {
 
     pub fn initWithManagedBufferLimit(
         allocator: std.mem.Allocator,
+        io: std.Io,
         cfg: Config,
         managed_buffer_limit_bytes: u64,
     ) !ProxyState {
@@ -350,7 +355,7 @@ pub const ProxyState = struct {
             mask_target = blk: {
                 if (cfg.mask_port == 443) break :blk cfg.tls_domain;
 
-                if (isRunningInNonInitNetns()) {
+                if (isRunningInNonInitNetns(io)) {
                     log.info(
                         "mask_port={d} with non-init netns detected, using host veth IP {s} for local masking",
                         .{ cfg.mask_port, tunnel_mask_gateway_ip },
@@ -361,7 +366,7 @@ pub const ProxyState = struct {
                 break :blk "127.0.0.1";
             };
             if (std.Io.net.IpAddress.parse(mask_target.?, cfg.mask_port)) |_| {
-                const list = try net.getAddressList(allocator, mask_target.?, cfg.mask_port);
+                const list = try net.getAddressList(allocator, io, mask_target.?, cfg.mask_port);
                 if (list.addrs.len > 0) {
                     resolved_addrs = list.addrs;
                     log.info("Using literal mask target '{s}:{d}'", .{ mask_target.?, cfg.mask_port });
@@ -383,7 +388,7 @@ pub const ProxyState = struct {
         errdefer if (web_mask_dns) |cache| cache.destroy();
         if (cfg.web.enabled) {
             if (cfg.web.mask_backend) |spec| {
-                web_mask_dns = try web_support.createMaskDns(allocator, spec);
+                web_mask_dns = try web_support.createMaskDns(allocator, io, spec);
                 const snapshot = web_mask_dns.?.snapshot(0);
                 if (snapshot.len == 0) {
                     log.warn("[web].mask_backend could not be resolved; background DNS refresh will retry", .{});
@@ -418,6 +423,7 @@ pub const ProxyState = struct {
 
         return .{
             .allocator = allocator,
+            .io = io,
             .config = cfg,
             .managed_buffer_limit_bytes = managed_buffer_limit_bytes,
             .user_secrets = user_secrets,
@@ -978,11 +984,12 @@ pub const ProxyState = struct {
         // tunnel network namespace. Trusting a stale host config in direct mode would
         // put the VPN server's address into the KDF while Telegram observes the host's
         // public egress address, causing every MiddleProxy handshake to fail.
-        const tunnel_active = isRunningInNonInitNetns();
+        const tunnel_active = isRunningInNonInitNetns(self.io);
         var awg_ip: ?[4]u8 = null;
         if (tunnel_active) {
             awg_ip = try detectAwgEndpointIpv4(
                 self.allocator,
+                self.io,
                 &self.middle_proxy_updater_stop,
             );
         }
@@ -991,6 +998,7 @@ pub const ProxyState = struct {
         if (awg_ip == null and !self.middle_proxy_updater_stop.load(.acquire)) {
             public_ip = try detectPublicIpv4(
                 self.allocator,
+                self.io,
                 &self.middle_proxy_updater_stop,
             );
         }
@@ -1020,6 +1028,7 @@ pub const ProxyState = struct {
 
         const list = net.getAddressListCancelable(
             self.allocator,
+            self.io,
             target,
             self.config.mask_port,
             &self.middle_proxy_updater_stop,
@@ -1059,6 +1068,7 @@ pub const ProxyState = struct {
             if (self.middle_proxy_updater_stop.load(.acquire)) return error.UpdateCancelled;
             const bytes = http_fetch.fetchUrlBytes(
                 self.allocator,
+                self.io,
                 url,
                 .{
                     .max_response_bytes = 1 * 1024 * 1024,
@@ -4984,15 +4994,13 @@ test "middle proxy nonce response failures fall back to direct path" {
     };
     defer cfg.deinit(std.testing.allocator);
 
-    var state = try ProxyState.init(std.testing.allocator, cfg);
+    var state = try ProxyState.init(std.testing.allocator, std.testing.io, cfg);
     defer state.deinit();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var tmp_io_state = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer tmp_io_state.deinit();
-    const tmp_io = tmp_io_state.io();
+    const tmp_io = std.testing.io;
 
     var upstream_file = try tmp.dir.createFile(tmp_io, "middle-proxy-upstream", .{ .read = true });
     var upstream_file_owned = true;
@@ -5123,7 +5131,7 @@ test "pipelined handshake capacity stays independent of relay scratch size" {
 }
 
 fn initProxyStateAndDeinit(allocator: std.mem.Allocator, cfg: Config) !void {
-    var state = try ProxyState.init(allocator, cfg);
+    var state = try ProxyState.init(allocator, std.testing.io, cfg);
     defer state.deinit();
 }
 
@@ -5159,7 +5167,7 @@ test "middle proxy updater stop joins sleeping thread" {
     cfg.mask = false;
     cfg.datacenter_override = net.ip4(.{ 127, 0, 0, 1 }, 443);
 
-    var state = try ProxyState.init(std.testing.allocator, cfg);
+    var state = try ProxyState.init(std.testing.allocator, std.testing.io, cfg);
     defer state.deinit();
 
     state.startMiddleProxyUpdater();
@@ -5232,7 +5240,7 @@ test "handshake budget is charged once after the first client byte" {
     };
     defer cfg.deinit(std.testing.allocator);
 
-    var state = try ProxyState.init(std.testing.allocator, cfg);
+    var state = try ProxyState.init(std.testing.allocator, std.testing.io, cfg);
     defer state.deinit();
 
     var loop = EventLoop{
@@ -5371,7 +5379,7 @@ test "concurrent workers share connection, handshake, replay, rate and wedge lim
         .rate_limit_per_subnet = 1,
     };
     defer cfg.deinit(std.testing.allocator);
-    var state = try ProxyState.init(std.testing.allocator, cfg);
+    var state = try ProxyState.init(std.testing.allocator, std.testing.io, cfg);
     defer state.deinit();
 
     var cap = std.atomic.Value(u32).init(0);
@@ -5442,7 +5450,7 @@ test "shared subnet admission and unauthenticated caps are not multiplied" {
         .mask = false,
     };
     defer cfg.deinit(std.testing.allocator);
-    var state = try ProxyState.init(std.testing.allocator, cfg);
+    var state = try ProxyState.init(std.testing.allocator, std.testing.io, cfg);
     defer state.deinit();
 
     const address = net.ip4(.{ 198, 51, 100, 1 }, 443);
@@ -5483,7 +5491,7 @@ test "MiddleProxy route snapshots remain synchronized across workers" {
         .mask = false,
     };
     defer cfg.deinit(std.testing.allocator);
-    var state = try ProxyState.init(std.testing.allocator, cfg);
+    var state = try ProxyState.init(std.testing.allocator, std.testing.io, cfg);
     defer state.deinit();
     var race = MiddleProxyMetadataRace{ .state = &state };
     var threads: [4]std.Thread = undefined;
@@ -5536,7 +5544,7 @@ test "abandoned worker startup releases its reuseport listener" {
         .mask = false,
     };
     defer cfg.deinit(std.testing.allocator);
-    var state = try ProxyState.init(std.testing.allocator, cfg);
+    var state = try ProxyState.init(std.testing.allocator, std.testing.io, cfg);
     defer state.deinit();
 
     const address = net.ip4(.{ 127, 0, 0, 1 }, 0);

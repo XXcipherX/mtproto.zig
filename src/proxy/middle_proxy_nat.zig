@@ -20,17 +20,14 @@ pub fn parseIpv4Literal(text: []const u8) ?[4]u8 {
     return ip;
 }
 
-pub fn isRunningInNonInitNetns() bool {
+pub fn isRunningInNonInitNetns(io: std.Io) bool {
     if (builtin.os.tag != .linux) return false;
 
     var self_buf: [std.fs.max_path_bytes]u8 = undefined;
     var init_buf: [std.fs.max_path_bytes]u8 = undefined;
 
-    var threaded_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer threaded_io.deinit();
-    const local_io = threaded_io.io();
-    const self_len = std.Io.Dir.readLinkAbsolute(local_io, "/proc/self/ns/net", &self_buf) catch return false;
-    const init_len = std.Io.Dir.readLinkAbsolute(local_io, "/proc/1/ns/net", &init_buf) catch return false;
+    const self_len = std.Io.Dir.readLinkAbsolute(io, "/proc/self/ns/net", &self_buf) catch return false;
+    const init_len = std.Io.Dir.readLinkAbsolute(io, "/proc/1/ns/net", &init_buf) catch return false;
     const self_ns = self_buf[0..self_len];
     const init_ns = init_buf[0..init_len];
 
@@ -58,6 +55,7 @@ fn parseEndpointHost(endpoint: []const u8) ?[]const u8 {
 
 fn resolveHostnameIpv4(
     allocator: std.mem.Allocator,
+    io: std.Io,
     host: []const u8,
     stop: ?*const std.atomic.Value(bool),
 ) !?[4]u8 {
@@ -66,12 +64,12 @@ fn resolveHostnameIpv4(
     }
 
     var list = if (stop) |stop_flag|
-        net.getAddressListCancelable(allocator, host, 443, stop_flag) catch |err| {
+        net.getAddressListCancelable(allocator, io, host, 443, stop_flag) catch |err| {
             if (err == error.UpdateCancelled) return err;
             return null;
         }
     else
-        net.getAddressList(allocator, host, 443) catch return null;
+        net.getAddressList(allocator, io, host, 443) catch return null;
     defer list.deinit();
 
     for (list.addrs) |addr| {
@@ -83,6 +81,7 @@ fn resolveHostnameIpv4(
 
 fn parseAwgEndpointIpv4FromConfig(
     allocator: std.mem.Allocator,
+    io: std.Io,
     content: []const u8,
     stop: ?*const std.atomic.Value(bool),
 ) !?[4]u8 {
@@ -115,7 +114,7 @@ fn parseAwgEndpointIpv4FromConfig(
         const host = parseEndpointHost(value) orelse continue;
 
         if (parseIpv4Literal(host)) |ip| return ip;
-        if (try resolveHostnameIpv4(allocator, host, stop)) |resolved_ip| return resolved_ip;
+        if (try resolveHostnameIpv4(allocator, io, host, stop)) |resolved_ip| return resolved_ip;
     }
 
     return null;
@@ -123,13 +122,10 @@ fn parseAwgEndpointIpv4FromConfig(
 
 pub fn detectAwgEndpointIpv4(
     allocator: std.mem.Allocator,
+    io: std.Io,
     stop: ?*const std.atomic.Value(bool),
 ) !?[4]u8 {
     if (builtin.os.tag != .linux) return null;
-
-    var threaded_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer threaded_io.deinit();
-    const io = threaded_io.io();
 
     const paths = [_][]const u8{
         "/etc/amnezia/amneziawg/awg0.conf",
@@ -146,7 +142,7 @@ pub fn detectAwgEndpointIpv4(
         defer allocator.free(content);
         if (content.len > 64 * 1024) continue;
 
-        if (try parseAwgEndpointIpv4FromConfig(allocator, content, stop)) |ip| return ip;
+        if (try parseAwgEndpointIpv4FromConfig(allocator, io, content, stop)) |ip| return ip;
     }
 
     return null;
@@ -165,6 +161,7 @@ pub fn selectDetectedMiddleProxyNatIpv4(
 
 pub fn detectPublicIpv4(
     allocator: std.mem.Allocator,
+    io: std.Io,
     stop: ?*const std.atomic.Value(bool),
 ) !?[4]u8 {
     const services = [_][]const u8{
@@ -176,6 +173,7 @@ pub fn detectPublicIpv4(
     for (services) |url| {
         const stdout = http_fetch.fetchUrlBytes(
             allocator,
+            io,
             url,
             .{
                 .max_response_bytes = 64 * 1024,
@@ -262,6 +260,7 @@ test "parse awg endpoint ipv4 from config" {
 
     const parsed = (try parseAwgEndpointIpv4FromConfig(
         std.testing.allocator,
+        std.testing.io,
         content,
         null,
     )) orelse return error.TestExpectedEqual;

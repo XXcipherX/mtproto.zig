@@ -65,7 +65,7 @@ fn effectivePath(allocator: std.mem.Allocator, base_path: []const u8, suffix: []
 
 /// Return sensitive, caller-owned JSON. The caller must write it only to the probe's
 /// stdin and zero it before freeing.
-pub fn render(allocator: std.mem.Allocator, cfg: *const config.Config) ![]u8 {
+pub fn render(allocator: std.mem.Allocator, io: std.Io, cfg: *const config.Config) ![]u8 {
     const raw_domain = cfg.web.domain orelse return error.MissingDomain;
     var domain_buf: [capability.max_host_len]u8 = undefined;
     const domain = try capability.normalizeHost(raw_domain, &domain_buf);
@@ -79,7 +79,6 @@ pub fn render(allocator: std.mem.Allocator, cfg: *const config.Config) ![]u8 {
     defer std.crypto.secureZero(u8, &secret);
     var bridge_capability = capability.deriveForPaddedSecret(domain, base_path, secret);
     defer std.crypto.secureZero(u8, &bridge_capability);
-    const io = std.Io.Threaded.global_single_threaded.io();
     const seconds: u64 = @intCast(@max(0, std.Io.Clock.real.now(io).toSeconds()));
     var initial: [64]u8 = undefined;
     try std.Io.randomSecure(io, &initial);

@@ -7,16 +7,19 @@ const net = @import("net_helpers.zig");
 
 pub const Cache = struct {
     allocator: std.mem.Allocator,
+    /// Borrowed from the application; the backend must tolerate concurrent OS
+    /// threads, and destroy joins the refresh thread before the borrow ends.
+    io: std.Io,
     entries: std.ArrayList(Entry) = .empty,
     mutex: runtime_sync.BlockingMutex = .{},
     stopping: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
     const Entry = struct { host: []const u8, port: u16, addresses: net.AddressCandidates, literal: bool };
-    const Resolver = *const fn (std.mem.Allocator, []const u8, u16) anyerror!net.AddressList;
+    const Resolver = *const fn (std.mem.Allocator, std.Io, []const u8, u16) anyerror!net.AddressList;
 
-    pub fn create(allocator: std.mem.Allocator) !*Cache {
+    pub fn create(allocator: std.mem.Allocator, io: std.Io) !*Cache {
         const self = try allocator.create(Cache);
-        self.* = .{ .allocator = allocator };
+        self.* = .{ .allocator = allocator, .io = io };
         return self;
     }
 
@@ -54,17 +57,17 @@ pub const Cache = struct {
         self.allocator.destroy(self);
     }
 
-    fn resolve(allocator: std.mem.Allocator, host: []const u8, port: u16) !net.AddressList {
+    fn resolve(allocator: std.mem.Allocator, io: std.Io, host: []const u8, port: u16) !net.AddressList {
         // Production is Linux. NSS resolution in a deadline-bounded child also
         // bounds shutdown even if the system resolver is wedged (five seconds).
-        return if (builtin.os.tag == .linux) net.lookupViaGetent(allocator, host, port) else net.getAddressList(allocator, host, port);
+        return if (builtin.os.tag == .linux) net.lookupViaGetent(allocator, io, host, port) else net.getAddressList(allocator, io, host, port);
     }
 
     fn refresh(self: *Cache, resolver: Resolver) void {
         for (self.entries.items, 0..) |entry, id| {
             if (self.stopping.load(.acquire)) return;
             if (entry.literal) continue;
-            const list = resolver(self.allocator, entry.host, entry.port) catch continue;
+            const list = resolver(self.allocator, self.io, entry.host, entry.port) catch continue;
             defer list.deinit();
             if (list.addrs.len == 0) continue; // Keep the last good answer.
             // Stable family preference matches startup resolution.
@@ -91,23 +94,23 @@ pub const Cache = struct {
 };
 
 test "DNS refresh replaces snapshots, preserves last good answers, skips literals" {
-    const cache = try Cache.create(std.testing.allocator);
+    const cache = try Cache.create(std.testing.allocator, std.testing.io);
     defer cache.destroy();
     const original = net.AddressCandidates.init(&.{net.ip4(.{ 192, 0, 2, 1 }, 443)});
     const id = try cache.add("example.test", 443, original);
     const literal_id = try cache.add("127.0.0.1", 443, original);
     const frozen = cache.snapshot(id);
     const Fake = struct {
-        fn good(a: std.mem.Allocator, _: []const u8, port: u16) !net.AddressList {
+        fn good(a: std.mem.Allocator, _: std.Io, _: []const u8, port: u16) !net.AddressList {
             const addresses = try a.alloc(net.Address, 2);
             addresses[0] = net.ip6(@splat(1), port, 0, 0);
             addresses[1] = net.ip4(.{ 192, 0, 2, 2 }, port);
             return .{ .allocator = a, .addrs = addresses };
         }
-        fn bad(_: std.mem.Allocator, _: []const u8, _: u16) !net.AddressList {
+        fn bad(_: std.mem.Allocator, _: std.Io, _: []const u8, _: u16) !net.AddressList {
             return error.ResolveFailed;
         }
-        fn empty(a: std.mem.Allocator, _: []const u8, _: u16) !net.AddressList {
+        fn empty(a: std.mem.Allocator, _: std.Io, _: []const u8, _: u16) !net.AddressList {
             return .{ .allocator = a, .addrs = try a.alloc(net.Address, 0) };
         }
     };
@@ -125,11 +128,11 @@ test "DNS refresh replaces snapshots, preserves last good answers, skips literal
 }
 
 test "DNS worker joins on shutdown and literal-only caches need no worker" {
-    const cache = try Cache.create(std.testing.allocator);
+    const cache = try Cache.create(std.testing.allocator, std.testing.io);
     _ = try cache.add("example.test", 443, .{});
     try cache.start();
     cache.destroy();
-    const literals = try Cache.create(std.testing.allocator);
+    const literals = try Cache.create(std.testing.allocator, std.testing.io);
     defer literals.destroy();
     _ = try literals.add("127.0.0.1", 443, .{});
     try literals.start();
@@ -137,7 +140,7 @@ test "DNS worker joins on shutdown and literal-only caches need no worker" {
 }
 
 test "DNS snapshots remain coherent across concurrent readers and refresh" {
-    const cache = try Cache.create(std.testing.allocator);
+    const cache = try Cache.create(std.testing.allocator, std.testing.io);
     defer cache.destroy();
     const initial = net.AddressCandidates.init(&.{net.ip4(.{ 192, 0, 2, 1 }, 443)});
     _ = try cache.add("example.test", 443, initial);
@@ -150,7 +153,7 @@ test "DNS snapshots remain coherent across concurrent readers and refresh" {
                 std.debug.assert(!net.isIpv6(snapshot.addresses[0]));
             }
         }
-        fn resolve(a: std.mem.Allocator, _: []const u8, port: u16) !net.AddressList {
+        fn resolve(a: std.mem.Allocator, _: std.Io, _: []const u8, port: u16) !net.AddressList {
             const addresses = try a.alloc(net.Address, 1);
             addresses[0] = net.ip4(.{ 192, 0, 2, 2 }, port);
             return .{ .allocator = a, .addrs = addresses };

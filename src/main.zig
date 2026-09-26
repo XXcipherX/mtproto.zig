@@ -242,14 +242,14 @@ const CapacityEstimate = struct {
     safe_connections: u32,
 };
 
-fn detectTotalRamBytes(allocator: std.mem.Allocator) ?u64 {
+fn detectTotalRamBytes(allocator: std.mem.Allocator, io: std.Io) ?u64 {
     if (builtin.os.tag != .linux) return null;
 
     if (detectTotalRamBytesSysinfo()) |total| {
         return total;
     }
 
-    const content = linux_fs.readPseudoFileAlloc(allocator, "/proc/meminfo", 16 * 1024) catch return null;
+    const content = linux_fs.readPseudoFileAlloc(allocator, io, "/proc/meminfo", 16 * 1024) catch return null;
     defer allocator.free(content);
 
     const key = "MemTotal:";
@@ -310,10 +310,11 @@ fn parseCgroupMemoryLimit(version: CgroupVersion, content: []const u8) ?u64 {
 
 fn readCgroupMemoryLimitFile(
     allocator: std.mem.Allocator,
+    io: std.Io,
     version: CgroupVersion,
     path: []const u8,
 ) ?u64 {
-    const content = linux_fs.readPseudoFileAlloc(allocator, path, 256) catch return null;
+    const content = linux_fs.readPseudoFileAlloc(allocator, io, path, 256) catch return null;
     defer allocator.free(content);
     return parseCgroupMemoryLimit(version, content);
 }
@@ -449,6 +450,7 @@ fn mountedCgroupLeafPath(
 
 fn scanCgroupHierarchy(
     allocator: std.mem.Allocator,
+    io: std.Io,
     version: CgroupVersion,
     mount_point: []const u8,
     leaf: []const u8,
@@ -470,7 +472,7 @@ fn scanCgroupHierarchy(
         if (limit_path) |path| {
             best = minMemoryLimit(
                 best,
-                readCgroupMemoryLimitFile(allocator, version, path),
+                readCgroupMemoryLimitFile(allocator, io, version, path),
             );
         }
 
@@ -484,6 +486,7 @@ fn scanCgroupHierarchy(
 
 fn scanMountedCgroup(
     allocator: std.mem.Allocator,
+    io: std.Io,
     mount: CgroupMount,
     membership: []const u8,
     mapped: *bool,
@@ -501,23 +504,25 @@ fn scanMountedCgroup(
         membership,
     ) orelse return null;
     mapped.* = true;
-    return scanCgroupHierarchy(allocator, mount.version, mount_point, leaf);
+    return scanCgroupHierarchy(allocator, io, mount.version, mount_point, leaf);
 }
 
 fn scanConventionalCgroupMounts(
     allocator: std.mem.Allocator,
+    io: std.Io,
     v1_membership: ?[]const u8,
     v2_membership: ?[]const u8,
 ) ?u64 {
     var best: ?u64 = null;
     best = minMemoryLimit(
         best,
-        readCgroupMemoryLimitFile(allocator, .v2, "/sys/fs/cgroup/memory.max"),
+        readCgroupMemoryLimitFile(allocator, io, .v2, "/sys/fs/cgroup/memory.max"),
     );
     best = minMemoryLimit(
         best,
         readCgroupMemoryLimitFile(
             allocator,
+            io,
             .v1,
             "/sys/fs/cgroup/memory/memory.limit_in_bytes",
         ),
@@ -526,6 +531,7 @@ fn scanConventionalCgroupMounts(
     if (v2_membership) |cgroup_path| {
         best = minMemoryLimit(best, scanMountedCgroup(
             allocator,
+            io,
             .{ .version = .v2, .root = "/", .mount_point = "/sys/fs/cgroup" },
             cgroup_path,
             &mapped,
@@ -534,6 +540,7 @@ fn scanConventionalCgroupMounts(
     if (v1_membership) |cgroup_path| {
         best = minMemoryLimit(best, scanMountedCgroup(
             allocator,
+            io,
             .{ .version = .v1, .root = "/", .mount_point = "/sys/fs/cgroup/memory" },
             cgroup_path,
             &mapped,
@@ -542,14 +549,15 @@ fn scanConventionalCgroupMounts(
     return best;
 }
 
-fn detectCgroupMemoryLimitBytes(allocator: std.mem.Allocator) ?u64 {
+fn detectCgroupMemoryLimitBytes(allocator: std.mem.Allocator, io: std.Io) ?u64 {
     if (builtin.os.tag != .linux) return null;
 
     const membership = linux_fs.readPseudoFileAlloc(
         allocator,
+        io,
         "/proc/self/cgroup",
         64 * 1024,
-    ) catch return scanConventionalCgroupMounts(allocator, null, null);
+    ) catch return scanConventionalCgroupMounts(allocator, io, null, null);
     defer allocator.free(membership);
     var v1_membership: ?[]const u8 = null;
     var v2_membership: ?[]const u8 = null;
@@ -573,10 +581,12 @@ fn detectCgroupMemoryLimitBytes(allocator: std.mem.Allocator) ?u64 {
 
     const mountinfo = linux_fs.readPseudoFileAlloc(
         allocator,
+        io,
         "/proc/self/mountinfo",
         1024 * 1024,
     ) catch return scanConventionalCgroupMounts(
         allocator,
+        io,
         v1_membership,
         v2_membership,
     );
@@ -593,19 +603,19 @@ fn detectCgroupMemoryLimitBytes(allocator: std.mem.Allocator) ?u64 {
         var mapped = false;
         best = minMemoryLimit(
             best,
-            scanMountedCgroup(allocator, mount, cgroup_path, &mapped),
+            scanMountedCgroup(allocator, io, mount, cgroup_path, &mapped),
         );
         mapped_any = mapped_any or mapped;
     }
     return if (mapped_any)
         best
     else
-        scanConventionalCgroupMounts(allocator, v1_membership, v2_membership);
+        scanConventionalCgroupMounts(allocator, io, v1_membership, v2_membership);
 }
 
-fn detectEffectiveMemoryBytes(allocator: std.mem.Allocator) ?u64 {
-    const host = detectTotalRamBytes(allocator);
-    const cgroup = detectCgroupMemoryLimitBytes(allocator);
+fn detectEffectiveMemoryBytes(allocator: std.mem.Allocator, io: std.Io) ?u64 {
+    const host = detectTotalRamBytes(allocator, io);
+    const cgroup = detectCgroupMemoryLimitBytes(allocator, io);
     if (host) |host_bytes| {
         if (cgroup) |limit| return @min(host_bytes, limit);
         return host_bytes;
@@ -815,7 +825,7 @@ fn writeConnectionLinkEntries(cfg: config.Config) void {
     }
 }
 
-fn runWebRelay(allocator: std.mem.Allocator, cfg: *const config.Config) !void {
+fn runWebRelay(allocator: std.mem.Allocator, io: std.Io, cfg: *const config.Config) !void {
     var domain_buf: [web_capability.max_host_len]u8 = undefined;
     var opts = web_relay.Options.fromConfig(cfg, &domain_buf) catch |err| {
         const hint = switch (err) {
@@ -829,12 +839,12 @@ fn runWebRelay(allocator: std.mem.Allocator, cfg: *const config.Config) !void {
         writeStderr("web relay cannot start: {s} ({s})\n", .{ @errorName(err), hint });
         return err;
     };
-    opts.backend = web_relay.resolveBackend(allocator, cfg) catch |err| {
+    opts.backend = web_relay.resolveBackend(allocator, io, cfg) catch |err| {
         writeStderr("web relay cannot resolve [web].backend: {s}\n", .{@errorName(err)});
         return err;
     };
 
-    var relay = try web_relay.Relay.init(allocator, opts, cfg);
+    var relay = try web_relay.Relay.init(allocator, io, opts, cfg);
     defer relay.deinit();
     try relay.run();
 }
@@ -995,6 +1005,7 @@ pub fn main(init: std.process.Init) !void {
     // GPA has an internal mutex that causes deadlocks under heavy thread contention
     // (1000+ simultaneous connections all doing TLS validation allocations).
     const allocator = std.heap.page_allocator;
+    const io = init.io;
     ignoreSigpipe();
 
     // Parse config path and explicit secret-display modes.
@@ -1049,7 +1060,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // Parse config
-    var cfg = config.Config.loadFromFile(allocator, config_path) catch |err| {
+    var cfg = config.Config.loadFromFile(allocator, io, config_path) catch |err| {
         writeStderr("\x1b[1m\x1b[31m  ✗ Failed to load config '{s}': {}\x1b[0m\n", .{ config_path, err });
         writeUsage();
         return err;
@@ -1081,11 +1092,11 @@ pub fn main(init: std.process.Init) !void {
     if (web_relay_mode) {
         if (show_secrets or print_links) return error.InvalidArguments;
         cfg.emitWarnings();
-        return runWebRelay(allocator, &cfg);
+        return runWebRelay(allocator, io, &cfg);
     }
 
     if (web_probe_material_mode) {
-        const material = try web_probe_material.render(allocator, &cfg);
+        const material = try web_probe_material.render(allocator, io, &cfg);
         defer {
             std.crypto.secureZero(u8, material);
             allocator.free(material);
@@ -1111,7 +1122,7 @@ pub fn main(init: std.process.Init) !void {
         );
     }
 
-    const capacity_estimate = if (detectEffectiveMemoryBytes(allocator)) |memory_limit|
+    const capacity_estimate = if (detectEffectiveMemoryBytes(allocator, io)) |memory_limit|
         estimateCapacity(&cfg, memory_limit)
     else
         null;
@@ -1134,6 +1145,7 @@ pub fn main(init: std.process.Init) !void {
     // Create shared state (DI — no globals)
     var state = try proxy.ProxyState.initWithManagedBufferLimit(
         allocator,
+        io,
         cfg,
         managed_buffer_limit_bytes,
     );

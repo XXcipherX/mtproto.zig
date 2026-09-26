@@ -1,6 +1,5 @@
 //! Operator-owned static public files, loaded once so the network loop never reads disk.
 const std = @import("std");
-const io = std.Io.Threaded.global_single_threaded.io();
 const max_files: usize = 256;
 const max_file_bytes: usize = 2 * 1024 * 1024;
 const max_total_bytes: usize = 16 * 1024 * 1024;
@@ -23,14 +22,14 @@ pub const Site = struct {
         self.entries.deinit(allocator);
     }
 
-    pub fn load(allocator: std.mem.Allocator, path: ?[]const u8) !Site {
+    pub fn load(allocator: std.mem.Allocator, io: std.Io, path: ?[]const u8) !Site {
         if (path == null) return .{};
         var dir = try std.Io.Dir.cwd().openDir(io, path.?, .{ .iterate = true });
         defer dir.close(io);
-        return fromDir(allocator, dir);
+        return fromDir(allocator, io, dir);
     }
 
-    pub fn fromDir(allocator: std.mem.Allocator, dir: std.Io.Dir) !Site {
+    pub fn fromDir(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !Site {
         var opened = try dir.openDir(io, ".", .{ .iterate = true });
         defer opened.close(io);
         var walker = try opened.walk(allocator);
@@ -87,12 +86,13 @@ pub const Site = struct {
 };
 
 test "public files retain operator bytes and exact routes without generated cover" {
+    const io = std.testing.io;
     var dir = std.testing.tmpDir(.{});
     defer dir.cleanup();
     try dir.dir.writeFile(io, .{ .sub_path = "index.html", .data = "My real website" });
     try dir.dir.writeFile(io, .{ .sub_path = "style.css", .data = "body{}" });
     try dir.dir.writeFile(io, .{ .sub_path = ".secret", .data = "never public" });
-    var site = try Site.fromDir(std.testing.allocator, dir.dir);
+    var site = try Site.fromDir(std.testing.allocator, io, dir.dir);
     defer site.deinit(std.testing.allocator);
 
     try std.testing.expect(site.find("/") != null);
@@ -106,6 +106,7 @@ test "public files retain operator bytes and exact routes without generated cove
 }
 
 test "public site file count is bounded" {
+    const io = std.testing.io;
     var dir = std.testing.tmpDir(.{});
     defer dir.cleanup();
     var name_buf: [32]u8 = undefined;
@@ -113,10 +114,11 @@ test "public site file count is bounded" {
         const name = try std.fmt.bufPrint(&name_buf, "asset-{d}.txt", .{index});
         try dir.dir.writeFile(io, .{ .sub_path = name, .data = "" });
     }
-    try std.testing.expectError(error.PublicSiteTooLarge, Site.fromDir(std.testing.allocator, dir.dir));
+    try std.testing.expectError(error.PublicSiteTooLarge, Site.fromDir(std.testing.allocator, io, dir.dir));
 }
 
 test "public site rejects a file above the per-file limit" {
+    const io = std.testing.io;
     const allocator = std.testing.allocator;
     var dir = std.testing.tmpDir(.{});
     defer dir.cleanup();
@@ -126,7 +128,7 @@ test "public site rejects a file above the per-file limit" {
     try dir.dir.writeFile(io, .{ .sub_path = "oversized.bin", .data = oversized });
 
     var rejected = false;
-    var site = Site.fromDir(allocator, dir.dir) catch blk: {
+    var site = Site.fromDir(allocator, io, dir.dir) catch blk: {
         rejected = true;
         break :blk Site{};
     };
@@ -135,6 +137,7 @@ test "public site rejects a file above the per-file limit" {
 }
 
 test "public site total loaded bytes are bounded" {
+    const io = std.testing.io;
     const allocator = std.testing.allocator;
     var dir = std.testing.tmpDir(.{});
     defer dir.cleanup();
@@ -146,11 +149,11 @@ test "public site total loaded bytes are bounded" {
         const name = try std.fmt.bufPrint(&name_buf, "chunk-{d}.bin", .{index});
         try dir.dir.writeFile(io, .{ .sub_path = name, .data = chunk });
     }
-    try std.testing.expectError(error.PublicSiteTooLarge, Site.fromDir(allocator, dir.dir));
+    try std.testing.expectError(error.PublicSiteTooLarge, Site.fromDir(allocator, io, dir.dir));
 }
 
 test "no configured public directory creates no deployment fingerprint" {
-    var site = try Site.load(std.testing.allocator, null);
+    var site = try Site.load(std.testing.allocator, std.testing.io, null);
     defer site.deinit(std.testing.allocator);
     try std.testing.expect(site.find("/") == null);
 }

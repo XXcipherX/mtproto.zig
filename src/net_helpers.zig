@@ -121,12 +121,8 @@ const AddressLookupEvent = union(enum) {
     stop: anyerror!void,
 };
 
-pub fn getAddressList(allocator: std.mem.Allocator, host: []const u8, port: u16) !AddressList {
+pub fn getAddressList(allocator: std.mem.Allocator, io: std.Io, host: []const u8, port: u16) !AddressList {
     if (try addressListForLiteral(allocator, host, port)) |list| return list;
-
-    var threaded_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer threaded_io.deinit();
-    const io = threaded_io.io();
     return getAddressListWithIo(allocator, host, port, io);
 }
 
@@ -137,6 +133,7 @@ pub fn getAddressList(allocator: std.mem.Allocator, host: []const u8, port: u16)
 /// buffers and arguments owned by this scope.
 pub fn getAddressListCancelable(
     allocator: std.mem.Allocator,
+    io: std.Io,
     host: []const u8,
     port: u16,
     stop: *const std.atomic.Value(bool),
@@ -150,10 +147,6 @@ pub fn getAddressListCancelable(
         }
         return list;
     }
-
-    var threaded_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer threaded_io.deinit();
-    const io = threaded_io.io();
 
     var event_storage: [2]AddressLookupEvent = undefined;
     var select = std.Io.Select(AddressLookupEvent).init(io, &event_storage);
@@ -672,6 +665,6 @@ test "cancelable address lookup honors a pre-set stop flag" {
     var stop = std.atomic.Value(bool).init(true);
     try std.testing.expectError(
         error.UpdateCancelled,
-        getAddressListCancelable(std.testing.allocator, "127.0.0.1", 443, &stop),
+        getAddressListCancelable(std.testing.allocator, std.testing.io, "127.0.0.1", 443, &stop),
     );
 }

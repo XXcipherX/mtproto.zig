@@ -18,7 +18,7 @@ pub const Store = struct {
         self.entries.deinit(allocator);
     }
 
-    pub fn issue(self: *Store, allocator: std.mem.Allocator, user: []const u8, now: i64, limit: usize) !Token {
+    pub fn issue(self: *Store, allocator: std.mem.Allocator, io: std.Io, user: []const u8, now: i64, limit: usize) !Token {
         var i: usize = 0;
         while (i < self.entries.items.len) {
             if (self.entries.items[i].expires <= now) {
@@ -30,7 +30,7 @@ pub const Store = struct {
         if (self.entries.items.len >= limit) return error.Capacity;
 
         var entropy: [32]u8 = undefined;
-        try std.Io.randomSecure(std.Io.Threaded.global_single_threaded.io(), &entropy);
+        try std.Io.randomSecure(io, &entropy);
         var token: Token = undefined;
         _ = std.base64.url_safe_no_pad.Encoder.encode(&token, &entropy);
         try self.entries.append(allocator, .{
@@ -74,7 +74,7 @@ test "carrier credentials expire and cannot attach twice or resume an adopted se
     var store = Store{};
     defer store.deinit(allocator);
 
-    const token = try store.issue(allocator, "alice", 1000, 4);
+    const token = try store.issue(allocator, std.testing.io, "alice", 1000, 4);
     try std.testing.expectEqual(@as(usize, 43), token.len);
     for (token) |c| try std.testing.expect(std.ascii.isAlphanumeric(c) or c == '-' or c == '_');
     try std.testing.expectEqualStrings("alice", store.acquire(&token, 8, 1001).?);
@@ -84,7 +84,7 @@ test "carrier credentials expire and cannot attach twice or resume an adopted se
     store.release(&token, 9, true);
     try std.testing.expect(store.acquire(&token, 10, 1004) == null);
 
-    const fresh = try store.issue(allocator, "bob", 2000, 4);
+    const fresh = try store.issue(allocator, std.testing.io, "bob", 2000, 4);
     try std.testing.expect(store.acquire(&fresh, 11, 2000 + lifetime_ms) == null);
 }
 
@@ -93,10 +93,10 @@ test "expired entries release issuance capacity and failed acquisition does not 
     var store = Store{};
     defer store.deinit(allocator);
 
-    const first = try store.issue(allocator, "alice", 0, 1);
-    try std.testing.expectError(error.Capacity, store.issue(allocator, "bob", 1, 1));
+    const first = try store.issue(allocator, std.testing.io, "alice", 0, 1);
+    try std.testing.expectError(error.Capacity, store.issue(allocator, std.testing.io, "bob", 1, 1));
     try std.testing.expect(store.acquire("bad", 1, 2) == null);
-    const next = try store.issue(allocator, "bob", lifetime_ms, 1);
+    const next = try store.issue(allocator, std.testing.io, "bob", lifetime_ms, 1);
     try std.testing.expect(!std.mem.eql(u8, &first, &next));
     try std.testing.expectEqualStrings("bob", store.acquire(&next, 1, lifetime_ms + 1).?);
 }

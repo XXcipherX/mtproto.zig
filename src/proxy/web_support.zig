@@ -7,15 +7,15 @@ const net = @import("../net_helpers.zig");
 pub const DnsCache = @import("../web/dns_cache.zig").Cache;
 
 /// WEB terminator addresses refresh independently; failed lookups keep the last snapshot.
-pub fn createMaskDns(allocator: std.mem.Allocator, spec: []const u8) !*DnsCache {
+pub fn createMaskDns(allocator: std.mem.Allocator, io: std.Io, spec: []const u8) !*DnsCache {
     const helpers = @import("../web/net_helpers.zig");
     const colon = std.mem.lastIndexOfScalar(u8, spec, ':') orelse return error.InvalidWebMaskBackend;
     const host = std.mem.trim(u8, spec[0..colon], "[] ");
     const port = try std.fmt.parseInt(u16, spec[colon + 1 ..], 10);
     if (host.len == 0 or port == 0) return error.InvalidWebMaskBackend;
-    const cache = try DnsCache.create(allocator);
+    const cache = try DnsCache.create(allocator, io);
     errdefer cache.destroy();
-    const list = helpers.getAddressList(allocator, host, port) catch null;
+    const list = helpers.getAddressList(allocator, io, host, port) catch null;
     defer if (list) |addresses| addresses.deinit();
     _ = try cache.add(host, port, if (list) |addresses| helpers.AddressCandidates.init(addresses.addrs) else .{});
     return cache;

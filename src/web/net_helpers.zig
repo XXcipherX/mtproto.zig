@@ -91,7 +91,9 @@ pub fn addressEql(a: Address, b: Address) bool {
     return net.IpAddress.eql(&a, &b);
 }
 
-pub fn getAddressList(allocator: std.mem.Allocator, host: []const u8, port: u16) !AddressList {
+/// The non-Linux fallback shares `io` between a joined producer thread and
+/// this caller; its backend must support use from multiple OS threads.
+pub fn getAddressList(allocator: std.mem.Allocator, io: std.Io, host: []const u8, port: u16) !AddressList {
     if (net.IpAddress.parse(host, port)) |literal| {
         const addrs = try allocator.alloc(Address, 1);
         addrs[0] = literal;
@@ -101,9 +103,9 @@ pub fn getAddressList(allocator: std.mem.Allocator, host: []const u8, port: u16)
     // On Linux use the deadline-bounded NSS resolver. This avoids feeding VPS
     // resolv.conf quirks into Zig 0.16's resolver and is also used by refresh.
     const resolved = if (@import("builtin").os.tag == .linux)
-        try lookupViaGetent(allocator, host, port)
+        try lookupViaGetent(allocator, io, host, port)
     else
-        try lookupViaStd(allocator, host, port);
+        try lookupViaStd(allocator, io, host, port);
     preferIpv4(resolved.addrs);
     return resolved;
 }
@@ -129,20 +131,17 @@ const LookupProducer = struct {
     }
 };
 
-fn lookupViaStd(allocator: std.mem.Allocator, host: []const u8, port: u16) !AddressList {
+fn lookupViaStd(allocator: std.mem.Allocator, io: std.Io, host: []const u8, port: u16) !AddressList {
     const host_name = try net.HostName.init(host);
-    // The producer and queue consumer both use this context until join.
-    var io_instance = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_instance.deinit();
-    const io_ctx = io_instance.io();
+    // The producer and queue consumer share the caller's context until join.
 
     var results_buf: [32]net.HostName.LookupResult = undefined;
     var results: std.Io.Queue(net.HostName.LookupResult) = .init(&results_buf);
 
-    var producer: LookupProducer = .{ .host = host_name, .io = io_ctx, .results = &results, .port = port };
+    var producer: LookupProducer = .{ .host = host_name, .io = io, .results = &results, .port = port };
     const thread = try std.Thread.spawn(.{}, LookupProducer.run, .{&producer});
 
-    const drained = drainLookupResults(allocator, &results, io_ctx);
+    const drained = drainLookupResults(allocator, &results, io);
     // Draining is complete even when allocation failed; joining cannot deadlock
     // against a producer suspended on a full queue.
     thread.join();
@@ -178,7 +177,7 @@ fn drainLookupResults(allocator: std.mem.Allocator, results: *std.Io.Queue(net.H
     };
 }
 
-pub fn lookupViaGetent(allocator: std.mem.Allocator, host: []const u8, port: u16) !AddressList {
+pub fn lookupViaGetent(allocator: std.mem.Allocator, io: std.Io, host: []const u8, port: u16) !AddressList {
     // Only resolve plain hostnames (no shell metacharacters); host comes from
     // config (mask_target / upstream proxy host), but stay defensive.
     for (host) |c| {
@@ -187,10 +186,7 @@ pub fn lookupViaGetent(allocator: std.mem.Allocator, host: []const u8, port: u16
         if (!ok) return error.ResolveFailed;
     }
 
-    var io_instance: std.Io.Threaded = .init(std.heap.page_allocator, .{});
-    defer io_instance.deinit();
-
-    const result = @import("child_process.zig").run(allocator, io_instance.io(), .{
+    const result = @import("child_process.zig").run(allocator, io, .{
         .argv = &.{ "getent", "ahosts", "--", host },
         .timeout = .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } },
         .stdout_limit = std.Io.Limit.limited(64 * 1024),
@@ -256,9 +252,7 @@ const SyntheticLookupProducer = struct {
 };
 
 test "DNS queue drains more answers than its fixed capacity" {
-    var io_instance = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_instance.deinit();
-    const io_ctx = io_instance.io();
+    const io_ctx = std.testing.io;
     var storage: [32]net.HostName.LookupResult = undefined;
     var queue: std.Io.Queue(net.HostName.LookupResult) = .init(&storage);
     const producer = try std.Thread.spawn(.{}, SyntheticLookupProducer.run, .{ &queue, io_ctx });
@@ -271,9 +265,7 @@ test "DNS queue drains more answers than its fixed capacity" {
 }
 
 test "DNS queue still drains its producer after allocation failure" {
-    var io_instance = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_instance.deinit();
-    const io_ctx = io_instance.io();
+    const io_ctx = std.testing.io;
     var storage: [32]net.HostName.LookupResult = undefined;
     var queue: std.Io.Queue(net.HostName.LookupResult) = .init(&storage);
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });

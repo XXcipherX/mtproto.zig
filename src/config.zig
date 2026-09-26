@@ -475,14 +475,12 @@ pub const Config = struct {
         }
     }
 
-    pub fn loadFromFile(allocator: std.mem.Allocator, path: []const u8) !Config {
+    pub fn loadFromFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Config {
         // A regular config file has a meaningful stat size, so use Zig 0.16's
         // native bounded file API. Allow the exact historical 1 MiB limit.
         const max_bytes = 1024 * 1024;
-        var threaded_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
-        defer threaded_io.deinit();
         const content = try std.Io.Dir.cwd().readFileAlloc(
-            threaded_io.io(),
+            io,
             path,
             allocator,
             .limited(max_bytes + 1),

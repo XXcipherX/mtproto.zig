@@ -18,14 +18,10 @@ const FetchEvent = union(enum) {
     stop: anyerror!void,
 };
 
-pub fn fetchUrlBytes(allocator: std.mem.Allocator, url: []const u8, options: FetchOptions) ![]u8 {
+pub fn fetchUrlBytes(allocator: std.mem.Allocator, io: std.Io, url: []const u8, options: FetchOptions) ![]u8 {
     if (options.stop) |stop| {
         if (stop.load(.acquire)) return error.UpdateCancelled;
     }
-
-    var threaded_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer threaded_io.deinit();
-    const io = threaded_io.io();
 
     const worker_allocator = std.heap.page_allocator;
     const url_copy = try worker_allocator.dupe(u8, url);

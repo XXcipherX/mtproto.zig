@@ -178,7 +178,7 @@ pub const Options = struct {
 };
 
 /// Parse `[web].backend` (`host:port`), defaulting to this proxy on loopback.
-pub fn resolveBackend(allocator: std.mem.Allocator, cfg: *const config.Config) !Address {
+pub fn resolveBackend(allocator: std.mem.Allocator, io: std.Io, cfg: *const config.Config) !Address {
     const spec = cfg.web.backend orelse {
         return net_helpers.ip4(.{ 127, 0, 0, 1 }, cfg.port);
     };
@@ -186,7 +186,7 @@ pub fn resolveBackend(allocator: std.mem.Allocator, cfg: *const config.Config) !
     const host = std.mem.trim(u8, spec[0..colon], "[] ");
     const port = std.fmt.parseInt(u16, spec[colon + 1 ..], 10) catch return error.InvalidBackend;
     if (host.len == 0) return error.InvalidBackend;
-    const list = net_helpers.getAddressList(allocator, host, port) catch return error.InvalidBackend;
+    const list = net_helpers.getAddressList(allocator, io, host, port) catch return error.InvalidBackend;
     defer list.deinit();
     if (list.addrs.len == 0) return error.InvalidBackend;
     return list.addrs[0];
@@ -366,6 +366,8 @@ test "backend queue accommodates the granted window and PROXY header" {
 
 pub const Relay = struct {
     allocator: std.mem.Allocator,
+    /// Borrowed from main; the DNS refresh thread is joined by deinit.
+    io: std.Io,
     opts: Options,
     backend_dns: ?*dns_cache.Cache = null,
     backend_dns_id: usize = 0,
@@ -403,7 +405,7 @@ pub const Relay = struct {
     stop: bool = false,
     read_buf: [read_buf_size]u8 = undefined,
 
-    pub fn init(allocator: std.mem.Allocator, opts: Options, cfg: *const config.Config) !Relay {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, opts: Options, cfg: *const config.Config) !Relay {
         const caps = try buildCapabilities(allocator, cfg, opts.domain, opts.base_path);
         errdefer allocator.free(caps);
 
@@ -413,7 +415,7 @@ pub const Relay = struct {
         const websocket_path = try prefixedPath(allocator, opts.base_path, opts.ws_path);
         errdefer allocator.free(websocket_path);
 
-        var site = try public_site.Site.load(allocator, opts.public_dir);
+        var site = try public_site.Site.load(allocator, io, opts.public_dir);
         errdefer site.deinit(allocator);
 
         const epoll_fd = try socket_utils.epollCreate();
@@ -431,19 +433,20 @@ pub const Relay = struct {
         errdefer posix.sigprocmask(posix.SIG.SETMASK, &old_sigmask, null);
         const signal_fd = try posix.signalfd(-1, &mask, linux.SFD.CLOEXEC | linux.SFD.NONBLOCK);
         errdefer closeFd(signal_fd);
-        const cache = try dns_cache.Cache.create(allocator);
+        const cache = try dns_cache.Cache.create(allocator, io);
         errdefer cache.destroy();
         const spec = cfg.web.backend;
         const colon = if (spec) |value| std.mem.lastIndexOfScalar(u8, value, ':') orelse return error.InvalidBackend else 0;
         const host = if (spec) |value| std.mem.trim(u8, value[0..colon], "[] ") else "127.0.0.1";
         const port = if (spec) |value| try std.fmt.parseInt(u16, value[colon + 1 ..], 10) else cfg.port;
-        const addresses = try net_helpers.getAddressList(allocator, host, port);
+        const addresses = try net_helpers.getAddressList(allocator, io, host, port);
         defer addresses.deinit();
         const dns_id = try cache.add(host, port, net_helpers.AddressCandidates.init(addresses.addrs));
         try cache.start();
 
         return .{
             .allocator = allocator,
+            .io = io,
             .opts = opts,
             .backend_dns = cache,
             .backend_dns_id = dns_id,
@@ -1019,7 +1022,7 @@ pub const Relay = struct {
 
     fn serveBridge(self: *Relay, conn: *Conn, request: *const http.Request, user: []const u8) void {
         const limit = @min(@as(usize, self.opts.max_sessions) * 4 + 32, 4096);
-        const token = self.carrier_tokens.issue(self.allocator, user, nowMs(), limit) catch {
+        const token = self.carrier_tokens.issue(self.allocator, self.io, user, nowMs(), limit) catch {
             self.respondStatus(conn, "503 Service Unavailable");
             return;
         };
@@ -1124,7 +1127,7 @@ pub const Relay = struct {
         var head_buf: [2048]u8 = undefined;
         var writer: std.Io.Writer = .fixed(&head_buf);
         var date_buf: [40]u8 = undefined;
-        const seconds = std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).toSeconds();
+        const seconds = std.Io.Clock.real.now(self.io).toSeconds();
         const date = httpDate(&date_buf, @intCast(@max(0, seconds))) catch "Thu, 01 Jan 1970 00:00:00 GMT";
         writer.print("HTTP/1.1 {s}\r\nDate: {s}\r\n{s}Content-Length: {d}\r\nConnection: {s}\r\n\r\n", .{
             status,
@@ -2114,6 +2117,7 @@ fn testRelay(allocator: std.mem.Allocator, limit: usize) Relay {
     options.max_buffer_bytes = limit;
     return .{
         .allocator = allocator,
+        .io = std.testing.io,
         .opts = options,
         .caps = &.{},
         .bridge_path = "",
@@ -2548,6 +2552,7 @@ test "backend retry freezes candidates and preserves queued bytes while retiring
     const target = try socket_utils.localSocketAddress(listener.socket.handle);
     var relay = Relay{
         .allocator = allocator,
+        .io = std.testing.io,
         .opts = undefined,
         .caps = undefined,
         .bridge_path = undefined,
@@ -2667,6 +2672,7 @@ test "a burst of tiny websocket frames compacts the carrier buffer once, not onc
     // socket, session or epoll fd is reached. `alive()` is the connection map alone.
     var relay = Relay{
         .allocator = allocator,
+        .io = std.testing.io,
         .opts = undefined,
         .caps = undefined,
         .bridge_path = undefined,
@@ -2725,17 +2731,17 @@ test "backend spec parsing rejects nonsense" {
     };
     defer cfg.deinit(std.testing.allocator);
 
-    const fallback = try resolveBackend(std.testing.allocator, &cfg);
+    const fallback = try resolveBackend(std.testing.allocator, std.testing.io, &cfg);
     try std.testing.expectEqual(@as(u16, 443), fallback.ip4.port);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 127, 0, 0, 1 }, &fallback.ip4.bytes);
 
     cfg.web.backend = try std.testing.allocator.dupe(u8, "127.0.0.1:8443");
-    const parsed = try resolveBackend(std.testing.allocator, &cfg);
+    const parsed = try resolveBackend(std.testing.allocator, std.testing.io, &cfg);
     try std.testing.expectEqual(@as(u16, 8443), parsed.ip4.port);
 
     std.testing.allocator.free(cfg.web.backend.?);
     cfg.web.backend = try std.testing.allocator.dupe(u8, "no-port-here");
-    try std.testing.expectError(error.InvalidBackend, resolveBackend(std.testing.allocator, &cfg));
+    try std.testing.expectError(error.InvalidBackend, resolveBackend(std.testing.allocator, std.testing.io, &cfg));
 }
 
 test "options require an enabled section, a domain and at least one user" {
@@ -2866,7 +2872,7 @@ test "authenticated websocket key failures return 400 and release the token" {
         "Sec-WebSocket-Key: invalid\r\n",
     };
     for (key_headers, 0..) |key_header, index| {
-        const token = try relay.carrier_tokens.issue(allocator, "alice", nowMs(), 8);
+        const token = try relay.carrier_tokens.issue(allocator, std.testing.io, "alice", nowMs(), 8);
         const raw = try std.fmt.allocPrint(allocator, "GET /api/v1/socket HTTP/1.1\r\n" ++
             "Host: relay.example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n" ++
             "Sec-WebSocket-Version: 13\r\n{s}" ++
