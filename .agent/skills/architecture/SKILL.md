@@ -37,7 +37,7 @@ Code anchors:
 
 - `src/proxy/proxy.zig` (`ProxyState`, worker startup/shutdown, `EventLoop` dispatch, timeout actions, MiddleProxy metadata publication)
 - `src/proxy/connection.zig`, `connection_pool.zig`, `deadline_queue.zig` (slot ownership and wiping, generation-tagged fd roles, indexed deadlines)
-- `src/proxy/message_queue.zig`, `managed_buffer_allocator.zig`, `relay_io.zig` (worker-local queue pages, managed accounting, budgeted relay reads/writes and frame-aligned half-close checks)
+- `src/proxy/limits.zig`, `message_queue.zig`, `managed_buffer_allocator.zig`, `relay_io.zig` (shared fixed queue/ME headroom budgets, worker-local queue pages, managed accounting, budgeted relay reads/writes and frame-aligned half-close checks)
 - `src/proxy/security_state.zig`, `wedge_recovery.zig` (process-shared admission tables/gate and per-slot recovery tracker)
 - `src/proxy/middle_proxy_nat.zig`, `middle_proxy_routing.zig`, `timeout_policy.zig` (egress discovery, route/cooldown policy, connection timeout calculations)
 - `src/proxy/socket_ops.zig`, `src/runtime/tcp_options.zig`, `src/runtime/linux_events.zig` (proxy-specific socket errors, shared best-effort TCP tuning, and epoll/timerfd/eventfd primitives)
@@ -68,7 +68,10 @@ the monotonic `timerfd`; the heap only maintains order and slot indices.
 Both per-slot queues own their intrusive page chains; the worker block pool may
 retain wiped pages until teardown. Queue pages, retained free pages, MiddleProxy
 stream buffers, and scratch charge the worker's `ManagedBufferAllocator`
-partition. `ConnectionSlot.releaseHandshakeOnly()` drops temporary handshake
+partition. `proxy/limits.zig` is the single source of truth for the fixed 4 MiB
+queue ceiling, 256 KiB ME framing headroom, and resulting stream cap; the queue
+and MiddleProxy protocol no longer import the config schema for those values.
+`ConnectionSlot.releaseHandshakeOnly()` drops temporary handshake
 storage at relay start, while `resetOwnedBuffers()` wipes all remaining owned
 secrets and buffers at close. Candidate addresses are inline for up to four
 entries or owned heap fallback; `ProxyState` copies the selected route into a

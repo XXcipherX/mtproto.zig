@@ -1161,6 +1161,7 @@ test {
     _ = obfuscation;
     _ = tls;
     _ = config;
+    _ = @import("proxy/limits.zig");
     _ = proxy;
     _ = @import("proxy/web_support.zig");
     _ = @import("web/frame.zig");

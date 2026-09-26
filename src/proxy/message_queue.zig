@@ -3,7 +3,7 @@
 //! after every slot has released its queue blocks.
 const std = @import("std");
 const posix = std.posix;
-const Config = @import("../config.zig").Config;
+const limits = @import("limits.zig");
 const ManagedBufferAllocator = @import("managed_buffer_allocator.zig").ManagedBufferAllocator;
 
 const msg_block_header_size: usize = @sizeOf(?*anyopaque) + @sizeOf(usize);
@@ -86,7 +86,7 @@ pub const MessageBlockPool = struct {
 };
 
 pub const MessageQueue = struct {
-    const max_pending_bytes: usize = Config.relay_queue_max_pending_bytes;
+    const max_pending_bytes: usize = limits.relay_queue_max_pending_bytes;
 
     allocator: std.mem.Allocator,
     pool: ?*MessageBlockPool = null,
