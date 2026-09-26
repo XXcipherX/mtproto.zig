@@ -39,7 +39,7 @@ ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy --since "1 hour ago" --no-page
 ssh root@<SERVER_IP> 'cd /opt/mtproto-proxy && docker compose --env-file .env -f compose.yml logs --since 1h mtproto-proxy | grep -E "\[web\]\.only=true|WEB-only mode active|web_only: direct clients masked"'
 
 # Runtime capacity / fd-pressure signals
-ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy --since "1 hour ago" --no-pager | grep -E "conn stats|drops:|auto-clamping max_connections|baseline RAM ceiling|RAM admission clamp|max_connections clamped|fd quota reached|failed to resume accepts|connection saturation|saturation eased"'
+ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy --since "1 hour ago" --no-pager | grep -E "MTProto worker|conn stats|global drops:|memory_pressure|auto-clamping max_connections|baseline RAM ceiling|RAM admission clamp|max_connections clamped|fd quota reached|failed to resume accepts|connection saturation|saturation eased"'
 
 # Connect-path and fallback signals
 ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy --since "1 hour ago" --no-pager | grep -E "middle-proxy exhausted|middle-proxy handshake failed|media path connect failed|epoll hup/err"'
@@ -60,12 +60,12 @@ ssh root@<SERVER_IP> 'journalctl -u mtproto-proxy -n 120 --no-pager | grep -E "M
 Note:
 
 - Older grep patterns like `DIAG: Short read`, `DC4 MiddleProxy timeout`, `DC203 MiddleProxy timeout` are legacy and not emitted by current code.
-- `conn stats: active=... hs_inflight=... accepted+=... closed+=... tracked_fds=... total=... paused=<fd>/<saturation>` is the current 10s heartbeat for production visibility.
+- `conn stats: worker=... local_active=... global_active=... global_hs=... accepted+=... closed+=... local_pool_drops+=... tracked_fds=... global_total=... paused=<fd>/<saturation> worker_managed_buf=...` is the 10s heartbeat per worker. Worker 0 alone emits process-wide degradation deltas. Repeated local pool drops while the global cap has space indicate reuseport skew or slot-allocation pressure.
 - `paused=true/false` means fd-quota backoff is active; `paused=false/true` means 90%/80% saturation hysteresis is active.
 - Fatal hangups during `connecting_upstream` are now cleaned through the connect-completion path; repeated CPU spin on dead upstream sockets should no longer be expected.
-- `drops: ... hs_budget+=...` means the global handshake-inflight budget or the per-subnet unauthenticated concurrency allowance rejected a new handshake.
-- `drops: ... mp_fallback+=...` means MiddleProxy degraded and the proxy recovered by reconnecting directly to the same DC.
-- `drops: ... rate+=...` means the per-subnet token bucket rejected new connections; IPv4-mapped IPv6 addresses are grouped with their native IPv4 `/24`.
+- `global drops: ... hs_budget+=...` means the global handshake-inflight budget or the process-wide per-subnet unauthenticated concurrency allowance rejected a new handshake.
+- `global drops: ... mp_fallback+=...` means MiddleProxy degraded and the proxy recovered by reconnecting directly to the same DC.
+- `global drops: ... rate+=...` means the process-wide per-subnet token bucket rejected new connections; IPv4-mapped IPv6 addresses are grouped with their native IPv4 `/24`.
 - At debug level, `valid FakeTLS ClientHello: ... client=<ip>` identifies the authenticated client's IP without its ephemeral source port; unauthenticated and invalid-secret probes do not emit this line.
 - A `phase=mask_relaying` close reports `mask_cause`, the client IP without its source port, and `raw_c2s`/`raw_s2c` (raw bytes queued toward and received from the mask backend). `reason` describes how that relay later ended; `mask_cause` records why it entered masking in the first place. `web_carrier` is the expected WEB-domain path; `sni_mismatch`, `secret_mismatch`, `timestamp_skew`, `replay`, `invalid_session_id`, and `malformed_client_hello` isolate ordinary FakeTLS rejection classes without repeating HMAC work. A `timestamp_skew` line also carries `skew_s=<server timestamp - authenticated client timestamp>`; positive means the client timestamp is behind the server and negative means it is ahead.
 - A healthy WEB carrier logs `web session opened ... (client address: real)` in the relay. `loopback` there means the browser address was not preserved through the Caddy/PROXY-v2 hop; inspect `[web].mask_backend`, Caddy listener wrappers, `X-Forwarded-For`, and `[web].trusted_http_sources`. That HTTP-terminator list is intentionally separate from data-plane `[web].relay_sources`.
@@ -162,7 +162,7 @@ Interpretation helpers:
 
 - `RAM ceiling` is the startup baseline-admission ceiling, not simultaneous full-buffer capacity. `Configured` is the requested connection cap before any later fd clamp. `auto-clamping max_connections ...` means the effective-memory clamp reduced that configured cap to the RAM ceiling. `max_connections clamped ... due to RLIMIT_NOFILE` means the later fd-budget clamp reduced it again.
 - `fd quota reached ...` means the listener paused accepts; expect the first `paused=` flag to flip to `true` in nearby `conn stats` lines until the retry window clears.
-- `managed_buf=<used>/<limit>KiB peak=<peak>KiB` in `conn stats` reports the current, hard-limit, and process-lifetime peak for relay/MiddleProxy dynamic storage. It is not whole-process RSS and excludes kernel socket memory and non-managed allocations.
+- `worker_managed_buf=<used>/<limit>KiB peak=<peak>KiB` in `conn stats` reports that worker's dynamic-storage usage, hard partition, and peak. Partition limits sum to the process cap; this is not whole-process RSS and excludes kernel socket memory and non-managed allocations.
 - `memory_pressure+=...` means this hard buffer limit rejected allocations; an optional shrink may keep its existing allocation, while required growth sheds only the requesting path. Repeated increments indicate that the configured connection/traffic target exceeds the available burst budget.
 - `hs_budget+=...` means connection churn is exhausting either the global handshake budget or a source subnet's unauthenticated concurrency allowance before established relays become the bottleneck.
 - `mp_fallback+=...` means users are still being served, but MiddleProxy path quality is degraded enough to trigger direct fallback.

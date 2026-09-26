@@ -57,6 +57,9 @@ jobs:
       - name: Real-process relay E2E
         run: zig build e2e
 
+      - name: Multi-worker reuseport and relay E2E
+        run: zig build e2e -- --workers=2
+
       - name: Shipping-build real-process relay E2E
         run: zig build -Doptimize=ReleaseFast e2e
 

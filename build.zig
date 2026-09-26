@@ -6,7 +6,7 @@ pub fn build(b: *std.Build) void {
     const tsan = b.option(
         bool,
         "tsan",
-        "Instrument test and soak artifacts with ThreadSanitizer (default: false)",
+        "Instrument test, E2E proxy, and soak artifacts with ThreadSanitizer (default: false)",
     ) orelse false;
 
     // The proxy parses untrusted network input (FakeTLS, obfuscation,
@@ -105,6 +105,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = dataplane_optimize,
+        .sanitize_thread = tsan,
         .imports = &.{.{ .name = "build_options", .module = e2e_options.createModule() }},
     });
     const e2e_proxy = b.addExecutable(.{

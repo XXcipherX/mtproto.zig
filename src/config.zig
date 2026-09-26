@@ -96,6 +96,7 @@ pub const Config = struct {
         InvalidTlsDomain,
         InvalidPublicAddress,
         InvalidMiddleProxyNatIp,
+        InvalidWorkers,
         MissingWebDomain,
         InvalidWebDomain,
         WebDomainMatchesTlsDomain,
@@ -189,6 +190,9 @@ pub const Config = struct {
     /// Hard cap for concurrently handled client connections
     /// Default tuned for 1 vCPU / 1 GB VPS profile.
     max_connections: u32 = 512,
+    /// One epoll loop by default. Zero selects a bounded count from available
+    /// CPUs and the process-wide connection and managed-memory budgets.
+    workers: u8 = 1,
     /// Established relay idle timeout.
     /// The first client byte is independently capped at 10 seconds; lower
     /// configured values lower that admission deadline.
@@ -264,6 +268,9 @@ pub const Config = struct {
     datacenter_override: ?net.Address = null,
     web: Web = .{},
 
+    /// Hard ceiling for data-plane worker threads, independent of CPU count.
+    pub const max_workers: u8 = 16;
+
     /// Both relay directions ultimately feed a MessageQueue with this cap.
     /// Keep the value here so MiddleProxy framing and proxy backpressure share
     /// one source of truth without introducing an import cycle.
@@ -312,6 +319,7 @@ pub const Config = struct {
             error.InvalidTlsDomain => "censorship.tls_domain must be a valid fully-qualified ASCII hostname",
             error.InvalidPublicAddress => "server.public_ip must be a valid IP literal or hostname",
             error.InvalidMiddleProxyNatIp => "server.middle_proxy_nat_ip must be an IPv4 literal",
+            error.InvalidWorkers => "server.workers must be 0 (auto) or an integer in 1..16",
             error.MissingWebDomain => "[web].enabled=true requires [web].domain",
             error.InvalidWebDomain => "[web].domain must be a valid fully-qualified ASCII hostname",
             error.WebDomainMatchesTlsDomain => "[web].domain must differ from censorship.tls_domain",
@@ -334,6 +342,7 @@ pub const Config = struct {
     /// Validate relationships that parsing individual TOML values cannot prove.
     /// This is intentionally offline: no DNS lookup or socket is attempted.
     pub fn validate(self: *const Config) ValidationError!void {
+        if (self.workers > max_workers) return error.InvalidWorkers;
         if (self.users.count() == 0) return error.EmptyUsers;
         if (!isValidDomain(self.tls_domain)) return error.InvalidTlsDomain;
 
@@ -746,6 +755,12 @@ pub const Config = struct {
                         if (parseIntSetting(u32, key, value)) |parsed| {
                             cfg.max_connections = @max(@as(u32, 32), parsed);
                         }
+                    } else if (std.mem.eql(u8, key, "workers")) {
+                        const parsed = std.fmt.parseInt(u8, value, 10) catch
+                            return failConfigLine(error.InvalidWorkers, line_number, line);
+                        if (parsed > max_workers)
+                            return failConfigLine(error.InvalidWorkers, line_number, line);
+                        cfg.workers = parsed;
                     } else if (std.mem.eql(u8, key, "idle_timeout_sec")) {
                         if (parseIntSetting(u32, key, value)) |parsed| {
                             cfg.idle_timeout_sec = @max(@as(u32, 5), parsed);
@@ -1031,6 +1046,7 @@ test "parse config - missing fields defaults" {
     try std.testing.expectEqual(@as(u16, 443), cfg.port);
     try std.testing.expectEqual(@as(u32, 4096), cfg.backlog); // Default is 4096
     try std.testing.expectEqual(@as(u32, 512), cfg.max_connections);
+    try std.testing.expectEqual(@as(u8, 1), cfg.workers);
     try std.testing.expectEqual(@as(u32, 120), cfg.idle_timeout_sec);
     try std.testing.expectEqual(@as(u8, 15), cfg.idle_timeout_jitter_pct);
     try std.testing.expectEqual(@as(u32, 0), cfg.client_silence_close_sec);
@@ -1052,6 +1068,34 @@ test "parse config - missing fields defaults" {
     try std.testing.expect(!cfg.unsafe_override_limits);
     try std.testing.expectEqual(@as(usize, 1), cfg.users.count());
     try std.testing.expectEqual(@as(usize, 0), cfg.direct_users.count());
+}
+
+test "server workers explicit, auto and invalid values" {
+    const suffix =
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+    for ([_]struct { text: []const u8, expected: u8 }{
+        .{ .text = "[server]\nworkers = 0\n", .expected = 0 },
+        .{ .text = "[server]\nworkers = 2\n", .expected = 2 },
+        .{ .text = "[server]\nworkers = 16\n", .expected = 16 },
+    }) |case| {
+        const content = try std.mem.concat(std.testing.allocator, u8, &.{ case.text, suffix });
+        defer std.testing.allocator.free(content);
+        var cfg = try Config.parse(std.testing.allocator, content);
+        defer cfg.deinit(std.testing.allocator);
+        try std.testing.expectEqual(case.expected, cfg.workers);
+    }
+    for ([_][]const u8{
+        "[server]\nworkers = 17\n",
+        "[server]\nworkers = -1\n",
+        "[server]\nworkers = abc\n",
+        "[server]\nworkers = 256\n",
+    }) |prefix| {
+        const content = try std.mem.concat(std.testing.allocator, u8, &.{ prefix, suffix });
+        defer std.testing.allocator.free(content);
+        try std.testing.expectError(error.InvalidWorkers, Config.parse(std.testing.allocator, content));
+    }
 }
 
 test "parse config - direct users allowlist" {

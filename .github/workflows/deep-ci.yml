@@ -33,6 +33,9 @@ jobs:
       - name: Run multithreaded soak under ThreadSanitizer
         run: zig build -Doptimize=ReleaseSafe -Dtsan=true soak -- --seconds=30 --threads=4
 
+      - name: Run real multi-worker relay under ThreadSanitizer
+        run: zig build -Doptimize=ReleaseSafe -Dtsan=true e2e -- --workers=2
+
   valgrind:
     name: Valgrind Memcheck
     runs-on: ubuntu-24.04

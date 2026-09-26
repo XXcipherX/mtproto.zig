@@ -59,8 +59,8 @@ Connection-capacity methodology and command profiles: `test/README.md`.
 
 ## Runtime Model
 
-- Client relay is handled by a single-threaded Linux `epoll` event loop. `epoll_event.data.u64` carries the slot index, generation, and fd role, so dispatch does not need an fd hash lookup and stale events cannot attach to a reused slot. Relay reads reuse one 32 KiB event-loop scratch buffer instead of allocating a buffer for every active connection; queued output always copies data before another event can reuse that storage.
-- `SIGINT` and `SIGTERM` are bridged into that event loop through a non-blocking `eventfd`; the async signal handler performs only the raw notification write. The first signal disables new accepts and drains active connections for `graceful_shutdown_timeout_sec`; a second signal or the deadline closes the remaining slots before the listener and joinable discovery worker are released in ownership order.
+- Client relay uses one Linux `epoll` event loop by default. `[server].workers=0` auto-selects a bounded count or an explicit `2..16` runs independent loops and `SO_REUSEPORT` listeners. Each accepted connection stays on its worker. `epoll_event.data.u64` retains the slot index, generation, and fd role, so stale events cannot attach to a reused slot. Each loop has one 32 KiB relay-read scratch buffer; queued output copies data before another event reuses it.
+- `SIGINT` and `SIGTERM` use a non-blocking `eventfd`; the async signal handler only writes a notification. In multi-worker mode one control thread reads it and broadcasts to separate worker eventfds, so every sleeping `epoll_wait` wakes. The first signal disables new accepts and drains each worker's active slots for `graceful_shutdown_timeout_sec`; a second signal or each deadline closes remaining slots before all workers are joined and the discovery updater stops.
 - External discovery never delays the listening socket: MiddleProxy metadata/NAT detection and hostname-based masking resolution run in a joinable background worker. Metadata and masking candidates refresh hourly, reachability probes run in cancellable batches of at most four sockets, in-flight DNS/HTTPS/curl work is canceled cooperatively during shutdown, and stalled MiddleProxy handshakes can request an early refresh.
 - FakeTLS validation expects Telegram-style 32-byte ClientHello Session IDs and copies the Session ID into the synthetic ServerHello.
 - Handshake and relay lifetimes are controlled by monotonic `timerfd` deadlines in an indexed min-heap (`handshake_timeout_sec`, `idle_timeout_sec`), not by periodic slot scans or `SO_RCVTIMEO`; a silent connection gets at most 10 seconds to send its first byte.
@@ -70,7 +70,7 @@ Connection-capacity methodology and command profiles: `test/README.md`.
 - The timerfd wakes only for the earliest connection/admission deadline or the 10-second aggregated `conn stats` report; timer maintenance does not scan the slot pool.
 - Client payload bytes pipelined after the 64-byte MTProto obfuscation nonce are buffered and forwarded once the upstream path is ready.
 - WEB mode runs as a separate `mtproto-proxy web-relay` process. Caddy terminates the browser TLS/WebSocket carrier, while the public `:443` data plane continues to serve ordinary FakeTLS links and admits direct-obfuscated WEB streams only from trusted relay source addresses.
-- Outbound client/upstream writes use intrusive page-sized block queues backed by one event-loop free list and one shared hard buffer-memory budget, bounded `writev` dispatches, and a 4 MiB pending-byte cap per queue. Tail packing avoids one page allocation per small write, recycled pages are wiped, and per-event byte/operation budgets prevent one ready fd from monopolizing the loop.
+- Outbound client/upstream writes use intrusive page-sized block queues backed by a worker-local free list and a process-wide hard buffer-memory budget partitioned among workers. The sum of worker slot capacities equals `max_connections`; the sum of worker managed-buffer limits equals the original process budget. Bounded `writev`, a 4 MiB pending-byte cap per queue, tail packing, wiping recycled pages, and per-event I/O budgets remain unchanged. Replay, subnet admission/handshake limits, iOS wedge recovery, and numeric connection/handshake caps stay process-global.
 - MiddleProxy per-direction C2S/S2C buffers start at 16 KiB and grow on demand up to the effective `middleproxy_buffer_kb` cap; shared event-loop scratch buffers are allocated lazily and reused. Queue pages, retained free-list pages, stream buffers, scratch, and transient growth are all charged to the same runtime budget. C2S headers are parsed once during encapsulation, padded-intermediate S2C replies use only 0..3 padding bytes so the receiver's truncate-to-4 rule cannot retain garbage, and completed handshakes release route candidates, validation state, and ME handshake buffers immediately.
 - MiddleProxy route snapshots contain only candidates for the selected DC/path plus a versioned secret reference and NAT address. The common one-to-four-address connect plans stay inside each connection slot and use heap storage only for larger failover sets. The current and immediately previous secrets are retained centrally, so concurrent rotations do not copy a 256-byte secret into every handshake or split selector/KDF inputs.
 - Secret-bearing handshake, KDF, hash, and cipher temporaries are traversed by pointer where possible and explicitly cleared with `std.crypto.secureZero`; cleanup is field-wise for mixed structs so enum and pointer fields are never overwritten with invalid representations.
@@ -161,7 +161,7 @@ file even when `zig build` returns success. `make fuzz` stores its evidence unde
 90-day artifact.
 
 The separate **Deep CI** workflow runs weekly and on demand. Its ThreadSanitizer
-job instruments only the unit-test and benchmark/soak artifacts; normal production
+job instruments the unit-test, real multi-worker E2E proxy, and benchmark/soak artifacts; normal production
 builds are unchanged. A separate Valgrind Memcheck job drives the real daemon
 smoke through a controlled startup and graceful shutdown. Invalid memory accesses
 and definite/indirect leaks fail the job; all leak categories remain available in
@@ -214,6 +214,9 @@ python3 test/daemon_smoke.py --binary zig-out/bin/mtproto-proxy
 
 # Full real-process path through a deterministic loopback DC
 zig build e2e
+
+# Two actual SO_REUSEPORT listeners, relay, and graceful shutdown
+zig build e2e -- --workers=2
 
 # The same process path under the shipping optimization/safety policy
 zig build -Doptimize=ReleaseFast e2e
@@ -1056,6 +1059,7 @@ public_ip = "proxy.example.com"             # Same domain as tls_domain for self
 backlog = 4096                             # TCP listen queue size
 middleproxy_buffer_kb = 2048               # ME C2S/S2C buffers grow on demand up to this cap; runtime caps effective value at 3840 KiB
 max_connections = 512                      # Safe default for small (1 vCPU / ~1 GB) VPS
+# workers = 1                             # 1=original loop; 0=bounded auto; 2..16=explicit multi-worker
 idle_timeout_sec = 120
 # idle_timeout_jitter_pct = 15             # Per-connection idle timeout jitter in percent; 0 disables
 # client_silence_close_sec = 0             # Unified bounded iOS wedge recovery; use 15 to enable
@@ -1130,6 +1134,7 @@ alice = true   # direct where possible; CDN DC203 still requires MiddleProxy
 | `[server]` | `middle_proxy_nat_ip` | _(auto-detect)_ | Optional IPv4 override used in MiddleProxy NAT/AES derivation. `public_ip` is client-facing and is not reused as DC egress; auto-detection trusts an AWG endpoint only inside the active tunnel network namespace, otherwise it probes the process's public egress IPv4 |
 | `[server]` | `backlog` | `4096` | TCP listen queue size (for high-traffic loads) |
 | `[server]` | `max_connections` | `512` | Configured concurrent connection cap (small-VPS tuned default, parser lower bound 32), distinct from the banner's baseline RAM ceiling. On Linux, startup first auto-clamps this to that effective-memory ceiling unless `unsafe_override_limits=true`; the proxy then clamps again if `RLIMIT_NOFILE` can support at least 32 slots, otherwise startup fails safely |
+| `[server]` | `workers` | `1` | MTProto data-plane loops. `1` retains single-worker behavior; `0` auto-selects by available CPUs, at least 32 slots and a managed budget of at least 8 MiB or MiddleProxy scratch plus 4 MiB per worker; `2..16` selects an explicit count and fails startup if the effective budgets cannot support it. Connection, security, and managed-memory caps remain process-wide; WEB relay and Caddy remain separate processes |
 | `[server]` | `idle_timeout_sec` | `120` | Established relay idle timeout in seconds (parser lower bound 5). Pre-first-byte admission uses a separate fixed 10-second deadline |
 | `[server]` | `idle_timeout_jitter_pct` | `15` | Per-connection random jitter applied once when the slot is admitted to `idle_timeout_sec` (`±N%`, clamped to `0..100`). The effective timeout is then reused for every deadline update, floored to at least 5 seconds and at least half the base timeout. Set `0` to disable |
 | `[server]` | `client_silence_close_sec` | `0` | Unified proxy-side recovery for the field-captured iOS `bad_server_salt` silence pattern on generic DC relays. A request must first reach the upstream socket, subsequent server payload must begin within the [source-backed 12-second client window](https://github.com/TelegramMessenger/Telegram-iOS/blob/b16d9acdffa9b3f88db68e26b77a3713e87a92e3/submodules/MtProtoKit/Sources/MTTcpConnection.m#L980), and the response timer starts only after the client output queue drains. Because MTProto payload and client platform are not visible to the relay, this is a bounded timing heuristic applied to the same pattern from any client, not iOS identification or message matching. Any client progress cancels it; media/DC203, masking, half-closed, backpressured, and graceful-shutdown paths are excluded. Every recovery is bounded per real client IP + access user + DC to `T`, `2T`, `4T` (up to four parallel relays per wave); after three waves, ordinary idle timeout takes over for 30 minutes from the most recent actual breaker close. Normal matching traffic does not extend that cooldown. A mature healthy continuation upgrades only the diagnostic confidence (`proven`), never bypasses the group budget. `0` disables it; values below `10` or not below `idle_timeout_sec` are rejected; `15` is recommended |
@@ -1192,7 +1197,7 @@ alice = true   # direct where possible; CDN DC203 still requires MiddleProxy
 
 > **Operational note** &nbsp; On startup, `max_connections` is automatically clamped to an effective-memory estimate derived from host RAM and the lowest readable limit in the process's cgroup hierarchy. After kernel/process headroom, half of the remaining allowance backs guaranteed connection baselines and half is reserved for dynamic relay/MiddleProxy buffers. Set `unsafe_override_limits = true` to disable only the connection-count clamp; the shared runtime buffer limit remains enforced. Admission control also pauses `accept()` at 90% capacity, resumes at 80%, and limits concurrent unauthenticated sockets per source subnet.
 
-> **Operational note** &nbsp; MiddleProxy C2S/S2C buffers start at 16 KiB per direction and grow lazily. Relay pages, retained free-list pages, MiddleProxy stream buffers, shared scratch, and temporary replacement buffers during growth share one hard event-loop budget. A denied allocation is reported as `memory_pressure+=...`; an optional shrink keeps its existing buffer, while required growth closes the requesting path or uses direct fallback where available. This avoids reserving every connection's independent worst case simultaneously. Configured `middleproxy_buffer_kb` values above 3840 are accepted but the per-direction runtime cap remains 3840 KiB, leaving 256 KiB of framing headroom inside the 4 MiB relay queue.
+> **Operational note** &nbsp; MiddleProxy C2S/S2C buffers start at 16 KiB per direction and grow lazily. Relay pages, retained free-list pages, MiddleProxy stream buffers, scratch, and temporary replacement buffers during growth are charged to worker-local hard budgets whose sum is the original process limit. A denied allocation is reported as `worker ... memory_pressure+=...`; an optional shrink keeps its existing buffer, while required growth closes the requesting path or uses direct fallback where available. This avoids reserving every connection's independent worst case simultaneously. Configured `middleproxy_buffer_kb` values above 3840 are accepted but the per-direction runtime cap remains 3840 KiB, leaving 256 KiB of framing headroom inside the 4 MiB relay queue.
 
 > **Operational note** &nbsp; The proxy limits new connections to 30/sec per /24 subnet by default (`rate_limit_per_subnet`). Native IPv6 keys retain all 48 prefix bits, while IPv4-mapped IPv6 shares the native IPv4 `/24` key. This blocks ТСПУ scanners and DPI replay probes without affecting legitimate Telegram clients.
 
@@ -1206,7 +1211,7 @@ alice = true   # direct where possible; CDN DC203 still requires MiddleProxy
 
 > **Note** &nbsp; The parser supports inline `#` / `;` comments after values and treats duplicate owned string/user/direct-user entries as last-write-wins without leaking previous allocations.
 
-> **Note** &nbsp; MiddleProxy settings (regular DC1..5 endpoints + media-path endpoints + shared secret), NAT discovery, and masking DNS resolution run after the listener is ready. Metadata and all masking candidates refresh hourly, with reactive early refresh after stalled MiddleProxy handshakes and bundled MiddleProxy defaults as fallback. Shutdown cancels active resolver, HTTPS, and curl tasks before joining the updater; an unsafe resolver configuration leaves the previous masking candidates intact and is retried on the next refresh.
+> **Note** &nbsp; MiddleProxy settings (regular DC1..5 endpoints + media-path endpoints + shared secret), NAT discovery, and masking DNS resolution run in background without holding up listener startup. Metadata and all masking candidates refresh hourly, with reactive early refresh after stalled MiddleProxy handshakes and bundled MiddleProxy defaults as fallback. Shutdown cancels active resolver, HTTPS, and curl tasks before joining the updater; an unsafe resolver configuration leaves the previous masking candidates intact and is retried on the next refresh.
 
 ## &nbsp; Troubleshooting ("Updating...")
 
@@ -1224,14 +1229,14 @@ If your Telegram app is stuck on "Updating...", your provider or network is drop
 
 ### 0. Runtime expectations (important)
 
-This proxy uses a Linux `epoll` event loop (single-thread relay path). Timeouts use a monotonic `timerfd` plus an indexed min-heap with one current deadline per active slot; there is no fixed polling cadence or full-slot timeout scan. If you see stale guidance mentioning `poll()`/`SO_RCVTIMEO`/fixed max-lifetime, treat it as outdated.
+This proxy uses one Linux `epoll` event loop by default, or one per configured MTProto worker. Each loop retains its own monotonic `timerfd` and indexed min-heap with one current deadline per active slot; there is no fixed polling cadence or full-slot timeout scan. If you see stale guidance mentioning `SO_RCVTIMEO`/fixed max-lifetime, treat it as outdated.
 
 ### 1. Check runtime health and fd pressure first
 
 Before chasing client/network hypotheses, inspect the new low-noise runtime signals:
 
 ```bash
-ssh root@<VPS_IP> 'journalctl -u mtproto-proxy --since "30 min ago" --no-pager | grep -E "conn stats|drops:|auto-clamping max_connections|baseline RAM ceiling|RAM admission clamp|max_connections clamped|fd quota reached|failed to resume accepts|connection saturation|saturation eased"'
+ssh root@<VPS_IP> 'journalctl -u mtproto-proxy --since "30 min ago" --no-pager | grep -E "MTProto worker|conn stats|global drops:|memory_pressure|auto-clamping max_connections|baseline RAM ceiling|RAM admission clamp|max_connections clamped|fd quota reached|failed to resume accepts|connection saturation|saturation eased"'
 ssh root@<VPS_IP> 'cat /proc/$(pgrep -f mtproto-proxy)/limits | grep "open files"'
 ```
 
@@ -1239,11 +1244,11 @@ Interpretation:
 
 - `RAM ceiling` in the startup banner is the baseline admission ceiling derived from effective memory; `Configured` is the requested runtime cap before any later `RLIMIT_NOFILE` clamp. `auto-clamping max_connections ...` means startup reduced that configured cap to the RAM ceiling. `max_connections clamped ... due to RLIMIT_NOFILE` means runtime reduced it again to fit the process fd limit.
 - `fd quota reached ... pausing accepts for 500ms` means the listener hit `EMFILE`/`ENFILE` and intentionally backed off instead of busy-looping.
-- `conn stats ... paused=<fd_pause>/<saturation_pause> managed_buf=<used>/<limit>KiB peak=<peak>KiB` exposes both pause reasons and current/peak use of the shared dynamic-buffer budget. `managed_buf` is not whole-process RSS and excludes kernel socket memory and non-managed process allocations.
-- `drops: ... rate+=...` means the per-subnet rate limiter rejected excess new connections.
-- `drops: ... hs_budget+=...` means either the global handshake-inflight budget or the per-subnet unauthenticated-socket allowance rejected a new handshake.
-- `drops: ... mp_fallback+=...` means the MiddleProxy path degraded and the proxy recovered by reconnecting directly to the same DC.
-- `drops: ... memory_pressure+=...` means a relay page or MiddleProxy buffer allocation reached the shared hard limit; sustained increments call for a larger effective memory limit or a lower connection/traffic target.
+- `conn stats: worker=... local_active=... global_active=... local_pool_drops+=... paused=<fd_pause>/<saturation_pause> worker_managed_buf=<used>/<limit>KiB peak=<peak>KiB` distinguishes worker-local usage from process-wide connection totals. Worker budgets sum to the process dynamic-buffer limit; neither field is whole-process RSS. Sustained local pool drops before the global cap suggest uneven reuseport distribution; try fewer workers or a higher safe connection cap.
+- `global drops: ... rate+=...` means the process-wide per-subnet rate limiter rejected excess new connections.
+- `global drops: ... hs_budget+=...` means either the global handshake-inflight budget or the process-wide per-subnet unauthenticated-socket allowance rejected a new handshake.
+- `global drops: ... mp_fallback+=...` means the MiddleProxy path degraded and the proxy recovered by reconnecting directly to the same DC.
+- `worker ... memory_pressure+=...` means a relay page or MiddleProxy buffer allocation reached that worker's partition of the process hard limit; sustained increments call for a larger effective memory limit or a lower connection/traffic target.
 - `connection saturation ...` and `saturation eased ...` are the 90%/80% admission-control logs; if the second `paused=` flag is `true`, raise capacity only after checking RAM and probe results.
 
 If you use the AmneziaWG tunnel deployment path, also confirm the namespace tunnel is up:

@@ -1,4 +1,4 @@
-//! Proxy core — single-threaded Linux epoll event loop.
+//! Proxy core — worker-owned Linux epoll event loops.
 //!
 //! This replaces the thread-per-connection model with a pre-allocated
 //! connection pool and non-blocking state machine.
@@ -54,6 +54,10 @@ const relay_read_scratch_size: usize = 32 * 1024;
 const pipelined_initial_capacity: usize = 4096;
 const upstream_candidates_inline_cap: usize = 4;
 pub const default_managed_buffer_limit_bytes: u64 = 64 * 1024 * 1024;
+const min_worker_managed_bytes: u64 = 8 * 1024 * 1024;
+const min_worker_slots: u32 = 32;
+const worker_health_timeout_ms: i64 = 45 * std.time.ms_per_s;
+const worker_health_poll_ms: i32 = 10 * std.time.ms_per_s;
 const pre_first_byte_timeout_ms: i64 = 10 * std.time.ms_per_s;
 const middle_proxy_stage_timeout_ms: i64 = 5 * std.time.ms_per_s;
 // Telegram iOS arms a 12-second response watchdog for requests that expect a
@@ -339,8 +343,8 @@ const SubnetRateLimit = struct {
     const MAX_PROBES = 8;
     const stale_after_s: i64 = 60;
 
-    // Keep naturally aligned fields first: EventLoop embeds this fixed table,
-    // so padding multiplied by BUCKETS directly increases its stack frame.
+    // Keep naturally aligned fields first: padding multiplied by BUCKETS
+    // directly increases the process-wide security table allocation.
     const Entry = struct {
         subnet_key: u64 = 0,
         last_refill_s: i64 = 0,
@@ -555,7 +559,8 @@ fn destroyMsgBlock(allocator: std.mem.Allocator, blk: *MsgBlock) void {
     allocator.destroy(blk);
 }
 
-/// Exact process-local budget for dynamic relay and MiddleProxy storage.
+/// Exact worker-local partition of the process budget for dynamic relay and
+/// MiddleProxy storage.
 ///
 /// The epoll loop is single-threaded, so the accounting deliberately avoids
 /// atomics. `remap` is refused: `Allocator.realloc` then allocates the new
@@ -2361,30 +2366,118 @@ fn freeUserSecrets(allocator: std.mem.Allocator, secrets: []obfuscation.UserSecr
     allocator.free(secrets);
 }
 
+/// These fixed tables are process-wide: reuseport must not multiply subnet,
+/// replay, or wedge-recovery allowances by the number of workers. Admission
+/// checks avoid the ordinary per-byte relay path; the optional iOS wedge gate
+/// has its own lock when that recovery mode is enabled.
+const SecurityState = struct {
+    lock: compat.BlockingMutex,
+    wedge_lock: compat.BlockingMutex,
+    subnet_limiter: SubnetRateLimit,
+    subnet_handshakes: SubnetHandshakeLimit,
+    replay_cache: ReplayCache,
+    wedge_recovery_gate: WedgeRecoveryGate,
+
+    fn create(allocator: std.mem.Allocator) !*SecurityState {
+        const security = try allocator.create(SecurityState);
+        security.lock = .{};
+        security.wedge_lock = .{};
+        security.subnet_limiter.hash_seed = crypto.randomInt(u64);
+        for (&security.subnet_limiter.entries) |*entry| entry.* = .{};
+        security.subnet_handshakes.hash_seed = crypto.randomInt(u64);
+        for (&security.subnet_handshakes.entries) |*entry| entry.* = .{};
+        security.replay_cache.hash_seed = crypto.randomInt(u64);
+        for (&security.replay_cache.entries) |*entry| entry.* = .{};
+        security.wedge_recovery_gate.hash_seed = crypto.randomInt(u64);
+        for (&security.wedge_recovery_gate.entries) |*entry| entry.* = .{};
+        security.wedge_recovery_gate.untracked_suppression_reported = false;
+        return security;
+    }
+};
+
+/// Numeric limits do not publish connection memory to another worker: relaxed
+/// ordering is sufficient; the CAS itself makes each reservation indivisible.
+fn reserveGlobalCount(counter: *std.atomic.Value(u32), limit: u32) bool {
+    var current = counter.load(.monotonic);
+    while (current < limit) {
+        if (counter.cmpxchgWeak(current, current + 1, .monotonic, .monotonic)) |observed| {
+            current = observed;
+        } else return true;
+    }
+    return false;
+}
+
+fn releaseGlobalCount(counter: *std.atomic.Value(u32)) void {
+    const previous = counter.fetchSub(1, .monotonic);
+    std.debug.assert(previous > 0);
+}
+
+fn countStat(counter: *std.atomic.Value(u64)) void {
+    _ = counter.fetchAdd(1, .monotonic);
+}
+
+/// Slots and managed queue/block bytes are partitioned rather than cloned.
+/// MiddleProxy scratch is lazy but can consume most of an 8 MiB partition
+/// with a large configured MP stream cap. Keep queue/stream headroom when
+/// selecting workers automatically or admitting an explicit count.
+fn minWorkerManagedBytes(cfg: *const Config) u64 {
+    if (!cfg.requiresMiddleProxyRuntime()) return min_worker_managed_bytes;
+    const scratch: u64 = @intCast(cfg.middleProxySharedScratchBytes());
+    return @max(min_worker_managed_bytes, scratch + 4 * 1024 * 1024);
+}
+
+fn workerResourceLimit(max_connections: u32, managed_bytes: u64, min_managed_bytes: u64) u8 {
+    const by_slots = @as(u64, max_connections / min_worker_slots);
+    const by_memory = managed_bytes / min_managed_bytes;
+    return @intCast(@max(1, @min(@as(u64, Config.max_workers), @min(by_slots, by_memory))));
+}
+
+fn selectWorkerCount(requested: u8, max_connections: u32, managed_bytes: u64, min_managed_bytes: u64, cpu_count: usize) !u8 {
+    if (requested > Config.max_workers) return error.InvalidWorkers;
+    const resource_limit = workerResourceLimit(max_connections, managed_bytes, min_managed_bytes);
+    if (requested == 0) return @intCast(@max(1, @min(@as(usize, resource_limit), cpu_count)));
+    if (requested > 1 and requested > resource_limit) return error.InsufficientWorkerResources;
+    return requested;
+}
+
+fn workerSlotCapacity(total: u32, workers: u8, index: u8) u32 {
+    const count: u32 = workers;
+    return total / count + @intFromBool(@as(u32, index) < total % count);
+}
+
+fn workerManagedBudget(total: u64, workers: u8, index: u8) u64 {
+    const count: u64 = workers;
+    return total / count + @intFromBool(@as(u64, index) < total % count);
+}
+
+fn workerHeartbeatStale(now_ms: i64, last_ms: i64) bool {
+    return now_ms >= last_ms and now_ms - last_ms > worker_health_timeout_ms;
+}
+
 pub const ProxyState = struct {
     allocator: std.mem.Allocator,
     config: Config,
     managed_buffer_limit_bytes: u64,
     user_secrets: []obfuscation.UserSecret,
-    connection_count: u64,
-    active_connections: u32,
-    handshakes_inflight: u32,
+    connection_count: std.atomic.Value(u64),
+    active_connections: std.atomic.Value(u32),
+    handshakes_inflight: std.atomic.Value(u32),
     mask_target: ?[]const u8,
     mask_addrs: []net.Address,
     trusted_web_peers: web_support.TrustedPeers,
     web_only: bool = false,
     web_mask_dns: ?*web_support.DnsCache = null,
-    replay_cache: ReplayCache,
+    security: *SecurityState,
     tls_server_hello_template: []u8,
 
     // Degradation counters (monotonic totals, delta'd in stats log)
-    stats_dropped_cap: u64,
-    stats_dropped_saturation: u64,
-    stats_dropped_rate_limit: u64,
-    stats_dropped_hs_budget: u64,
-    stats_hs_timeout: u64,
-    stats_mp_fallback: u64,
-    stats_web_only_masked: u64 = 0,
+    stats_dropped_cap: std.atomic.Value(u64),
+    stats_dropped_saturation: std.atomic.Value(u64),
+    stats_dropped_rate_limit: std.atomic.Value(u64),
+    stats_dropped_hs_budget: std.atomic.Value(u64),
+    stats_hs_timeout: std.atomic.Value(u64),
+    stats_mp_fallback: std.atomic.Value(u64),
+    stats_web_only_masked: std.atomic.Value(u64) = .init(0),
 
     middle_proxy_lock: MiddleProxyLock = .{},
     middle_proxy_addrs_primary: [5]net.Address,
@@ -2442,6 +2535,9 @@ pub const ProxyState = struct {
         const user_secrets = try secrets.toOwnedSlice(allocator);
         secrets = .empty;
         errdefer freeUserSecrets(allocator, user_secrets);
+
+        const security = try SecurityState.create(allocator);
+        errdefer allocator.destroy(security);
 
         const tls_template = try tls.buildServerHelloTemplateAlloc(
             allocator,
@@ -2528,23 +2624,23 @@ pub const ProxyState = struct {
             .config = cfg,
             .managed_buffer_limit_bytes = managed_buffer_limit_bytes,
             .user_secrets = user_secrets,
-            .connection_count = 0,
-            .active_connections = 0,
-            .handshakes_inflight = 0,
+            .connection_count = .init(0),
+            .active_connections = .init(0),
+            .handshakes_inflight = .init(0),
             .mask_target = mask_target,
             .mask_addrs = resolved_addrs,
             .trusted_web_peers = trusted_web_peers,
             .web_only = cfg.web.onlyActive(),
             .web_mask_dns = web_mask_dns,
-            .replay_cache = ReplayCache.init(),
+            .security = security,
             .tls_server_hello_template = tls_template,
-            .stats_dropped_cap = 0,
-            .stats_dropped_saturation = 0,
-            .stats_dropped_rate_limit = 0,
-            .stats_dropped_hs_budget = 0,
-            .stats_hs_timeout = 0,
-            .stats_mp_fallback = 0,
-            .stats_web_only_masked = 0,
+            .stats_dropped_cap = .init(0),
+            .stats_dropped_saturation = .init(0),
+            .stats_dropped_rate_limit = .init(0),
+            .stats_dropped_hs_budget = .init(0),
+            .stats_hs_timeout = .init(0),
+            .stats_mp_fallback = .init(0),
+            .stats_web_only_masked = .init(0),
             .middle_proxy_addrs_primary = constants.tg_middle_proxies_v4,
             .middle_proxy_addrs_media_primary = constants.tg_media_middle_proxies_v4,
             .middle_proxy_addr_203 = constants.tg_cdn_middle_proxy_v4,
@@ -2569,8 +2665,9 @@ pub const ProxyState = struct {
     }
 
     pub fn deinit(self: *ProxyState) void {
-        if (self.web_mask_dns) |cache| cache.destroy();
         self.stopMiddleProxyUpdater();
+        if (self.web_mask_dns) |cache| cache.destroy();
+        self.allocator.destroy(self.security);
         self.middle_proxy_lock.lock();
         std.crypto.secureZero(u8, &self.middle_proxy_secret);
         self.middle_proxy_secret_len = 0;
@@ -2585,6 +2682,55 @@ pub const ProxyState = struct {
         freeUserSecrets(self.allocator, self.user_secrets);
     }
 
+    fn allowSubnet(self: *ProxyState, addr: net.Address) bool {
+        if (self.config.rate_limit_per_subnet == 0) return true;
+        self.security.lock.lock();
+        defer self.security.lock.unlock();
+        return self.security.subnet_limiter.check(addr, self.config.rate_limit_per_subnet);
+    }
+
+    fn reserveSubnetHandshake(self: *ProxyState, key: u64) bool {
+        self.security.lock.lock();
+        defer self.security.lock.unlock();
+        return self.security.subnet_handshakes.reserve(key, subnetHandshakeLimit(self.config.max_connections));
+    }
+
+    fn releaseSubnetHandshake(self: *ProxyState, key: u64) void {
+        self.security.lock.lock();
+        defer self.security.lock.unlock();
+        self.security.subnet_handshakes.release(key);
+    }
+
+    fn isReplay(self: *ProxyState, digest: *const [32]u8) bool {
+        self.security.lock.lock();
+        defer self.security.lock.unlock();
+        return self.security.replay_cache.checkAndInsert(digest);
+    }
+
+    fn wedgeSuppressesNewCandidates(self: *ProxyState, key: u64, dc: u16, now_ms: i64) bool {
+        self.security.wedge_lock.lock();
+        defer self.security.wedge_lock.unlock();
+        return self.security.wedge_recovery_gate.suppressesNewCandidates(key, dc, now_ms);
+    }
+
+    fn prepareWedge(self: *ProxyState, key: u64, dc: u16, now_ms: i64, timeout_ms: i64, idle_deadline_ms: i64) ?WedgeGateTicket {
+        self.security.wedge_lock.lock();
+        defer self.security.wedge_lock.unlock();
+        return self.security.wedge_recovery_gate.prepare(key, dc, now_ms, timeout_ms, idle_deadline_ms);
+    }
+
+    fn reportWedgeSuppression(self: *ProxyState, key: u64, dc: u16, now_ms: i64) bool {
+        self.security.wedge_lock.lock();
+        defer self.security.wedge_lock.unlock();
+        return self.security.wedge_recovery_gate.reportSuppression(key, dc, now_ms);
+    }
+
+    fn allowWedgeClose(self: *ProxyState, key: u64, dc: u16, ticket: WedgeGateTicket, now_ms: i64) bool {
+        self.security.wedge_lock.lock();
+        defer self.security.wedge_lock.unlock();
+        return self.security.wedge_recovery_gate.allowClose(key, dc, ticket, now_ms);
+    }
+
     pub fn run(self: *ProxyState, shutdown_fd: posix.fd_t) !void {
         if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
         if (self.web_mask_dns) |cache| try cache.start();
@@ -2592,36 +2738,6 @@ pub const ProxyState = struct {
         var middle_proxy_updater_started = false;
         defer {
             if (middle_proxy_updater_started) self.stopMiddleProxyUpdater();
-        }
-
-        const address = net.Address.initIp6(
-            .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
-            self.config.port,
-            0,
-            0,
-        );
-        var ipv6_ok = true;
-        var server = address.listen(.{
-            .reuse_address = true,
-            .kernel_backlog = @intCast(self.config.backlog),
-        }) catch |err| blk: {
-            if (err == error.AddressFamilyNotSupported) {
-                ipv6_ok = false;
-                log.warn("IPv6 not available, falling back to IPv4 (0.0.0.0)", .{});
-                const address_v4 = net.Address.initIp4(.{ 0, 0, 0, 0 }, self.config.port);
-                break :blk try address_v4.listen(.{
-                    .reuse_address = true,
-                    .kernel_backlog = @intCast(self.config.backlog),
-                });
-            }
-            return err;
-        };
-        defer server.deinit();
-
-        if (ipv6_ok) {
-            log.info("Listening on [::]:{d} (epoll, single-thread)", .{self.config.port});
-        } else {
-            log.info("Listening on 0.0.0.0:{d} (epoll, single-thread)", .{self.config.port});
         }
 
         if (self.config.requiresMiddleProxyRuntime()) {
@@ -2655,12 +2771,219 @@ pub const ProxyState = struct {
         const effective_needed_fds = requiredFdsForConnections(self.config.max_connections);
         checkNofileLimit(@max(effective_needed_fds, min_nofile_soft), self.config.max_connections);
 
-        const loop = try EventLoop.init(self, server.stream.handle, shutdown_fd);
+        const cpu_count = std.Thread.getCpuCount() catch 1;
+        const min_managed_bytes = minWorkerManagedBytes(&self.config);
+        const workers = selectWorkerCount(
+            self.config.workers,
+            self.config.max_connections,
+            self.managed_buffer_limit_bytes,
+            min_managed_bytes,
+            cpu_count,
+        ) catch |err| {
+            log.err("server.workers={d} cannot fit max_connections={d} and managed_budget={d}MiB (need at least {d} slots and {d}KiB per worker): {any}", .{
+                self.config.workers,
+                self.config.max_connections,
+                self.managed_buffer_limit_bytes / (1024 * 1024),
+                min_worker_slots,
+                min_managed_bytes / 1024,
+                err,
+            });
+            return err;
+        };
+        const mode: []const u8 = if (self.config.workers == 0) "auto" else if (workers == 1) "single" else "explicit";
+        log.info("MTProto workers: requested={d} effective={d} mode={s} CPUs={d} max_connections={d} managed_budget={d}MiB min_worker_budget={d}KiB", .{
+            self.config.workers,
+            workers,
+            mode,
+            cpu_count,
+            self.config.max_connections,
+            self.managed_buffer_limit_bytes / (1024 * 1024),
+            min_managed_bytes / 1024,
+        });
+
+        if (workers > 1) return self.runMultiWorkers(workers, shutdown_fd);
+
+        var listener = try self.openFirstListener(false);
+        defer listener.server.deinit();
+        log.info("Listening on {s}:{d} (epoll, single-thread)", .{
+            if (listener.ipv6) "[::]" else "0.0.0.0",
+            self.config.port,
+        });
+        const loop = try EventLoop.init(
+            self,
+            listener.server.stream.handle,
+            shutdown_fd,
+            0,
+            self.config.max_connections,
+            self.managed_buffer_limit_bytes,
+            null,
+        );
         defer {
             loop.deinit();
             self.allocator.destroy(loop);
         }
         try loop.run();
+    }
+
+    const ClientListener = struct {
+        server: net.Server,
+        ipv6: bool,
+    };
+
+    fn listenClient(self: *ProxyState, ipv6: bool, reuse_port: bool) !net.Server {
+        const address = if (ipv6)
+            net.Address.initIp6([_]u8{0} ** 16, self.config.port, 0, 0)
+        else
+            net.Address.initIp4(.{ 0, 0, 0, 0 }, self.config.port);
+        return address.listen(.{
+            .reuse_address = true,
+            .reuse_port = reuse_port,
+            .kernel_backlog = @intCast(self.config.backlog),
+        });
+    }
+
+    fn openFirstListener(self: *ProxyState, reuse_port: bool) !ClientListener {
+        const server = self.listenClient(true, reuse_port) catch |err| {
+            if (err != error.AddressFamilyNotSupported) return err;
+            log.warn("IPv6 not available, falling back to IPv4 (0.0.0.0)", .{});
+            return .{ .server = try self.listenClient(false, reuse_port), .ipv6 = false };
+        };
+        return .{ .server = server, .ipv6 = true };
+    }
+
+    fn runMultiWorkers(self: *ProxyState, count: u8, signal_fd: posix.fd_t) !void {
+        const completion_fd = try createWorkerEventFd();
+        defer closeFd(completion_fd);
+
+        // Stable stack addresses are shared with the threads. A worker owns
+        // its listener and loop after spawn; the control thread owns each
+        // worker's eventfd until every thread has been joined.
+        var workers: [Config.max_workers]Worker = undefined;
+        var started: usize = 0;
+        defer {
+            signalWorkers(workers[0..started], 2) catch |err| {
+                // Joining a worker that cannot be woken could hang forever
+                // while its listener remains in the reuseport group.
+                log.err("cannot wake MTProto workers during cleanup: {any}; exiting", .{err});
+                std.process.exit(1);
+            };
+            for (workers[0..started]) |*worker| worker.thread.join();
+            std.debug.assert(self.active_connections.load(.monotonic) == 0);
+            std.debug.assert(self.handshakes_inflight.load(.monotonic) == 0);
+            for (workers[0..started]) |*worker| closeFd(worker.control_fd);
+        }
+
+        var ipv6 = true;
+        for (0..count) |i| {
+            var listener = if (i == 0)
+                try self.openFirstListener(true)
+            else
+                ClientListener{ .server = try self.listenClient(ipv6, true), .ipv6 = ipv6 };
+            ipv6 = listener.ipv6;
+            const control_fd = createWorkerEventFd() catch |err| {
+                listener.server.deinit();
+                return err;
+            };
+            const id: u8 = @intCast(i);
+            workers[i] = .{
+                .id = id,
+                .loop = undefined,
+                .listen_fd = listener.server.stream.handle,
+                .control_fd = control_fd,
+                .completion_fd = completion_fd,
+                .heartbeat_ms = .init(compat.monotonicMilliTimestamp()),
+                .finished = .init(false),
+                .failed = .init(false),
+                .thread = undefined,
+            };
+            const loop = EventLoop.init(
+                self,
+                listener.server.stream.handle,
+                control_fd,
+                id,
+                workerSlotCapacity(self.config.max_connections, count, id),
+                workerManagedBudget(self.managed_buffer_limit_bytes, count, id),
+                &workers[i].heartbeat_ms,
+            ) catch |err| {
+                closeFd(control_fd);
+                listener.server.deinit();
+                return err;
+            };
+            workers[i].loop = loop;
+            workers[i].thread = std.Thread.spawn(.{}, Worker.run, .{&workers[i]}) catch |err| {
+                abandonUnstartedWorker(self, loop, control_fd, &listener.server);
+                return err;
+            };
+            started += 1;
+            log.info("MTProto worker {d}/{d} online: {s}:{d} slots={d} managed_budget={d}MiB", .{
+                i + 1,
+                count,
+                if (ipv6) "[::]" else "0.0.0.0",
+                self.config.port,
+                workerSlotCapacity(self.config.max_connections, count, id),
+                workerManagedBudget(self.managed_buffer_limit_bytes, count, id) / (1024 * 1024),
+            });
+        }
+
+        var shutdown_started = false;
+        var failure_shutdown_sent = false;
+        while (true) {
+            var completed: usize = 0;
+            var failed = false;
+            const now_ms = compat.monotonicMilliTimestamp();
+            for (workers[0..started]) |*worker| {
+                if (worker.finished.load(.acquire)) {
+                    completed += 1;
+                    failed = failed or worker.failed.load(.monotonic);
+                } else if (workerHeartbeatStale(now_ms, worker.heartbeat_ms.load(.monotonic))) {
+                    // A permanently wedged worker still owns sockets. Joining
+                    // it would hang; terminate the process so the supervisor
+                    // can restart a complete reuseport group.
+                    log.err("MTProto worker {d} unresponsive for >{d}ms; exiting", .{ worker.id, worker_health_timeout_ms });
+                    std.process.exit(1);
+                }
+            }
+            if (failed and !failure_shutdown_sent) {
+                log.err("MTProto worker failed; shutting down all workers", .{});
+                signalWorkers(workers[0..started], 2) catch |err| {
+                    log.err("cannot wake MTProto workers after failure: {any}; exiting", .{err});
+                    std.process.exit(1);
+                };
+                shutdown_started = true;
+                failure_shutdown_sent = true;
+            }
+            if (completed == started) {
+                if (failed) return error.WorkerFailed;
+                if (!shutdown_started) return error.WorkerExitedUnexpectedly;
+                return;
+            }
+
+            var fds = [_]posix.pollfd{
+                .{ .fd = signal_fd, .events = posix.POLL.IN, .revents = 0 },
+                .{ .fd = completion_fd, .events = posix.POLL.IN, .revents = 0 },
+            };
+            _ = try posix.poll(&fds, worker_health_poll_ms);
+            if ((fds[0].revents & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL)) != 0 or
+                (fds[1].revents & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL)) != 0)
+            {
+                return error.WorkerControlFdFailed;
+            }
+            if ((fds[0].revents & posix.POLL.IN) != 0) {
+                const signal_count = try readWorkerEventFd(signal_fd);
+                if (signal_count > 0) {
+                    // Each worker needs its own eventfd: a read on a shared
+                    // eventfd would wake only one epoll waiter.
+                    signalWorkers(workers[0..started], if (shutdown_started) 2 else signal_count) catch |err| {
+                        log.err("cannot broadcast MTProto shutdown: {any}; exiting", .{err});
+                        std.process.exit(1);
+                    };
+                    shutdown_started = true;
+                }
+            }
+            if ((fds[1].revents & posix.POLL.IN) != 0) {
+                _ = try readWorkerEventFd(completion_fd);
+            }
+        }
     }
 
     const MiddleProxySnapshot = struct {
@@ -3143,8 +3466,50 @@ pub const ProxyState = struct {
     }
 };
 
+const Worker = struct {
+    id: u8,
+    loop: *EventLoop,
+    listen_fd: posix.fd_t,
+    control_fd: posix.fd_t,
+    completion_fd: posix.fd_t,
+    heartbeat_ms: std.atomic.Value(i64),
+    finished: std.atomic.Value(bool),
+    failed: std.atomic.Value(bool),
+    thread: std.Thread,
+
+    fn run(self: *Worker) void {
+        self.loop.run() catch |err| {
+            log.err("MTProto worker {d} stopped on event-loop error: {any}", .{ self.id, err });
+            self.failed.store(true, .monotonic);
+        };
+        // Close before teardown: a failed loop must not leave a dead member
+        // in the kernel's SO_REUSEPORT listener group.
+        closeFd(self.listen_fd);
+        const allocator = self.loop.state.allocator;
+        self.loop.deinit();
+        allocator.destroy(self.loop);
+        self.finished.store(true, .release);
+        writeWorkerEventFd(self.completion_fd, 1) catch |err| {
+            log.err("MTProto worker {d} completion wake failed: {any}", .{ self.id, err });
+        };
+    }
+};
+
+fn signalWorkers(workers: []Worker, count: u64) !void {
+    for (workers) |*worker| try writeWorkerEventFd(worker.control_fd, count);
+}
+
+fn abandonUnstartedWorker(state: *ProxyState, loop: *EventLoop, control_fd: posix.fd_t, listener: *net.Server) void {
+    loop.deinit();
+    state.allocator.destroy(loop);
+    closeFd(control_fd);
+    listener.deinit();
+}
+
 const EventLoop = struct {
     state: *ProxyState,
+    worker_id: u8 = 0,
+    heartbeat_ms: ?*std.atomic.Value(i64) = null,
     epoll_fd: posix.fd_t,
     timer_fd: posix.fd_t,
     listen_fd: posix.fd_t,
@@ -3162,14 +3527,12 @@ const EventLoop = struct {
     stats_next_log_ns: i128,
     accepted_since_log: u64,
     closed_since_log: u64,
+    local_pool_drops_since_log: u64 = 0,
     wedge_candidates_since_log: u64 = 0,
     wedge_cancelled_since_log: u64 = 0,
     wedge_fresh_closes_since_log: u64 = 0,
     wedge_proven_closes_since_log: u64 = 0,
     wedge_suppressed_since_log: u64 = 0,
-    wedge_recovery_gate: WedgeRecoveryGate = .{},
-    subnet_limiter: SubnetRateLimit,
-    subnet_handshakes: SubnetHandshakeLimit,
     // Snapshot of degradation counters for delta logging
     prev_dropped_cap: u64,
     prev_dropped_saturation: u64,
@@ -3185,7 +3548,15 @@ const EventLoop = struct {
     pending_close_fds: std.ArrayList(posix.fd_t),
     tracked_fds: u32,
 
-    fn init(state: *ProxyState, listen_fd: posix.fd_t, shutdown_fd: posix.fd_t) !*EventLoop {
+    fn init(
+        state: *ProxyState,
+        listen_fd: posix.fd_t,
+        shutdown_fd: posix.fd_t,
+        worker_id: u8,
+        slot_capacity: u32,
+        managed_limit_bytes: u64,
+        heartbeat_ms: ?*std.atomic.Value(i64),
+    ) !*EventLoop {
         const epoll_fd = try epollCreate();
         errdefer closeFd(epoll_fd);
         const timer_fd = try createTimerFd();
@@ -3195,14 +3566,16 @@ const EventLoop = struct {
         errdefer state.allocator.destroy(loop);
 
         loop.state = state;
+        loop.worker_id = worker_id;
+        loop.heartbeat_ms = heartbeat_ms;
         loop.epoll_fd = epoll_fd;
         loop.timer_fd = timer_fd;
         loop.listen_fd = listen_fd;
         loop.shutdown_fd = shutdown_fd;
-        loop.pool = try ConnectionPool.init(state.allocator, state.config.max_connections);
+        loop.pool = try ConnectionPool.init(state.allocator, slot_capacity);
         errdefer loop.pool.deinit();
         const managed_buffer_limit: usize = @intCast(@min(
-            state.managed_buffer_limit_bytes,
+            managed_limit_bytes,
             @as(u64, std.math.maxInt(usize)),
         ));
         loop.managed_buffers = ManagedBufferAllocator.init(
@@ -3216,23 +3589,18 @@ const EventLoop = struct {
         loop.shutting_down = false;
         loop.shutdown_deadline_ns = 0;
         loop.deadline_heap = .empty;
-        try loop.deadline_heap.ensureTotalCapacity(state.allocator, state.config.max_connections);
+        try loop.deadline_heap.ensureTotalCapacity(state.allocator, slot_capacity);
         errdefer loop.deadline_heap.deinit(state.allocator);
         loop.armed_deadline_ns = 0;
         loop.stats_next_log_ns = compat.monotonicNanoTimestamp() + stats_log_interval_ns;
         loop.accepted_since_log = 0;
         loop.closed_since_log = 0;
+        loop.local_pool_drops_since_log = 0;
         loop.wedge_candidates_since_log = 0;
         loop.wedge_cancelled_since_log = 0;
         loop.wedge_fresh_closes_since_log = 0;
         loop.wedge_proven_closes_since_log = 0;
         loop.wedge_suppressed_since_log = 0;
-        loop.wedge_recovery_gate.hash_seed = crypto.randomInt(u64);
-        for (&loop.wedge_recovery_gate.entries) |*entry| entry.* = .{};
-        loop.subnet_limiter.hash_seed = crypto.randomInt(u64);
-        for (&loop.subnet_limiter.entries) |*entry| entry.* = .{};
-        loop.subnet_handshakes.hash_seed = crypto.randomInt(u64);
-        for (&loop.subnet_handshakes.entries) |*entry| entry.* = .{};
         loop.prev_dropped_cap = 0;
         loop.prev_dropped_saturation = 0;
         loop.prev_dropped_rate_limit = 0;
@@ -3294,6 +3662,9 @@ const EventLoop = struct {
         var events: [256]linux.epoll_event = undefined;
 
         while (true) {
+            if (self.heartbeat_ms) |heartbeat| {
+                heartbeat.store(compat.monotonicMilliTimestamp(), .monotonic);
+            }
             self.drainPendingCloses();
 
             const rc = linux.epoll_wait(self.epoll_fd, events[0..].ptr, @intCast(events.len), -1);
@@ -3353,7 +3724,7 @@ const EventLoop = struct {
             }
             // Saturation hysteresis: resume accepting when active drops below 80%
             if (!self.shutting_down and self.saturation_paused) {
-                const active = self.state.active_connections;
+                const active = self.state.active_connections.load(.monotonic);
                 const resume_threshold = (self.state.config.max_connections * 8) / 10;
                 if (active <= resume_threshold) {
                     self.resumeSaturation();
@@ -3457,13 +3828,13 @@ const EventLoop = struct {
 
         // Saturation hysteresis: if active > 90% of max, stop accepting entirely.
         // Resume only when active drops below 80% (checked in run() loop).
-        const active_now = self.state.active_connections;
+        const active_now = self.state.active_connections.load(.monotonic);
         const max = self.state.config.max_connections;
         if (active_now >= (max * 9) / 10) {
             if (!self.saturation_paused) {
                 self.pauseSaturation();
             }
-            self.state.stats_dropped_saturation +|= 1;
+            countStat(&self.state.stats_dropped_saturation);
             return;
         }
 
@@ -3490,23 +3861,21 @@ const EventLoop = struct {
             const trusted_web_peer = self.state.trusted_web_peers.contains(client_addr);
 
             // Per-/24 subnet rate limit (before we allocate any slot)
-            if (!trusted_web_peer and !self.subnet_limiter.check(client_addr, self.state.config.rate_limit_per_subnet)) {
-                self.state.stats_dropped_rate_limit +|= 1;
+            if (!trusted_web_peer and !self.state.allowSubnet(client_addr)) {
+                countStat(&self.state.stats_dropped_rate_limit);
                 closeFd(cfd);
                 continue;
             }
 
-            const active_before = self.state.active_connections;
-            self.state.active_connections +|= 1;
-            if (active_before >= self.state.config.max_connections) {
-                self.state.active_connections -= 1;
-                self.state.stats_dropped_cap +|= 1;
+            if (!reserveGlobalCount(&self.state.active_connections, self.state.config.max_connections)) {
+                countStat(&self.state.stats_dropped_cap);
                 closeFd(cfd);
                 continue;
             }
 
             const slot = self.pool.acquire() orelse {
-                self.state.active_connections -= 1;
+                releaseGlobalCount(&self.state.active_connections);
+                self.local_pool_drops_since_log +|= 1;
                 closeFd(cfd);
                 continue;
             };
@@ -3515,9 +3884,9 @@ const EventLoop = struct {
 
             const subnet_key = if (trusted_web_peer) 0 else SubnetRateLimit.subnetKey(client_addr);
             if (!trusted_web_peer) {
-                if (!self.subnet_handshakes.reserve(subnet_key, subnetHandshakeLimit(max))) {
-                    self.state.active_connections -= 1;
-                    self.state.stats_dropped_hs_budget +|= 1;
+                if (!self.state.reserveSubnetHandshake(subnet_key)) {
+                    releaseGlobalCount(&self.state.active_connections);
+                    countStat(&self.state.stats_dropped_hs_budget);
                     self.pool.release(slot);
                     closeFd(cfd);
                     continue;
@@ -3532,8 +3901,7 @@ const EventLoop = struct {
             slot.hs_counted = false;
             slot.subnet_key = subnet_key;
             slot.subnet_hs_counted = !trusted_web_peer;
-            slot.conn_id = self.state.connection_count;
-            self.state.connection_count +|= 1;
+            slot.conn_id = self.state.connection_count.fetchAdd(1, .monotonic);
             slot.client_fd = cfd;
             slot.peer_addr = client_addr;
             slot.trusted_peer = trusted_web_peer;
@@ -3562,19 +3930,21 @@ const EventLoop = struct {
     }
 
     fn logPeriodicStats(self: *EventLoop, now_ns: i128) void {
-        const active = self.state.active_connections;
-        const hs = self.state.handshakes_inflight;
-        const accepted_total = self.state.connection_count;
+        const active = self.state.active_connections.load(.monotonic);
+        const hs = self.state.handshakes_inflight.load(.monotonic);
+        const accepted_total = self.state.connection_count.load(.monotonic);
+        const primary = self.worker_id == 0;
 
-        // Snapshot degradation counters and compute deltas
-        const cur_cap = self.state.stats_dropped_cap;
-        const cur_sat = self.state.stats_dropped_saturation;
-        const cur_rate = self.state.stats_dropped_rate_limit;
-        const cur_hs = self.state.stats_dropped_hs_budget;
-        const cur_hst = self.state.stats_hs_timeout;
-        const cur_mpf = self.state.stats_mp_fallback;
+        // Only worker 0 delta-logs process counters. Every worker reports
+        // its own pool, fd, wedge, and managed-buffer utilization.
+        const cur_cap = if (primary) self.state.stats_dropped_cap.load(.monotonic) else self.prev_dropped_cap;
+        const cur_sat = if (primary) self.state.stats_dropped_saturation.load(.monotonic) else self.prev_dropped_saturation;
+        const cur_rate = if (primary) self.state.stats_dropped_rate_limit.load(.monotonic) else self.prev_dropped_rate_limit;
+        const cur_hs = if (primary) self.state.stats_dropped_hs_budget.load(.monotonic) else self.prev_dropped_hs_budget;
+        const cur_hst = if (primary) self.state.stats_hs_timeout.load(.monotonic) else self.prev_hs_timeout;
+        const cur_mpf = if (primary) self.state.stats_mp_fallback.load(.monotonic) else self.prev_mp_fallback;
         const cur_buffer_denials = self.managed_buffers.denied_allocations;
-        const cur_web_only_masked = self.state.stats_web_only_masked;
+        const cur_web_only_masked = if (primary) self.state.stats_web_only_masked.load(.monotonic) else self.prev_web_only_masked;
 
         const d_cap = cur_cap - self.prev_dropped_cap;
         const d_sat = cur_sat - self.prev_dropped_saturation;
@@ -3594,15 +3964,18 @@ const EventLoop = struct {
         self.prev_buffer_denials = cur_buffer_denials;
         self.prev_web_only_masked = cur_web_only_masked;
 
-        const has_drops =
-            d_cap + d_sat + d_rate + d_hs + d_hst + d_mpf + d_buffer_denials > 0;
+        const has_global_drops = d_cap + d_sat + d_rate + d_hs + d_hst + d_mpf > 0;
 
-        log.info("conn stats: active={d}/{d} hs_inflight={d} accepted+={d} closed+={d} tracked_fds={d} total={d} paused={}/{} managed_buf={d}/{d}KiB peak={d}KiB", .{
+        log.info("conn stats: worker={d} local_active={d}/{d} global_active={d}/{d} global_hs={d} accepted+={d} closed+={d} local_pool_drops+={d} tracked_fds={d} global_total={d} paused={}/{} worker_managed_buf={d}/{d}KiB peak={d}KiB", .{
+            self.worker_id,
+            self.pool.slots.len - @as(usize, self.pool.free_count),
+            self.pool.slots.len,
             active,
             self.state.config.max_connections,
             hs,
             self.accepted_since_log,
             self.closed_since_log,
+            self.local_pool_drops_since_log,
             self.tracked_fds,
             accepted_total,
             self.accept_paused,
@@ -3612,10 +3985,13 @@ const EventLoop = struct {
             self.managed_buffers.peak_bytes / 1024,
         });
 
-        if (has_drops) {
-            log.info("drops: cap+={d} sat+={d} rate+={d} hs_budget+={d} hs_timeout+={d} mp_fallback+={d} memory_pressure+={d}", .{
-                d_cap, d_sat, d_rate, d_hs, d_hst, d_mpf, d_buffer_denials,
+        if (has_global_drops) {
+            log.info("global drops: cap+={d} sat+={d} rate+={d} hs_budget+={d} hs_timeout+={d} mp_fallback+={d}", .{
+                d_cap, d_sat, d_rate, d_hs, d_hst, d_mpf,
             });
+        }
+        if (d_buffer_denials > 0) {
+            log.info("worker {d} memory_pressure+={d}", .{ self.worker_id, d_buffer_denials });
         }
 
         if (d_web_only_masked > 0) {
@@ -3626,7 +4002,8 @@ const EventLoop = struct {
             self.wedge_fresh_closes_since_log + self.wedge_proven_closes_since_log +
             self.wedge_suppressed_since_log > 0)
         {
-            log.info("ios_wedge: candidates+={d} cancelled+={d} fresh_close+={d} proven_close+={d} suppressed+={d}", .{
+            log.info("ios_wedge: worker={d} candidates+={d} cancelled+={d} fresh_close+={d} proven_close+={d} suppressed+={d}", .{
+                self.worker_id,
                 self.wedge_candidates_since_log,
                 self.wedge_cancelled_since_log,
                 self.wedge_fresh_closes_since_log,
@@ -3637,6 +4014,7 @@ const EventLoop = struct {
 
         self.accepted_since_log = 0;
         self.closed_since_log = 0;
+        self.local_pool_drops_since_log = 0;
         self.wedge_candidates_since_log = 0;
         self.wedge_cancelled_since_log = 0;
         self.wedge_fresh_closes_since_log = 0;
@@ -3697,7 +4075,7 @@ const EventLoop = struct {
             log.err("failed to pause accepts for saturation: {any}", .{mod_err});
         };
 
-        const active = self.state.active_connections;
+        const active = self.state.active_connections.load(.monotonic);
         const max = self.state.config.max_connections;
         log.warn(
             "connection saturation: active={d}/{d} (>{d}%); pausing new accepts. " ++
@@ -3719,7 +4097,7 @@ const EventLoop = struct {
             return;
         };
 
-        const active = self.state.active_connections;
+        const active = self.state.active_connections.load(.monotonic);
         if (self.wantsAcceptInterest()) {
             log.info("saturation eased: active={d}/{d}; resuming accepts", .{ active, self.state.config.max_connections });
         } else {
@@ -3739,7 +4117,7 @@ const EventLoop = struct {
 
         log.warn(
             "SIGINT/SIGTERM received: graceful shutdown started, active={d}, timeout={d}s",
-            .{ self.state.active_connections, self.state.config.graceful_shutdown_timeout_sec },
+            .{ self.state.active_connections.load(.monotonic), self.state.config.graceful_shutdown_timeout_sec },
         );
     }
 
@@ -3749,7 +4127,7 @@ const EventLoop = struct {
     }
 
     fn maybeCompleteShutdown(self: *EventLoop, now_ns: i128) bool {
-        const active = self.state.active_connections;
+        const active: u32 = @intCast(self.pool.slots.len - @as(usize, self.pool.free_count));
         if (active == 0) {
             log.info("graceful shutdown complete: all connections drained", .{});
             return true;
@@ -3911,12 +4289,9 @@ const EventLoop = struct {
     fn reserveHandshakeBudget(self: *EventLoop, slot: *ConnectionSlot) bool {
         if (slot.hs_counted) return true;
 
-        const hs_inflight = self.state.handshakes_inflight;
-        self.state.handshakes_inflight +|= 1;
         const hs_max = (self.state.config.max_connections * 3) / 10;
-        if (hs_max > 0 and hs_inflight >= hs_max) {
-            self.state.handshakes_inflight -= 1;
-            self.state.stats_dropped_hs_budget +|= 1;
+        if (!reserveGlobalCount(&self.state.handshakes_inflight, hs_max)) {
+            countStat(&self.state.stats_dropped_hs_budget);
             return false;
         }
 
@@ -3928,13 +4303,13 @@ const EventLoop = struct {
     /// completion can release it early; all error paths funnel through closeSlot.
     fn releaseHandshakeBudget(self: *EventLoop, slot: *ConnectionSlot) void {
         if (!slot.hs_counted) return;
-        self.state.handshakes_inflight -= 1;
+        releaseGlobalCount(&self.state.handshakes_inflight);
         slot.hs_counted = false;
     }
 
     fn releaseSubnetHandshake(self: *EventLoop, slot: *ConnectionSlot) void {
         if (!slot.subnet_hs_counted) return;
-        self.subnet_handshakes.release(slot.subnet_key);
+        self.state.releaseSubnetHandshake(slot.subnet_key);
         slot.subnet_hs_counted = false;
         slot.subnet_key = 0;
     }
@@ -3972,14 +4347,14 @@ const EventLoop = struct {
                     .ok => |result| {
                         if (result.src) |real_client| {
                             slot.peer_addr = real_client;
-                            if (!self.subnet_limiter.check(real_client, self.state.config.rate_limit_per_subnet)) {
-                                self.state.stats_dropped_rate_limit +|= 1;
+                            if (!self.state.allowSubnet(real_client)) {
+                                countStat(&self.state.stats_dropped_rate_limit);
                                 self.closeSlot(slot, "WEB client subnet rate limit");
                                 return;
                             }
                             const subnet_key = SubnetRateLimit.subnetKey(real_client);
-                            if (!self.subnet_handshakes.reserve(subnet_key, subnetHandshakeLimit(self.state.config.max_connections))) {
-                                self.state.stats_dropped_hs_budget +|= 1;
+                            if (!self.state.reserveSubnetHandshake(subnet_key)) {
+                                countStat(&self.state.stats_dropped_hs_budget);
                                 self.closeSlot(slot, "WEB client subnet handshake limit");
                                 return;
                             }
@@ -4175,7 +4550,7 @@ const EventLoop = struct {
         // mode an external client gets the exact same masking behavior as a bad
         // secret, while the relay remains allowed through.
         if (webOnlyMasksPeer(self.state.web_only, slot.trusted_peer)) {
-            self.state.stats_web_only_masked +|= 1;
+            countStat(&self.state.stats_web_only_masked);
             self.startMasking(slot, client_hello, .web_only) catch {
                 self.closeSlot(slot, "web-only masking failed");
             };
@@ -4210,7 +4585,7 @@ const EventLoop = struct {
             };
             return;
         };
-        if (self.state.replay_cache.checkAndInsert(&v.canonical_hmac)) {
+        if (self.state.isReplay(&v.canonical_hmac)) {
             self.startMasking(slot, client_hello, .replay) catch {
                 self.closeSlot(slot, "replay detected, masking failed");
             };
@@ -4748,7 +5123,7 @@ const EventLoop = struct {
 
         if (!slot.direct_fallback_used and slot.direct_fallback_addr != null and slot.use_middle_proxy) {
             slot.direct_fallback_used = true;
-            self.state.stats_mp_fallback +|= 1;
+            countStat(&self.state.stats_mp_fallback);
             slot.use_middle_proxy = false;
             const fallback = slot.direct_fallback_addr.?;
             const one = [_]net.Address{fallback};
@@ -4923,7 +5298,7 @@ const EventLoop = struct {
             if (slot.wedge.noteClientPayload(now_ms, slot.relay_started_at_ms)) {
                 self.wedge_cancelled_since_log +|= 1;
             }
-            if (self.wedge_recovery_gate.suppressesNewCandidates(
+            if (self.state.wedgeSuppressesNewCandidates(
                 slot.wedge_client_key,
                 slot.dc_abs,
                 now_ms,
@@ -4973,14 +5348,14 @@ const EventLoop = struct {
             _ = slot.wedge.noteReplyDelivered(now_ms, 0, null);
             return;
         }
-        const ticket = self.wedge_recovery_gate.prepare(
+        const ticket = self.state.prepareWedge(
             slot.wedge_client_key,
             slot.dc_abs,
             now_ms,
             base_timeout_ms,
             slot.last_activity_ms + slot.idle_timeout_ms,
         ) orelse {
-            if (self.wedge_recovery_gate.reportSuppression(
+            if (self.state.reportWedgeSuppression(
                 slot.wedge_client_key,
                 slot.dc_abs,
                 now_ms,
@@ -5637,7 +6012,7 @@ const EventLoop = struct {
 
         if (slot.obf_params == null) return false;
         slot.direct_fallback_used = true;
-        self.state.stats_mp_fallback +|= 1;
+        countStat(&self.state.stats_mp_fallback);
         slot.use_middle_proxy = false;
         slot.mp_secret_version = 0;
         slot.mp_nat_ip4 = null;
@@ -6072,7 +6447,7 @@ const EventLoop = struct {
                     return;
                 }
             } else if (now_ms - slot.first_byte_at_ms >= secondsToMs(self.state.config.handshake_timeout_sec)) {
-                self.state.stats_hs_timeout +|= 1;
+                countStat(&self.state.stats_hs_timeout);
                 if (slot.phase == .middle_proxy_handshake and slot.mp_step.awaitingMiddleProxy()) {
                     self.state.requestMiddleProxyRefresh();
                 }
@@ -6089,7 +6464,7 @@ const EventLoop = struct {
             if (self.wedgeEligibleSlot(slot) and !slot.hasClientPending()) {
                 if (slot.wedge.closeKind(now_ms)) |kind| {
                     const ticket = slot.wedge.gate_ticket orelse {
-                        if (self.wedge_recovery_gate.reportSuppression(
+                        if (self.state.reportWedgeSuppression(
                             slot.wedge_client_key,
                             slot.dc_abs,
                             now_ms,
@@ -6099,13 +6474,13 @@ const EventLoop = struct {
                         slot.wedge.abandonCandidate();
                         return;
                     };
-                    if (!self.wedge_recovery_gate.allowClose(
+                    if (!self.state.allowWedgeClose(
                         slot.wedge_client_key,
                         slot.dc_abs,
                         ticket,
                         now_ms,
                     )) {
-                        if (self.wedge_recovery_gate.reportSuppression(
+                        if (self.state.reportWedgeSuppression(
                             slot.wedge_client_key,
                             slot.dc_abs,
                             now_ms,
@@ -6529,7 +6904,7 @@ const EventLoop = struct {
         slot.resetOwnedBuffers(self.state.allocator);
 
         if (slot.active_reserved) {
-            self.state.active_connections -= 1;
+            releaseGlobalCount(&self.state.active_connections);
             slot.active_reserved = false;
             self.closed_since_log += 1;
         }
@@ -6851,6 +7226,32 @@ fn epollCreate() !posix.fd_t {
         .SUCCESS => return @intCast(rc),
         else => |err| return posix.unexpectedErrno(err),
     }
+}
+
+fn createWorkerEventFd() !posix.fd_t {
+    const rc = linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
+    switch (posix.errno(rc)) {
+        .SUCCESS => return @intCast(rc),
+        else => |err| return posix.unexpectedErrno(err),
+    }
+}
+
+fn writeWorkerEventFd(fd: posix.fd_t, count: u64) !void {
+    var value = count;
+    const bytes = std.mem.asBytes(&value);
+    const written = try writeFd(fd, bytes);
+    if (written != bytes.len) return error.ShortWorkerEventWrite;
+}
+
+fn readWorkerEventFd(fd: posix.fd_t) !u64 {
+    var value: u64 = 0;
+    const bytes = std.mem.asBytes(&value);
+    const read_count = posix.read(fd, bytes) catch |err| switch (err) {
+        error.WouldBlock => return 0,
+        else => |e| return e,
+    };
+    if (read_count != bytes.len) return error.ShortWorkerEventRead;
+    return value;
 }
 
 fn requiredFdsForConnections(max_connections: u32) usize {
@@ -7867,8 +8268,6 @@ test "middle proxy nonce response failures fall back to direct path" {
         .stats_next_log_ns = compat.monotonicNanoTimestamp() + stats_log_interval_ns,
         .accepted_since_log = 0,
         .closed_since_log = 0,
-        .subnet_limiter = SubnetRateLimit.init(),
-        .subnet_handshakes = SubnetHandshakeLimit.init(),
         .prev_dropped_cap = 0,
         .prev_dropped_saturation = 0,
         .prev_dropped_rate_limit = 0,
@@ -7948,7 +8347,7 @@ test "middle proxy nonce response failures fall back to direct path" {
     try std.testing.expectEqual(@as(usize, 1), slot.upstreamCandidates().len);
     try std.testing.expect(slot.current_upstream_addr.?.eql(fallback_addr));
     try std.testing.expect(slot.phase == .connecting_upstream or slot.phase == .writing_dc_nonce);
-    try std.testing.expectEqual(@as(u64, 1), state.stats_mp_fallback);
+    try std.testing.expectEqual(@as(u64, 1), state.stats_mp_fallback.load(.monotonic));
 }
 
 test "connection slot stores common candidate sets inline" {
@@ -8842,8 +9241,6 @@ test "handshake budget is charged once after the first client byte" {
         .stats_next_log_ns = 0,
         .accepted_since_log = 0,
         .closed_since_log = 0,
-        .subnet_limiter = SubnetRateLimit.init(),
-        .subnet_handshakes = SubnetHandshakeLimit.init(),
         .prev_dropped_cap = 0,
         .prev_dropped_saturation = 0,
         .prev_dropped_rate_limit = 0,
@@ -8867,18 +9264,18 @@ test "handshake budget is charged once after the first client byte" {
     const slot = loop.pool.acquire() orelse return error.TestExpectedEqual;
     defer loop.pool.release(slot);
 
-    try std.testing.expectEqual(@as(u32, 0), state.handshakes_inflight);
+    try std.testing.expectEqual(@as(u32, 0), state.handshakes_inflight.load(.monotonic));
     try std.testing.expect(loop.reserveHandshakeBudget(slot));
     try std.testing.expect(slot.hs_counted);
-    try std.testing.expectEqual(@as(u32, 1), state.handshakes_inflight);
+    try std.testing.expectEqual(@as(u32, 1), state.handshakes_inflight.load(.monotonic));
 
     try std.testing.expect(loop.reserveHandshakeBudget(slot));
-    try std.testing.expectEqual(@as(u32, 1), state.handshakes_inflight);
+    try std.testing.expectEqual(@as(u32, 1), state.handshakes_inflight.load(.monotonic));
 
     loop.releaseHandshakeBudget(slot);
     loop.releaseHandshakeBudget(slot);
     try std.testing.expect(!slot.hs_counted);
-    try std.testing.expectEqual(@as(u32, 0), state.handshakes_inflight);
+    try std.testing.expectEqual(@as(u32, 0), state.handshakes_inflight.load(.monotonic));
 }
 
 test "subnet handshake limit bounds and releases unauthenticated slots" {
@@ -8900,4 +9297,264 @@ test "subnet handshake limit scales within defensive bounds" {
     try std.testing.expectEqual(@as(u16, 16), subnetHandshakeLimit(32));
     try std.testing.expectEqual(@as(u16, 64), subnetHandshakeLimit(512));
     try std.testing.expectEqual(@as(u16, 128), subnetHandshakeLimit(100_000));
+}
+
+test "worker selection and partitioning preserve process budgets" {
+    const budget = 64 * 1024 * 1024;
+    try std.testing.expectEqual(@as(u8, 1), try selectWorkerCount(1, 512, budget, min_worker_managed_bytes, 64));
+    try std.testing.expectEqual(@as(u8, 2), try selectWorkerCount(2, 512, budget, min_worker_managed_bytes, 1));
+    try std.testing.expectEqual(@as(u8, 8), try selectWorkerCount(0, 512, budget, min_worker_managed_bytes, 64));
+    try std.testing.expectEqual(@as(u8, 2), try selectWorkerCount(0, 64, budget, min_worker_managed_bytes, 64));
+    try std.testing.expectEqual(@as(u8, 1), try selectWorkerCount(0, 512, budget, min_worker_managed_bytes, 1));
+    try std.testing.expectError(error.InsufficientWorkerResources, selectWorkerCount(9, 512, budget, min_worker_managed_bytes, 64));
+    try std.testing.expectError(error.InsufficientWorkerResources, selectWorkerCount(3, 64, budget, min_worker_managed_bytes, 64));
+    try std.testing.expectError(error.InvalidWorkers, selectWorkerCount(17, 512, budget, min_worker_managed_bytes, 64));
+
+    var mp_cfg = Config{
+        .users = std.StringHashMap([16]u8).init(std.testing.allocator),
+        .direct_users = std.StringHashMap(void).init(std.testing.allocator),
+    };
+    defer mp_cfg.deinit(std.testing.allocator);
+    const mp_floor = minWorkerManagedBytes(&mp_cfg);
+    try std.testing.expect(mp_floor > min_worker_managed_bytes);
+    try std.testing.expectEqual(@as(u8, 7), try selectWorkerCount(0, 512, budget, mp_floor, 64));
+
+    var slots: u32 = 0;
+    var bytes: u64 = 0;
+    for (0..8) |i| {
+        const id: u8 = @intCast(i);
+        const local_slots = workerSlotCapacity(513, 8, id);
+        const local_bytes = workerManagedBudget(budget + 3, 8, id);
+        try std.testing.expect(local_slots >= min_worker_slots);
+        try std.testing.expect(local_bytes >= min_worker_managed_bytes);
+        slots += local_slots;
+        bytes += local_bytes;
+    }
+    try std.testing.expectEqual(@as(u32, 513), slots);
+    try std.testing.expectEqual(@as(u64, budget + 3), bytes);
+    try std.testing.expect(!workerHeartbeatStale(1000, 1000));
+    try std.testing.expect(!workerHeartbeatStale(worker_health_timeout_ms, 0));
+    try std.testing.expect(workerHeartbeatStale(worker_health_timeout_ms + 1, 0));
+}
+
+const MultiWorkerRace = struct {
+    state: *ProxyState,
+    counter: *std.atomic.Value(u32),
+    admitted: *std.atomic.Value(u32),
+    handshake_winners: *std.atomic.Value(u32),
+    replay_winners: *std.atomic.Value(u32),
+    wedge_winners: *std.atomic.Value(u32),
+    rate_winners: *std.atomic.Value(u32),
+    ready: *std.atomic.Value(u32),
+    go: *std.atomic.Value(bool),
+    digest: [32]u8,
+    wedge_ticket: WedgeGateTicket,
+
+    fn run(self: *MultiWorkerRace) void {
+        _ = self.ready.fetchAdd(1, .monotonic);
+        while (!self.go.load(.acquire)) std.atomic.spinLoopHint();
+        if (reserveGlobalCount(self.counter, 4)) {
+            _ = self.admitted.fetchAdd(1, .monotonic);
+        } else {
+            countStat(&self.state.stats_dropped_cap);
+        }
+        if (reserveGlobalCount(&self.state.handshakes_inflight, 3))
+            _ = self.handshake_winners.fetchAdd(1, .monotonic);
+        if (!self.state.isReplay(&self.digest)) _ = self.replay_winners.fetchAdd(1, .monotonic);
+        if (self.state.allowWedgeClose(0x1234, 1, self.wedge_ticket, 1000))
+            _ = self.wedge_winners.fetchAdd(1, .monotonic);
+        if (self.state.allowSubnet(net.Address.initIp4(.{ 198, 51, 100, 1 }, 443)))
+            _ = self.rate_winners.fetchAdd(1, .monotonic);
+    }
+};
+
+test "concurrent workers share connection, handshake, replay, rate and wedge limits" {
+    var cfg = Config{
+        .users = std.StringHashMap([16]u8).init(std.testing.allocator),
+        .direct_users = std.StringHashMap(void).init(std.testing.allocator),
+        .mask = false,
+        .rate_limit_per_subnet = 1,
+    };
+    defer cfg.deinit(std.testing.allocator);
+    var state = try ProxyState.init(std.testing.allocator, cfg);
+    defer state.deinit();
+
+    var cap = std.atomic.Value(u32).init(0);
+    var admitted = std.atomic.Value(u32).init(0);
+    var handshake_winners = std.atomic.Value(u32).init(0);
+    var replay_winners = std.atomic.Value(u32).init(0);
+    var wedge_winners = std.atomic.Value(u32).init(0);
+    var rate_winners = std.atomic.Value(u32).init(0);
+    var ready = std.atomic.Value(u32).init(0);
+    var go = std.atomic.Value(bool).init(false);
+    const wedge_ticket = state.prepareWedge(0x1234, 1, 1000, 15_000, 100_000) orelse return error.TestExpectedEqual;
+    const rate_addr = net.Address.initIp4(.{ 198, 51, 100, 1 }, 443);
+    const rate_key = SubnetRateLimit.subnetKey(rate_addr);
+    const rate_index = state.security.subnet_limiter.indexFor(rate_key);
+    state.security.subnet_limiter.entries[rate_index] = .{
+        .subnet_key = rate_key,
+        .last_refill_s = @divTrunc(compat.monotonicMilliTimestamp(), 1000) + 60,
+        .used = true,
+        .tokens = 1,
+    };
+    var race = MultiWorkerRace{
+        .state = &state,
+        .counter = &cap,
+        .admitted = &admitted,
+        .handshake_winners = &handshake_winners,
+        .replay_winners = &replay_winners,
+        .wedge_winners = &wedge_winners,
+        .rate_winners = &rate_winners,
+        .ready = &ready,
+        .go = &go,
+        .digest = [_]u8{0x42} ** 32,
+        .wedge_ticket = wedge_ticket,
+    };
+    var threads: [8]std.Thread = undefined;
+    var spawned: usize = 0;
+    errdefer {
+        go.store(true, .release);
+        for (threads[0..spawned]) |thread| thread.join();
+    }
+    for (&threads) |*thread| {
+        thread.* = try std.Thread.spawn(.{}, MultiWorkerRace.run, .{&race});
+        spawned += 1;
+    }
+    while (ready.load(.monotonic) < threads.len) std.atomic.spinLoopHint();
+    go.store(true, .release);
+    for (threads) |thread| thread.join();
+    spawned = 0;
+    try std.testing.expectEqual(@as(u32, 4), admitted.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 4), cap.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 4), state.stats_dropped_cap.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 3), handshake_winners.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 3), state.handshakes_inflight.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 1), replay_winners.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, WedgeRecoveryGate.max_wave_closes), wedge_winners.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 1), rate_winners.load(.monotonic));
+    for (0..4) |_| releaseGlobalCount(&cap);
+    for (0..3) |_| releaseGlobalCount(&state.handshakes_inflight);
+    try std.testing.expectEqual(@as(u32, 0), cap.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 0), state.handshakes_inflight.load(.monotonic));
+}
+
+test "shared subnet admission and unauthenticated caps are not multiplied" {
+    var cfg = Config{
+        .users = std.StringHashMap([16]u8).init(std.testing.allocator),
+        .direct_users = std.StringHashMap(void).init(std.testing.allocator),
+        .max_connections = 64,
+        .rate_limit_per_subnet = 1,
+        .mask = false,
+    };
+    defer cfg.deinit(std.testing.allocator);
+    var state = try ProxyState.init(std.testing.allocator, cfg);
+    defer state.deinit();
+
+    const address = net.Address.initIp4(.{ 198, 51, 100, 1 }, 443);
+    try std.testing.expect(state.allowSubnet(address));
+    // Freeze this entry's refill clock to avoid a test flake at a second edge.
+    const key = SubnetRateLimit.subnetKey(address);
+    state.security.lock.lock();
+    state.security.subnet_limiter.findEntry(key).?.last_refill_s += 5;
+    state.security.lock.unlock();
+    try std.testing.expect(!state.allowSubnet(net.Address.initIp4(.{ 198, 51, 100, 2 }, 443)));
+
+    const hs_limit = subnetHandshakeLimit(state.config.max_connections);
+    for (0..hs_limit) |_| try std.testing.expect(state.reserveSubnetHandshake(key));
+    try std.testing.expect(!state.reserveSubnetHandshake(key));
+    for (0..hs_limit) |_| state.releaseSubnetHandshake(key);
+    try std.testing.expect(state.reserveSubnetHandshake(key));
+    state.releaseSubnetHandshake(key);
+}
+
+const MiddleProxyMetadataRace = struct {
+    state: *ProxyState,
+
+    fn run(self: *MiddleProxyMetadataRace) void {
+        const candidate = constants.tg_middle_proxies_v4[0];
+        for (0..500) |_| {
+            const snapshot = self.state.getMiddleProxySnapshot(1, false);
+            std.debug.assert(snapshot.candidate_len > 0);
+            _ = self.state.cooldownMiddleProxyCandidate(candidate);
+            _ = self.state.promoteMiddleProxyCandidate(1, false, candidate);
+        }
+    }
+};
+
+test "MiddleProxy route snapshots remain synchronized across workers" {
+    var cfg = Config{
+        .users = std.StringHashMap([16]u8).init(std.testing.allocator),
+        .direct_users = std.StringHashMap(void).init(std.testing.allocator),
+        .mask = false,
+    };
+    defer cfg.deinit(std.testing.allocator);
+    var state = try ProxyState.init(std.testing.allocator, cfg);
+    defer state.deinit();
+    var race = MiddleProxyMetadataRace{ .state = &state };
+    var threads: [4]std.Thread = undefined;
+    var spawned: usize = 0;
+    errdefer {
+        for (threads[0..spawned]) |thread| thread.join();
+    }
+    for (&threads) |*thread| {
+        thread.* = try std.Thread.spawn(.{}, MiddleProxyMetadataRace.run, .{&race});
+        spawned += 1;
+    }
+    for (threads) |thread| thread.join();
+    spawned = 0;
+}
+
+test "control broadcast wakes every worker eventfd" {
+    if (builtin.os.tag != .linux) return;
+    const first = try createWorkerEventFd();
+    defer closeFd(first);
+    const second = try createWorkerEventFd();
+    defer closeFd(second);
+    var workers = [_]Worker{
+        .{ .id = 0, .loop = undefined, .listen_fd = invalid_fd, .control_fd = first, .completion_fd = invalid_fd, .heartbeat_ms = .init(0), .finished = .init(false), .failed = .init(false), .thread = undefined },
+        .{ .id = 1, .loop = undefined, .listen_fd = invalid_fd, .control_fd = second, .completion_fd = invalid_fd, .heartbeat_ms = .init(0), .finished = .init(false), .failed = .init(false), .thread = undefined },
+    };
+    try signalWorkers(&workers, 1);
+    try std.testing.expectEqual(@as(u64, 1), try readWorkerEventFd(first));
+    try std.testing.expectEqual(@as(u64, 1), try readWorkerEventFd(second));
+}
+
+test "abandoned worker startup releases its reuseport listener" {
+    if (builtin.os.tag != .linux) return;
+    var cfg = Config{
+        .users = std.StringHashMap([16]u8).init(std.testing.allocator),
+        .direct_users = std.StringHashMap(void).init(std.testing.allocator),
+        .mask = false,
+    };
+    defer cfg.deinit(std.testing.allocator);
+    var state = try ProxyState.init(std.testing.allocator, cfg);
+    defer state.deinit();
+
+    const address = net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+    var listener = try address.listen(.{ .reuse_address = true, .reuse_port = true });
+    var listener_owned = true;
+    defer if (listener_owned) listener.deinit();
+    var bound: net.Address = undefined;
+    var bound_len: posix.socklen_t = @sizeOf(net.Address);
+    try getsocknameFd(listener.stream.handle, &bound.any, &bound_len);
+    const port = std.mem.bigToNative(u16, bound.in.sa.port);
+
+    const control_fd = try createWorkerEventFd();
+    var control_owned = true;
+    defer if (control_owned) closeFd(control_fd);
+    const loop = try EventLoop.init(&state, listener.stream.handle, control_fd, 0, 32, default_managed_buffer_limit_bytes, null);
+    var loop_owned = true;
+    defer if (loop_owned) {
+        loop.deinit();
+        state.allocator.destroy(loop);
+    };
+
+    // Exercise the same cleanup used when Thread.spawn fails after a valid
+    // epoll/timer/listener has already been prepared.
+    abandonUnstartedWorker(&state, loop, control_fd, &listener);
+    loop_owned = false;
+    control_owned = false;
+    listener_owned = false;
+    var replacement = try net.Address.initIp4(.{ 127, 0, 0, 1 }, port).listen(.{ .reuse_address = true });
+    defer replacement.deinit();
 }
