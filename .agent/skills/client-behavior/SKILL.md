@@ -15,7 +15,7 @@ Use this skill when behavior differs by platform (iOS/Android/Desktop) or when t
 
 ## Proxy Runtime Context
 
-Current proxy runtime is a Linux single-thread `epoll` event loop with timer-driven stage control (`idle_timeout_sec`, `handshake_timeout_sec`). Interpret client behavior against that model, not legacy `poll` or thread-per-connection assumptions.
+Current proxy runtime defaults to one Linux `epoll` event loop; optional MTProto workers each own a connection from accept through close, with the same timer-driven stage control (`idle_timeout_sec`, `handshake_timeout_sec`). Interpret client behavior against that model, not legacy `poll` or thread-per-connection assumptions.
 
 Current FakeTLS and MTProto handshake assumptions:
 

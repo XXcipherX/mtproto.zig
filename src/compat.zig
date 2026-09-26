@@ -234,7 +234,7 @@ fn writeLinuxFd(fd: i32, bytes: []const u8) void {
     var offset: usize = 0;
     while (offset < bytes.len) {
         const rc = linux.write(fd, bytes[offset..].ptr, bytes.len - offset);
-        switch (posix.errno(rc)) {
+        switch (linux.errno(rc)) {
             .SUCCESS => {
                 if (rc == 0) return;
                 offset += rc;
@@ -315,7 +315,7 @@ fn futexWake(ptr: *const std.atomic.Value(u32), max_waiters: u32) void {
 fn nanoTimestampLinux() i128 {
     const linux = std.os.linux;
     var ts: linux.timespec = undefined;
-    switch (posix.errno(linux.clock_gettime(.REALTIME, &ts))) {
+    switch (linux.errno(linux.clock_gettime(.REALTIME, &ts))) {
         .SUCCESS => return @as(i128, ts.sec) * std.time.ns_per_s + @as(i128, ts.nsec),
         else => return 0,
     }
@@ -324,7 +324,7 @@ fn nanoTimestampLinux() i128 {
 fn monotonicNanoTimestampLinux() i128 {
     const linux = std.os.linux;
     var ts: linux.timespec = undefined;
-    switch (posix.errno(linux.clock_gettime(.MONOTONIC, &ts))) {
+    switch (linux.errno(linux.clock_gettime(.MONOTONIC, &ts))) {
         .SUCCESS => return @as(i128, ts.sec) * std.time.ns_per_s + @as(i128, ts.nsec),
         else => return nanoTimestampLinux(),
     }
@@ -339,7 +339,7 @@ fn sleepLinux(ns: u64) void {
     var rem: linux.timespec = undefined;
 
     while (true) {
-        switch (posix.errno(linux.nanosleep(&req, &rem))) {
+        switch (linux.errno(linux.nanosleep(&req, &rem))) {
             .SUCCESS => return,
             .INTR => req = rem,
             else => return,
@@ -352,7 +352,7 @@ fn randomBytesSecureLinux(buf: []u8) !void {
     var offset: usize = 0;
     while (offset < buf.len) {
         const rc = linux.getrandom(buf[offset..].ptr, buf.len - offset, 0);
-        switch (posix.errno(rc)) {
+        switch (linux.errno(rc)) {
             .SUCCESS => {
                 if (rc == 0) return error.EntropyUnavailable;
                 offset += rc;

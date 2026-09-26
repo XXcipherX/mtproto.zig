@@ -421,7 +421,7 @@ fn linuxListen(a: Address, options: Address.ListenOptions) ListenError!Server {
         linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK,
         0,
     );
-    const fd: posix.fd_t = switch (posix.errno(socket_rc)) {
+    const fd: posix.fd_t = switch (linux.errno(socket_rc)) {
         .SUCCESS => @intCast(socket_rc),
         .ACCES, .PERM => return error.PermissionDenied,
         .AFNOSUPPORT => return error.AddressFamilyNotSupported,
@@ -439,7 +439,7 @@ fn linuxListen(a: Address, options: Address.ListenOptions) ListenError!Server {
     }
 
     const bind_rc = linux.bind(fd, &a.any, a.getOsSockLen());
-    switch (posix.errno(bind_rc)) {
+    switch (linux.errno(bind_rc)) {
         .SUCCESS => {},
         .ACCES, .PERM => return error.PermissionDenied,
         .ADDRINUSE => return error.AddressInUse,
@@ -452,7 +452,7 @@ fn linuxListen(a: Address, options: Address.ListenOptions) ListenError!Server {
     }
 
     const listen_rc = linux.listen(fd, options.kernel_backlog);
-    switch (posix.errno(listen_rc)) {
+    switch (linux.errno(listen_rc)) {
         .SUCCESS => {},
         .ADDRINUSE => return error.AddressInUse,
         .MFILE => return error.ProcessFdQuotaExceeded,
@@ -478,7 +478,7 @@ fn linuxSetSockOptIntAtLevel(fd: posix.fd_t, level: i32, optname: u32, value: i3
         bytes.ptr,
         @intCast(bytes.len),
     );
-    switch (posix.errno(rc)) {
+    switch (linux.errno(rc)) {
         .SUCCESS => {},
         .ACCES, .PERM => return error.PermissionDenied,
         .NOBUFS, .NOMEM => return error.SystemResources,

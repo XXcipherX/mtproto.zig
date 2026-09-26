@@ -130,7 +130,8 @@ def wait_for_proxy(proc: subprocess.Popen[str], port: int, timeout: float) -> No
     raise RuntimeError(f"proxy did not listen on port {port}: {last_error}")
 
 
-def write_config(path: Path, port: int) -> None:
+def write_config(path: Path, port: int, workers: int) -> None:
+    worker_line = f"workers = {workers}" if workers != 1 else ""
     path.write_text(
         textwrap.dedent(
             f"""\
@@ -140,6 +141,7 @@ def write_config(path: Path, port: int) -> None:
 
             [server]
             port = {port}
+            {worker_line}
             public_ip = "127.0.0.1"
             max_connections = 64
             idle_timeout_sec = 30
@@ -162,6 +164,35 @@ def write_config(path: Path, port: int) -> None:
     )
 
 
+def wait_for_reuseport_listeners(proc: subprocess.Popen[str], port: int, count: int) -> None:
+    """Distinct live socket inodes on one address/port prove the kernel group exists."""
+    deadline = time.monotonic() + 8
+    groups: dict[tuple[str, str], set[str]] = {}
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError(f"proxy exited during worker startup with code {proc.returncode}")
+        owned: set[str] = set()
+        for fd in Path(f"/proc/{proc.pid}/fd").iterdir():
+            try:
+                target = os.readlink(fd)
+            except OSError:
+                continue
+            if target.startswith("socket:[") and target.endswith("]"):
+                owned.add(target[8:-1])
+        groups = {}
+        for table in (Path("/proc/net/tcp"), Path("/proc/net/tcp6")):
+            for row in table.read_text(encoding="ascii").splitlines()[1:]:
+                fields = row.split()
+                if (fields[3] == "0A" and int(fields[1].rsplit(":", 1)[1], 16) == port
+                        and fields[9] in owned):
+                    family_address = (table.name, fields[1])
+                    groups.setdefault(family_address, set()).add(fields[9])
+        if any(len(inodes) == count for inodes in groups.values()):
+            return
+        time.sleep(0.04)
+    raise AssertionError(f"expected {count} live reuseport listeners on one address/port, found {groups}")
+
+
 def stop_process(proc: subprocess.Popen[str]) -> None:
     if proc.poll() is not None:
         return
@@ -181,6 +212,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--proxy-bin", required=True)
     parser.add_argument("--obf-gen", required=True)
+    parser.add_argument("--workers", type=int, default=1, choices=(1, 2))
     args = parser.parse_args()
 
     proxy_bin = Path(args.proxy_bin).resolve()
@@ -198,7 +230,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="mtproto-process-e2e-") as temp_dir:
         config_path = Path(temp_dir) / "config.toml"
         log_path = Path(temp_dir) / "proxy.log"
-        write_config(config_path, proxy_port)
+        write_config(config_path, proxy_port, args.workers)
 
         with log_path.open("w", encoding="utf-8") as log_file:
             proc = subprocess.Popen(
@@ -216,6 +248,8 @@ def main() -> int:
 
         try:
             wait_for_proxy(proc, proxy_port, 8)
+            if args.workers > 1:
+                wait_for_reuseport_listeners(proc, proxy_port, args.workers)
             with socket.create_connection(("127.0.0.1", proxy_port), timeout=2) as client:
                 client.settimeout(5)
                 hello = build_tls_auth_client_hello(bytes.fromhex(SECRET_HEX), TLS_DOMAIN)
@@ -245,6 +279,10 @@ def main() -> int:
                     f"fake DC received {len(fake_dc.received)} bytes; "
                     f"expected {DC_NONCE_SIZE + len(CLIENT_PAYLOAD)}"
                 )
+            proc.terminate()
+            proc.wait(timeout=5)
+            if proc.returncode != 0:
+                raise AssertionError(f"proxy did not complete graceful shutdown: {proc.returncode}")
         except BaseException as error:  # noqa: BLE001 - preserve complete process diagnostics.
             stop_process(proc)
             output = log_path.read_text(encoding="utf-8", errors="replace")
@@ -255,7 +293,7 @@ def main() -> int:
             fake_dc.stop()
             stop_process(proc)
 
-    print("process E2E passed: FakeTLS, obfuscation, direct C2S and S2C relay")
+    print(f"process E2E passed: workers={args.workers}, FakeTLS, obfuscation, direct C2S and S2C relay")
     return 0
 
 

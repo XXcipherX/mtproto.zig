@@ -1,20 +1,17 @@
 //! Owned background DNS refresh. Event loops only copy bounded snapshots.
 const std = @import("std");
 const builtin = @import("builtin");
+const compat = @import("../compat.zig");
 const net = @import("net_helpers.zig");
 
 pub const Cache = struct {
     allocator: std.mem.Allocator,
     entries: std.ArrayList(Entry) = .empty,
-    mutex: std.Io.Mutex = .init,
+    mutex: compat.BlockingMutex = .{},
     stopping: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
     const Entry = struct { host: []const u8, port: u16, addresses: net.AddressCandidates, literal: bool };
     const Resolver = *const fn (std.mem.Allocator, []const u8, u16) anyerror!net.AddressList;
-
-    fn io() std.Io {
-        return std.Io.Threaded.global_single_threaded.io();
-    }
 
     pub fn create(allocator: std.mem.Allocator) !*Cache {
         const self = try allocator.create(Cache);
@@ -43,8 +40,8 @@ pub const Cache = struct {
     }
 
     pub fn snapshot(self: *Cache, id: usize) net.AddressCandidates {
-        self.mutex.lockUncancelable(io());
-        defer self.mutex.unlock(io());
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return self.entries.items[id].addresses;
     }
 
@@ -75,9 +72,9 @@ pub const Cache = struct {
                     return !net.isIpv6(a) and net.isIpv6(b);
                 }
             }.less);
-            self.mutex.lockUncancelable(io());
+            self.mutex.lock();
             self.entries.items[id].addresses = .init(list.addrs);
-            self.mutex.unlock(io());
+            self.mutex.unlock();
         }
     }
 
@@ -85,7 +82,7 @@ pub const Cache = struct {
         while (!self.stopping.load(.acquire)) {
             for (0..600) |_| {
                 if (self.stopping.load(.acquire)) return;
-                std.Io.sleep(io(), .fromMilliseconds(100), .awake) catch return;
+                compat.sleep(100 * std.time.ns_per_ms);
             }
             self.refresh(resolve);
         }

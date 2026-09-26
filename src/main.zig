@@ -187,7 +187,7 @@ const ShutdownSignalBridge = struct {
         errdefer posix.sigprocmask(posix.SIG.SETMASK, &previous_mask, null);
 
         const rc = linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
-        const fd: posix.fd_t = switch (posix.errno(rc)) {
+        const fd: posix.fd_t = switch (linux.errno(rc)) {
             .SUCCESS => @intCast(rc),
             .MFILE => return error.ProcessFdQuotaExceeded,
             .NFILE => return error.SystemFdQuotaExceeded,
@@ -618,10 +618,11 @@ fn percentOfMemory(value: u64, percent: u8) u64 {
 
 fn estimateCapacity(cfg: *const config.Config, total_ram_bytes: u64) CapacityEstimate {
     // Guaranteed per-connection baseline in the epoll model. Relay queue pages,
-    // MiddleProxy growth, and shared scratch are charged to one runtime-enforced
-    // managed budget instead of multiplying their rare maxima by every slot.
+    // MiddleProxy growth and its scratch are charged to one process
+    // runtime-enforced managed budget (partitioned if workers > 1) instead of
+    // multiplying their rare maxima by every slot.
     // Deliberately keep the admission estimate conservative even though relay
-    // reads now use one event-loop-wide scratch buffer rather than 4 KiB/slot.
+    // reads now use one scratch buffer per event loop rather than 4 KiB/slot.
     const tls_working_bytes: u64 = @intCast(6 * 1024);
     const requires_middle_proxy_runtime = cfg.requiresMiddleProxyRuntime();
     const managed_initial_per_conn_bytes: u64 = if (requires_middle_proxy_runtime)

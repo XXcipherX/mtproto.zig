@@ -44,6 +44,14 @@ port = 443
 # unsafe_override_limits=true.
 # max_connections = 512
 
+# MTProto data-plane workers. 1 preserves the original single-loop behavior;
+# 0 auto-selects from CPUs, max_connections (at least 32 slots per worker),
+# and the process managed-buffer budget (at least 8 MiB per worker, or
+# MiddleProxy scratch plus 4 MiB when that requires more).
+# Explicit values are limited to 1..16 and fail startup if the effective
+# connection/memory budgets cannot support them. WEB relay stays separate.
+# workers = 1
+
 # Established relay idle timeout in seconds.
 # The first client byte is independently capped at 10 seconds; configured
 # values below 10 seconds lower that admission deadline.

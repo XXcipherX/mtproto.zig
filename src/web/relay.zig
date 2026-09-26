@@ -514,7 +514,7 @@ pub const Relay = struct {
             self.drainPendingCloses();
 
             const rc = linux.epoll_wait(self.epoll_fd, events[0..].ptr, @intCast(events.len), event_loop_wait_ms);
-            switch (posix.errno(rc)) {
+            switch (linux.errno(rc)) {
                 .SUCCESS => {},
                 .INTR => continue,
                 else => |err| return posix.unexpectedErrno(err),
@@ -562,7 +562,7 @@ pub const Relay = struct {
         if (want_out) flags |= linux.EPOLL.OUT;
         var ev = linux.epoll_event{ .events = flags, .data = .{ .fd = fd } };
         const rc = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_ADD, fd, &ev);
-        switch (posix.errno(rc)) {
+        switch (linux.errno(rc)) {
             .SUCCESS => {},
             else => |err| return posix.unexpectedErrno(err),
         }

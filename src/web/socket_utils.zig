@@ -20,7 +20,7 @@ pub const AcceptResult = struct {
 
 pub fn epollCreate() !posix.fd_t {
     const rc = linux.epoll_create1(linux.EPOLL.CLOEXEC);
-    switch (posix.errno(rc)) {
+    switch (linux.errno(rc)) {
         .SUCCESS => return @intCast(rc),
         else => |err| return posix.unexpectedErrno(err),
     }

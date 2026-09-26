@@ -50,7 +50,11 @@ DC override exists only in that dedicated executable; normal builds cannot accep
 the test-only command-line option. This Linux-only scenario needs Python 3 but no
 Telegram connectivity or elevated privileges.
 
-CI executes both `zig build e2e` and `zig build -Doptimize=ReleaseFast e2e`.
+`zig build e2e -- --workers=2` additionally verifies two live listening
+socket inodes on the same address/port (a real `SO_REUSEPORT` group), completes
+the relay, and checks graceful process shutdown. CI executes the default,
+two-worker, and `zig build -Doptimize=ReleaseFast e2e` variants. Deep CI runs
+the two-worker variant with ThreadSanitizer instrumentation.
 The latter applies the repository's actual shipping policy (`ReleaseSafe` for the
 internet-facing data plane by default), catching runtime-only release defects that
 a cross-compile or binary-exists check cannot detect.
