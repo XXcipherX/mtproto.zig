@@ -54,6 +54,15 @@ const EventIoBudget = connection.EventIoBudget;
 const ConnectionSlot = connection.ConnectionSlot;
 pub const BenchCandidatePath = connection.BenchCandidatePath;
 const secureFree = connection.secureFree;
+const connection_pool = @import("connection_pool.zig");
+const epoll_listener_token = connection_pool.epoll_listener_token;
+const epoll_timer_token = connection_pool.epoll_timer_token;
+const epoll_shutdown_token = connection_pool.epoll_shutdown_token;
+const SlotFdRole = connection_pool.SlotFdRole;
+const nextSlotGeneration = connection_pool.nextSlotGeneration;
+const encodeSlotEventToken = connection_pool.encodeSlotEventToken;
+const decodeSlotEventToken = connection_pool.decodeSlotEventToken;
+const ConnectionPool = connection_pool.ConnectionPool;
 
 const log = std.log.scoped(.proxy);
 
@@ -93,46 +102,6 @@ const pre_first_byte_timeout_ms: i64 = 10 * std.time.ms_per_s;
 const middle_proxy_stage_timeout_ms: i64 = 5 * std.time.ms_per_s;
 const tls_control_record_budget: usize = 8;
 const tls_control_byte_budget: usize = 64 * 1024;
-const epoll_listener_token: u64 = 0;
-const epoll_timer_token: u64 = 1;
-const epoll_shutdown_token: u64 = 2;
-const max_slot_generation: u32 = 0x7fff_ffff;
-
-const SlotFdRole = enum(u1) {
-    client = 0,
-    upstream = 1,
-};
-
-const SlotEventToken = struct {
-    index: u32,
-    generation: u32,
-    role: SlotFdRole,
-};
-
-fn nextSlotGeneration(current: u32) u32 {
-    const next = (current +% 1) & max_slot_generation;
-    return if (next == 0) 1 else next;
-}
-
-fn encodeSlotEventToken(slot: *const ConnectionSlot, role: SlotFdRole) u64 {
-    const generation = switch (role) {
-        .client => slot.client_event_generation,
-        .upstream => slot.upstream_event_generation,
-    };
-    return @as(u64, slot.index) |
-        (@as(u64, generation) << 32) |
-        (@as(u64, @intFromEnum(role)) << 63);
-}
-
-fn decodeSlotEventToken(token: u64) ?SlotEventToken {
-    const generation: u32 = @intCast((token >> 32) & @as(u64, max_slot_generation));
-    if (generation == 0) return null;
-    return .{
-        .index = @truncate(token),
-        .generation = generation,
-        .role = @enumFromInt(@as(u1, @truncate(token >> 63))),
-    };
-}
 
 fn isInvalidFd(fd: posix.fd_t) bool {
     return fd == invalid_fd;
@@ -391,90 +360,6 @@ const MiddleProxyCooldown = struct {
 const DeadlineEntry = struct {
     deadline_ns: i128,
     slot_index: u32,
-};
-
-const ConnectionPool = struct {
-    allocator: std.mem.Allocator,
-    slots: []?*ConnectionSlot,
-    free_stack: []u32,
-    free_count: u32,
-
-    fn init(allocator: std.mem.Allocator, capacity: u32) !ConnectionPool {
-        const slots = try allocator.alloc(?*ConnectionSlot, capacity);
-        errdefer allocator.free(slots);
-
-        const free_stack = try allocator.alloc(u32, capacity);
-        errdefer allocator.free(free_stack);
-
-        for (slots) |*slot| {
-            slot.* = null;
-        }
-
-        var i: usize = 0;
-        while (i < capacity) : (i += 1) {
-            free_stack[i] = @intCast(capacity - 1 - i);
-        }
-
-        return ConnectionPool{
-            .allocator = allocator,
-            .slots = slots,
-            .free_stack = free_stack,
-            .free_count = capacity,
-        };
-    }
-
-    fn deinit(self: *ConnectionPool) void {
-        for (self.slots) |slot_opt| {
-            if (slot_opt) |slot_ptr| {
-                slot_ptr.resetOwnedBuffers(self.allocator);
-                self.allocator.destroy(slot_ptr);
-            }
-        }
-        self.allocator.free(self.free_stack);
-        self.allocator.free(self.slots);
-    }
-
-    fn acquire(self: *ConnectionPool) ?*ConnectionSlot {
-        if (self.free_count == 0) return null;
-        self.free_count -= 1;
-        const idx = self.free_stack[self.free_count];
-        if (self.slots[idx] == null) {
-            const fresh = self.allocator.create(ConnectionSlot) catch {
-                self.free_stack[self.free_count] = idx;
-                self.free_count += 1;
-                return null;
-            };
-            fresh.* = .{};
-            self.slots[idx] = fresh;
-        }
-
-        const slot = self.slots[idx].?;
-        const event_generation = slot.event_generation;
-        slot.* = .{};
-        slot.index = idx;
-        slot.event_generation = event_generation;
-        slot.client_queue.allocator = self.allocator;
-        slot.upstream_queue.allocator = self.allocator;
-        return slot;
-    }
-
-    fn release(self: *ConnectionPool, slot: *ConnectionSlot) void {
-        self.free_stack[self.free_count] = slot.index;
-        self.free_count += 1;
-        slot.phase = .idle;
-    }
-
-    fn getByToken(self: *ConnectionPool, token: SlotEventToken) ?*ConnectionSlot {
-        if (@as(usize, token.index) >= self.slots.len) return null;
-        const slot = self.slots[token.index] orelse return null;
-        if (slot.phase == .idle) return null;
-        const current_generation = switch (token.role) {
-            .client => slot.client_event_generation,
-            .upstream => slot.upstream_event_generation,
-        };
-        if (current_generation != token.generation) return null;
-        return slot;
-    }
 };
 
 fn readSlotFd(slot: *ConnectionSlot, fd: posix.fd_t, buffer: []u8) !usize {
@@ -6659,27 +6544,6 @@ test "relay half-close completes only after both FIN paths drain" {
     slot.client_queue.total_len = 0;
     slot.upstream_queue.total_len = 1;
     try std.testing.expect(!relayHalfCloseComplete(&slot));
-}
-
-test "epoll slot tokens preserve registration generation and fd role" {
-    var slot = ConnectionSlot{
-        .index = 123,
-        .client_event_generation = 77,
-        .upstream_event_generation = 91,
-    };
-
-    const client = decodeSlotEventToken(encodeSlotEventToken(&slot, .client)).?;
-    try std.testing.expectEqual(@as(u32, 123), client.index);
-    try std.testing.expectEqual(@as(u32, 77), client.generation);
-    try std.testing.expectEqual(SlotFdRole.client, client.role);
-
-    const upstream = decodeSlotEventToken(encodeSlotEventToken(&slot, .upstream)).?;
-    try std.testing.expectEqual(@as(u32, 91), upstream.generation);
-    try std.testing.expectEqual(SlotFdRole.upstream, upstream.role);
-    try std.testing.expectEqual(@as(u32, 1), nextSlotGeneration(max_slot_generation));
-    try std.testing.expect(decodeSlotEventToken(epoll_listener_token) == null);
-    try std.testing.expect(decodeSlotEventToken(epoll_timer_token) == null);
-    try std.testing.expect(decodeSlotEventToken(epoll_shutdown_token) == null);
 }
 
 test "fatal hangup close policy distinguishes client/upstream while connecting" {
