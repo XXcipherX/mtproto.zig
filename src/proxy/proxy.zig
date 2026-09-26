@@ -98,6 +98,8 @@ const invalid_fd = connection.invalid_fd;
 const UpstreamKind = connection.UpstreamKind;
 const MaskCause = connection.MaskCause;
 const ConnectionPhase = connection.ConnectionPhase;
+const RelayEofSide = connection.RelayEofSide;
+const connectionLifetimeMs = connection.connectionLifetimeMs;
 const MiddleProxyHandshakeStep = connection.MiddleProxyHandshakeStep;
 const DynamicRecordSizer = connection.DynamicRecordSizer;
 const EventIoBudget = connection.EventIoBudget;
@@ -278,6 +280,8 @@ pub const ProxyState = struct {
     stats_hs_timeout: std.atomic.Value(u64),
     stats_mp_fallback: std.atomic.Value(u64),
     stats_web_only_masked: std.atomic.Value(u64) = .init(0),
+    stats_relay_client_eof_first: std.atomic.Value(u64) = .init(0),
+    stats_relay_upstream_eof_first: std.atomic.Value(u64) = .init(0),
 
     middle_proxy_lock: MiddleProxyLock = .{},
     middle_proxy_addrs_primary: [5]net.Address,
@@ -444,6 +448,8 @@ pub const ProxyState = struct {
             .stats_hs_timeout = .init(0),
             .stats_mp_fallback = .init(0),
             .stats_web_only_masked = .init(0),
+            .stats_relay_client_eof_first = .init(0),
+            .stats_relay_upstream_eof_first = .init(0),
             .middle_proxy_addrs_primary = constants.tg_middle_proxies_v4,
             .middle_proxy_addrs_media_primary = constants.tg_media_middle_proxies_v4,
             .middle_proxy_addr_203 = constants.tg_cdn_middle_proxy_v4,
@@ -1338,6 +1344,8 @@ const EventLoop = struct {
     prev_mp_fallback: u64,
     prev_buffer_denials: u64,
     prev_web_only_masked: u64 = 0,
+    prev_relay_client_eof_first: u64 = 0,
+    prev_relay_upstream_eof_first: u64 = 0,
     relay_read_scratch: [relay_read_scratch_size]u8,
     mp_c2s_scratch: ?[]u8,
     mp_s2c_scratch: ?[]u8,
@@ -1405,6 +1413,8 @@ const EventLoop = struct {
         loop.prev_mp_fallback = 0;
         loop.prev_buffer_denials = 0;
         loop.prev_web_only_masked = 0;
+        loop.prev_relay_client_eof_first = 0;
+        loop.prev_relay_upstream_eof_first = 0;
         loop.relay_read_scratch = undefined;
         loop.mp_c2s_scratch = null;
         loop.mp_s2c_scratch = null;
@@ -1733,6 +1743,8 @@ const EventLoop = struct {
         const cur_mpf = if (primary) self.state.stats_mp_fallback.load(.monotonic) else self.prev_mp_fallback;
         const cur_buffer_denials = self.managed_buffers.denied_allocations;
         const cur_web_only_masked = if (primary) self.state.stats_web_only_masked.load(.monotonic) else self.prev_web_only_masked;
+        const cur_client_eof_first = if (primary) self.state.stats_relay_client_eof_first.load(.monotonic) else self.prev_relay_client_eof_first;
+        const cur_upstream_eof_first = if (primary) self.state.stats_relay_upstream_eof_first.load(.monotonic) else self.prev_relay_upstream_eof_first;
 
         const d_cap = cur_cap - self.prev_dropped_cap;
         const d_sat = cur_sat - self.prev_dropped_saturation;
@@ -1742,6 +1754,8 @@ const EventLoop = struct {
         const d_mpf = cur_mpf - self.prev_mp_fallback;
         const d_buffer_denials = cur_buffer_denials - self.prev_buffer_denials;
         const d_web_only_masked = cur_web_only_masked - self.prev_web_only_masked;
+        const d_client_eof_first = cur_client_eof_first - self.prev_relay_client_eof_first;
+        const d_upstream_eof_first = cur_upstream_eof_first - self.prev_relay_upstream_eof_first;
 
         self.prev_dropped_cap = cur_cap;
         self.prev_dropped_saturation = cur_sat;
@@ -1751,6 +1765,8 @@ const EventLoop = struct {
         self.prev_mp_fallback = cur_mpf;
         self.prev_buffer_denials = cur_buffer_denials;
         self.prev_web_only_masked = cur_web_only_masked;
+        self.prev_relay_client_eof_first = cur_client_eof_first;
+        self.prev_relay_upstream_eof_first = cur_upstream_eof_first;
 
         const has_global_drops = d_cap + d_sat + d_rate + d_hs + d_hst + d_mpf > 0;
 
@@ -1784,6 +1800,9 @@ const EventLoop = struct {
 
         if (d_web_only_masked > 0) {
             log.info("web_only: direct clients masked+={d}", .{d_web_only_masked});
+        }
+        if (d_client_eof_first != 0 or d_upstream_eof_first != 0) {
+            log.info("relay first EOF: client+={d} upstream+={d}", .{ d_client_eof_first, d_upstream_eof_first });
         }
 
         if (self.wedge_candidates_since_log + self.wedge_cancelled_since_log +
@@ -4392,11 +4411,15 @@ const EventLoop = struct {
         }
 
         slot.wedge.reset();
-        switch (role) {
-            .client => {
-                slot.client_read_closed = true;
-            },
-            .upstream => slot.upstream_read_closed = true,
+        const side: RelayEofSide = switch (role) {
+            .client => .client,
+            .upstream => .upstream,
+        };
+        if (slot.recordRelayReadEof(side)) {
+            switch (side) {
+                .client => countStat(&self.state.stats_relay_client_eof_first),
+                .upstream => countStat(&self.state.stats_relay_upstream_eof_first),
+            }
         }
         slot.last_activity_ms = runtime_time.monotonicMilli();
         self.maybeAdvanceRelayHalfClose(slot);
@@ -4551,11 +4574,13 @@ const EventLoop = struct {
 
     fn closeSlot(self: *EventLoop, slot: *ConnectionSlot, reason: []const u8) void {
         if (slot.phase == .idle) return;
+        const first_eof = if (slot.first_relay_eof) |side| @tagName(side) else "none";
+        const lifetime_ms = connectionLifetimeMs(slot.created_at_ms, runtime_time.monotonicMilli());
         if (slot.phase == .mask_relaying) {
             var client_ip_buf: [64]u8 = undefined;
             const client_ip = formatClientIp(slot.peer_addr, &client_ip_buf);
             if (slot.mask_timestamp_skew_s) |skew_s| {
-                log.debug("[{d}] closing: dc_idx={d} media={} phase={s} mask_cause={s} skew_s={d} reason={s} raw_c2s={d} raw_s2c={d} client={s}", .{
+                log.debug("[{d}] closing: dc_idx={d} media={} phase={s} mask_cause={s} skew_s={d} reason={s} raw_c2s={d} raw_s2c={d} first_eof={s} lifetime_ms={d} client={s}", .{
                     slot.conn_id,
                     slot.dc_idx,
                     slot.is_media_path,
@@ -4565,10 +4590,12 @@ const EventLoop = struct {
                     reason,
                     slot.mask_c2s_bytes,
                     slot.mask_s2c_bytes,
+                    first_eof,
+                    lifetime_ms,
                     client_ip,
                 });
             } else {
-                log.debug("[{d}] closing: dc_idx={d} media={} phase={s} mask_cause={s} reason={s} raw_c2s={d} raw_s2c={d} client={s}", .{
+                log.debug("[{d}] closing: dc_idx={d} media={} phase={s} mask_cause={s} reason={s} raw_c2s={d} raw_s2c={d} first_eof={s} lifetime_ms={d} client={s}", .{
                     slot.conn_id,
                     slot.dc_idx,
                     slot.is_media_path,
@@ -4577,13 +4604,15 @@ const EventLoop = struct {
                     reason,
                     slot.mask_c2s_bytes,
                     slot.mask_s2c_bytes,
+                    first_eof,
+                    lifetime_ms,
                     client_ip,
                 });
             }
         } else {
             var client_ip_buf: [64]u8 = undefined;
             const client_ip = formatClientIp(slot.peer_addr, &client_ip_buf);
-            log.debug("[{d}] closing: dc_idx={d} media={} phase={s} reason={s} c2s={d} s2c={d} client={s}", .{
+            log.debug("[{d}] closing: dc_idx={d} media={} phase={s} reason={s} c2s={d} s2c={d} first_eof={s} lifetime_ms={d} client={s}", .{
                 slot.conn_id,
                 slot.dc_idx,
                 slot.is_media_path,
@@ -4591,6 +4620,8 @@ const EventLoop = struct {
                 reason,
                 slot.c2s_bytes,
                 slot.s2c_bytes,
+                first_eof,
+                lifetime_ms,
                 client_ip,
             });
         }

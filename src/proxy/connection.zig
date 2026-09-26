@@ -31,6 +31,16 @@ pub const ClientTransport = enum {
     direct_obfuscated,
 };
 
+pub const RelayEofSide = enum(u8) {
+    client,
+    upstream,
+};
+
+pub fn connectionLifetimeMs(created_at_ms: i64, now_ms: i64) u64 {
+    if (created_at_ms <= 0 or now_ms <= created_at_ms) return 0;
+    return @intCast(now_ms - created_at_ms);
+}
+
 pub const MaskCause = enum {
     none,
     non_tls,
@@ -314,6 +324,26 @@ pub const ConnectionSlot = struct {
     upstream_read_closed: bool = false,
     client_write_shutdown: bool = false,
     upstream_write_shutdown: bool = false,
+    first_relay_eof: ?RelayEofSide = null,
+
+    /// Record only a complete relay-frame EOF. Duplicate notifications and
+    /// non-relay phases must not affect the first observed source.
+    pub fn recordRelayReadEof(self: *ConnectionSlot, side: RelayEofSide) bool {
+        if (self.phase != .relaying and self.phase != .mask_relaying) return false;
+        switch (side) {
+            .client => {
+                if (self.client_read_closed) return false;
+                self.client_read_closed = true;
+            },
+            .upstream => {
+                if (self.upstream_read_closed) return false;
+                self.upstream_read_closed = true;
+            },
+        }
+        if (self.first_relay_eof != null) return false;
+        self.first_relay_eof = side;
+        return true;
+    }
 
     pub fn hasClientPending(self: *const ConnectionSlot) bool {
         return !self.client_queue.isEmpty();
@@ -504,6 +534,39 @@ pub const ConnectionSlot = struct {
         self.upstream_candidate_next = 0;
     }
 };
+
+test "relay first EOF survives the opposite FIN and duplicate notifications" {
+    var client_first = ConnectionSlot{ .phase = .relaying };
+    try std.testing.expect(client_first.recordRelayReadEof(.client));
+    try std.testing.expect(client_first.client_read_closed);
+    try std.testing.expect(!client_first.upstream_read_closed);
+    try std.testing.expect(!client_first.upstream_write_shutdown);
+    try std.testing.expect(!client_first.recordRelayReadEof(.upstream));
+    try std.testing.expect(!client_first.recordRelayReadEof(.client));
+    try std.testing.expectEqual(RelayEofSide.client, client_first.first_relay_eof.?);
+    try std.testing.expect(client_first.upstream_read_closed);
+
+    var upstream_first = ConnectionSlot{ .phase = .mask_relaying };
+    try std.testing.expect(upstream_first.recordRelayReadEof(.upstream));
+    try std.testing.expect(!upstream_first.recordRelayReadEof(.client));
+    try std.testing.expectEqual(RelayEofSide.upstream, upstream_first.first_relay_eof.?);
+    try std.testing.expect(upstream_first.client_read_closed);
+    try std.testing.expect(!upstream_first.client_write_shutdown);
+}
+
+test "non-relay EOF cannot become a relay initiator" {
+    var slot = ConnectionSlot{ .phase = .reading_tls_header };
+    try std.testing.expect(!slot.recordRelayReadEof(.client));
+    try std.testing.expect(slot.first_relay_eof == null);
+    try std.testing.expect(!slot.client_read_closed);
+    try std.testing.expect(!slot.upstream_read_closed);
+}
+
+test "connection lifetime uses monotonic elapsed milliseconds" {
+    try std.testing.expectEqual(@as(u64, 725), connectionLifetimeMs(1000, 1725));
+    try std.testing.expectEqual(@as(u64, 0), connectionLifetimeMs(1725, 1000));
+    try std.testing.expectEqual(@as(u64, 0), connectionLifetimeMs(0, 1725));
+}
 
 /// Minimal production-path adapter used by the standalone handshake benchmark.
 /// Keeping candidate staging here makes the benchmark exercise the same

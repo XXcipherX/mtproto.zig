@@ -67,6 +67,7 @@ Connection-capacity methodology and command profiles: `test/README.md`.
 - Handshake and relay lifetimes are controlled by monotonic `timerfd` deadlines in an indexed min-heap (`handshake_timeout_sec`, `idle_timeout_sec`), not by periodic slot scans or `SO_RCVTIMEO`; a silent connection gets at most 10 seconds to send its first byte.
 - Unauthenticated sockets share a per-/24 or per-/48 concurrent allowance (`clamp(max_connections / 8, 16, 128)`). The global handshake-inflight budget is charged after the first byte and released after authentication.
 - Graceful `EPOLLRDHUP` is treated as a read-side hint and drained to actual EOF. Client and upstream read/write halves remain independent: queued data is flushed before `shutdown(SHUT_WR)` propagates FIN, while the reverse relay direction stays active.
+- The first frame-aligned relay EOF is recorded as client- or upstream-initiated without changing half-close behavior. Debug close diagnostics show `first_eof` and monotonic `lifetime_ms`; worker 0 alone reports process-wide first-EOF counters.
 - Failed non-blocking upstream connects are reclaimed immediately on fatal hangup events; the relay loop should not spin on dead upstream sockets.
 - The timerfd wakes only for the earliest connection/admission deadline or the 10-second aggregated `conn stats` report; timer maintenance does not scan the slot pool.
 - Client payload bytes pipelined after the 64-byte MTProto obfuscation nonce are buffered and forwarded once the upstream path is ready.
@@ -1256,6 +1257,7 @@ Interpretation:
 - `global drops: ... rate+=...` means the process-wide per-subnet rate limiter rejected excess new connections.
 - `global drops: ... hs_budget+=...` means either the global handshake-inflight budget or the process-wide per-subnet unauthenticated-socket allowance rejected a new handshake.
 - `global drops: ... mp_fallback+=...` means the MiddleProxy path degraded and the proxy recovered by reconnecting directly to the same DC.
+- `relay first EOF: client+=... upstream+=...` counts which side first ended reads on relay connections; it is a process-wide delta printed only by worker 0, not a count of all disconnects.
 - `worker ... memory_pressure+=...` means a relay page or MiddleProxy buffer allocation reached that worker's partition of the process hard limit; sustained increments call for a larger effective memory limit or a lower connection/traffic target.
 - `connection saturation ...` and `saturation eased ...` are the 90%/80% admission-control logs; if the second `paused=` flag is `true`, raise capacity only after checking RAM and probe results.
 
