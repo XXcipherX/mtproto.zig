@@ -41,7 +41,8 @@ Code anchors:
 - `src/proxy/security_state.zig`, `wedge_recovery.zig` (process-shared admission tables/gate and per-slot recovery tracker)
 - `src/proxy/middle_proxy_nat.zig`, `middle_proxy_routing.zig`, `timeout_policy.zig` (egress discovery, route/cooldown policy, connection timeout calculations)
 - `src/proxy/socket_ops.zig`, `src/runtime/tcp_options.zig`, `src/runtime/linux_events.zig` (proxy-specific socket errors, shared best-effort TCP tuning, and epoll/timerfd/eventfd primitives)
-- `src/main.zig` (startup banner, capacity estimate, lock-free logger, public-IP detection)
+- `src/main.zig` (CLI/startup orchestration, capacity policy/banner, lock-free logger, public-IP detection)
+- `src/runtime/resources.zig`, `src/runtime/signals.zig` (host/cgroup memory detection and the process signal/eventfd bridge; neither owns the application `std.Io` backend)
 - `src/http_fetch.zig` (bounded HTTPS fetch helper for background public-IPv4 and MiddleProxy metadata discovery)
 - `deploy/setup_tunnel.sh` (namespace + AmneziaWG deployment path)
 
@@ -237,7 +238,7 @@ The startup ceiling no longer multiplies every connection by two full 4 MiB rela
 
 The runtime limit includes the 16 KiB-per-direction MiddleProxy baseline for every configured slot plus the shared burst reserve, but is capped so the unmanaged baseline and managed allocation ceiling cannot exceed `allocatable_bytes` together. This baseline applies to every normal runtime because CDN DC203 can require MiddleProxy independently of the optional DC1..5 routing preferences; only the test-only `datacenter_override` bypasses it. The 6 KiB TLS working allowance remains intentionally conservative after the relay read buffer becomes event-loop-wide; do not raise the advertised RAM ceiling merely by subtracting that former per-slot allocation. When effective memory cannot be detected, the managed pool uses a 64 MiB default. For a 960 MiB limit and `max_connections=256`, the banner reports a ~40 KiB baseline, ~216 MiB shared dynamic-pool limit, a baseline RAM ceiling of ~5324, the separately configured cap, and the 90%/80% admission hysteresis.
 
-The cgroup detector resolves the process membership through `/proc/self/cgroup` and `/proc/self/mountinfo`, then takes the lowest readable leaf or ancestor limit. In cgroup v2 a numeric `0` is a real hard limit; only `max` means unlimited. Conventional `/sys/fs/cgroup` paths remain a fallback when procfs mount metadata is unavailable.
+`runtime/resources.zig` resolves the process membership through `/proc/self/cgroup` and `/proc/self/mountinfo`, then takes the lowest readable leaf or ancestor limit. In cgroup v2 a numeric `0` is a real hard limit; only `max` means unlimited. Conventional `/sys/fs/cgroup` paths remain a fallback when procfs mount metadata is unavailable. `main.zig` retains the application capacity formula and startup policy.
 
 If `max_connections` exceeds the baseline RAM ceiling, startup auto-clamps it before the proxy starts unless `[server].unsafe_override_limits = true`. If the ceiling is below the supported minimum of 32 slots, safe mode fails startup instead of forcing 32. With the override enabled, startup keeps the configured value and logs a warning; the shared dynamic-pool hard limit remains active. If neither host nor cgroup memory can be read on Linux, startup logs that the RAM admission clamp was skipped.
 
