@@ -38,10 +38,10 @@ port = 443
 # TCP listen queue depth. Higher values absorb connection bursts better.
 # backlog = 4096
 
-# Maximum concurrent client connections. The pool allocates slot indexes and
-# fd maps for this cap at startup; ConnectionSlot objects themselves are
-# created on demand. Startup auto-clamps this to a RAM-safe estimate unless
-# unsafe_override_limits=true.
+# Maximum concurrent client connections. Worker pools preallocate slot-pointer
+# tables and free-index stacks for their share of this cap. ConnectionSlot
+# objects are created on demand. Startup auto-clamps this to a RAM-safe
+# estimate unless unsafe_override_limits=true.
 # max_connections = 512
 
 # MTProto data-plane workers. 1 preserves the original single-loop behavior;
