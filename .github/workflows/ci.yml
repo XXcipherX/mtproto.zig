@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
   pull_request:
@@ -29,6 +30,9 @@ jobs:
 
       - name: Test benchmark and probe helpers
         run: python3 -m unittest discover -s test -p 'test_probe_helpers.py'
+
+      - name: Test offline stress harness helpers
+        run: python3 -m unittest discover -s test -p 'test_stress_helpers.py'
 
       - name: Test WEB setup end-to-end probe fixtures
         run: python3 -m unittest discover -s test -p 'test_web_setup_probe.py'
