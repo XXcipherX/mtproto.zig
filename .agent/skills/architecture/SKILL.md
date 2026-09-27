@@ -120,6 +120,51 @@ from a low-level module into `EventLoop`.
 6. MiddleProxy TCP and endpoint-specific handshake failures try the next candidate within the original client handshake deadline. After candidates are exhausted, the proxy can reconnect directly only when the selected DC has a real fallback endpoint. Shared-secret/metadata failures skip futile same-version MP retries; DC203 never uses a raw direct fallback.
 7. Bidirectional relay starts (`relaying` phase).
 
+## Offline Relay Stress Boundary
+
+`test/stress_ci.py` and `.github/workflows/stress-ci.yml` exercise this same
+FakeTLS → obfuscated MTProto → direct-DC relay path with thousands of complete
+synthetic sessions, not merely TCP/FakeTLS capacity. The asyncio fake DC derives
+the direct nonce ciphers and validates connection-ID/sequence/checksum-bound
+intermediate frames; each client verifies its own decrypted response. The
+batch nonce generator uses the production obfuscation implementation. The
+loopback DC override exists only in `mtproto-proxy-e2e` under compile-time
+`e2e_test_hooks`; normal shipping `mtproto-proxy` cannot select it. The harness
+keeps production worker-local epoll/queues/deadlines and process-wide admission
+tables intact, including the 128 in-flight per-subnet handshake bound. A
+64-connection opening gate avoids making valid load appear hostile. Stress CI
+derives capacity from the seeded population with headroom above the 90%
+admission-pause threshold, checks the live reuseport group
+for multi-worker runs, and records worker-local stats and resource recovery.
+The resource timeline also records Linux TCP keepalive/abort and softnet
+receive-drop/budget counters to help diagnose socket timeout under load.
+The test-generated proxy idle timeout is at least one hour, beyond the hosted
+workflow's 45-minute limit, so intentionally idle held relays cannot expire
+before later stress phases; production idle settings are unchanged.
+The fake DC waits up to 61 minutes for a new frame's first byte; the remainder
+of its header and body each retain a 30-second timeout. Idle endurance peers
+are not protocol failures.
+The `queue_pressure` stress phase forces C2S and S2C backpressure only at
+synthetic peer sockets, below each 4 MiB relay-queue ceiling. S2C fake-DC
+responses are held until every request has been validated, separating its
+managed-peak increase from C2S congestion. Each direction must increase the
+historical worker-local managed peak and subsequently verify the full drained
+response stream; retained `MessageBlockPool` pages may keep current managed
+usage nonzero. Optional `endurance` holds a full persistent population over
+seeded, jittered light traffic and gradual full-relay reconnects, with periodic
+TCP/DC population and worker-heartbeat reconciliation. Its 20-minute default
+is manual only; the validation branch does not make the workflow's UI button or
+weekly schedule available without a default-branch workflow file.
+Its live-population invariant uses per-client Linux TCP inode/state plus
+proxy-side `ESTABLISHED` and fake-DC active logical IDs; retained Python session
+objects alone never prove liveness. Failure-time evidence must be captured
+before bounded cancellation/teardown, otherwise self-induced shutdown is
+misreported as a proxy failure. Targeted manual `proxy_log_level=debug` runs
+can correlate close reasons without making scheduled full load depend on debug
+logging overhead.
+Historical idle/TLS-auth capacity probes and the one-connection process E2E
+prove different, narrower properties; neither substitutes for this suite.
+
 ## WEB Proxy Flow (Telegram Desktop 7.1+)
 
 1. Telegram Desktop opens a browser HTTPS carrier to `[web].domain` on public `:443`; with the default `[web].only=false`, ordinary FakeTLS clients continue to use the same listener with `censorship.tls_domain`.

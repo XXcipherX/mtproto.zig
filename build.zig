@@ -123,6 +123,14 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    // Stress CI uses the same non-shipping proxy hook as process E2E, but
+    // installs both executables without running any local process tests.
+    const stress_tools = b.step("stress-tools", "Build the offline full-relay stress executables");
+    const install_stress_proxy = b.addInstallArtifact(e2e_proxy, .{});
+    const install_stress_generator = b.addInstallArtifact(obf_gen, .{});
+    stress_tools.dependOn(&install_stress_proxy.step);
+    stress_tools.dependOn(&install_stress_generator.step);
+
     const e2e_cmd = b.addSystemCommand(&.{"python3"});
     e2e_cmd.addFileArg(b.path("test/process_e2e.py"));
     e2e_cmd.addArg("--proxy-bin");

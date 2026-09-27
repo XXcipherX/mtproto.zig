@@ -59,6 +59,118 @@ The latter applies the repository's actual shipping policy (`ReleaseSafe` for th
 internet-facing data plane by default), catching runtime-only release defects that
 a cross-compile or binary-exists check cannot detect.
 
+## Offline full-relay Stress CI
+
+`.github/workflows/stress-ci.yml` is a separate Ubuntu 24.04 job; it is **not**
+part of each push/PR test. While this workflow lives only on the validation
+branch, GitHub does not show its `Run workflow` button or run its weekly schedule:
+those triggers require a workflow file on the default branch. The registered
+workflow can instead be dispatched explicitly from the validation branch with
+GitHub CLI (do not omit `--ref`):
+
+```bash
+gh workflow run stress-ci.yml --repo XXcipherX/mtproto.zig --ref stress-validation-36359107644 -f scenario=full
+gh workflow run stress-ci.yml --repo XXcipherX/mtproto.zig --ref stress-validation-36359107644 -f scenario=endurance -f endurance_minutes=20
+```
+
+These commands start remote GitHub jobs; they do not build or test on the local
+machine. `zig build -Doptimize=ReleaseFast
+stress-tools` builds the same compile-time-hooked E2E proxy plus a batch-mode
+obfuscated-handshake generator. The normal shipping executable has no DC
+override. No Telegram, public endpoint, self-hosted runner, Python package
+installation, or external network is used during the stress run.
+
+`test/stress_ci.py` creates a seed-deterministic number of connections for each
+virtual user, then ramps the population through 25/50/75/100%. Every counted
+relay first completes a unique, authenticated FakeTLS ClientHello; a fresh Zig-
+generated MTProto nonce; the real direct upstream connection; and a validated
+encrypted C2S/S2C exchange. The asyncio fake DC verifies the intermediate
+frame's connection ID, sequence, deterministic payload and checksum, and sends
+a response bound to that exact request. The client decrypts and verifies the
+complete response. Thus a held socket alone never counts as relay-ready.
+
+The one workflow supports `quick`, `steady`, `churn`, `adversarial`, `full`, and
+optional `endurance`, using shared ramp, steady traffic, burst, slow client/DC
+reader, reconnect,
+full-lifecycle churn, half-close, cleanup and graceful-shutdown phases. Both
+`adversarial` and `full` also include `queue_pressure`: 12 C2S and 24 S2C
+full-relay sessions use 252 validated 16,000-byte frames each. Only the
+synthetic recipient's receive buffer is reduced (requested 4096 bytes; effective
+Linux value is recorded) and its reads are paused. For S2C, the fake DC first
+validates and buffers all requests, then releases the responses while client
+reads are paused, so an increased worker managed-buffer peak is attributable to
+the S2C queue rather than upstream request congestion. Each direction must
+increase the historical worker peak relative to its own baseline, fully drain
+and verify every response, and show no managed-budget denial. The queue block
+pool intentionally retains freed pages, so nonzero managed *current* after
+drain is not by itself a leak.
+
+`endurance` uses the same seeded full-relay ramp and bounded cleanup, but holds
+the persistent population for 1–30 minutes (default 20). A seed-derived schedule
+varies the approximately 2-second traffic tick, selects a small set of distinct
+sessions per tick, weights body sizes toward 256/1024 bytes with occasional
+4096/16000-byte messages, and replaces roughly one connection every 9–18 seconds
+through the complete handshake/relay path. The proxy's test configuration sets
+idle timeout beyond the selected duration; it does not change production socket
+policy. Every 30 seconds the harness reconciles real client/proxy/DC liveness,
+worker heartbeats, pool drops, managed use and RSS. The report includes live
+start/min/end, reconnect and payload counts, RSS/FD range, managed stats, and
+Linux keepalive/abort and softnet-drop deltas. A nonzero system-wide TCP abort
+counter alone is diagnostic, not proof that this proxy lost a relay.
+
+Manual inputs are `scenario`, `proxy_log_level`, `users`, `connections_min`,
+`connections_max`, `workers`,
+`steady_seconds`, `active_percent`, `payload_bytes`, `traffic_interval_ms`,
+`churn_total`, `churn_concurrency`, `slow_reader_percent`,
+`reconnect_percent`, `success_threshold`, `seed`, and `endurance_minutes`.
+Empty inputs (and the weekly schedule if the workflow is ever promoted to the
+default branch) resolve to the single default set in `StressConfig`: `full`,
+`info` proxy logs, 1000 users, 5–15 connections/user, 2 workers, 60 s steady, 10% active,
+4096-byte bodies, 1000 ms interval, 20000 churn lifecycles, 500 churn task
+workers, 5% slow readers, 20% reconnect, 99.5% minimum success, seed 1337;
+`endurance_minutes=20` is used only for the optional endurance scenario.
+
+The harness rejects a requested population above 15000 simultaneous full
+relays or 200000 planned lifecycles, raises only its own soft `RLIMIT_NOFILE`
+when the runner hard limit permits, opens at most 64 handshakes concurrently,
+paces churn at 100 starts/s, and uses four loopback source /24s to reduce
+client ephemeral-port reuse pressure. It does not change global sysctls. The
+generated proxy config derives `max_connections` from the actual seeded total
+plus reconnect/churn headroom and keeps the planned peak below the proxy's
+90% admission-pause threshold. It disables only the per-subnet rate *rate* limit,
+keeps the shared in-flight handshake admission path, and sets `fast_mode=false`
+so both AES conversions execute. `workers=0` is auto, as in production. A
+multi-worker run also proves the live `SO_REUSEPORT` listener group.
+The generated proxy idle timeout is at least one hour, longer than the hosted
+job's 45-minute limit. Ordinary held relays therefore remain eligible for the
+later queue-pressure and churn checks even if those phases run slowly; this
+test-only setting does not change the production idle policy.
+The synthetic DC waits 61 minutes for the first byte of a *new* frame on an
+otherwise idle relay; the remaining header and body each have a 30-second
+completion timeout.
+
+Artifacts contain exact population/settings, per-phase results, sampled RSS/
+VM/FD/TCP, Linux TCP keepalive/abort and per-CPU receive-drop/budget counters,
+worker managed-buffer stats,
+proxy/fake-DC logs, and bounded
+failure context. Held Python objects do not count as live relays: the harness
+maps each client fd to its Linux TCP inode/state, cross-checks proxy-side
+`ESTABLISHED` and fake-DC active logical IDs, and removes dead sessions after
+each phase. Only deliberately slowed peers may be classified as expected
+adversarial closures; ordinary losses fail the configured threshold. Failure-
+time evidence is written before bounded teardown, separately from the post-
+cleanup state. Manual `proxy_log_level=debug` captures close reasons for
+targeted diagnosis; fake-DC peer-close reasons are recorded independently.
+Scheduled runs keep `info` to avoid observer overhead.
+Port/FD exhaustion on the generator is classified separately from proxy
+corruption. There is no throughput or latency hard gate; latency is reported
+only. MiddleProxy and WEB transport
+stress are future extensions, not covered by this direct-DC suite.
+
+The historical capacity numbers below are **idle sockets** or **FakeTLS-auth
+only**. They do not establish any full-MTProto-relay stress capacity; consult
+the actual Stress CI run artifact for that result.
+
 ## Handshake performance signals
 
 The standalone `mtproto-bench` program has two handshake-specific modes in

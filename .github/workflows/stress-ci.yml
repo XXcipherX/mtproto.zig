@@ -1,0 +1,122 @@
+name: Stress CI
+
+on:
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: "quick, steady, churn, adversarial, full, or endurance"
+        type: choice
+        options: [quick, steady, churn, adversarial, full, endurance]
+        default: full
+      proxy_log_level:
+        description: "Proxy diagnostics: info (default) or debug"
+        type: choice
+        options: [info, debug]
+        default: info
+      users:
+        description: "Virtual users (default 1000)"
+        type: string
+      connections_min:
+        description: "Minimum relay connections per user (default 5)"
+        type: string
+      connections_max:
+        description: "Maximum relay connections per user (default 15)"
+        type: string
+      workers:
+        description: "Proxy workers: 0=auto, 1..16 (default 2)"
+        type: string
+      steady_seconds:
+        description: "Steady phase duration, 0..600 (default 60)"
+        type: string
+      active_percent:
+        description: "Percent exchanging periodic traffic (default 10)"
+        type: string
+      payload_bytes:
+        description: "Intermediate-frame body bytes (default 4096)"
+        type: string
+      traffic_interval_ms:
+        description: "Steady traffic interval in ms (default 1000)"
+        type: string
+      churn_total:
+        description: "Full relay churn lifecycles (default 20000)"
+        type: string
+      churn_concurrency:
+        description: "Churn task workers, 1..500 (default 500)"
+        type: string
+      slow_reader_percent:
+        description: "Slow client and DC fraction (default 5)"
+        type: string
+      reconnect_percent:
+        description: "Reconnected full relay fraction (default 20)"
+        type: string
+      success_threshold:
+        description: "Minimum valid relay percent (default 99.5)"
+        type: string
+      seed:
+        description: "Deterministic population seed (default 1337)"
+        type: string
+      endurance_minutes:
+        description: "Endurance duration, 1..30 minutes (default 20; endurance only)"
+        type: string
+  schedule:
+    - cron: '17 3 * * 0'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stress-ci-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  full-relay:
+    name: Offline full-relay stress
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Test stress harness helpers
+        run: python3 -m unittest discover -s test -p 'test_stress_helpers.py'
+
+      - name: Build test-hooked proxy and batch nonce generator
+        run: zig build -Doptimize=ReleaseFast stress-tools
+
+      - name: Run offline full-relay stress
+        env:
+          STRESS_SCENARIO: ${{ inputs.scenario }}
+          STRESS_PROXY_LOG_LEVEL: ${{ inputs.proxy_log_level }}
+          STRESS_USERS: ${{ inputs.users }}
+          STRESS_CONNECTIONS_MIN: ${{ inputs.connections_min }}
+          STRESS_CONNECTIONS_MAX: ${{ inputs.connections_max }}
+          STRESS_WORKERS: ${{ inputs.workers }}
+          STRESS_STEADY_SECONDS: ${{ inputs.steady_seconds }}
+          STRESS_ACTIVE_PERCENT: ${{ inputs.active_percent }}
+          STRESS_PAYLOAD_BYTES: ${{ inputs.payload_bytes }}
+          STRESS_TRAFFIC_INTERVAL_MS: ${{ inputs.traffic_interval_ms }}
+          STRESS_CHURN_TOTAL: ${{ inputs.churn_total }}
+          STRESS_CHURN_CONCURRENCY: ${{ inputs.churn_concurrency }}
+          STRESS_SLOW_READER_PERCENT: ${{ inputs.slow_reader_percent }}
+          STRESS_RECONNECT_PERCENT: ${{ inputs.reconnect_percent }}
+          STRESS_SUCCESS_THRESHOLD: ${{ inputs.success_threshold }}
+          STRESS_SEED: ${{ inputs.seed }}
+          STRESS_ENDURANCE_MINUTES: ${{ inputs.endurance_minutes }}
+        run: |
+          python3 test/stress_ci.py \
+            --proxy-bin zig-out/bin/mtproto-proxy-e2e \
+            --obf-gen zig-out/bin/e2e-obf-handshake-gen \
+            --output-dir stress-artifacts
+
+      - name: Upload stress evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: stress-${{ github.run_id }}-${{ github.run_attempt }}
+          path: stress-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
