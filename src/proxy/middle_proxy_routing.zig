@@ -37,11 +37,185 @@ pub const MiddleProxyLock = struct {
 
 pub const middle_proxy_connect_cooldown_ms: i64 = 60 * std.time.ms_per_s;
 pub const middle_proxy_cooldown_slots = 32;
+pub const middle_proxy_health_slots = 192;
+const health_sample_max_ms: i64 = 60 * std.time.ms_per_s;
+const health_sample_ttl_ms: i64 = 10 * 60 * std.time.ms_per_s;
+const health_failure_penalty_ms: i64 = 5 * 60 * std.time.ms_per_s;
+const health_explore_every: u64 = 16;
 
 pub const MiddleProxyCooldown = struct {
     active: bool = false,
     addr: net.Address = undefined,
     until_ms: i64 = 0,
+};
+
+pub const MiddleProxyHealth = struct {
+    active: bool = false,
+    addr: net.Address = undefined,
+    connect_ewma_ms: u32 = 0,
+    auth_ewma_ms: u32 = 0,
+    connect_samples: u8 = 0,
+    auth_samples: u8 = 0,
+    failure_streak: u8 = 0,
+    last_success_ms: i64 = 0,
+    last_failure_ms: i64 = 0,
+    last_observed_ms: i64 = 0,
+};
+
+/// Bounded, by-value endpoint history. The caller holds the existing MP lock;
+/// neither routing nor health updates touch the relay data plane.
+pub const MiddleProxyHealthStore = struct {
+    entries: [middle_proxy_health_slots]MiddleProxyHealth = [_]MiddleProxyHealth{.{}} ** middle_proxy_health_slots,
+    selections: u64 = 0,
+
+    fn find(self: *MiddleProxyHealthStore, addr: net.Address) ?*MiddleProxyHealth {
+        for (&self.entries) |*entry| {
+            if (entry.active and isSameIpEndpoint(entry.addr, addr)) return entry;
+        }
+        return null;
+    }
+
+    fn findConst(self: *const MiddleProxyHealthStore, addr: net.Address) ?*const MiddleProxyHealth {
+        for (&self.entries) |*entry| {
+            if (entry.active and isSameIpEndpoint(entry.addr, addr)) return entry;
+        }
+        return null;
+    }
+
+    fn getOrCreate(self: *MiddleProxyHealthStore, addr: net.Address, now_ms: i64) *MiddleProxyHealth {
+        if (self.find(addr)) |entry| return entry;
+        var replacement = &self.entries[0];
+        for (&self.entries) |*entry| {
+            if (!entry.active) {
+                replacement = entry;
+                break;
+            }
+            if (entry.last_observed_ms < replacement.last_observed_ms) replacement = entry;
+        }
+        replacement.* = .{ .active = true, .addr = addr, .last_observed_ms = now_ms };
+        return replacement;
+    }
+
+    fn sampleMs(duration_ms: i64) u32 {
+        return @intCast(@min(@max(duration_ms, 1), health_sample_max_ms));
+    }
+
+    fn updateEwma(previous: u32, sample: u32, count: *u8) u32 {
+        // One overloaded connect/auth must not erase an otherwise stable
+        // route preference; sustained regressions still move the estimate.
+        const bounded_sample = if (count.* == 0) sample else @min(sample, previous * 4);
+        const estimate = if (count.* == 0) sample else @as(u32, @intCast((@as(u64, previous) * 7 + bounded_sample + 4) / 8));
+        count.* +|= 1;
+        return estimate;
+    }
+
+    pub fn noteConnect(self: *MiddleProxyHealthStore, addr: net.Address, duration_ms: i64, now_ms: i64) void {
+        const entry = self.getOrCreate(addr, now_ms);
+        entry.connect_ewma_ms = updateEwma(entry.connect_ewma_ms, sampleMs(duration_ms), &entry.connect_samples);
+        entry.last_observed_ms = now_ms;
+    }
+
+    pub fn noteAuth(self: *MiddleProxyHealthStore, addr: net.Address, duration_ms: i64, now_ms: i64) void {
+        const entry = self.getOrCreate(addr, now_ms);
+        entry.auth_ewma_ms = updateEwma(entry.auth_ewma_ms, sampleMs(duration_ms), &entry.auth_samples);
+        entry.failure_streak = 0;
+        entry.last_success_ms = now_ms;
+        entry.last_observed_ms = now_ms;
+    }
+
+    pub fn noteFailure(self: *MiddleProxyHealthStore, addr: net.Address, now_ms: i64) void {
+        const entry = self.getOrCreate(addr, now_ms);
+        entry.failure_streak +|= 1;
+        entry.last_failure_ms = now_ms;
+        entry.last_observed_ms = now_ms;
+    }
+
+    pub fn clear(self: *MiddleProxyHealthStore) void {
+        self.* = .{};
+    }
+
+    pub fn retain(self: *MiddleProxyHealthStore, candidates: []const net.Address) void {
+        for (&self.entries) |*entry| {
+            if (!entry.active) continue;
+            var present = false;
+            for (candidates) |addr| {
+                if (isSameIpEndpoint(entry.addr, addr)) {
+                    present = true;
+                    break;
+                }
+            }
+            if (!present) entry.* = .{};
+        }
+    }
+
+    const Grade = struct { tier: u8, latency_ms: u32 = 0 };
+
+    fn grade(self: *const MiddleProxyHealthStore, addr: net.Address, now_ms: i64) Grade {
+        const entry = self.findConst(addr) orelse return .{ .tier = 1 };
+        if (entry.failure_streak > 0 and now_ms - entry.last_failure_ms < health_failure_penalty_ms)
+            return .{ .tier = 2 };
+        if (entry.connect_samples < 2 or entry.auth_samples < 2 or
+            now_ms - entry.last_success_ms >= health_sample_ttl_ms)
+            return .{ .tier = 1 };
+        return .{ .tier = 0, .latency_ms = entry.connect_ewma_ms + entry.auth_ewma_ms };
+    }
+
+    fn precedes(a: Grade, b: Grade) bool {
+        if (a.tier != b.tier) return a.tier < b.tier;
+        if (a.tier != 0) return false;
+        const margin = @max(@as(u32, 10), b.latency_ms / 5);
+        return a.latency_ms + margin < b.latency_ms;
+    }
+
+    /// Preserve cooldown priority, then stably prefer confidently faster
+    /// authenticated endpoints. Every sixteenth selection samples one healthy
+    /// unknown/stale candidate so new metadata cannot remain unmeasured.
+    pub fn rank(
+        self: *MiddleProxyHealthStore,
+        candidates: *[16]net.Address,
+        candidate_len: usize,
+        cooldowns: []const MiddleProxyCooldown,
+        now_ms: i64,
+    ) void {
+        prioritizeMiddleProxyCandidates(candidates, candidate_len, cooldowns, now_ms);
+        const len = @min(candidate_len, candidates.len);
+        var healthy_len: usize = 0;
+        while (healthy_len < len and middleProxyCooldownUntilMs(cooldowns, candidates[healthy_len], now_ms) == null) : (healthy_len += 1) {}
+        self.selections +%= 1;
+        if (healthy_len < 2) return;
+
+        // Resolve the fixed-size history once per candidate while holding the
+        // metadata lock; insertion sort must not rescan it for every compare.
+        var grades: [16]Grade = undefined;
+        for (candidates[0..healthy_len], 0..) |addr, i| grades[i] = self.grade(addr, now_ms);
+        for (1..healthy_len) |i| {
+            var j = i;
+            while (j > 0 and precedes(grades[j], grades[j - 1])) : (j -= 1) {
+                std.mem.swap(net.Address, &candidates[j], &candidates[j - 1]);
+                std.mem.swap(Grade, &grades[j], &grades[j - 1]);
+            }
+        }
+
+        if (self.selections % health_explore_every != 0) return;
+        var unknown_count: usize = 0;
+        for (grades[0..healthy_len]) |item| {
+            if (item.tier == 1) unknown_count += 1;
+        }
+        if (unknown_count == 0) return;
+        var selected_unknown: usize = @intCast((self.selections / health_explore_every) % @as(u64, @intCast(unknown_count)));
+        for (grades[0..healthy_len], 0..) |item, i| {
+            if (item.tier != 1) continue;
+            if (selected_unknown > 0) {
+                selected_unknown -= 1;
+                continue;
+            }
+            const chosen = candidates[i];
+            var j = i;
+            while (j > 0) : (j -= 1) candidates[j] = candidates[j - 1];
+            candidates[0] = chosen;
+            break;
+        }
+    }
 };
 
 pub const MiddleProxySnapshot = struct {
@@ -581,4 +755,106 @@ test "middle-proxy cooldown tries earliest recovery first when all cooled" {
     try std.testing.expect(net.exactAddressEql(candidates[0], second));
     try std.testing.expect(net.exactAddressEql(candidates[1], third));
     try std.testing.expect(net.exactAddressEql(candidates[2], first));
+}
+
+test "middle-proxy health prefers a stably faster authenticated endpoint" {
+    const slow = net.ip4(.{ 11, 11, 11, 11 }, 443);
+    const fast = net.ip4(.{ 12, 12, 12, 12 }, 443);
+    var health: MiddleProxyHealthStore = .{};
+    for (0..2) |i| {
+        const now_ms: i64 = @as(i64, @intCast(i)) + 1_000;
+        health.noteConnect(slow, 180, now_ms);
+        health.noteAuth(slow, 220, now_ms);
+        health.noteConnect(fast, 40, now_ms);
+        health.noteAuth(fast, 60, now_ms);
+    }
+    const none = [_]MiddleProxyCooldown{};
+    var candidates = [_]net.Address{ slow, fast } ++ ([_]net.Address{slow} ** 14);
+    health.rank(&candidates, 2, &none, 2_000);
+    try std.testing.expect(net.exactAddressEql(candidates[0], fast));
+
+    // A single transient delay is bounded and cannot flip the preference.
+    health.noteConnect(fast, 60_000, 2_001);
+    health.noteAuth(fast, 60_000, 2_001);
+    candidates[0] = slow;
+    candidates[1] = fast;
+    health.rank(&candidates, 2, &none, 2_002);
+    try std.testing.expect(net.exactAddressEql(candidates[0], fast));
+}
+
+test "middle-proxy health keeps cooldown authoritative and ages stale samples" {
+    const first = net.ip4(.{ 11, 11, 11, 11 }, 443);
+    const second = net.ip4(.{ 12, 12, 12, 12 }, 443);
+    var health: MiddleProxyHealthStore = .{};
+    for (0..2) |i| {
+        const now_ms: i64 = @as(i64, @intCast(i)) + 1_000;
+        health.noteConnect(first, 30, now_ms);
+        health.noteAuth(first, 30, now_ms);
+        health.noteConnect(second, 200, now_ms);
+        health.noteAuth(second, 200, now_ms);
+    }
+    var candidates = [_]net.Address{ first, second } ++ ([_]net.Address{first} ** 14);
+    const cooled = [_]MiddleProxyCooldown{.{ .active = true, .addr = first, .until_ms = 3_000 }};
+    health.rank(&candidates, 2, &cooled, 2_000);
+    try std.testing.expect(net.exactAddressEql(candidates[0], second));
+
+    const none = [_]MiddleProxyCooldown{};
+    candidates[0] = second;
+    candidates[1] = first;
+    health.rank(&candidates, 2, &none, 2_000);
+    try std.testing.expect(net.exactAddressEql(candidates[0], first));
+    candidates[0] = second;
+    candidates[1] = first;
+    health.rank(&candidates, 2, &none, 2_000 + health_sample_ttl_ms);
+    try std.testing.expect(net.exactAddressEql(candidates[0], second));
+}
+
+test "middle-proxy health explores unknown endpoints and discards rotated metadata" {
+    const known = net.ip4(.{ 11, 11, 11, 11 }, 443);
+    const unknown = net.ip4(.{ 12, 12, 12, 12 }, 443);
+    var health: MiddleProxyHealthStore = .{};
+    health.noteConnect(known, 30, 1_000);
+    health.noteAuth(known, 30, 1_000);
+    health.noteConnect(known, 30, 1_001);
+    health.noteAuth(known, 30, 1_001);
+    const none = [_]MiddleProxyCooldown{};
+    for (0..15) |_| {
+        var candidates = [_]net.Address{ known, unknown } ++ ([_]net.Address{known} ** 14);
+        health.rank(&candidates, 2, &none, 2_000);
+        try std.testing.expect(net.exactAddressEql(candidates[0], known));
+    }
+    var candidates = [_]net.Address{ known, unknown } ++ ([_]net.Address{known} ** 14);
+    health.rank(&candidates, 2, &none, 2_000);
+    try std.testing.expect(net.exactAddressEql(candidates[0], unknown));
+
+    health.retain(&.{unknown});
+    try std.testing.expect(health.findConst(known) == null);
+    health.noteFailure(unknown, 2_001);
+    try std.testing.expectEqual(@as(u8, 1), health.findConst(unknown).?.failure_streak);
+    health.clear();
+    try std.testing.expect(health.findConst(unknown) == null);
+}
+
+test "middle-proxy health failure penalty ends after authenticated recovery" {
+    const fast = net.ip4(.{ 11, 11, 11, 11 }, 443);
+    const slow = net.ip4(.{ 12, 12, 12, 12 }, 443);
+    var health: MiddleProxyHealthStore = .{};
+    for (0..2) |i| {
+        const now_ms: i64 = @as(i64, @intCast(i)) + 1_000;
+        health.noteConnect(fast, 30, now_ms);
+        health.noteAuth(fast, 30, now_ms);
+        health.noteConnect(slow, 200, now_ms);
+        health.noteAuth(slow, 200, now_ms);
+    }
+    const none = [_]MiddleProxyCooldown{};
+    health.noteFailure(fast, 2_000);
+    var candidates = [_]net.Address{ fast, slow } ++ ([_]net.Address{fast} ** 14);
+    health.rank(&candidates, 2, &none, 2_001);
+    try std.testing.expect(net.exactAddressEql(candidates[0], slow));
+
+    health.noteAuth(fast, 30, 2_002);
+    candidates[0] = slow;
+    candidates[1] = fast;
+    health.rank(&candidates, 2, &none, 2_003);
+    try std.testing.expect(net.exactAddressEql(candidates[0], fast));
 }

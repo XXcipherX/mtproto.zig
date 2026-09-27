@@ -307,6 +307,7 @@ pub const ConnectionSlot = struct {
     mp_frame_encrypted: bool = false,
     mp_frame_first_decrypted: bool = false,
     mp_step_deadline_ms: i64 = 0,
+    mp_auth_started_at_ms: i64 = 0,
     mp_secret_version: u64 = 0,
     mp_nat_ip4: ?[4]u8 = null,
 
@@ -439,6 +440,7 @@ pub const ConnectionSlot = struct {
         self.handshake_pos = 0;
         self.mp_timestamp = 0;
         self.mp_secret_version = 0;
+        self.mp_auth_started_at_ms = 0;
         self.mp_nat_ip4 = null;
     }
 
@@ -490,6 +492,7 @@ pub const ConnectionSlot = struct {
         self.validation_force_direct = false;
         self.handshake_pos = 0;
         self.mp_secret_version = 0;
+        self.mp_auth_started_at_ms = 0;
         self.mp_nat_ip4 = null;
     }
 

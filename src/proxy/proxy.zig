@@ -52,6 +52,7 @@ const middle_proxy_handshake = @import("middle_proxy_handshake.zig");
 const middle_proxy_routing = @import("middle_proxy_routing.zig");
 const MiddleProxyLock = middle_proxy_routing.MiddleProxyLock;
 const MiddleProxyCooldown = middle_proxy_routing.MiddleProxyCooldown;
+const MiddleProxyHealthStore = middle_proxy_routing.MiddleProxyHealthStore;
 const MiddleProxySnapshot = middle_proxy_routing.MiddleProxySnapshot;
 const middle_proxy_connect_cooldown_ms = middle_proxy_routing.middle_proxy_connect_cooldown_ms;
 const middle_proxy_cooldown_slots = middle_proxy_routing.middle_proxy_cooldown_slots;
@@ -59,7 +60,6 @@ const isSameIpEndpoint = middle_proxy_routing.isSameIpEndpoint;
 const defaultMiddleProxyCandidateLists = middle_proxy_routing.defaultMiddleProxyCandidateLists;
 const copyMiddleProxyCandidates = middle_proxy_routing.copyMiddleProxyCandidates;
 const promoteMiddleProxyCandidateInList = middle_proxy_routing.promoteMiddleProxyCandidateInList;
-const prioritizeMiddleProxyCandidates = middle_proxy_routing.prioritizeMiddleProxyCandidates;
 const prioritizeIpv4Addresses = middle_proxy_routing.prioritizeIpv4Addresses;
 const shouldUseMiddleProxySnapshot = middle_proxy_routing.shouldUseMiddleProxySnapshot;
 const buildDcConnectPlan = middle_proxy_routing.buildDcConnectPlan;
@@ -292,6 +292,7 @@ pub const ProxyState = struct {
     middle_proxy_candidates_203: [16]net.Address,
     middle_proxy_candidates_203_len: usize,
     middle_proxy_cooldowns: [middle_proxy_cooldown_slots]MiddleProxyCooldown,
+    middle_proxy_health: MiddleProxyHealthStore,
     middle_proxy_secret: [256]u8,
     middle_proxy_secret_len: usize,
     middle_proxy_secret_version: u64,
@@ -458,6 +459,7 @@ pub const ProxyState = struct {
             .middle_proxy_candidates_203 = [_]net.Address{constants.tg_cdn_middle_proxy_v4} ** 16,
             .middle_proxy_candidates_203_len = 1,
             .middle_proxy_cooldowns = [_]MiddleProxyCooldown{.{}} ** middle_proxy_cooldown_slots,
+            .middle_proxy_health = .{},
             .middle_proxy_secret = default_middle_proxy_secret,
             .middle_proxy_secret_len = middleproxy.proxy_secret.len,
             .middle_proxy_secret_version = 1,
@@ -794,8 +796,8 @@ pub const ProxyState = struct {
     }
 
     fn getMiddleProxySnapshot(self: *ProxyState, dc_abs: usize, media: bool) MiddleProxySnapshot {
-        self.middle_proxy_lock.lockShared();
-        defer self.middle_proxy_lock.unlockShared();
+        self.middle_proxy_lock.lock();
+        defer self.middle_proxy_lock.unlock();
 
         var snapshot = MiddleProxySnapshot{
             .candidates = undefined,
@@ -822,8 +824,22 @@ pub const ProxyState = struct {
         }
 
         const now_ms = runtime_time.monotonicMilli();
-        prioritizeMiddleProxyCandidates(&snapshot.candidates, snapshot.candidate_len, &self.middle_proxy_cooldowns, now_ms);
+        self.middle_proxy_health.rank(&snapshot.candidates, snapshot.candidate_len, &self.middle_proxy_cooldowns, now_ms);
         return snapshot;
+    }
+
+    fn noteMiddleProxyConnectSuccess(self: *ProxyState, addr: net.Address, secret_version: u64, duration_ms: i64, now_ms: i64) void {
+        self.middle_proxy_lock.lock();
+        defer self.middle_proxy_lock.unlock();
+        if (secret_version != self.middle_proxy_secret_version) return;
+        self.middle_proxy_health.noteConnect(addr, duration_ms, now_ms);
+    }
+
+    fn noteMiddleProxyAuthSuccess(self: *ProxyState, addr: net.Address, secret_version: u64, duration_ms: i64, now_ms: i64) void {
+        self.middle_proxy_lock.lock();
+        defer self.middle_proxy_lock.unlock();
+        if (secret_version != self.middle_proxy_secret_version) return;
+        self.middle_proxy_health.noteAuth(addr, duration_ms, now_ms);
     }
 
     /// Caller must hold middle_proxy_lock for shared or exclusive access.
@@ -837,9 +853,10 @@ pub const ProxyState = struct {
         return null;
     }
 
-    fn promoteMiddleProxyCandidate(self: *ProxyState, dc_abs: usize, media: bool, addr: net.Address) bool {
+    fn promoteMiddleProxyCandidate(self: *ProxyState, dc_abs: usize, media: bool, addr: net.Address, secret_version: u64) bool {
         self.middle_proxy_lock.lock();
         defer self.middle_proxy_lock.unlock();
+        if (secret_version != self.middle_proxy_secret_version) return false;
 
         self.clearMiddleProxyCooldownLocked(addr);
 
@@ -866,11 +883,13 @@ pub const ProxyState = struct {
         );
     }
 
-    fn cooldownMiddleProxyCandidate(self: *ProxyState, addr: net.Address) bool {
+    fn cooldownMiddleProxyCandidate(self: *ProxyState, addr: net.Address, secret_version: u64) bool {
         self.middle_proxy_lock.lock();
         defer self.middle_proxy_lock.unlock();
+        if (secret_version != self.middle_proxy_secret_version) return false;
 
         const now_ms = runtime_time.monotonicMilli();
+        self.middle_proxy_health.noteFailure(addr, now_ms);
         var replacement_index: usize = 0;
         var replacement_until_ms: i64 = std.math.maxInt(i64);
         for (&self.middle_proxy_cooldowns, 0..) |*entry, i| {
@@ -1242,10 +1261,31 @@ pub const ProxyState = struct {
                 self.middle_proxy_secret_len = next_secret.len;
                 const next_version = self.middle_proxy_secret_version +% 1;
                 self.middle_proxy_secret_version = if (next_version == 0) 1 else next_version;
+                // Scores from the previous authentication epoch cannot rank
+                // endpoints whose new shared secret has not succeeded yet.
+                self.middle_proxy_health.clear();
+                for (&self.middle_proxy_cooldowns) |*entry| entry.* = .{};
                 changed = true;
             }
 
             if (changed) {
+                var active_candidates: [11 * 16]net.Address = undefined;
+                var active_len: usize = 0;
+                for (0..self.middle_proxy_candidates.len) |i| {
+                    for (self.middle_proxy_candidates[i][0..self.middle_proxy_candidate_lens[i]]) |addr| {
+                        active_candidates[active_len] = addr;
+                        active_len += 1;
+                    }
+                    for (self.middle_proxy_media_candidates[i][0..self.middle_proxy_media_candidate_lens[i]]) |addr| {
+                        active_candidates[active_len] = addr;
+                        active_len += 1;
+                    }
+                }
+                for (self.middle_proxy_candidates_203[0..self.middle_proxy_candidates_203_len]) |addr| {
+                    active_candidates[active_len] = addr;
+                    active_len += 1;
+                }
+                self.middle_proxy_health.retain(active_candidates[0..active_len]);
                 changed_dc4 = self.middle_proxy_addrs_primary[3];
                 changed_dc203 = self.middle_proxy_addr_203;
                 changed_secret_len = self.middle_proxy_secret_len;
@@ -2813,6 +2853,15 @@ const EventLoop = struct {
 
         configureRelaySocket(slot.client_fd);
         configureRelaySocket(slot.upstream_fd);
+        if (slot.use_middle_proxy and slot.upstream_kind == .dc) {
+            const now_ms = runtime_time.monotonicMilli();
+            if (slot.current_upstream_addr) |addr| {
+                if (slot.upstream_connect_started_ms > 0) {
+                    self.state.noteMiddleProxyConnectSuccess(addr, slot.mp_secret_version, now_ms - slot.upstream_connect_started_ms, now_ms);
+                }
+            }
+            slot.mp_auth_started_at_ms = now_ms;
+        }
         slot.upstream_connect_started_ms = 0;
         slot.upstream_connect_deadline_ms = 0;
 
@@ -2872,9 +2921,15 @@ const EventLoop = struct {
         const candidates = slot.upstreamCandidates();
         const candidate_count = candidates.len;
 
+        // No alternate remote address can repair exhausted local socket or
+        // epoll resources, and this is not evidence against an MP endpoint.
+        if (err == error.OutOfMemory or err == error.SystemResources or
+            err == error.ProcessFdQuotaExceeded or err == error.SystemFdQuotaExceeded)
+            return false;
+
         if (slot.use_middle_proxy) {
             if (attempt_addr) |addr| {
-                if (self.state.cooldownMiddleProxyCandidate(addr)) {
+                if (self.state.cooldownMiddleProxyCandidate(addr, slot.mp_secret_version)) {
                     log.info("[{d}] cooling failed middle-proxy endpoint for {d}s: dc_idx={d}", .{
                         slot.conn_id,
                         60,
@@ -3719,6 +3774,13 @@ const EventLoop = struct {
                 };
 
                 self.setMiddleProxyStep(slot, .done);
+                if (slot.current_upstream_addr) |addr| {
+                    if (slot.mp_auth_started_at_ms > 0) {
+                        const now_ms = runtime_time.monotonicMilli();
+                        self.state.noteMiddleProxyAuthSuccess(addr, slot.mp_secret_version, now_ms - slot.mp_auth_started_at_ms, now_ms);
+                    }
+                }
+                slot.mp_auth_started_at_ms = 0;
                 self.promoteSuccessfulMiddleProxyCandidate(slot);
                 self.startRelay(slot);
             },
@@ -3730,7 +3792,7 @@ const EventLoop = struct {
         if (!slot.use_middle_proxy or slot.upstream_candidate_next <= 1) return;
         const addr = slot.current_upstream_addr orelse return;
 
-        if (self.state.promoteMiddleProxyCandidate(@intCast(slot.dc_abs), slot.is_media_path, addr)) {
+        if (self.state.promoteMiddleProxyCandidate(@intCast(slot.dc_abs), slot.is_media_path, addr, slot.mp_secret_version)) {
             log.info("[{d}] promoted successful middle-proxy fallback candidate: dc_idx={d}", .{
                 slot.conn_id,
                 slot.dc_idx,
@@ -3769,6 +3831,7 @@ const EventLoop = struct {
     fn resetMiddleProxyAttempt(self: *EventLoop, slot: *ConnectionSlot) void {
         self.cleanupFailedUpstreamConnect(slot);
         self.setMiddleProxyStep(slot, .none);
+        slot.mp_auth_started_at_ms = 0;
         if (slot.mp_enc) |*enc| enc.wipe();
         if (slot.mp_dec) |*dec| dec.wipe();
         slot.mp_enc = null;
@@ -5578,8 +5641,8 @@ const MiddleProxyMetadataRace = struct {
         for (0..500) |_| {
             const snapshot = self.state.getMiddleProxySnapshot(1, false);
             std.debug.assert(snapshot.candidate_len > 0);
-            _ = self.state.cooldownMiddleProxyCandidate(candidate);
-            _ = self.state.promoteMiddleProxyCandidate(1, false, candidate);
+            _ = self.state.cooldownMiddleProxyCandidate(candidate, snapshot.secret_version);
+            _ = self.state.promoteMiddleProxyCandidate(1, false, candidate, snapshot.secret_version);
         }
     }
 };
