@@ -80,11 +80,14 @@ Connection-capacity methodology and command profiles: `test/README.md`.
 - Secret-bearing handshake, KDF, hash, and cipher temporaries are traversed by pointer where possible and explicitly cleared with `std.crypto.secureZero`; cleanup is field-wise for mixed structs so enum and pointer fields are never overwritten with invalid representations.
 - Runtime AES-CBC state keeps only the key schedule required by its direction, CTR and CBC decryption use eight-block AES bulk batches followed by `4/2/1` cascades where chaining permits, XOR runs a full 128-bit block at a time, and high-frequency FakeTLS/ME randomness comes from a thread-local ChaCha20 DRBG periodically reseeded from the OS CSPRNG.
 
-The ordinary proxy's orchestration remains in `src/proxy/proxy.zig`; worker-owned
-connection state, pool/generation tokens, indexed deadlines, queues/memory,
-relay I/O, timeout policy, shared security/wedge logic, and MiddleProxy
-discovery/routing live in focused modules beside it. The wire protocol remains
-in `src/protocol/`. Ownership and dependency boundaries are documented in
+The ordinary proxy's fd/epoll and connection orchestration remains in
+`src/proxy/proxy.zig`; worker-owned connection state, pool/generation tokens,
+indexed deadlines, queues/memory, relay I/O, pure deadline selection, shared
+security/wedge logic, MiddleProxy discovery/routing, and handshake KDF/frame
+preparation live in focused modules beside it. The worker still owns the
+versioned-secret lock, socket address lookups, CBC state, retry/fallback and
+timerfd arming. The wire protocol remains in `src/protocol/`. Ownership and
+dependency boundaries are documented in
 `.agent/skills/architecture/SKILL.md`.
 
 ## &nbsp; Quick Start

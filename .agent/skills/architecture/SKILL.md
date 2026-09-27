@@ -39,7 +39,7 @@ Code anchors:
 - `src/proxy/connection.zig`, `connection_pool.zig`, `deadline_queue.zig` (slot ownership and wiping, generation-tagged fd roles, indexed deadlines)
 - `src/proxy/limits.zig`, `message_queue.zig`, `managed_buffer_allocator.zig`, `relay_io.zig` (shared fixed queue/ME headroom budgets, worker-local queue pages, managed accounting, budgeted relay reads/writes and frame-aligned half-close checks)
 - `src/proxy/security_state.zig`, `wedge_recovery.zig` (process-shared admission tables/gate and per-slot recovery tracker)
-- `src/proxy/middle_proxy_nat.zig`, `middle_proxy_routing.zig`, `timeout_policy.zig` (egress discovery, route/cooldown policy, connection timeout calculations)
+- `src/proxy/middle_proxy_nat.zig`, `middle_proxy_routing.zig`, `middle_proxy_handshake.zig`, `timeout_policy.zig` (egress discovery, route/cooldown policy, handshake KDF/frame preparation, pure slot-deadline calculations)
 - `src/proxy/socket_ops.zig`, `src/runtime/tcp_options.zig`, `src/runtime/linux_events.zig` (proxy-specific socket errors, shared best-effort TCP tuning, and epoll/timerfd/eventfd primitives)
 - `src/main.zig` (CLI/startup orchestration, capacity policy/banner, lock-free logger, public-IP detection)
 - `src/runtime/resources.zig`, `src/runtime/signals.zig` (host/cgroup memory detection and the process signal/eventfd bridge; neither owns the application `std.Io` backend)
@@ -63,8 +63,10 @@ partition, and relay scratch. The pool heap-creates `ConnectionSlot` objects on
 demand and destroys them after `resetOwnedBuffers()`; slot close removes its
 single indexed deadline before pool release. The deadline queue borrows the
 worker's slot pointers only during insert/update/remove and never retains an
-`EventLoop` or pool-field pointer. `EventLoop` chooses deadline policy and arms
-the monotonic `timerfd`; the heap only maintains order and slot indices.
+`EventLoop` or pool-field pointer. `timeout_policy.zig` calculates slot and
+handshake deadlines from a slot plus narrow configuration inputs; `EventLoop`
+selects those inputs and arms the monotonic `timerfd`. The heap only maintains
+order and slot indices.
 
 Both per-slot queues own their intrusive page chains; the worker block pool may
 retain wiped pages until teardown. Queue pages, retained free pages, MiddleProxy
@@ -79,8 +81,12 @@ entries or owned heap fallback; `ProxyState` copies the selected route into a
 local snapshot under the MiddleProxy metadata lock, then the slot copies its
 candidate list from that snapshot. The protocol wire/crypto
 implementation remains in `src/protocol/middleproxy.zig`; NAT detection and
-route/cooldown selection live in the proxy modules named above, while
-`ProxyState` still owns refresh and publication.
+route/cooldown selection live in the proxy modules named above. The pure
+`middle_proxy_handshake.zig` derives directional keys from already selected
+nonce/address/secret inputs and encodes outgoing handshake frames. `EventLoop`
+still owns the socket address queries, versioned-secret read lock, CBC state,
+nonblocking frame reads, fallback, and phase transitions; `ProxyState` still
+owns refresh and publication.
 
 `relay_io.zig` performs bounded fd operations, queue writes/flushes, TLS record
 wrapping, and frame-boundary checks without new locks or packet-path

@@ -48,8 +48,7 @@ const detectAwgEndpointIpv4 = middle_proxy_nat.detectAwgEndpointIpv4;
 const selectDetectedMiddleProxyNatIpv4 = middle_proxy_nat.selectDetectedMiddleProxyNatIpv4;
 const detectPublicIpv4 = middle_proxy_nat.detectPublicIpv4;
 const formatIpv4Bytes = middle_proxy_nat.formatIpv4Bytes;
-const ipv4BytesForMiddleProxyKdf = middle_proxy_nat.ipv4BytesForMiddleProxyKdf;
-const ipv4AddressBytesForMiddleProxyKdf = middle_proxy_nat.ipv4AddressBytesForMiddleProxyKdf;
+const middle_proxy_handshake = @import("middle_proxy_handshake.zig");
 const middle_proxy_routing = @import("middle_proxy_routing.zig");
 const MiddleProxyLock = middle_proxy_routing.MiddleProxyLock;
 const MiddleProxyCooldown = middle_proxy_routing.MiddleProxyCooldown;
@@ -118,8 +117,7 @@ const ConnectionPool = connection_pool.ConnectionPool;
 const DeadlineQueue = @import("deadline_queue.zig").DeadlineQueue;
 const timeout_policy = @import("timeout_policy.zig");
 const secondsToMs = timeout_policy.secondsToMs;
-const budgetedConnectTimeoutMs = timeout_policy.budgetedConnectTimeoutMs;
-const budgetedMiddleProxyStageTimeoutMs = timeout_policy.budgetedMiddleProxyStageTimeoutMs;
+const earlierDeadline = timeout_policy.earlierDeadline;
 const idleTimeoutSeed = timeout_policy.idleTimeoutSeed;
 const jitteredIdleTimeoutMs = timeout_policy.jitteredIdleTimeoutMs;
 
@@ -148,7 +146,7 @@ fn webOnlyMasksPeer(web_only: bool, trusted_peer: bool) bool {
 
 const tunnel_mask_gateway_ip = "10.200.200.1";
 const min_nofile_soft: usize = 65535;
-const mp_handshake_frame_buf_size: usize = 2048;
+const mp_handshake_frame_buf_size = middle_proxy_handshake.frame_buf_size;
 const relay_read_scratch_size: usize = 32 * 1024;
 const pipelined_initial_capacity: usize = 4096;
 pub const default_managed_buffer_limit_bytes: u64 = 64 * 1024 * 1024;
@@ -2741,25 +2739,12 @@ const EventLoop = struct {
     }
 
     fn upstreamConnectDeadlineMs(self: *EventLoop, slot: *const ConnectionSlot, started_at_ms: i64) i64 {
-        const configured_timeout_ms = secondsToMs(self.state.config.dc_connect_timeout_sec);
-
-        const candidates = slot.upstreamCandidates();
-        var candidate_count = if (candidates.len > 0) blk: {
-            const next_index = @min(@as(usize, @intCast(slot.upstream_candidate_next)), candidates.len);
-            break :blk candidates.len - next_index + 1;
-        } else 1;
-        if (slot.use_middle_proxy and !slot.direct_fallback_used and slot.direct_fallback_addr != null) {
-            candidate_count += 1;
-        }
-        const attempt_timeout_ms = budgetedConnectTimeoutMs(
-            configured_timeout_ms,
-            slot.first_byte_at_ms,
+        return timeout_policy.upstreamConnectDeadlineMs(
+            slot,
+            secondsToMs(self.state.config.dc_connect_timeout_sec),
             secondsToMs(self.state.config.handshake_timeout_sec),
             started_at_ms,
-            candidate_count,
         );
-        if (attempt_timeout_ms <= 0) return 0;
-        return started_at_ms + attempt_timeout_ms;
     }
 
     fn startConnectUpstream(self: *EventLoop, slot: *ConnectionSlot, addr: net.Address, kind: UpstreamKind) !void {
@@ -3578,8 +3563,8 @@ const EventLoop = struct {
                     return;
                 }
 
-                var enc_keys: struct { [32]u8, [16]u8 } = undefined;
-                var dec_keys: struct { [32]u8, [16]u8 } = undefined;
+                var enc_keys: middle_proxy_handshake.KeyIv = undefined;
+                var dec_keys: middle_proxy_handshake.KeyIv = undefined;
                 defer std.crypto.secureZero(u8, std.mem.asBytes(&enc_keys));
                 defer std.crypto.secureZero(u8, std.mem.asBytes(&dec_keys));
                 var middle_local_addr: net.Address = undefined;
@@ -3597,9 +3582,6 @@ const EventLoop = struct {
 
                     slot.mp_rpc_nonce_ans = payload[16..32][0..16].*;
 
-                    var ts_arr: [4]u8 = undefined;
-                    std.mem.writeInt(u32, &ts_arr, slot.mp_timestamp, .little);
-
                     const peer_addr = net.peerAddress(slot.upstream_fd) catch {
                         break :handshake "mp getpeername failed";
                     };
@@ -3607,70 +3589,20 @@ const EventLoop = struct {
                     const local_addr = net.localAddress(slot.upstream_fd) catch {
                         break :handshake "mp getsockname failed";
                     };
-                    middle_local_addr = local_addr;
-
-                    var tg_port: [2]u8 = undefined;
-                    var my_port: [2]u8 = undefined;
-                    var tg_ip_v4_opt: ?[4]u8 = null;
-                    var my_ip_v4_opt: ?[4]u8 = null;
-                    var tg_ip_v6_opt: ?[16]u8 = null;
-                    var my_ip_v6_opt: ?[16]u8 = null;
-
-                    if (peer_addr == .ip4 and local_addr == .ip4) {
-                        tg_ip_v4_opt = ipv4AddressBytesForMiddleProxyKdf(peer_addr);
-                        var my_ip_v4 = ipv4AddressBytesForMiddleProxyKdf(local_addr);
-
-                        if (slot.mp_nat_ip4) |nat_ip| {
-                            my_ip_v4 = ipv4BytesForMiddleProxyKdf(nat_ip);
-                            middle_local_addr = net.ip4(nat_ip, local_addr.ip4.port);
-                        }
-
-                        my_ip_v4_opt = my_ip_v4;
-
-                        std.mem.writeInt(u16, &tg_port, peer_addr.ip4.port, .little);
-                        std.mem.writeInt(u16, &my_port, local_addr.ip4.port, .little);
-                    } else if (peer_addr == .ip6 and local_addr == .ip6) {
-                        tg_ip_v6_opt = peer_addr.ip6.bytes;
-                        my_ip_v6_opt = local_addr.ip6.bytes;
-
-                        std.mem.writeInt(u16, &tg_port, peer_addr.ip6.port, .little);
-                        std.mem.writeInt(u16, &my_port, local_addr.ip6.port, .little);
-                    } else {
-                        break :handshake "mp unsupported addr family";
-                    }
-
-                    const tg_ip_v4_ptr: ?*const [4]u8 = if (tg_ip_v4_opt) |*ip| ip else null;
-                    const my_ip_v4_ptr: ?*const [4]u8 = if (my_ip_v4_opt) |*ip| ip else null;
-                    const my_ip_v6_ptr: ?*const [16]u8 = if (my_ip_v6_opt) |*ip| ip else null;
-                    const tg_ip_v6_ptr: ?*const [16]u8 = if (tg_ip_v6_opt) |*ip| ip else null;
-
-                    enc_keys = middleproxy.getAesKeyAndIv(
+                    middle_local_addr = middle_proxy_handshake.deriveKeys(
                         &slot.mp_rpc_nonce_ans,
                         &slot.mp_nonce,
-                        &ts_arr,
-                        tg_ip_v4_ptr,
-                        &my_port,
-                        "CLIENT",
-                        my_ip_v4_ptr,
-                        &tg_port,
+                        slot.mp_timestamp,
+                        peer_addr,
+                        local_addr,
+                        slot.mp_nat_ip4,
                         secret_slice,
-                        my_ip_v6_ptr,
-                        tg_ip_v6_ptr,
-                    ) catch break :handshake "mp kdf input invalid";
-
-                    dec_keys = middleproxy.getAesKeyAndIv(
-                        &slot.mp_rpc_nonce_ans,
-                        &slot.mp_nonce,
-                        &ts_arr,
-                        tg_ip_v4_ptr,
-                        &my_port,
-                        "SERVER",
-                        my_ip_v4_ptr,
-                        &tg_port,
-                        secret_slice,
-                        my_ip_v6_ptr,
-                        tg_ip_v6_ptr,
-                    ) catch break :handshake "mp kdf input invalid";
+                        &enc_keys,
+                        &dec_keys,
+                    ) catch |err| break :handshake if (err == error.UnsupportedAddressFamily)
+                        "mp unsupported addr family"
+                    else
+                        "mp kdf input invalid";
 
                     break :handshake null;
                 };
@@ -3854,24 +3786,13 @@ const EventLoop = struct {
         slot.mp_step = step;
         slot.mp_step_deadline_ms = switch (step) {
             .none, .done => 0,
-            else => blk: {
-                const now_ms = runtime_time.monotonicMilli();
-                const configured_stage_ms = @min(
-                    secondsToMs(self.state.config.handshake_timeout_sec),
-                    middle_proxy_stage_timeout_ms,
-                );
-                const reserve_direct_fallback = slot.use_middle_proxy and
-                    !slot.direct_fallback_used and
-                    slot.direct_fallback_addr != null;
-                const stage_timeout_ms = budgetedMiddleProxyStageTimeoutMs(
-                    configured_stage_ms,
-                    slot.first_byte_at_ms,
-                    secondsToMs(self.state.config.handshake_timeout_sec),
-                    now_ms,
-                    reserve_direct_fallback,
-                );
-                break :blk now_ms + stage_timeout_ms;
-            },
+            else => timeout_policy.middleProxyStepDeadlineMs(
+                slot,
+                step,
+                secondsToMs(self.state.config.handshake_timeout_sec),
+                middle_proxy_stage_timeout_ms,
+                runtime_time.monotonicMilli(),
+            ),
         };
     }
 
@@ -3879,30 +3800,9 @@ const EventLoop = struct {
         _ = self;
         var plain: [mp_handshake_frame_buf_size]u8 = undefined;
         defer std.crypto.secureZero(u8, &plain);
-        const total_len: usize = payload.len + 12;
-        if (total_len > plain.len) return error.BadMiddleProxyFrameSize;
-
-        std.mem.writeInt(u32, plain[0..4], @intCast(total_len), .little);
-        std.mem.writeInt(i32, plain[4..8], slot.mp_write_seq_no, .little);
-        slot.mp_write_seq_no = slot.mp_write_seq_no +% 1;
-
-        @memcpy(plain[8 .. 8 + payload.len], payload);
-        const checksum = middleproxy.crc32(plain[0 .. 8 + payload.len]);
-        std.mem.writeInt(u32, plain[8 + payload.len ..][0..4], checksum, .little);
-
-        var frame_len = total_len;
-        if (encrypted) {
-            const pad = (16 - (frame_len % 16)) % 16;
-            if (frame_len + pad > plain.len) return error.BadMiddleProxyFrameSize;
-            var i: usize = 0;
-            while (i < pad) : (i += 4) {
-                std.mem.writeInt(u32, plain[frame_len + i ..][0..4], 4, .little);
-            }
-            frame_len += pad;
-            try slot.mp_enc.?.encryptInPlace(plain[0..frame_len]);
-        }
-
-        _ = try queueUpstream(slot, plain[0..frame_len]);
+        const cipher: ?*crypto.AesCbcEncryptor = if (encrypted) &slot.mp_enc.? else null;
+        const frame = try middle_proxy_handshake.encodeFrame(&plain, &slot.mp_write_seq_no, payload, cipher);
+        _ = try queueUpstream(slot, frame);
     }
 
     fn mpTryReadFrame(self: *EventLoop, slot: *ConnectionSlot, encrypted: bool) !?[]const u8 {
@@ -4043,50 +3943,13 @@ const EventLoop = struct {
         }
     }
 
-    fn earlierDeadline(current: ?i128, candidate: i128) i128 {
-        return if (current) |deadline| @min(deadline, candidate) else candidate;
-    }
-
-    fn deadlineMsToNs(deadline_ms: i64) i128 {
-        return @as(i128, deadline_ms) * std.time.ns_per_ms;
-    }
-
     fn nextSlotDeadlineNs(self: *const EventLoop, slot: *const ConnectionSlot) ?i128 {
-        if (slot.phase == .idle) return null;
-        if (slot.phase == .closing) return 1;
-
-        var deadline: ?i128 = null;
-        if (slot.phase == .desync_wait) {
-            deadline = earlierDeadline(deadline, slot.desync_deadline_ns);
-        }
-        if (slot.phase == .connecting_upstream and slot.upstream_connect_deadline_ms > 0) {
-            deadline = earlierDeadline(deadline, deadlineMsToNs(slot.upstream_connect_deadline_ms));
-        }
-        if (slot.phase == .middle_proxy_handshake and slot.mp_step_deadline_ms > 0) {
-            deadline = earlierDeadline(deadline, deadlineMsToNs(slot.mp_step_deadline_ms));
-        }
-
-        if (slot.handshakeInProgress()) {
-            const handshake_deadline_ms = if (slot.first_byte_at_ms == 0)
-                slot.created_at_ms + @min(slot.idle_timeout_ms, pre_first_byte_timeout_ms)
-            else
-                slot.first_byte_at_ms + secondsToMs(self.state.config.handshake_timeout_sec);
-            deadline = earlierDeadline(deadline, deadlineMsToNs(handshake_deadline_ms));
-        } else if (slot.phase == .relaying or slot.phase == .mask_relaying) {
-            deadline = earlierDeadline(deadline, deadlineMsToNs(slot.last_activity_ms + slot.idle_timeout_ms));
-            if (slot.phase == .mask_relaying and !slot.web_carrier and self.state.config.mask_relay_max_secs > 0) {
-                deadline = earlierDeadline(
-                    deadline,
-                    deadlineMsToNs(slot.created_at_ms + secondsToMs(self.state.config.mask_relay_max_secs)),
-                );
-            }
-            if (self.wedgeEligibleSlot(slot) and !slot.hasClientPending()) {
-                if (slot.wedge.nextDeadlineMs()) |wedge_deadline_ms| {
-                    deadline = earlierDeadline(deadline, deadlineMsToNs(wedge_deadline_ms));
-                }
-            }
-        }
-        return deadline;
+        return timeout_policy.nextSlotDeadlineNs(slot, .{
+            .handshake_timeout_sec = self.state.config.handshake_timeout_sec,
+            .mask_relay_max_secs = self.state.config.mask_relay_max_secs,
+            .pre_first_byte_timeout_ms = pre_first_byte_timeout_ms,
+            .wedge_eligible = self.wedgeEligibleSlot(slot),
+        });
     }
 
     fn refreshSlotDeadline(self: *EventLoop, slot: *ConnectionSlot) void {
@@ -5001,17 +4864,10 @@ fn mpReadReset(slot: *ConnectionSlot, encrypted: bool) void {
 
 fn writePlainMiddleProxyTestFrame(fd: posix.fd_t, seq_no: i32, payload: []const u8) !void {
     var frame: [mp_handshake_frame_buf_size]u8 = undefined;
-    const total_len = payload.len + 12;
-    if (total_len > frame.len) return error.BadMiddleProxyFrameSize;
-
-    std.mem.writeInt(u32, frame[0..4], @intCast(total_len), .little);
-    std.mem.writeInt(i32, frame[4..8], seq_no, .little);
-    @memcpy(frame[8 .. 8 + payload.len], payload);
-    const checksum = middleproxy.crc32(frame[0 .. 8 + payload.len]);
-    std.mem.writeInt(u32, frame[8 + payload.len ..][0..4], checksum, .little);
-
-    const written = try writeFd(fd, frame[0..total_len]);
-    try std.testing.expectEqual(total_len, written);
+    var frame_seq = seq_no;
+    const encoded = try middle_proxy_handshake.encodeFrame(&frame, &frame_seq, payload, null);
+    const written = try writeFd(fd, encoded);
+    try std.testing.expectEqual(encoded.len, written);
 }
 
 test "middle proxy nonce response failures fall back to direct path" {

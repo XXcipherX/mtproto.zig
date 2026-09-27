@@ -694,6 +694,8 @@ test {
     _ = resources;
     _ = signals;
     _ = @import("proxy/limits.zig");
+    _ = @import("proxy/middle_proxy_handshake.zig");
+    _ = @import("proxy/timeout_policy.zig");
     _ = proxy;
     _ = @import("proxy/web_support.zig");
     _ = @import("web/frame.zig");

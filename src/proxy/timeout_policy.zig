@@ -1,5 +1,6 @@
 const std = @import("std");
 const ConnectionSlot = @import("connection.zig").ConnectionSlot;
+const MiddleProxyHandshakeStep = @import("connection.zig").MiddleProxyHandshakeStep;
 
 pub fn secondsToMs(sec: u32) i64 {
     return @as(i64, @intCast(sec)) * std.time.ms_per_s;
@@ -38,6 +39,106 @@ pub fn budgetedMiddleProxyStageTimeoutMs(
     const remaining_handshake_ms = @max(@as(i64, 1), handshake_deadline_ms - started_at_ms);
     const stage_share_ms = @max(@as(i64, 1), @divTrunc(remaining_handshake_ms, 2));
     return @min(configured_stage_timeout_ms, stage_share_ms);
+}
+
+pub fn upstreamConnectDeadlineMs(
+    slot: *const ConnectionSlot,
+    configured_timeout_ms: i64,
+    handshake_timeout_ms: i64,
+    started_at_ms: i64,
+) i64 {
+    const candidates = slot.upstreamCandidates();
+    var candidate_count = if (candidates.len > 0) blk: {
+        const next_index = @min(@as(usize, @intCast(slot.upstream_candidate_next)), candidates.len);
+        break :blk candidates.len - next_index + 1;
+    } else 1;
+    if (slot.use_middle_proxy and !slot.direct_fallback_used and slot.direct_fallback_addr != null) {
+        candidate_count += 1;
+    }
+    const attempt_timeout_ms = budgetedConnectTimeoutMs(
+        configured_timeout_ms,
+        slot.first_byte_at_ms,
+        handshake_timeout_ms,
+        started_at_ms,
+        candidate_count,
+    );
+    if (attempt_timeout_ms <= 0) return 0;
+    return started_at_ms + attempt_timeout_ms;
+}
+
+pub fn middleProxyStepDeadlineMs(
+    slot: *const ConnectionSlot,
+    step: MiddleProxyHandshakeStep,
+    handshake_timeout_ms: i64,
+    stage_timeout_ms: i64,
+    now_ms: i64,
+) i64 {
+    if (step == .none or step == .done) return 0;
+    const configured_stage_ms = @min(handshake_timeout_ms, stage_timeout_ms);
+    const reserve_direct_fallback = slot.use_middle_proxy and
+        !slot.direct_fallback_used and
+        slot.direct_fallback_addr != null;
+    const budget_ms = budgetedMiddleProxyStageTimeoutMs(
+        configured_stage_ms,
+        slot.first_byte_at_ms,
+        handshake_timeout_ms,
+        now_ms,
+        reserve_direct_fallback,
+    );
+    return now_ms + budget_ms;
+}
+
+pub const SlotDeadlineInputs = struct {
+    handshake_timeout_sec: u32,
+    mask_relay_max_secs: u32,
+    pre_first_byte_timeout_ms: i64,
+    wedge_eligible: bool,
+};
+
+pub fn earlierDeadline(current: ?i128, candidate: i128) i128 {
+    return if (current) |deadline| @min(deadline, candidate) else candidate;
+}
+
+fn deadlineMsToNs(deadline_ms: i64) i128 {
+    return @as(i128, deadline_ms) * std.time.ns_per_ms;
+}
+
+pub fn nextSlotDeadlineNs(slot: *const ConnectionSlot, inputs: SlotDeadlineInputs) ?i128 {
+    if (slot.phase == .idle) return null;
+    if (slot.phase == .closing) return 1;
+
+    var deadline: ?i128 = null;
+    if (slot.phase == .desync_wait) {
+        deadline = earlierDeadline(deadline, slot.desync_deadline_ns);
+    }
+    if (slot.phase == .connecting_upstream and slot.upstream_connect_deadline_ms > 0) {
+        deadline = earlierDeadline(deadline, deadlineMsToNs(slot.upstream_connect_deadline_ms));
+    }
+    if (slot.phase == .middle_proxy_handshake and slot.mp_step_deadline_ms > 0) {
+        deadline = earlierDeadline(deadline, deadlineMsToNs(slot.mp_step_deadline_ms));
+    }
+
+    if (slot.handshakeInProgress()) {
+        const handshake_deadline_ms = if (slot.first_byte_at_ms == 0)
+            slot.created_at_ms + @min(slot.idle_timeout_ms, inputs.pre_first_byte_timeout_ms)
+        else
+            slot.first_byte_at_ms + secondsToMs(inputs.handshake_timeout_sec);
+        deadline = earlierDeadline(deadline, deadlineMsToNs(handshake_deadline_ms));
+    } else if (slot.phase == .relaying or slot.phase == .mask_relaying) {
+        deadline = earlierDeadline(deadline, deadlineMsToNs(slot.last_activity_ms + slot.idle_timeout_ms));
+        if (slot.phase == .mask_relaying and !slot.web_carrier and inputs.mask_relay_max_secs > 0) {
+            deadline = earlierDeadline(
+                deadline,
+                deadlineMsToNs(slot.created_at_ms + secondsToMs(inputs.mask_relay_max_secs)),
+            );
+        }
+        if (inputs.wedge_eligible and !slot.hasClientPending()) {
+            if (slot.wedge.nextDeadlineMs()) |wedge_deadline_ms| {
+                deadline = earlierDeadline(deadline, deadlineMsToNs(wedge_deadline_ms));
+            }
+        }
+    }
+    return deadline;
 }
 
 pub fn idleTimeoutSeed(slot: *const ConnectionSlot) u64 {
@@ -96,6 +197,41 @@ test "middle proxy stage reserves remaining handshake budget for direct fallback
         @as(i64, 5_000),
         budgetedMiddleProxyStageTimeoutMs(5_000, 1_000, 5_000, 4_000, false),
     );
+}
+
+test "slot deadline policy preserves pre-first-byte, handshake and WEB carrier exemptions" {
+    var slot: ConnectionSlot = .{};
+    const inputs: SlotDeadlineInputs = .{
+        .handshake_timeout_sec = 15,
+        .mask_relay_max_secs = 60,
+        .pre_first_byte_timeout_ms = 10_000,
+        .wedge_eligible = false,
+    };
+
+    try std.testing.expectEqual(@as(?i128, null), nextSlotDeadlineNs(&slot, inputs));
+    slot.phase = .reading_tls_header;
+    slot.created_at_ms = 1000;
+    slot.idle_timeout_ms = 120_000;
+    try std.testing.expectEqual(@as(?i128, 11_000 * std.time.ns_per_ms), nextSlotDeadlineNs(&slot, inputs));
+
+    slot.first_byte_at_ms = 2000;
+    try std.testing.expectEqual(@as(?i128, 17_000 * std.time.ns_per_ms), nextSlotDeadlineNs(&slot, inputs));
+
+    slot.phase = .mask_relaying;
+    slot.last_activity_ms = 5000;
+    try std.testing.expectEqual(@as(?i128, 61_000 * std.time.ns_per_ms), nextSlotDeadlineNs(&slot, inputs));
+    slot.web_carrier = true;
+    try std.testing.expectEqual(@as(?i128, 125_000 * std.time.ns_per_ms), nextSlotDeadlineNs(&slot, inputs));
+}
+
+test "connect and MiddleProxy step deadline keep candidate and fallback shares" {
+    var slot: ConnectionSlot = .{};
+    slot.first_byte_at_ms = 1000;
+    slot.use_middle_proxy = true;
+    slot.direct_fallback_addr = @import("../net_helpers.zig").ip4(.{ 149, 154, 167, 40 }, 443);
+    try std.testing.expectEqual(@as(i64, 9000), upstreamConnectDeadlineMs(&slot, 10_000, 15_000, 2000));
+    try std.testing.expectEqual(@as(i64, 15_000), middleProxyStepDeadlineMs(&slot, .sending_rpc_nonce, 15_000, 5000, 14_000));
+    try std.testing.expectEqual(@as(i64, 0), middleProxyStepDeadlineMs(&slot, .done, 15_000, 5000, 6000));
 }
 
 test "jittered idle timeout stays bounded" {
