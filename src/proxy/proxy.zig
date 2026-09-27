@@ -1992,24 +1992,27 @@ const EventLoop = struct {
             return;
         }
 
+        self.advanceServerHelloWrite(slot);
+    }
+
+    /// Complete a ServerHello phase as soon as its last byte reaches the kernel.
+    /// The split timer remains the only way to start the second desync write.
+    fn advanceServerHelloWrite(self: *EventLoop, slot: *ConnectionSlot) void {
+        if (slot.hasClientPending()) return;
         switch (slot.phase) {
             .writing_server_hello_first => {
-                if (!slot.hasClientPending()) {
-                    slot.phase = .desync_wait;
-                    slot.desync_deadline_ns = self.desyncSplitDeadlineNs();
-                }
+                slot.phase = .desync_wait;
+                slot.desync_deadline_ns = self.desyncSplitDeadlineNs();
             },
             .writing_server_hello_rest => {
-                if (!slot.hasClientPending()) {
-                    if (slot.server_hello) |buf| {
-                        secureFree(self.state.allocator, buf);
-                        slot.server_hello = null;
-                    }
-                    slot.phase = .reading_mtproto_tls_header;
-                    slot.tls_hdr_pos = 0;
-                    slot.tls_body_len = 0;
-                    slot.tls_body_pos = 0;
+                if (slot.server_hello) |buf| {
+                    secureFree(self.state.allocator, buf);
+                    slot.server_hello = null;
                 }
+                slot.phase = .reading_mtproto_tls_header;
+                slot.tls_hdr_pos = 0;
+                slot.tls_body_len = 0;
+                slot.tls_body_pos = 0;
             },
             else => {},
         }
@@ -2265,6 +2268,9 @@ const EventLoop = struct {
         slot.tls_body_len = @intCast(record_len);
         slot.tls_body_pos = 0;
         slot.phase = .reading_client_hello_body;
+        // readSlotFd enforces the same per-event budget and returns WouldBlock
+        // if either the budget or the socket has no more readable bytes.
+        self.readClientHelloBody(slot);
     }
 
     fn readDirectObfuscatedHandshake(self: *EventLoop, slot: *ConnectionSlot) void {
@@ -2455,6 +2461,7 @@ const EventLoop = struct {
                 return;
             }
             slot.server_hello_off = 1;
+            self.advanceServerHelloWrite(slot);
         } else {
             slot.phase = .writing_server_hello_rest;
             if (queueClient(slot, slot.server_hello.?)) |_| {} else |_| {
@@ -2462,6 +2469,7 @@ const EventLoop = struct {
                 return;
             }
             slot.server_hello_off = slot.server_hello.?.len;
+            self.advanceServerHelloWrite(slot);
         }
     }
 
@@ -3067,6 +3075,7 @@ const EventLoop = struct {
         slot.tg_encryptor = tg_encryptor;
         slot.tg_decryptor = crypto.AesCtr.init(&tg_dec_key, tg_dec_iv);
         slot.phase = .writing_dc_nonce;
+        if (!slot.hasUpstreamPending()) self.onDcNonceWritable(slot);
     }
 
     fn wedgeEligibleSlot(self: *const EventLoop, slot: *const ConnectionSlot) bool {
@@ -4003,6 +4012,7 @@ const EventLoop = struct {
                     slot.server_hello_off = sh.len;
                 }
             }
+            self.advanceServerHelloWrite(slot);
         }
 
         if (slot.phase == .closing) {
@@ -5000,6 +5010,101 @@ test "middle proxy nonce response failures fall back to direct path" {
     try std.testing.expect(net.exactAddressEql(slot.current_upstream_addr.?, fallback_addr));
     try std.testing.expect(slot.phase == .connecting_upstream or slot.phase == .writing_dc_nonce);
     try std.testing.expectEqual(@as(u64, 1), state.stats_mp_fallback.load(.monotonic));
+}
+
+test "ServerHello advances only after the queued bytes are fully written" {
+    var cfg = Config{
+        .users = std.StringHashMap([16]u8).init(std.testing.allocator),
+        .direct_users = std.StringHashMap(void).init(std.testing.allocator),
+        .desync_split_delay_ms = 3,
+        .desync_split_jitter_ms = 0,
+    };
+    defer cfg.deinit(std.testing.allocator);
+    var state = try ProxyState.init(std.testing.allocator, std.testing.io, cfg);
+    defer state.deinit();
+    var loop: EventLoop = undefined;
+    loop.state = &state;
+
+    var slot = ConnectionSlot{};
+    defer slot.client_queue.deinit();
+    slot.phase = .writing_server_hello_first;
+    try slot.client_queue.appendCopy(&.{0x16});
+    loop.advanceServerHelloWrite(&slot);
+    try std.testing.expectEqual(ConnectionPhase.writing_server_hello_first, slot.phase);
+    try std.testing.expectEqual(@as(i128, 0), slot.desync_deadline_ns);
+
+    slot.client_queue.clear();
+    const before = runtime_time.monotonicNano();
+    loop.advanceServerHelloWrite(&slot);
+    const after = runtime_time.monotonicNano();
+    try std.testing.expectEqual(ConnectionPhase.desync_wait, slot.phase);
+    try std.testing.expect(slot.desync_deadline_ns >= before + 3 * std.time.ns_per_ms);
+    try std.testing.expect(slot.desync_deadline_ns <= after + 3 * std.time.ns_per_ms);
+
+    slot.phase = .writing_server_hello_rest;
+    slot.server_hello = try state.allocator.alloc(u8, 3);
+    slot.tls_hdr_pos = 5;
+    slot.tls_body_len = 17;
+    slot.tls_body_pos = 2;
+    loop.advanceServerHelloWrite(&slot);
+    try std.testing.expectEqual(ConnectionPhase.reading_mtproto_tls_header, slot.phase);
+    try std.testing.expect(slot.server_hello == null);
+    try std.testing.expectEqual(@as(u8, 0), slot.tls_hdr_pos);
+    try std.testing.expectEqual(@as(u16, 0), slot.tls_body_len);
+    try std.testing.expectEqual(@as(u16, 0), slot.tls_body_pos);
+
+    slot.phase = .idle;
+    loop.advanceServerHelloWrite(&slot);
+    try std.testing.expectEqual(ConnectionPhase.idle, slot.phase);
+}
+
+test "handshake read yields when the event I/O budget is exhausted" {
+    var slot = ConnectionSlot{};
+    var budget = EventIoBudget{ .bytes_remaining = 0 };
+    slot.event_io_budget = &budget;
+    var byte: [1]u8 = undefined;
+    try std.testing.expectError(error.WouldBlock, readSlotFd(&slot, invalid_fd, &byte));
+    try std.testing.expectEqual(@as(usize, 0), budget.bytes_remaining);
+}
+
+test "immediate direct nonce and promotion tail reach relay without another writable event" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var cfg = Config{
+        .users = std.StringHashMap([16]u8).init(std.testing.allocator),
+        .direct_users = std.StringHashMap(void).init(std.testing.allocator),
+        .tag = [_]u8{0x42} ** 16,
+    };
+    defer cfg.deinit(std.testing.allocator);
+    var state = try ProxyState.init(std.testing.allocator, std.testing.io, cfg);
+    defer state.deinit();
+    var loop: EventLoop = undefined;
+    loop.state = &state;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var upstream_file = try tmp.dir.createFile(std.testing.io, "direct-startup", .{ .read = true });
+    defer upstream_file.close(std.testing.io);
+
+    var slot = ConnectionSlot{};
+    defer slot.upstream_queue.deinit();
+    slot.upstream_fd = upstream_file.handle;
+    slot.dc_abs = 4;
+    slot.obf_params = .{
+        .decrypt_key = [_]u8{0} ** constants.key_len,
+        .decrypt_iv = 0,
+        .encrypt_key = [_]u8{0} ** constants.key_len,
+        .encrypt_iv = 0,
+        .proto_tag = .intermediate,
+        .dc_idx = 4,
+    };
+
+    loop.sendDcNonce(&slot);
+    try std.testing.expectEqual(ConnectionPhase.relaying, slot.phase);
+    try std.testing.expect(slot.dc_initial_tail == null);
+    try std.testing.expect(!slot.hasUpstreamPending());
+    try seekFdToStart(upstream_file.handle);
+    var bytes: [89]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 88), try posix.read(upstream_file.handle, &bytes));
 }
 
 test "pipelined handshake capacity stays independent of relay scratch size" {
