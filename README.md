@@ -42,7 +42,7 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 | **WEB Proxy** | Browser HTTPS Carrier | Runs Telegram Desktop 7.1+ WEB links in parallel with ordinary MTProto, using the existing Caddy instance for real TLS/WebSocket termination |
 | **PQ FakeTLS** | DPI Evasion | Echoes `X25519MLKEM768` (`0x11ec`) ServerHello key_share for modern Desktop/Android ClientHellos |
 | **Fast Mode** | Direct-Path S2C Offload | Reduces CPU usage by delegating S2C AES work to Telegram DCs on direct paths (non-MiddleProxy) |
-| **MiddleProxy** | Telemt-Compatible ME | Optional ME transport for DC1..5 (`use_middle_proxy`); retries TCP candidates, applies a 5-second per-stage handshake deadline, cools failed endpoints for 60 seconds, and falls back directly when a real DC endpoint exists (never for CDN DC203) |
+| **MiddleProxy** | Telemt-Compatible ME | Optional ME transport for DC1..5 (`use_middle_proxy`); retries candidates after TCP or endpoint-specific protocol failures within the global handshake deadline, applies a 5-second per-stage deadline, cools failed endpoints for 60 seconds, and falls back directly only when a real DC endpoint exists (never for CDN DC203) |
 | **Auto Refresh** | Runtime Discovery | Periodically updates regular/media MiddleProxy metadata and re-resolves all masking DNS candidates without delaying listener startup |
 | **Promotion** | Tag Support | Optional promotion tag for sponsored proxy channel registration |
 | **IPv6 Hopping** | DPI Evasion | Rotates IPv6 from a routed /64 and updates Cloudflare AAAA records; installers schedule a hop every 5 minutes, while `--auto` provides foreground ban-detection mode |

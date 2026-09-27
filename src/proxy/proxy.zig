@@ -195,7 +195,7 @@ fn shouldCloseOnFatalHangup(phase: ConnectionPhase, event_fd: posix.fd_t, upstre
     return !(phase == .connecting_upstream and event_fd == upstream_fd);
 }
 
-fn shouldFallbackMiddleProxyOnFatalHangup(phase: ConnectionPhase, event_fd: posix.fd_t, upstream_fd: posix.fd_t) bool {
+fn shouldRecoverMiddleProxyOnFatalHangup(phase: ConnectionPhase, event_fd: posix.fd_t, upstream_fd: posix.fd_t) bool {
     return phase == .middle_proxy_handshake and event_fd == upstream_fd;
 }
 
@@ -1602,8 +1602,8 @@ const EventLoop = struct {
             ((events & linux.EPOLL.RDHUP) != 0 and
                 slot.phase != .relaying and slot.phase != .mask_relaying);
         if (fatal_hangup and shouldCloseOnFatalHangup(slot.phase, fd, slot.upstream_fd)) {
-            if (shouldFallbackMiddleProxyOnFatalHangup(slot.phase, fd, slot.upstream_fd) and
-                self.fallbackFromMiddleProxyToDirect(slot))
+            if (shouldRecoverMiddleProxyOnFatalHangup(slot.phase, fd, slot.upstream_fd) and
+                self.recoverMiddleProxyFailure(slot, .endpoint, error.ConnectionReset))
             {
                 return;
             }
@@ -2041,7 +2041,8 @@ const EventLoop = struct {
                     }
                 } else |err| {
                     log.debug("[{d}] upstream flush error: {any}", .{ slot.conn_id, err });
-                    if (slot.phase == .middle_proxy_handshake and self.fallbackFromMiddleProxyToDirect(slot)) return;
+                    if (slot.phase == .middle_proxy_handshake and
+                        self.recoverMiddleProxyFailure(slot, if (err == error.OutOfMemory) .local else .endpoint, err)) return;
                     self.closeSlot(slot, "upstream flush error");
                     return;
                 }
@@ -2869,7 +2870,6 @@ const EventLoop = struct {
 
     fn tryNextDcEndpoint(self: *EventLoop, slot: *ConnectionSlot, err: anyerror, attempt_addr: ?net.Address) bool {
         const candidates = slot.upstreamCandidates();
-        if (candidates.len == 0) return false;
         const candidate_count = candidates.len;
 
         if (slot.use_middle_proxy) {
@@ -2883,6 +2883,11 @@ const EventLoop = struct {
                 }
             }
         }
+
+        const now_ms = runtime_time.monotonicMilli();
+        const has_time = slot.first_byte_at_ms == 0 or
+            now_ms - slot.first_byte_at_ms < secondsToMs(self.state.config.handshake_timeout_sec);
+        if (!has_time) return false;
 
         if (slot.upstream_candidate_next < candidates.len) {
             const next_idx = slot.upstream_candidate_next;
@@ -3510,7 +3515,8 @@ const EventLoop = struct {
         self.state.middle_proxy_lock.lockShared();
         const secret = self.state.middleProxySecretForVersionLocked(slot.mp_secret_version) orelse {
             self.state.middle_proxy_lock.unlockShared();
-            if (!self.fallbackFromMiddleProxyToDirect(slot)) self.closeSlot(slot, "missing middle-proxy secret snapshot");
+            if (!self.recoverMiddleProxyFailure(slot, .shared_metadata, error.MissingMiddleProxySecret))
+                self.closeSlot(slot, "missing middle-proxy secret snapshot");
             return;
         };
         @memcpy(msg[4..8], secret[0..4]);
@@ -3519,8 +3525,8 @@ const EventLoop = struct {
         @memcpy(msg[12..16], &crypto_ts);
         @memcpy(msg[16..32], &slot.mp_nonce);
 
-        self.mpWriteFrame(slot, msg[0..], false) catch {
-            if (!self.fallbackFromMiddleProxyToDirect(slot)) {
+        self.mpWriteFrame(slot, msg[0..], false) catch |err| {
+            if (!self.recoverMiddleProxyFailure(slot, if (err == error.OutOfMemory) .local else .endpoint, err)) {
                 self.closeSlot(slot, "mp send nonce failed");
             }
             return;
@@ -3553,20 +3559,20 @@ const EventLoop = struct {
             .waiting_rpc_nonce_response => {
                 const payload = self.mpTryReadFrame(slot, false) catch |err| {
                     log.debug("[{d}] mp nonce frame read failed: {any}", .{ slot.conn_id, err });
-                    if (!self.fallbackFromMiddleProxyToDirect(slot)) {
+                    if (!self.recoverMiddleProxyFailure(slot, if (err == error.OutOfMemory) .local else .endpoint, err)) {
                         self.closeSlot(slot, "mp read nonce ans failed");
                     }
                     return;
                 } orelse return;
 
                 if (payload.len != 32) {
-                    if (!self.fallbackFromMiddleProxyToDirect(slot)) {
+                    if (!self.recoverMiddleProxyFailure(slot, .endpoint, error.BadMiddleProxyNonceResponse)) {
                         self.closeSlot(slot, "mp bad nonce ans len");
                     }
                     return;
                 }
                 if (!std.mem.eql(u8, payload[0..4], &middleproxy.rpc_nonce_req)) {
-                    if (!self.fallbackFromMiddleProxyToDirect(slot)) {
+                    if (!self.recoverMiddleProxyFailure(slot, .endpoint, error.BadMiddleProxyNonceResponse)) {
                         self.closeSlot(slot, "mp bad nonce ans type");
                     }
                     return;
@@ -3577,26 +3583,27 @@ const EventLoop = struct {
                 defer std.crypto.secureZero(u8, std.mem.asBytes(&enc_keys));
                 defer std.crypto.secureZero(u8, std.mem.asBytes(&dec_keys));
                 var middle_local_addr: net.Address = undefined;
-                const mp_handshake_error: ?[]const u8 = handshake: {
+                const HandshakeFailure = struct { reason: []const u8, class: MiddleProxyFailureClass };
+                const mp_handshake_error: ?HandshakeFailure = handshake: {
                     self.state.middle_proxy_lock.lockShared();
                     defer self.state.middle_proxy_lock.unlockShared();
                     const secret_slice = self.state.middleProxySecretForVersionLocked(slot.mp_secret_version) orelse
-                        break :handshake "mp secret version expired";
+                        break :handshake .{ .reason = "mp secret version expired", .class = .shared_metadata };
                     if (!std.mem.eql(u8, payload[4..8], secret_slice[0..4])) {
-                        break :handshake "mp key selector mismatch";
+                        break :handshake .{ .reason = "mp key selector mismatch", .class = .endpoint };
                     }
                     if (!std.mem.eql(u8, payload[8..12], &middleproxy.rpc_crypto_aes)) {
-                        break :handshake "mp crypto schema mismatch";
+                        break :handshake .{ .reason = "mp crypto schema mismatch", .class = .endpoint };
                     }
 
                     slot.mp_rpc_nonce_ans = payload[16..32][0..16].*;
 
                     const peer_addr = net.peerAddress(slot.upstream_fd) catch {
-                        break :handshake "mp getpeername failed";
+                        break :handshake .{ .reason = "mp getpeername failed", .class = .local };
                     };
 
                     const local_addr = net.localAddress(slot.upstream_fd) catch {
-                        break :handshake "mp getsockname failed";
+                        break :handshake .{ .reason = "mp getsockname failed", .class = .local };
                     };
                     middle_local_addr = middle_proxy_handshake.deriveKeys(
                         &slot.mp_rpc_nonce_ans,
@@ -3608,17 +3615,20 @@ const EventLoop = struct {
                         secret_slice,
                         &enc_keys,
                         &dec_keys,
-                    ) catch |err| break :handshake if (err == error.UnsupportedAddressFamily)
-                        "mp unsupported addr family"
-                    else
-                        "mp kdf input invalid";
+                    ) catch |err| break :handshake .{
+                        .reason = if (err == error.UnsupportedAddressFamily)
+                            "mp unsupported addr family"
+                        else
+                            "mp kdf input invalid",
+                        .class = .local,
+                    };
 
                     break :handshake null;
                 };
 
-                if (mp_handshake_error) |reason| {
-                    if (!self.fallbackFromMiddleProxyToDirect(slot)) {
-                        self.closeSlot(slot, reason);
+                if (mp_handshake_error) |failure| {
+                    if (!self.recoverMiddleProxyFailure(slot, failure.class, error.MiddleProxyHandshakeFailed)) {
+                        self.closeSlot(slot, failure.reason);
                     }
                     return;
                 }
@@ -3632,8 +3642,8 @@ const EventLoop = struct {
                 @memcpy(hs_msg[8..20], "IPIPPRPDTIME");
                 @memcpy(hs_msg[20..32], "IPIPPRPDTIME");
 
-                self.mpWriteFrame(slot, hs_msg[0..], true) catch {
-                    if (!self.fallbackFromMiddleProxyToDirect(slot)) {
+                self.mpWriteFrame(slot, hs_msg[0..], true) catch |err| {
+                    if (!self.recoverMiddleProxyFailure(slot, if (err == error.OutOfMemory) .local else .endpoint, err)) {
                         self.closeSlot(slot, "mp send handshake failed");
                     }
                     return;
@@ -3648,33 +3658,33 @@ const EventLoop = struct {
             .waiting_rpc_handshake_response => {
                 const payload = self.mpTryReadFrame(slot, true) catch |err| {
                     log.debug("[{d}] mp handshake frame read failed: {any}", .{ slot.conn_id, err });
-                    if (!self.fallbackFromMiddleProxyToDirect(slot)) {
+                    if (!self.recoverMiddleProxyFailure(slot, if (err == error.OutOfMemory) .local else .endpoint, err)) {
                         self.closeSlot(slot, "mp read handshake ans failed");
                     }
                     return;
                 } orelse return;
 
                 if (payload.len != 32) {
-                    if (!self.fallbackFromMiddleProxyToDirect(slot)) {
+                    if (!self.recoverMiddleProxyFailure(slot, .endpoint, error.BadMiddleProxyHandshakeResponse)) {
                         self.closeSlot(slot, "mp bad handshake ans len");
                     }
                     return;
                 }
                 if (!std.mem.eql(u8, payload[0..4], &middleproxy.rpc_handshake)) {
-                    if (!self.fallbackFromMiddleProxyToDirect(slot)) {
+                    if (!self.recoverMiddleProxyFailure(slot, .endpoint, error.BadMiddleProxyHandshakeResponse)) {
                         self.closeSlot(slot, "mp bad handshake ans type");
                     }
                     return;
                 }
                 if (!std.mem.eql(u8, payload[20..32], "IPIPPRPDTIME")) {
-                    if (!self.fallbackFromMiddleProxyToDirect(slot)) {
+                    if (!self.recoverMiddleProxyFailure(slot, .endpoint, error.BadMiddleProxyHandshakeResponse)) {
                         self.closeSlot(slot, "mp bad handshake pid");
                     }
                     return;
                 }
 
                 const local_addr = net.localAddress(slot.upstream_fd) catch {
-                    if (!self.fallbackFromMiddleProxyToDirect(slot)) {
+                    if (!self.recoverMiddleProxyFailure(slot, .local, error.MiddleProxyLocalAddressUnavailable)) {
                         self.closeSlot(slot, "mp getsockname failed");
                     }
                     return;
@@ -3702,7 +3712,7 @@ const EventLoop = struct {
                     self.state.config.tag,
                     self.state.config.middleProxyBufferBytes(),
                 ) catch {
-                    if (!self.fallbackFromMiddleProxyToDirect(slot)) {
+                    if (!self.recoverMiddleProxyFailure(slot, .local, error.OutOfMemory)) {
                         self.closeSlot(slot, "mp context init failed");
                     }
                     return;
@@ -3728,29 +3738,36 @@ const EventLoop = struct {
         }
     }
 
-    fn fallbackFromMiddleProxyToDirect(self: *EventLoop, slot: *ConnectionSlot) bool {
-        if (slot.use_middle_proxy) {
-            // A protocol-stage failure can also indicate stale endpoint or
-            // secret metadata. Refresh reactively even when this route cannot
-            // use a direct fallback (notably CDN DC 203).
-            self.state.requestMiddleProxyRefresh();
-            if (slot.current_upstream_addr) |addr| {
-                if (self.state.cooldownMiddleProxyCandidate(addr)) {
-                    log.info("[{d}] cooling failed middle-proxy endpoint after handshake failure: dc_idx={d}", .{
-                        slot.conn_id,
-                        slot.dc_idx,
-                    });
-                }
-            }
-        }
-        if (slot.direct_fallback_addr == null or slot.direct_fallback_used) return false;
+    const MiddleProxyFailureClass = enum { endpoint, shared_metadata, local };
 
-        if (slot.obf_params == null) return false;
-        slot.direct_fallback_used = true;
-        countStat(&self.state.stats_mp_fallback);
-        slot.use_middle_proxy = false;
-        slot.mp_secret_version = 0;
-        slot.mp_nat_ip4 = null;
+    /// An endpoint-specific protocol failure can use another MP candidate.
+    /// A missing shared secret cannot be repaired by trying the same metadata
+    /// against every endpoint, and a local resource error is not remote health.
+    fn recoverMiddleProxyFailure(
+        self: *EventLoop,
+        slot: *ConnectionSlot,
+        class: MiddleProxyFailureClass,
+        err: anyerror,
+    ) bool {
+        switch (class) {
+            .local => return false,
+            .shared_metadata => {
+                self.state.requestMiddleProxyRefresh();
+                return self.fallbackFromMiddleProxyToDirect(slot);
+            },
+            .endpoint => {
+                const failed_addr = slot.current_upstream_addr;
+                self.state.requestMiddleProxyRefresh();
+                self.resetMiddleProxyAttempt(slot);
+                return self.tryNextDcEndpoint(slot, err, failed_addr);
+            },
+        }
+    }
+
+    /// Keep the client handshake, route plan and handshake reservation intact.
+    /// All fd, queue, CBC and RPC state below belongs to one MP attempt only.
+    fn resetMiddleProxyAttempt(self: *EventLoop, slot: *ConnectionSlot) void {
+        self.cleanupFailedUpstreamConnect(slot);
         self.setMiddleProxyStep(slot, .none);
         if (slot.mp_enc) |*enc| enc.wipe();
         if (slot.mp_dec) |*dec| dec.wipe();
@@ -3758,6 +3775,31 @@ const EventLoop = struct {
         slot.mp_dec = null;
         if (slot.middle_ctx) |*mp| mp.deinit();
         slot.middle_ctx = null;
+        if (slot.mp_frame_buf) |buf| secureFree(self.state.allocator, buf);
+        slot.mp_frame_buf = null;
+        slot.mp_frame_have = 0;
+        slot.mp_frame_need = 0;
+        slot.mp_frame_total_len = 0;
+        slot.mp_frame_padded_len = 0;
+        slot.mp_frame_encrypted = false;
+        slot.mp_frame_first_decrypted = false;
+        slot.mp_write_seq_no = -2;
+        slot.mp_read_seq_no = -2;
+        std.crypto.secureZero(u8, &slot.mp_nonce);
+        std.crypto.secureZero(u8, &slot.mp_rpc_nonce_ans);
+        slot.mp_timestamp = 0;
+    }
+
+    fn fallbackFromMiddleProxyToDirect(self: *EventLoop, slot: *ConnectionSlot) bool {
+        if (slot.direct_fallback_addr == null or slot.direct_fallback_used) return false;
+
+        if (slot.obf_params == null) return false;
+        slot.direct_fallback_used = true;
+        countStat(&self.state.stats_mp_fallback);
+        self.resetMiddleProxyAttempt(slot);
+        slot.use_middle_proxy = false;
+        slot.mp_secret_version = 0;
+        slot.mp_nat_ip4 = null;
 
         slot.use_fast_mode = self.state.config.fast_mode and
             (slot.dc_abs >= 1 and slot.dc_abs <= constants.tg_datacenters_v4.len);
@@ -3773,7 +3815,6 @@ const EventLoop = struct {
         slot.tg_decryptor = null;
 
         const fallback = slot.direct_fallback_addr.?;
-        self.cleanupFailedUpstreamConnect(slot);
         const one = [_]net.Address{fallback};
         slot.setUpstreamCandidates(self.state.allocator, &one) catch {
             return false;
@@ -4035,8 +4076,7 @@ const EventLoop = struct {
         if (slot.phase == .middle_proxy_handshake and slot.mp_step_deadline_ms > 0 and
             now_ms >= slot.mp_step_deadline_ms)
         {
-            self.state.requestMiddleProxyRefresh();
-            if (self.fallbackFromMiddleProxyToDirect(slot)) return;
+            if (self.recoverMiddleProxyFailure(slot, .endpoint, error.MiddleProxyStageTimedOut)) return;
             self.closeSlot(slot, "middle-proxy stage timeout");
             return;
         }
@@ -4880,7 +4920,7 @@ fn writePlainMiddleProxyTestFrame(fd: posix.fd_t, seq_no: i32, payload: []const 
     try std.testing.expectEqual(encoded.len, written);
 }
 
-test "middle proxy nonce response failures fall back to direct path" {
+test "middle proxy nonce response failure retries another candidate before direct fallback" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
 
     var cfg = Config{
@@ -4974,6 +5014,12 @@ test "middle proxy nonce response failures fall back to direct path" {
     defer fallback_server.deinit();
 
     const fallback_addr = try net.localAddress(fallback_server.handle);
+    var next_mp_server = try net.listen(net.ip4(.{ 127, 0, 0, 1 }, 0), .{
+        .reuse_address = true,
+        .kernel_backlog = 8,
+    });
+    defer next_mp_server.deinit();
+    const next_mp_addr = try net.localAddress(next_mp_server.handle);
 
     slot.conn_id = 42;
     slot.upstream_fd = upstream_file.handle;
@@ -4985,6 +5031,15 @@ test "middle proxy nonce response failures fall back to direct path" {
     slot.direct_fallback_addr = fallback_addr;
     slot.current_upstream_addr = fallback_addr;
     slot.dc_abs = 4;
+    slot.mp_secret_version = state.middle_proxy_secret_version;
+    slot.first_byte_at_ms = runtime_time.monotonicMilli();
+    const original_first_byte_ms = slot.first_byte_at_ms;
+    slot.pipelined_data = try state.allocator.alloc(u8, 4);
+    @memcpy(slot.pipelined_data.?, "test"[0..4]);
+    slot.pipelined_len = 4;
+    const mp_candidates = [_]net.Address{ fallback_addr, next_mp_addr };
+    try slot.setUpstreamCandidates(state.allocator, &mp_candidates);
+    slot.upstream_candidate_next = 1;
     slot.obf_params = .{
         .decrypt_key = [_]u8{0} ** constants.key_len,
         .decrypt_iv = 0,
@@ -5002,6 +5057,22 @@ test "middle proxy nonce response failures fall back to direct path" {
 
     loop.middleProxyOnReadable(slot);
 
+    try std.testing.expect(!slot.direct_fallback_used);
+    try std.testing.expect(slot.use_middle_proxy);
+    try std.testing.expect(net.exactAddressEql(slot.current_upstream_addr.?, next_mp_addr));
+    try std.testing.expectEqual(original_first_byte_ms, slot.first_byte_at_ms);
+    try std.testing.expectEqualStrings("test", slot.pipelined_data.?[0..slot.pipelined_len]);
+    if (slot.phase == .connecting_upstream) {
+        try std.testing.expectEqual(@as(i32, -2), slot.mp_write_seq_no);
+        try std.testing.expectEqual(@as(i32, -2), slot.mp_read_seq_no);
+        try std.testing.expectEqual(@as(u32, 0), slot.mp_timestamp);
+        try std.testing.expect(slot.mp_enc == null and slot.mp_dec == null);
+    } else {
+        try std.testing.expectEqual(ConnectionPhase.middle_proxy_handshake, slot.phase);
+    }
+    try std.testing.expectEqual(@as(u64, 0), state.stats_mp_fallback.load(.monotonic));
+
+    try std.testing.expect(loop.recoverMiddleProxyFailure(slot, .endpoint, error.BadMiddleProxyHandshakeResponse));
     try std.testing.expect(slot.direct_fallback_used);
     try std.testing.expect(!slot.use_middle_proxy);
     try std.testing.expectEqual(MiddleProxyHandshakeStep.none, slot.mp_step);
@@ -5010,6 +5081,43 @@ test "middle proxy nonce response failures fall back to direct path" {
     try std.testing.expect(net.exactAddressEql(slot.current_upstream_addr.?, fallback_addr));
     try std.testing.expect(slot.phase == .connecting_upstream or slot.phase == .writing_dc_nonce);
     try std.testing.expectEqual(@as(u64, 1), state.stats_mp_fallback.load(.monotonic));
+
+    const cdn_slot = loop.pool.acquire() orelse return error.TestExpectedEqual;
+    cdn_slot.client_queue.pool = &loop.message_block_pool;
+    cdn_slot.upstream_queue.pool = &loop.message_block_pool;
+    defer if (cdn_slot.phase != .idle) {
+        if (!isInvalidFd(cdn_slot.upstream_fd)) closeFd(cdn_slot.upstream_fd);
+        cdn_slot.upstream_fd = invalid_fd;
+        cdn_slot.resetOwnedBuffers(state.allocator);
+        loop.pool.release(cdn_slot);
+    };
+    var cdn_file = try tmp.dir.createFile(tmp_io, "cdn-middle-proxy-upstream", .{ .read = true });
+    var cdn_file_owned = true;
+    defer if (cdn_file_owned) cdn_file.close(tmp_io);
+    cdn_slot.conn_id = 43;
+    cdn_slot.upstream_fd = cdn_file.handle;
+    cdn_file_owned = false;
+    cdn_slot.phase = .middle_proxy_handshake;
+    cdn_slot.mp_step = .waiting_rpc_nonce_response;
+    cdn_slot.mp_read_seq_no = -2;
+    cdn_slot.use_middle_proxy = true;
+    cdn_slot.current_upstream_addr = fallback_addr;
+    cdn_slot.dc_abs = 203;
+    cdn_slot.dc_idx = 203;
+    cdn_slot.mp_secret_version = state.middle_proxy_secret_version;
+    try cdn_slot.setUpstreamCandidates(state.allocator, &mp_candidates);
+    cdn_slot.upstream_candidate_next = 1;
+    mpReadReset(cdn_slot, false);
+    try writePlainMiddleProxyTestFrame(cdn_file.handle, -2, &bad_nonce_payload);
+    try seekFdToStart(cdn_file.handle);
+
+    loop.middleProxyOnReadable(cdn_slot);
+    try std.testing.expect(cdn_slot.use_middle_proxy);
+    try std.testing.expect(!cdn_slot.direct_fallback_used);
+    try std.testing.expect(net.exactAddressEql(cdn_slot.current_upstream_addr.?, next_mp_addr));
+    try std.testing.expect(!loop.recoverMiddleProxyFailure(cdn_slot, .endpoint, error.BadMiddleProxyHandshakeResponse));
+    try std.testing.expect(isInvalidFd(cdn_slot.upstream_fd));
+    try std.testing.expect(!cdn_slot.direct_fallback_used);
 }
 
 test "ServerHello advances only after the queued bytes are fully written" {
@@ -5189,13 +5297,13 @@ test "fatal hangup close policy distinguishes client/upstream while connecting" 
     try std.testing.expect(!shouldCloseOnFatalHangup(.idle, client_fd, upstream_fd));
 }
 
-test "fatal middle-proxy upstream hangup is fallback eligible" {
+test "fatal middle-proxy upstream hangup is recovery eligible" {
     const client_fd = fakeFd(41);
     const upstream_fd = fakeFd(42);
 
-    try std.testing.expect(shouldFallbackMiddleProxyOnFatalHangup(.middle_proxy_handshake, upstream_fd, upstream_fd));
-    try std.testing.expect(!shouldFallbackMiddleProxyOnFatalHangup(.middle_proxy_handshake, client_fd, upstream_fd));
-    try std.testing.expect(!shouldFallbackMiddleProxyOnFatalHangup(.connecting_upstream, upstream_fd, upstream_fd));
+    try std.testing.expect(shouldRecoverMiddleProxyOnFatalHangup(.middle_proxy_handshake, upstream_fd, upstream_fd));
+    try std.testing.expect(!shouldRecoverMiddleProxyOnFatalHangup(.middle_proxy_handshake, client_fd, upstream_fd));
+    try std.testing.expect(!shouldRecoverMiddleProxyOnFatalHangup(.connecting_upstream, upstream_fd, upstream_fd));
     try std.testing.expect(shouldCloseOnFatalHangup(.middle_proxy_handshake, upstream_fd, upstream_fd));
 }
 
