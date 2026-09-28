@@ -93,7 +93,11 @@ wrapping, and frame-boundary checks without new locks or packet-path
 allocations. `EventLoop` keeps the actual phase transitions, FIN propagation,
 epoll interest updates, and timeout actions. The proxy and WEB relay share
 `epollCreate` in `runtime/linux_events.zig` and TCP_NODELAY/keepalive/
-TCP_USER_TIMEOUT values in `runtime/tcp_options.zig`. Socket tuning remains
+TCP_USER_TIMEOUT values in `runtime/tcp_options.zig`. The per-fd first-probe
+delay is staggered across 30–60 seconds so mass admission does not synchronize
+kernel probes. The 90-second user timeout covers the latest first probe plus
+10 × 3-second keepalive probe window; otherwise Linux can
+abort an idle connection after only one lost probe. Socket tuning remains
 best-effort: proxy keeps trying keepalive options after one failure, while WEB
 stops that keepalive sequence; both still attempt TCP_USER_TIMEOUT. Their
 connect-error mapping, address formatting, and relay policy remain separate.
