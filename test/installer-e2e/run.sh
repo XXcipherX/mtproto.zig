@@ -154,7 +154,7 @@ if grep -Rqi -- 'nginx' "$INSTALL_DIR"; then
     exit 1
 fi
 
-for helper in setup_masking.sh setup_web.sh web_link.sh web_probe.py setup_nfqws.sh setup_synfix.sh setup_mask_monitor.sh; do
+for helper in setup_masking.sh setup_web.sh web_link.sh add_user.sh web_probe.py setup_nfqws.sh setup_synfix.sh setup_mask_monitor.sh; do
     cmp "/workspace/deploy/$helper" "$INSTALL_DIR/$helper"
 done
 
@@ -241,6 +241,85 @@ exit 1
 CONTAINER_TEST
 }
 
+verify_add_user() {
+    # Capture the command's links for assertions instead of echoing its output.
+    docker exec -i \
+        -e INSTALL_DIR="$INSTALL_DIR" \
+        -e CONFIG_FILE="$CONFIG_FILE" \
+        -e ENV_FILE="$ENV_FILE" \
+        -e ORIGINAL_SECRET="$SECRET" \
+        "$CONTAINER" bash -s <<'CONTAINER_TEST'
+set -Eeuo pipefail
+
+proxy_before="$(docker inspect -f '{{.Id}}' mtproto-proxy)"
+relay_before="$(docker inspect -f '{{.Id}}' mtproto-web-relay)"
+caddy_before="$(docker inspect -f '{{.Id}}' mtproto-mask-caddy)"
+attributes_before="$(stat -c '%u:%g:%a' "$CONFIG_FILE")"
+if ! output="$("$INSTALL_DIR/add_user.sh" --add-user tablet-2 2>&1)"; then
+    echo 'add_user.sh failed to add a user' >&2
+    exit 1
+fi
+
+new_secret="$(awk -F '"' '/^[[:space:]]*tablet-2[[:space:]]*=/{print $2; exit}' "$CONFIG_FILE")"
+[[ "$new_secret" =~ ^[0-9a-f]{32}$ && "$new_secret" != "$ORIGINAL_SECRET" ]]
+grep -Fq "user = \"$ORIGINAL_SECRET\"" "$CONFIG_FILE"
+test "$(stat -c '%u:%g:%a' "$CONFIG_FILE")" = "$attributes_before"
+mapfile -t links < <(printf '%s\n' "$output" | grep '^tg://')
+test "${#links[@]}" -eq 2
+domain_hex="$(printf '%s' mask.example.test | od -An -tx1 | tr -d ' \n')"
+test "${links[0]}" = "tg://proxy?server=127.0.0.1&port=443&secret=ee${new_secret}${domain_hex}"
+[[ "${links[1]}" == 'tg://webproxy?server='* ]]
+
+# The binary is the independent link oracle; compare both new links without
+# printing them to the runner log.
+canonical="$(docker exec mtproto-proxy /usr/local/bin/mtproto-proxy \
+    /etc/mtproto-proxy/config.toml --print-links | sed -E 's/\x1B\[[0-9;]*m//g')"
+for link in "${links[@]}"; do [[ "$canonical" == *"$link"* ]]; done
+
+test "$(docker inspect -f '{{.Id}}' mtproto-proxy)" != "$proxy_before"
+test "$(docker inspect -f '{{.Id}}' mtproto-web-relay)" != "$relay_before"
+test "$(docker inspect -f '{{.Id}}' mtproto-mask-caddy)" = "$caddy_before"
+config_hash="$(sha256sum "$CONFIG_FILE" | awk '{print $1}')"
+for service in mtproto-proxy mtproto-web-relay; do
+    test "$(docker inspect -f '{{.State.Running}}' "$service")" = true
+    test "$(docker exec "$service" sha256sum /etc/mtproto-proxy/config.toml | awk '{print $1}')" = "$config_hash"
+    if docker logs "$service" 2>&1 | grep -Fq "$new_secret"; then
+        echo 'new user secret leaked into service logs' >&2
+        exit 1
+    fi
+done
+
+proxy_after="$(docker inspect -f '{{.Id}}' mtproto-proxy)"
+relay_after="$(docker inspect -f '{{.Id}}' mtproto-web-relay)"
+for rejected in tablet-2 bad/name; do
+    if "$INSTALL_DIR/add_user.sh" --add-user "$rejected" >/dev/null 2>&1; then
+        echo "add_user.sh accepted rejected name: $rejected" >&2
+        exit 1
+    fi
+done
+test "$(sha256sum "$CONFIG_FILE" | awk '{print $1}')" = "$config_hash"
+test "$(docker inspect -f '{{.Id}}' mtproto-proxy)" = "$proxy_after"
+test "$(docker inspect -f '{{.Id}}' mtproto-web-relay)" = "$relay_after"
+test "$(docker inspect -f '{{.Id}}' mtproto-mask-caddy)" = "$caddy_before"
+
+# Force the pre-recreate validation to fail; the helper must restore the old
+# config without touching any running container.
+cp -a "$ENV_FILE" "${ENV_FILE}.add-user-ci-backup"
+sed -i 's|^MTPROTO_IMAGE=.*|MTPROTO_IMAGE=mtproto-add-user-ci:missing|' "$ENV_FILE"
+if "$INSTALL_DIR/add_user.sh" --add-user rollback-user >/dev/null 2>&1; then
+    mv "${ENV_FILE}.add-user-ci-backup" "$ENV_FILE"
+    echo 'add_user.sh accepted an unavailable image during validation' >&2
+    exit 1
+fi
+mv "${ENV_FILE}.add-user-ci-backup" "$ENV_FILE"
+test "$(sha256sum "$CONFIG_FILE" | awk '{print $1}')" = "$config_hash"
+test "$(docker inspect -f '{{.Id}}' mtproto-proxy)" = "$proxy_after"
+test "$(docker inspect -f '{{.Id}}' mtproto-web-relay)" = "$relay_after"
+test "$(docker inspect -f '{{.Id}}' mtproto-mask-caddy)" = "$caddy_before"
+echo 'add-user E2E passed'
+CONTAINER_TEST
+}
+
 echo "::group::Build isolated ${BASE_IMAGE} host"
 docker build --build-arg "BASE_IMAGE=$BASE_IMAGE" -t "$TEST_IMAGE" "$ROOT/test/installer-e2e"
 echo "::endgroup::"
@@ -309,6 +388,12 @@ verify_install 2>&1 | tee "$LOG_DIR/${SAFE_IMAGE}.verify.log"
 verify_masking_maintenance_lock 2>&1 | tee "$LOG_DIR/${SAFE_IMAGE}.maintenance-lock.log"
 echo "::endgroup::"
 
+echo "::group::Add access user"
+verify_add_user
+wait_for_status "$TLS_DOMAIN" 8443 404
+wait_for_status "$WEB_DOMAIN" 443 404
+echo "::endgroup::"
+
 echo "::group::Idempotent reinstall"
 before_hash="$(docker exec "$CONTAINER" sha256sum "$CONFIG_FILE" | awk '{print $1}')"
 run_installer 2>&1 | tee "$LOG_DIR/${SAFE_IMAGE}.reinstall.log"
@@ -323,6 +408,7 @@ if [[ "$before_hash" != "$after_hash" ]]; then
     exit 1
 fi
 verify_install 2>&1 | tee "$LOG_DIR/${SAFE_IMAGE}.verify-reinstall.log"
+docker exec "$CONTAINER" grep -Eq '^[[:space:]]*tablet-2[[:space:]]*=' "$CONFIG_FILE"
 echo "::endgroup::"
 
 echo "Installer E2E passed on ${BASE_IMAGE}"

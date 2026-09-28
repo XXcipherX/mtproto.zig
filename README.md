@@ -478,6 +478,14 @@ docker exec -it mtproto-proxy \
 
 The one-shot process reads the container's mounted config, writes the secret links only to the current terminal, and exits while the main proxy process keeps running.
 
+To add a user on either installer-managed Docker Compose or source/systemd setup, run on the server (use any distinct name, for example `iphone` or `tablet`):
+
+```bash
+sudo /opt/mtproto-proxy/add_user.sh --add-user iphone
+```
+
+The host-side command generates a separate 16-byte secret, updates `config.toml`, validates it, reloads the proxy and (when enabled) the WEB relay, then prints only the new user's link(s). Docker services are recreated rather than restarted because `config.toml` is a file bind mount. Names may contain letters, digits, `_`, `-` and `.`, up to 64 characters; existing names are rejected. Keep the printed links private. There is no need to rebuild or pull an image to add a user.
+
 ## WEB proxy (Telegram Desktop 7.1+)
 
 By default, WEB mode is an additional transport rather than a replacement for the ordinary proxy. Existing `tg://proxy` FakeTLS clients continue to use public TCP `443`; Telegram Desktop can additionally use a `tg://webproxy` link whose traffic is carried by a real browser HTTPS/WebSocket session. Optional WEB-only mode disables that direct door.

@@ -268,7 +268,7 @@ install_packages() {
 fetch_helper_scripts() {
     info "Fetching deployment helper scripts..."
     local file
-    for file in setup_masking.sh setup_web.sh web_link.sh setup_nfqws.sh setup_synfix.sh setup_mask_monitor.sh ipv6-hop.sh update_dns.sh; do
+    for file in setup_masking.sh setup_web.sh web_link.sh add_user.sh setup_nfqws.sh setup_synfix.sh setup_mask_monitor.sh ipv6-hop.sh update_dns.sh; do
         curl -fsSL "${REPO_RAW_URL}/deploy/${file}" -o "${INSTALL_DIR}/${file}" \
             || fail "Failed to download deploy/${file}"
         chmod 0755 "${INSTALL_DIR}/${file}"
