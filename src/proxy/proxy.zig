@@ -3547,26 +3547,14 @@ const EventLoop = struct {
 
     fn middleProxyBegin(self: *EventLoop, slot: *ConnectionSlot) void {
         slot.phase = .middle_proxy_handshake;
-        self.setMiddleProxyStep(slot, .sending_rpc_nonce);
-        slot.mp_write_seq_no = -2;
-        slot.mp_read_seq_no = -2;
-        slot.mp_frame_have = 0;
-        slot.mp_frame_need = 0;
-        slot.mp_enc = null;
-        slot.mp_dec = null;
 
-        crypto.randomBytes(&slot.mp_nonce);
-        const ts: u32 = @intCast(@mod(runtime_time.realtimeSeconds(), 4294967296));
-        slot.mp_timestamp = ts;
+        var nonce: [16]u8 = undefined;
+        crypto.randomBytes(&nonce);
+        defer std.crypto.secureZero(u8, &nonce);
+        const timestamp: u32 = @intCast(@mod(runtime_time.realtimeSeconds(), 4294967296));
+        var selector: [4]u8 = undefined;
+        defer std.crypto.secureZero(u8, &selector);
 
-        var crypto_ts: [4]u8 = undefined;
-        defer std.crypto.secureZero(u8, &crypto_ts);
-        std.mem.writeInt(u32, &crypto_ts, ts, .little);
-
-        var msg: [32]u8 = undefined;
-        defer std.crypto.secureZero(u8, &msg);
-        @memcpy(msg[0..4], &middleproxy.rpc_nonce_req);
-        @memset(msg[4..8], 0);
         self.state.middle_proxy_lock.lockShared();
         const secret = self.state.middleProxySecretForVersionLocked(slot.mp_secret_version) orelse {
             self.state.middle_proxy_lock.unlockShared();
@@ -3574,202 +3562,147 @@ const EventLoop = struct {
                 self.closeSlot(slot, "missing middle-proxy secret snapshot");
             return;
         };
-        @memcpy(msg[4..8], secret[0..4]);
+        @memcpy(&selector, secret[0..4]);
         self.state.middle_proxy_lock.unlockShared();
-        @memcpy(msg[8..12], &middleproxy.rpc_crypto_aes);
-        @memcpy(msg[12..16], &crypto_ts);
-        @memcpy(msg[16..32], &slot.mp_nonce);
 
-        self.mpWriteFrame(slot, msg[0..], false) catch |err| {
-            if (!self.recoverMiddleProxyFailure(slot, if (err == error.OutOfMemory) .local else .endpoint, err)) {
-                self.closeSlot(slot, "mp send nonce failed");
-            }
+        var frame_buf: [mp_handshake_frame_buf_size]u8 = undefined;
+        defer std.crypto.secureZero(u8, &frame_buf);
+        const frame = slot.mp_transport.begin(&frame_buf, &selector, &nonce, timestamp) catch |err| {
+            if (!self.recoverMiddleProxyFailure(slot, .local, err))
+                self.closeSlot(slot, "mp prepare nonce failed");
             return;
         };
-
-        if (!slot.hasUpstreamPending()) {
-            self.setMiddleProxyStep(slot, .waiting_rpc_nonce_response);
-            mpReadReset(slot, false);
-        }
+        self.setMiddleProxyStep(slot, .sending_rpc_nonce);
+        _ = queueUpstream(slot, frame) catch |err| {
+            if (!self.recoverMiddleProxyFailure(slot, if (err == error.OutOfMemory) .local else .endpoint, err))
+                self.closeSlot(slot, "mp send nonce failed");
+            return;
+        };
+        if (!slot.hasUpstreamPending()) self.middleProxyOnWritable(slot);
     }
 
     fn middleProxyOnWritable(self: *EventLoop, slot: *ConnectionSlot) void {
         if (slot.hasUpstreamPending()) return;
-
-        switch (slot.mp_step) {
-            .sending_rpc_nonce => {
-                self.setMiddleProxyStep(slot, .waiting_rpc_nonce_response);
-                mpReadReset(slot, false);
-            },
-            .sending_rpc_handshake => {
-                self.setMiddleProxyStep(slot, .waiting_rpc_handshake_response);
-                mpReadReset(slot, true);
-            },
-            else => {},
-        }
+        const previous_step = slot.mp_transport.step;
+        slot.mp_transport.writeDrained();
+        if (slot.mp_transport.step != previous_step)
+            self.setMiddleProxyStep(slot, slot.mp_transport.step);
     }
 
     fn middleProxyOnReadable(self: *EventLoop, slot: *ConnectionSlot) void {
-        switch (slot.mp_step) {
+        const step = slot.mp_transport.step;
+        if (step != .waiting_rpc_nonce_response and step != .waiting_rpc_handshake_response) return;
+        const encrypted = step == .waiting_rpc_handshake_response;
+        const read_adapter = struct {
+            fn read(s: *ConnectionSlot, dest: []u8) !usize {
+                return readSlotFd(s, s.upstream_fd, dest);
+            }
+        }.read;
+        const payload = slot.mp_transport.tryReadFrame(
+            self.state.allocator,
+            slot,
+            read_adapter,
+            encrypted,
+        ) catch |err| {
+            log.debug("[{d}] mp frame read failed: step={s} err={any}", .{ slot.conn_id, @tagName(step), err });
+            if (!self.recoverMiddleProxyFailure(slot, if (err == error.OutOfMemory) .local else .endpoint, err))
+                self.closeSlot(slot, "mp frame read failed");
+            return;
+        } orelse return;
+
+        switch (step) {
             .waiting_rpc_nonce_response => {
-                const payload = self.mpTryReadFrame(slot, false) catch |err| {
-                    log.debug("[{d}] mp nonce frame read failed: {any}", .{ slot.conn_id, err });
-                    if (!self.recoverMiddleProxyFailure(slot, if (err == error.OutOfMemory) .local else .endpoint, err)) {
-                        self.closeSlot(slot, "mp read nonce ans failed");
-                    }
-                    return;
-                } orelse return;
-
-                if (payload.len != 32) {
-                    if (!self.recoverMiddleProxyFailure(slot, .endpoint, error.BadMiddleProxyNonceResponse)) {
-                        self.closeSlot(slot, "mp bad nonce ans len");
-                    }
+                if (payload.len != 32 or !std.mem.eql(u8, payload[0..4], &middleproxy.rpc_nonce_req)) {
+                    if (!self.recoverMiddleProxyFailure(slot, .endpoint, error.BadMiddleProxyNonceResponse))
+                        self.closeSlot(slot, "mp bad nonce answer");
                     return;
                 }
-                if (!std.mem.eql(u8, payload[0..4], &middleproxy.rpc_nonce_req)) {
-                    if (!self.recoverMiddleProxyFailure(slot, .endpoint, error.BadMiddleProxyNonceResponse)) {
-                        self.closeSlot(slot, "mp bad nonce ans type");
-                    }
-                    return;
-                }
-
-                var enc_keys: middle_proxy_handshake.KeyIv = undefined;
-                var dec_keys: middle_proxy_handshake.KeyIv = undefined;
-                defer std.crypto.secureZero(u8, std.mem.asBytes(&enc_keys));
-                defer std.crypto.secureZero(u8, std.mem.asBytes(&dec_keys));
-                var middle_local_addr: net.Address = undefined;
-                const HandshakeFailure = struct { reason: []const u8, class: MiddleProxyFailureClass };
-                const mp_handshake_error: ?HandshakeFailure = handshake: {
-                    self.state.middle_proxy_lock.lockShared();
-                    defer self.state.middle_proxy_lock.unlockShared();
-                    const secret_slice = self.state.middleProxySecretForVersionLocked(slot.mp_secret_version) orelse
-                        break :handshake .{ .reason = "mp secret version expired", .class = .shared_metadata };
-                    if (!std.mem.eql(u8, payload[4..8], secret_slice[0..4])) {
-                        break :handshake .{ .reason = "mp key selector mismatch", .class = .endpoint };
-                    }
-                    if (!std.mem.eql(u8, payload[8..12], &middleproxy.rpc_crypto_aes)) {
-                        break :handshake .{ .reason = "mp crypto schema mismatch", .class = .endpoint };
-                    }
-
-                    slot.mp_rpc_nonce_ans = payload[16..32][0..16].*;
-
-                    const peer_addr = net.peerAddress(slot.upstream_fd) catch {
-                        break :handshake .{ .reason = "mp getpeername failed", .class = .local };
-                    };
-
-                    const local_addr = net.localAddress(slot.upstream_fd) catch {
-                        break :handshake .{ .reason = "mp getsockname failed", .class = .local };
-                    };
-                    middle_local_addr = middle_proxy_handshake.deriveKeys(
-                        &slot.mp_rpc_nonce_ans,
-                        &slot.mp_nonce,
-                        slot.mp_timestamp,
-                        peer_addr,
-                        local_addr,
-                        slot.mp_nat_ip4,
-                        secret_slice,
-                        &enc_keys,
-                        &dec_keys,
-                    ) catch |err| break :handshake .{
-                        .reason = if (err == error.UnsupportedAddressFamily)
-                            "mp unsupported addr family"
-                        else
-                            "mp kdf input invalid",
-                        .class = .local,
-                    };
-
-                    break :handshake null;
-                };
-
-                if (mp_handshake_error) |failure| {
-                    if (!self.recoverMiddleProxyFailure(slot, failure.class, error.MiddleProxyHandshakeFailed)) {
-                        self.closeSlot(slot, failure.reason);
-                    }
-                    return;
-                }
-
-                slot.mp_enc = crypto.AesCbcEncryptor.init(&enc_keys[0], &enc_keys[1]);
-                slot.mp_dec = crypto.AesCbcDecryptor.init(&dec_keys[0], &dec_keys[1]);
-
-                var hs_msg: [32]u8 = undefined;
-                @memcpy(hs_msg[0..4], &middleproxy.rpc_handshake);
-                @memset(hs_msg[4..8], 0);
-                @memcpy(hs_msg[8..20], "IPIPPRPDTIME");
-                @memcpy(hs_msg[20..32], "IPIPPRPDTIME");
-
-                self.mpWriteFrame(slot, hs_msg[0..], true) catch |err| {
-                    if (!self.recoverMiddleProxyFailure(slot, if (err == error.OutOfMemory) .local else .endpoint, err)) {
-                        self.closeSlot(slot, "mp send handshake failed");
-                    }
+                self.state.middle_proxy_lock.lockShared();
+                const secret = self.state.middleProxySecretForVersionLocked(slot.mp_secret_version) orelse {
+                    self.state.middle_proxy_lock.unlockShared();
+                    if (!self.recoverMiddleProxyFailure(slot, .shared_metadata, error.MissingMiddleProxySecret))
+                        self.closeSlot(slot, "mp secret version expired");
                     return;
                 };
-
-                self.setMiddleProxyStep(slot, if (slot.hasUpstreamPending()) .sending_rpc_handshake else .waiting_rpc_handshake_response);
-                if (!slot.hasUpstreamPending()) {
-                    mpReadReset(slot, true);
-                }
-            },
-
-            .waiting_rpc_handshake_response => {
-                const payload = self.mpTryReadFrame(slot, true) catch |err| {
-                    log.debug("[{d}] mp handshake frame read failed: {any}", .{ slot.conn_id, err });
-                    if (!self.recoverMiddleProxyFailure(slot, if (err == error.OutOfMemory) .local else .endpoint, err)) {
-                        self.closeSlot(slot, "mp read handshake ans failed");
-                    }
+                slot.mp_transport.validateNonceResponse(payload, secret) catch |err| {
+                    self.state.middle_proxy_lock.unlockShared();
+                    if (!self.recoverMiddleProxyFailure(slot, .endpoint, err))
+                        self.closeSlot(slot, "mp nonce answer invalid");
                     return;
-                } orelse return;
-
-                if (payload.len != 32) {
-                    if (!self.recoverMiddleProxyFailure(slot, .endpoint, error.BadMiddleProxyHandshakeResponse)) {
-                        self.closeSlot(slot, "mp bad handshake ans len");
-                    }
+                };
+                const peer_addr = net.peerAddress(slot.upstream_fd) catch |err| {
+                    self.state.middle_proxy_lock.unlockShared();
+                    if (!self.recoverMiddleProxyFailure(slot, .local, err))
+                        self.closeSlot(slot, "mp getpeername failed");
                     return;
-                }
-                if (!std.mem.eql(u8, payload[0..4], &middleproxy.rpc_handshake)) {
-                    if (!self.recoverMiddleProxyFailure(slot, .endpoint, error.BadMiddleProxyHandshakeResponse)) {
-                        self.closeSlot(slot, "mp bad handshake ans type");
-                    }
-                    return;
-                }
-                if (!std.mem.eql(u8, payload[20..32], "IPIPPRPDTIME")) {
-                    if (!self.recoverMiddleProxyFailure(slot, .endpoint, error.BadMiddleProxyHandshakeResponse)) {
-                        self.closeSlot(slot, "mp bad handshake pid");
-                    }
-                    return;
-                }
-
-                const local_addr = net.localAddress(slot.upstream_fd) catch {
-                    if (!self.recoverMiddleProxyFailure(slot, .local, error.MiddleProxyLocalAddressUnavailable)) {
+                };
+                const local_addr = net.localAddress(slot.upstream_fd) catch |err| {
+                    self.state.middle_proxy_lock.unlockShared();
+                    if (!self.recoverMiddleProxyFailure(slot, .local, err))
                         self.closeSlot(slot, "mp getsockname failed");
-                    }
                     return;
                 };
 
-                var middle_local_addr = local_addr;
-                if (slot.mp_nat_ip4) |nat_ip| {
-                    if (local_addr == .ip4) {
-                        middle_local_addr = net.ip4(nat_ip, local_addr.ip4.port);
-                    }
-                }
+                var frame_buf: [mp_handshake_frame_buf_size]u8 = undefined;
+                defer std.crypto.secureZero(u8, &frame_buf);
+                const frame = slot.mp_transport.acceptNonceResponse(
+                    &frame_buf,
+                    payload,
+                    peer_addr,
+                    local_addr,
+                    slot.mp_nat_ip4,
+                    secret,
+                ) catch |err| {
+                    self.state.middle_proxy_lock.unlockShared();
+                    const class: MiddleProxyFailureClass = if (err == error.BadMiddleProxyNonceResponse)
+                        .endpoint
+                    else
+                        .local;
+                    if (!self.recoverMiddleProxyFailure(slot, class, err))
+                        self.closeSlot(slot, "mp nonce answer invalid");
+                    return;
+                };
+                self.state.middle_proxy_lock.unlockShared();
 
+                _ = queueUpstream(slot, frame) catch |err| {
+                    if (!self.recoverMiddleProxyFailure(slot, if (err == error.OutOfMemory) .local else .endpoint, err))
+                        self.closeSlot(slot, "mp send handshake failed");
+                    return;
+                };
+                if (!slot.hasUpstreamPending()) slot.mp_transport.writeDrained();
+                self.setMiddleProxyStep(slot, slot.mp_transport.step);
+            },
+            .waiting_rpc_handshake_response => {
+                slot.mp_transport.acceptHandshakeResponse(payload) catch |err| {
+                    if (!self.recoverMiddleProxyFailure(slot, .endpoint, err))
+                        self.closeSlot(slot, "mp handshake answer invalid");
+                    return;
+                };
+
+                var auth = slot.mp_transport.takeAuthenticatedState() catch |err| {
+                    if (!self.recoverMiddleProxyFailure(slot, .local, err))
+                        self.closeSlot(slot, "mp authenticated state unavailable");
+                    return;
+                };
+                defer auth.wipe();
                 var conn_id: [8]u8 = undefined;
                 crypto.randomBytes(&conn_id);
+                defer std.crypto.secureZero(u8, &conn_id);
 
                 slot.middle_ctx = middleproxy.MiddleProxyContext.initWithBuffer(
                     self.managed_buffers.allocator(),
-                    slot.mp_enc.?,
-                    slot.mp_dec.?,
+                    auth.encryptor,
+                    auth.decryptor,
                     conn_id,
-                    slot.mp_write_seq_no,
+                    auth.write_seq_no,
                     slot.peer_addr,
-                    middle_local_addr,
+                    auth.effective_local_addr,
                     slot.proto_tag,
                     self.state.config.tag,
                     self.state.config.middleProxyBufferBytes(),
-                ) catch {
-                    if (!self.recoverMiddleProxyFailure(slot, .local, error.OutOfMemory)) {
+                ) catch |err| {
+                    if (!self.recoverMiddleProxyFailure(slot, .local, err))
                         self.closeSlot(slot, "mp context init failed");
-                    }
                     return;
                 };
 
@@ -3777,14 +3710,19 @@ const EventLoop = struct {
                 if (slot.current_upstream_addr) |addr| {
                     if (slot.mp_auth_started_at_ms > 0) {
                         const now_ms = runtime_time.monotonicMilli();
-                        self.state.noteMiddleProxyAuthSuccess(addr, slot.mp_secret_version, now_ms - slot.mp_auth_started_at_ms, now_ms);
+                        self.state.noteMiddleProxyAuthSuccess(
+                            addr,
+                            slot.mp_secret_version,
+                            now_ms - slot.mp_auth_started_at_ms,
+                            now_ms,
+                        );
                     }
                 }
                 slot.mp_auth_started_at_ms = 0;
                 self.promoteSuccessfulMiddleProxyCandidate(slot);
                 self.startRelay(slot);
             },
-            else => {},
+            else => unreachable,
         }
     }
 
@@ -3832,25 +3770,9 @@ const EventLoop = struct {
         self.cleanupFailedUpstreamConnect(slot);
         self.setMiddleProxyStep(slot, .none);
         slot.mp_auth_started_at_ms = 0;
-        if (slot.mp_enc) |*enc| enc.wipe();
-        if (slot.mp_dec) |*dec| dec.wipe();
-        slot.mp_enc = null;
-        slot.mp_dec = null;
         if (slot.middle_ctx) |*mp| mp.deinit();
         slot.middle_ctx = null;
-        if (slot.mp_frame_buf) |buf| secureFree(self.state.allocator, buf);
-        slot.mp_frame_buf = null;
-        slot.mp_frame_have = 0;
-        slot.mp_frame_need = 0;
-        slot.mp_frame_total_len = 0;
-        slot.mp_frame_padded_len = 0;
-        slot.mp_frame_encrypted = false;
-        slot.mp_frame_first_decrypted = false;
-        slot.mp_write_seq_no = -2;
-        slot.mp_read_seq_no = -2;
-        std.crypto.secureZero(u8, &slot.mp_nonce);
-        std.crypto.secureZero(u8, &slot.mp_rpc_nonce_ans);
-        slot.mp_timestamp = 0;
+        slot.mp_transport.deinit(self.state.allocator);
     }
 
     fn fallbackFromMiddleProxyToDirect(self: *EventLoop, slot: *ConnectionSlot) bool {
@@ -3896,7 +3818,7 @@ const EventLoop = struct {
     }
 
     fn setMiddleProxyStep(self: *EventLoop, slot: *ConnectionSlot, step: MiddleProxyHandshakeStep) void {
-        slot.mp_step = step;
+        slot.mp_transport.step = step;
         slot.mp_step_deadline_ms = switch (step) {
             .none, .done => 0,
             else => timeout_policy.middleProxyStepDeadlineMs(
@@ -3907,153 +3829,6 @@ const EventLoop = struct {
                 runtime_time.monotonicMilli(),
             ),
         };
-    }
-
-    fn mpWriteFrame(self: *EventLoop, slot: *ConnectionSlot, payload: []const u8, encrypted: bool) !void {
-        _ = self;
-        var plain: [mp_handshake_frame_buf_size]u8 = undefined;
-        defer std.crypto.secureZero(u8, &plain);
-        const cipher: ?*crypto.AesCbcEncryptor = if (encrypted) &slot.mp_enc.? else null;
-        const frame = try middle_proxy_handshake.encodeFrame(&plain, &slot.mp_write_seq_no, payload, cipher);
-        _ = try queueUpstream(slot, frame);
-    }
-
-    fn mpTryReadFrame(self: *EventLoop, slot: *ConnectionSlot, encrypted: bool) !?[]const u8 {
-        const frame_buf = try ensureMpFrameBuf(slot, self.state.allocator);
-
-        while (true) {
-            if (slot.mp_frame_need == 0) {
-                mpReadReset(slot, encrypted);
-            }
-
-            if (slot.mp_frame_have < slot.mp_frame_need) {
-                const n = readSlotFd(slot, slot.upstream_fd, frame_buf[slot.mp_frame_have..slot.mp_frame_need]) catch |err| {
-                    if (err == error.WouldBlock) return null;
-                    log.debug("[{d}] mp read error: step={s} encrypted={} have={d} need={d} err={any}", .{
-                        slot.conn_id,
-                        @tagName(slot.mp_step),
-                        encrypted,
-                        slot.mp_frame_have,
-                        slot.mp_frame_need,
-                        err,
-                    });
-                    return err;
-                };
-                if (n == 0) {
-                    log.debug("[{d}] mp upstream eof: step={s} encrypted={} have={d} need={d}", .{
-                        slot.conn_id,
-                        @tagName(slot.mp_step),
-                        encrypted,
-                        slot.mp_frame_have,
-                        slot.mp_frame_need,
-                    });
-                    return error.EndOfStream;
-                }
-                slot.mp_frame_have += n;
-                if (slot.mp_frame_have < slot.mp_frame_need) return null;
-            }
-
-            if (!encrypted) {
-                if (slot.mp_frame_total_len == 0) {
-                    slot.mp_frame_total_len = std.mem.readInt(u32, frame_buf[0..4], .little);
-                    if (slot.mp_frame_total_len < 12 or slot.mp_frame_total_len > frame_buf.len) {
-                        log.debug("[{d}] mp plain frame size invalid: total_len={d} have={d} need={d}", .{
-                            slot.conn_id,
-                            slot.mp_frame_total_len,
-                            slot.mp_frame_have,
-                            slot.mp_frame_need,
-                        });
-                        return error.BadMiddleProxyFrameSize;
-                    }
-                    slot.mp_frame_need = slot.mp_frame_total_len;
-                    continue;
-                }
-            } else {
-                if (!slot.mp_frame_first_decrypted) {
-                    slot.mp_dec.?.decryptInPlace(frame_buf[0..16]) catch |err| {
-                        log.debug("[{d}] mp decrypt first block failed: step={s} err={any}", .{
-                            slot.conn_id,
-                            @tagName(slot.mp_step),
-                            err,
-                        });
-                        return err;
-                    };
-                    slot.mp_frame_first_decrypted = true;
-                    slot.mp_frame_total_len = std.mem.readInt(u32, frame_buf[0..4], .little);
-                    if (slot.mp_frame_total_len < 12 or slot.mp_frame_total_len > (1 << 24)) {
-                        const first4_le = std.mem.readInt(u32, frame_buf[0..4], .little);
-                        const first4_be = std.mem.readInt(u32, frame_buf[0..4], .big);
-                        log.debug("[{d}] mp encrypted frame size invalid: total_len={d} first4_le=0x{x} first4_be=0x{x}", .{
-                            slot.conn_id,
-                            slot.mp_frame_total_len,
-                            first4_le,
-                            first4_be,
-                        });
-                        return error.BadMiddleProxyFrameSize;
-                    }
-                    slot.mp_frame_padded_len = if (slot.mp_frame_total_len % 16 == 0)
-                        slot.mp_frame_total_len
-                    else
-                        slot.mp_frame_total_len + (16 - (slot.mp_frame_total_len % 16));
-                    if (slot.mp_frame_padded_len > frame_buf.len) {
-                        log.debug("[{d}] mp encrypted padded size invalid: total_len={d} padded_len={d} frame_buf={d}", .{
-                            slot.conn_id,
-                            slot.mp_frame_total_len,
-                            slot.mp_frame_padded_len,
-                            frame_buf.len,
-                        });
-                        return error.BadMiddleProxyFrameSize;
-                    }
-                    slot.mp_frame_need = slot.mp_frame_padded_len;
-                    if (slot.mp_frame_have < slot.mp_frame_need) return null;
-                }
-
-                if (slot.mp_frame_padded_len > 16) {
-                    slot.mp_dec.?.decryptInPlace(frame_buf[16..slot.mp_frame_padded_len]) catch |err| {
-                        log.debug("[{d}] mp decrypt payload failed: step={s} padded_len={d} err={any}", .{
-                            slot.conn_id,
-                            @tagName(slot.mp_step),
-                            slot.mp_frame_padded_len,
-                            err,
-                        });
-                        return err;
-                    };
-                }
-            }
-
-            const frame = frame_buf[0..slot.mp_frame_total_len];
-            const msg_seq = std.mem.readInt(i32, frame[4..8], .little);
-            if (msg_seq != slot.mp_read_seq_no) {
-                log.debug("[{d}] mp seq mismatch: got={d} expected={d} step={s}", .{
-                    slot.conn_id,
-                    msg_seq,
-                    slot.mp_read_seq_no,
-                    @tagName(slot.mp_step),
-                });
-                return error.BadMiddleProxySeqNo;
-            }
-            slot.mp_read_seq_no = slot.mp_read_seq_no +% 1;
-
-            const expected_checksum = std.mem.readInt(u32, frame[frame.len - 4 ..][0..4], .little);
-            const computed_checksum = middleproxy.crc32(frame[0 .. frame.len - 4]);
-            if (expected_checksum != computed_checksum) {
-                log.debug("[{d}] mp checksum mismatch: expected=0x{x} computed=0x{x} frame_len={d}", .{
-                    slot.conn_id,
-                    expected_checksum,
-                    computed_checksum,
-                    frame.len,
-                });
-                return error.BadMiddleProxyChecksum;
-            }
-
-            // Copy payload into front of frame_buf so caller can consume before reset.
-            const payload_len = frame.len - 12;
-            std.mem.copyForwards(u8, frame_buf[0..payload_len], frame[8 .. frame.len - 4]);
-            const payload = frame_buf[0..payload_len];
-
-            mpReadReset(slot, encrypted);
-            return payload;
-        }
     }
 
     fn nextSlotDeadlineNs(self: *const EventLoop, slot: *const ConnectionSlot) ?i128 {
@@ -4152,7 +3927,7 @@ const EventLoop = struct {
                 }
             } else if (now_ms - slot.first_byte_at_ms >= secondsToMs(self.state.config.handshake_timeout_sec)) {
                 countStat(&self.state.stats_hs_timeout);
-                if (slot.phase == .middle_proxy_handshake and slot.mp_step.awaitingMiddleProxy()) {
+                if (slot.phase == .middle_proxy_handshake and slot.mp_transport.step.awaitingMiddleProxy()) {
                     self.state.requestMiddleProxyRefresh();
                 }
                 self.closeSlot(slot, "handshake timeout");
@@ -4276,10 +4051,10 @@ const EventLoop = struct {
 
             .middle_proxy_handshake => {
                 want_upstream_out = want_upstream_out or
-                    slot.mp_step == .sending_rpc_nonce or
-                    slot.mp_step == .sending_rpc_handshake;
-                want_upstream_in = slot.mp_step == .waiting_rpc_nonce_response or
-                    slot.mp_step == .waiting_rpc_handshake_response;
+                    slot.mp_transport.step == .sending_rpc_nonce or
+                    slot.mp_transport.step == .sending_rpc_handshake;
+                want_upstream_in = slot.mp_transport.step == .waiting_rpc_nonce_response or
+                    slot.mp_transport.step == .waiting_rpc_handshake_response;
             },
 
             .relaying, .mask_relaying => {
@@ -4959,22 +4734,6 @@ fn checkNofileLimit(required: usize, max_connections: u32) void {
     });
 }
 
-fn ensureMpFrameBuf(slot: *ConnectionSlot, allocator: std.mem.Allocator) ![]u8 {
-    if (slot.mp_frame_buf) |buf| return buf;
-    const buf = try allocator.alloc(u8, mp_handshake_frame_buf_size);
-    slot.mp_frame_buf = buf;
-    return buf;
-}
-
-fn mpReadReset(slot: *ConnectionSlot, encrypted: bool) void {
-    slot.mp_frame_have = 0;
-    slot.mp_frame_total_len = 0;
-    slot.mp_frame_padded_len = 0;
-    slot.mp_frame_encrypted = encrypted;
-    slot.mp_frame_first_decrypted = false;
-    slot.mp_frame_need = if (encrypted) 16 else 4;
-}
-
 fn writePlainMiddleProxyTestFrame(fd: posix.fd_t, seq_no: i32, payload: []const u8) !void {
     var frame: [mp_handshake_frame_buf_size]u8 = undefined;
     var frame_seq = seq_no;
@@ -5088,8 +4847,8 @@ test "middle proxy nonce response failure retries another candidate before direc
     slot.upstream_fd = upstream_file.handle;
     upstream_file_owned = false;
     slot.phase = .middle_proxy_handshake;
-    slot.mp_step = .waiting_rpc_nonce_response;
-    slot.mp_read_seq_no = -2;
+    slot.mp_transport.step = .waiting_rpc_nonce_response;
+    slot.mp_transport.read_seq_no = -2;
     slot.use_middle_proxy = true;
     slot.direct_fallback_addr = fallback_addr;
     slot.current_upstream_addr = fallback_addr;
@@ -5111,7 +4870,7 @@ test "middle proxy nonce response failure retries another candidate before direc
         .proto_tag = .intermediate,
         .dc_idx = 4,
     };
-    mpReadReset(slot, false);
+    slot.mp_transport.resetFrame(false);
 
     var bad_nonce_payload = [_]u8{0} ** 32;
     @memcpy(bad_nonce_payload[0..4], &middleproxy.rpc_proxy_ans);
@@ -5126,10 +4885,10 @@ test "middle proxy nonce response failure retries another candidate before direc
     try std.testing.expectEqual(original_first_byte_ms, slot.first_byte_at_ms);
     try std.testing.expectEqualStrings("test", slot.pipelined_data.?[0..slot.pipelined_len]);
     if (slot.phase == .connecting_upstream) {
-        try std.testing.expectEqual(@as(i32, -2), slot.mp_write_seq_no);
-        try std.testing.expectEqual(@as(i32, -2), slot.mp_read_seq_no);
-        try std.testing.expectEqual(@as(u32, 0), slot.mp_timestamp);
-        try std.testing.expect(slot.mp_enc == null and slot.mp_dec == null);
+        try std.testing.expectEqual(@as(i32, -2), slot.mp_transport.write_seq_no);
+        try std.testing.expectEqual(@as(i32, -2), slot.mp_transport.read_seq_no);
+        try std.testing.expectEqual(@as(u32, 0), slot.mp_transport.timestamp);
+        try std.testing.expect(slot.mp_transport.enc == null and slot.mp_transport.dec == null);
     } else {
         try std.testing.expectEqual(ConnectionPhase.middle_proxy_handshake, slot.phase);
     }
@@ -5138,7 +4897,7 @@ test "middle proxy nonce response failure retries another candidate before direc
     try std.testing.expect(loop.recoverMiddleProxyFailure(slot, .endpoint, error.BadMiddleProxyHandshakeResponse));
     try std.testing.expect(slot.direct_fallback_used);
     try std.testing.expect(!slot.use_middle_proxy);
-    try std.testing.expectEqual(MiddleProxyHandshakeStep.none, slot.mp_step);
+    try std.testing.expectEqual(MiddleProxyHandshakeStep.none, slot.mp_transport.step);
     try std.testing.expectEqual(UpstreamKind.dc, slot.upstream_kind);
     try std.testing.expectEqual(@as(usize, 1), slot.upstreamCandidates().len);
     try std.testing.expect(net.exactAddressEql(slot.current_upstream_addr.?, fallback_addr));
@@ -5161,8 +4920,8 @@ test "middle proxy nonce response failure retries another candidate before direc
     cdn_slot.upstream_fd = cdn_file.handle;
     cdn_file_owned = false;
     cdn_slot.phase = .middle_proxy_handshake;
-    cdn_slot.mp_step = .waiting_rpc_nonce_response;
-    cdn_slot.mp_read_seq_no = -2;
+    cdn_slot.mp_transport.step = .waiting_rpc_nonce_response;
+    cdn_slot.mp_transport.read_seq_no = -2;
     cdn_slot.use_middle_proxy = true;
     cdn_slot.current_upstream_addr = fallback_addr;
     cdn_slot.dc_abs = 203;
@@ -5170,7 +4929,7 @@ test "middle proxy nonce response failure retries another candidate before direc
     cdn_slot.mp_secret_version = state.middle_proxy_secret_version;
     try cdn_slot.setUpstreamCandidates(state.allocator, &mp_candidates);
     cdn_slot.upstream_candidate_next = 1;
-    mpReadReset(cdn_slot, false);
+    cdn_slot.mp_transport.resetFrame(false);
     try writePlainMiddleProxyTestFrame(cdn_file.handle, -2, &bad_nonce_payload);
     try seekFdToStart(cdn_file.handle);
 

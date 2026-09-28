@@ -83,10 +83,14 @@ candidate list from that snapshot. The protocol wire/crypto
 implementation remains in `src/protocol/middleproxy.zig`; NAT detection and
 route/cooldown selection live in the proxy modules named above. The pure
 `middle_proxy_handshake.zig` derives directional keys from already selected
-nonce/address/secret inputs and encodes outgoing handshake frames. `EventLoop`
-still owns the socket address queries, versioned-secret read lock, CBC state,
-nonblocking frame reads, fallback, and phase transitions; `ProxyState` still
-owns refresh and publication.
+nonce/address/secret inputs and encodes outgoing handshake frames.
+`MiddleProxyTransport` owns the client-independent nonce/auth state machine,
+CBC chaining, RPC sequence numbers, and bounded nonblocking frame parser.
+The cold `ConnectionSlot` embeds it; after authentication the CBC/sequence
+state transfers once into the client-specific `MiddleProxyContext`.
+`EventLoop` still owns fd/epoll registration, socket address queries, the
+versioned-secret read lock, stage deadlines, fallback, and phase transitions;
+`ProxyState` still owns refresh and publication. There is no warm pool yet.
 
 `relay_io.zig` performs bounded fd operations, queue writes/flushes, TLS record
 wrapping, and frame-boundary checks without new locks or packet-path

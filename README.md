@@ -86,8 +86,11 @@ The ordinary proxy's fd/epoll and connection orchestration remains in
 indexed deadlines, queues/memory, relay I/O, pure deadline selection, shared
 security/wedge logic, MiddleProxy discovery/routing, and handshake KDF/frame
 preparation live in focused modules beside it. The worker still owns the
-versioned-secret lock, socket address lookups, CBC state, retry/fallback and
-timerfd arming. The wire protocol remains in `src/protocol/`. Ownership and
+versioned-secret lock, socket address lookups, fd/epoll registration,
+retry/fallback and timerfd arming. The client-independent
+`MiddleProxyTransport` owns nonce/auth framing, CBC chaining and RPC sequence
+state until successful authentication; the resulting state moves once into
+the client-specific `MiddleProxyContext`. The wire protocol remains in `src/protocol/`. Ownership and
 dependency boundaries are documented in
 `.agent/skills/architecture/SKILL.md`.
 

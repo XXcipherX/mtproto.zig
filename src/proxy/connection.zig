@@ -6,6 +6,7 @@ const constants = @import("../protocol/constants.zig");
 const crypto = @import("../crypto/crypto.zig");
 const obfuscation = @import("../protocol/obfuscation.zig");
 const middleproxy = @import("../protocol/middleproxy.zig");
+const middle_proxy_transport = @import("middle_proxy_transport.zig");
 const MessageQueue = @import("message_queue.zig").MessageQueue;
 const WedgeTracker = @import("wedge_recovery.zig").WedgeTracker;
 
@@ -76,25 +77,7 @@ pub const ConnectionPhase = enum {
     closing,
 };
 
-pub const MiddleProxyHandshakeStep = enum {
-    none,
-    sending_rpc_nonce,
-    waiting_rpc_nonce_response,
-    sending_rpc_handshake,
-    waiting_rpc_handshake_response,
-    done,
-
-    pub fn awaitingMiddleProxy(self: MiddleProxyHandshakeStep) bool {
-        return switch (self) {
-            .sending_rpc_nonce,
-            .waiting_rpc_nonce_response,
-            .sending_rpc_handshake,
-            .waiting_rpc_handshake_response,
-            => true,
-            .none, .done => false,
-        };
-    }
-};
+pub const MiddleProxyHandshakeStep = middle_proxy_transport.Step;
 
 pub const DynamicRecordSizer = struct {
     current_size: usize,
@@ -290,22 +273,9 @@ pub const ConnectionSlot = struct {
     /// probe-cover relays it must not be cut off by mask_relay_max_secs.
     web_carrier: bool = false,
 
-    // Non-blocking MiddleProxy handshake state
-    mp_step: MiddleProxyHandshakeStep = .none,
-    mp_write_seq_no: i32 = -2,
-    mp_read_seq_no: i32 = -2,
-    mp_nonce: [16]u8 = [_]u8{0} ** 16,
-    mp_timestamp: u32 = 0,
-    mp_rpc_nonce_ans: [16]u8 = [_]u8{0} ** 16,
-    mp_enc: ?crypto.AesCbcEncryptor = null,
-    mp_dec: ?crypto.AesCbcDecryptor = null,
-    mp_frame_buf: ?[]u8 = null,
-    mp_frame_have: usize = 0,
-    mp_frame_need: usize = 0,
-    mp_frame_total_len: usize = 0,
-    mp_frame_padded_len: usize = 0,
-    mp_frame_encrypted: bool = false,
-    mp_frame_first_decrypted: bool = false,
+    // Client-independent RPC handshake; fd, route, deadlines and recovery
+    // remain owned by this slot's worker.
+    mp_transport: middle_proxy_transport.MiddleProxyTransport = .{},
     mp_step_deadline_ms: i64 = 0,
     mp_auth_started_at_ms: i64 = 0,
     mp_secret_version: u64 = 0,
@@ -408,8 +378,7 @@ pub const ConnectionSlot = struct {
         self.dc_abs = 0;
         self.is_media_path = false;
 
-        if (self.mp_frame_buf) |buf| secureFree(allocator, buf);
-        self.mp_frame_buf = null;
+        self.mp_transport.deinit(allocator);
 
         if (self.obf_params) |*params| params.wipe();
         self.obf_params = null;
@@ -418,27 +387,20 @@ pub const ConnectionSlot = struct {
         if (self.client_decryptor) |*c| c.wipe();
         if (self.tg_encryptor) |*c| c.wipe();
         if (self.tg_decryptor) |*c| c.wipe();
-        if (self.mp_enc) |*c| c.wipe();
-        if (self.mp_dec) |*c| c.wipe();
 
         self.client_encryptor = null;
         self.client_decryptor = null;
         self.tg_encryptor = null;
         self.tg_decryptor = null;
-        self.mp_enc = null;
-        self.mp_dec = null;
         std.crypto.secureZero(u8, &self.validation_secret);
         std.crypto.secureZero(u8, &self.validation_digest);
         std.crypto.secureZero(u8, &self.validation_session_id);
         std.crypto.secureZero(u8, &self.validation_user);
         std.crypto.secureZero(u8, &self.handshake_buf);
-        std.crypto.secureZero(u8, &self.mp_nonce);
-        std.crypto.secureZero(u8, &self.mp_rpc_nonce_ans);
         self.validation_session_id_len = 0;
         self.validation_user_len = 0;
         self.validation_force_direct = false;
         self.handshake_pos = 0;
-        self.mp_timestamp = 0;
         self.mp_secret_version = 0;
         self.mp_auth_started_at_ms = 0;
         self.mp_nat_ip4 = null;
@@ -466,27 +428,16 @@ pub const ConnectionSlot = struct {
 
         self.clearUpstreamCandidates(allocator);
 
-        if (self.mp_frame_buf) |buf| secureFree(allocator, buf);
-        self.mp_frame_buf = null;
-        self.mp_frame_have = 0;
-        self.mp_frame_need = 0;
-        self.mp_frame_total_len = 0;
-        self.mp_frame_padded_len = 0;
+        self.mp_transport.deinit(allocator);
 
         if (self.obf_params) |*params| params.wipe();
         self.obf_params = null;
-        if (self.mp_enc) |*enc| enc.wipe();
-        if (self.mp_dec) |*dec| dec.wipe();
-        self.mp_enc = null;
-        self.mp_dec = null;
 
         std.crypto.secureZero(u8, &self.validation_secret);
         std.crypto.secureZero(u8, &self.validation_digest);
         std.crypto.secureZero(u8, &self.validation_session_id);
         std.crypto.secureZero(u8, &self.validation_user);
         std.crypto.secureZero(u8, &self.handshake_buf);
-        std.crypto.secureZero(u8, &self.mp_nonce);
-        std.crypto.secureZero(u8, &self.mp_rpc_nonce_ans);
         self.validation_session_id_len = 0;
         self.validation_user_len = 0;
         self.validation_force_direct = false;

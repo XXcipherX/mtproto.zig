@@ -1,4 +1,5 @@
-//! Pure MiddleProxy handshake preparation. The worker owns fds, secrets and CBC state.
+//! Pure MiddleProxy handshake preparation. The worker owns fds and secrets;
+//! MiddleProxyTransport owns pre-client CBC and sequence state.
 
 const std = @import("std");
 const net = @import("../net_helpers.zig");
@@ -93,7 +94,7 @@ pub fn deriveKeys(
 }
 
 /// Encode a single outgoing handshake frame into caller-owned scratch.
-/// Cipher state and sequence number remain owned by the connection slot.
+/// Cipher state and sequence number remain owned by the caller's transport.
 pub fn encodeFrame(
     buffer: []u8,
     seq_no: *i32,
