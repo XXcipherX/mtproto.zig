@@ -7,7 +7,7 @@ const MessageQueue = @import("message_queue.zig").MessageQueue;
 const socket_ops = @import("socket_ops.zig");
 const writeFd = socket_ops.writeFd;
 const writevFd = socket_ops.writevFd;
-const max_scatter_parts: usize = 64;
+pub const max_scatter_parts: usize = 64;
 // Outbound FakeTLS sizing heuristic: reserve the TLS 1.3 content-type/tag
 // margin (1 + 16 bytes) to avoid repeated bulk 0x4000 records. This is not a
 // TLS legality limit, and FakeTLS does not actually add TLS AEAD overhead.
@@ -289,6 +289,12 @@ pub fn queueClientPair(slot: *ConnectionSlot, first: []const u8, second: []const
 
 pub fn queueUpstream(slot: *ConnectionSlot, data: []const u8) !bool {
     return queueOrWriteMsg(slot, slot.upstream_fd, &slot.upstream_queue, data);
+}
+
+/// Write borrowed parts synchronously or copy their exact unsent suffix into
+/// the upstream queue before the caller reuses its scratch storage.
+pub fn queueUpstreamParts(slot: *ConnectionSlot, parts: []const []const u8) !bool {
+    return queueOrWriteParts(slot, slot.upstream_fd, &slot.upstream_queue, parts);
 }
 
 pub fn flushClientPending(slot: *ConnectionSlot) !usize {

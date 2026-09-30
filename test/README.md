@@ -47,6 +47,15 @@ FakeTLS application records and an intervening CCS, using the real AES-CTR state
 They also cover one-byte segmentation, malformed headers, and incomplete framing
 at EOF. C2S consumes all records in one bounded read chunk before reusing scratch.
 
+Direct C2S socketpair regressions use different client/upstream AES keys and a
+two-operation budget to require one read plus one scatter write for three records
+with an intervening CCS. They check a partial write inside the second payload,
+real socket EAGAIN, read-exhausted byte/operation budgets, exact owned suffixes
+after scratch overwrite, and later queue flushing. Further cases forward partial
+record bodies immediately across reads, preserve a valid prefix before a malformed
+record, and split 131 tiny records into bounded batches without losing order when
+the first batch exhausts output capacity. Counters retain per-payload-piece units.
+
 S2C unit tests check exact multi-record wire bytes, a single budgeted scatter
 write, partial writes at every iovec boundary, ordered fallback, and stack-header
 reuse across batches. Queue tests inject allocation failures during multipart

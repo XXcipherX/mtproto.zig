@@ -4491,6 +4491,15 @@ fn pipelinedCapacity(current_capacity: usize, required_len: usize) usize {
     return next;
 }
 
+fn queueDirectClientPayloadBatch(slot: *ConnectionSlot, parts: []const []const u8) !void {
+    _ = try relay_io.queueUpstreamParts(slot, parts);
+    // Account accepted payload pieces, regardless of physical write count.
+    for (parts) |payload| {
+        slot.wedge_forwarded_c2s_seq +|= 1;
+        slot.c2s_bytes += payload.len;
+    }
+}
+
 fn relayClientToUpstreamStep(self: *EventLoop, slot: *ConnectionSlot) !RelayProgress {
     const read_buf = self.relay_read_scratch[0..];
     const n = readSlotFd(slot, slot.client_fd, read_buf) catch |err| {
@@ -4501,9 +4510,17 @@ fn relayClientToUpstreamStep(self: *EventLoop, slot: *ConnectionSlot) !RelayProg
 
     var remaining = read_buf[0..n];
     var forwarded = false;
+    var parts: [relay_io.max_scatter_parts][]const u8 = undefined;
+    var part_count: usize = 0;
     // Finish this bounded chunk even if output becomes queued: all slices borrow
-    // read scratch and queueUpstream copies unsent bytes before the next read.
-    while (try relay_io.nextClientTlsPayload(slot, &remaining)) |payload| {
+    // read scratch and the queue helpers own unsent bytes before the next read.
+    while (true) {
+        const payload = (relay_io.nextClientTlsPayload(slot, &remaining) catch |err| {
+            // The previous per-payload path already forwarded valid prefixes
+            // before encountering a malformed record in the same read.
+            if (part_count > 0) try queueDirectClientPayloadBatch(slot, parts[0..part_count]);
+            return err;
+        }) orelse break;
         if (slot.client_decryptor) |*dec| dec.apply(payload);
 
         if (slot.middle_ctx) |*mp| {
@@ -4516,13 +4533,20 @@ fn relayClientToUpstreamStep(self: *EventLoop, slot: *ConnectionSlot) !RelayProg
             }
         } else if (slot.tg_encryptor) |*enc| {
             enc.apply(payload);
-            _ = try queueUpstream(slot, payload);
-            slot.wedge_forwarded_c2s_seq +|= 1;
+            parts[part_count] = payload;
+            part_count += 1;
+            if (part_count == parts.len) {
+                try queueDirectClientPayloadBatch(slot, &parts);
+                part_count = 0;
+            }
+            forwarded = true;
+            continue;
         }
 
         slot.c2s_bytes += payload.len;
         forwarded = true;
     }
+    if (part_count > 0) try queueDirectClientPayloadBatch(slot, parts[0..part_count]);
     return if (forwarded) .forwarded else .partial;
 }
 
@@ -4953,6 +4977,289 @@ fn relayDrainTestSocketPair() ![2]posix.fd_t {
     const rc = linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0, &fds);
     if (linux.errno(rc) != .SUCCESS) return posix.unexpectedErrno(linux.errno(rc));
     return fds;
+}
+
+fn expectRelayTestQueue(queue: *const message_queue.MessageQueue, expected: []const u8) !void {
+    try std.testing.expectEqual(expected.len, queue.total_len);
+    var iovecs: [relay_io.max_scatter_parts]posix.iovec_const = undefined;
+    const count = queue.prepareIovecs(&iovecs, expected.len);
+    var off: usize = 0;
+    for (iovecs[0..count]) |iov| {
+        try std.testing.expectEqualSlices(u8, expected[off..][0..iov.len], iov.base[0..iov.len]);
+        off += iov.len;
+    }
+    try std.testing.expectEqual(expected.len, off);
+}
+
+test "direct C2S batches records with CCS and owns backpressured suffixes" {
+    const client_key = [_]u8{0x37} ** 32;
+    const upstream_key = [_]u8{0x92} ** 32;
+    var plaintext: [47]u8 = undefined;
+    for (&plaintext, 0..) |*byte, i| byte.* = @truncate(i * 29 + 9);
+    var ciphertext = plaintext;
+    var client_cipher = crypto.AesCtr.init(&client_key, 7);
+    client_cipher.apply(&ciphertext);
+    var expected = plaintext;
+    var upstream_cipher = crypto.AesCtr.init(&upstream_key, 19);
+    upstream_cipher.apply(&expected);
+
+    var wire: [plaintext.len + 3 * 5 + 6]u8 = undefined;
+    var wire_off: usize = 0;
+    var payload_off: usize = 0;
+    for ([_]usize{ 7, 19, 21 }, 0..) |len, i| {
+        if (i == 1) {
+            @memcpy(wire[wire_off..][0..6], &[_]u8{ 0x14, 3, 3, 0, 1, 1 });
+            wire_off += 6;
+        }
+        @memcpy(wire[wire_off..][0..3], &[_]u8{ 0x17, 3, 3 });
+        std.mem.writeInt(u16, wire[wire_off + 3 ..][0..2], @intCast(len), .big);
+        @memcpy(wire[wire_off + 5 ..][0..len], ciphertext[payload_off..][0..len]);
+        wire_off += 5 + len;
+        payload_off += len;
+    }
+
+    const loop = try std.testing.allocator.create(EventLoop);
+    defer std.testing.allocator.destroy(loop);
+    const fixtures = [_]struct { budget: EventIoBudget, sent: usize, blocked: bool = false }{
+        .{ .budget = .{ .operations_remaining = 2 }, .sent = expected.len },
+        // The byte limit clips writev five bytes into the second payload.
+        .{ .budget = .{ .bytes_remaining = wire.len + 12, .operations_remaining = 2 }, .sent = 12 },
+        .{ .budget = .{ .operations_remaining = 1 }, .sent = 0 },
+        .{ .budget = .{ .bytes_remaining = wire.len, .operations_remaining = 2 }, .sent = 0 },
+        .{ .budget = .{ .operations_remaining = 2 }, .sent = 0, .blocked = true },
+    };
+    for (fixtures) |fixture| {
+        const client = try relayDrainTestSocketPair();
+        defer closeFd(client[0]);
+        defer closeFd(client[1]);
+        const upstream = try relayDrainTestSocketPair();
+        defer closeFd(upstream[0]);
+        defer closeFd(upstream[1]);
+        var blocked_bytes: usize = 0;
+        const fill = [_]u8{0} ** 4096;
+        if (fixture.blocked) {
+            var blocked = false;
+            for (0..1024) |_| {
+                blocked_bytes += socket_ops.writeFd(upstream[0], &fill) catch |err| {
+                    if (err != error.WouldBlock) return err;
+                    blocked = true;
+                    break;
+                };
+            }
+            try std.testing.expect(blocked);
+        }
+        try std.testing.expectEqual(wire.len, try socket_ops.writeFd(client[1], &wire));
+        var budget = fixture.budget;
+        var slot = ConnectionSlot{
+            .phase = .relaying,
+            .client_fd = client[0],
+            .upstream_fd = upstream[0],
+            .client_decryptor = crypto.AesCtr.init(&client_key, 7),
+            .tg_encryptor = crypto.AesCtr.init(&upstream_key, 19),
+            .upstream_queue = .{ .allocator = std.testing.allocator },
+            .event_io_budget = &budget,
+        };
+        defer slot.upstream_queue.deinit();
+        try std.testing.expectEqual(RelayProgress.forwarded, try relayClientToUpstreamStep(loop, &slot));
+        const writes: usize = @intFromBool(fixture.sent > 0 or fixture.blocked);
+        try std.testing.expectEqual(fixture.budget.operations_remaining - 1 - writes, budget.operations_remaining);
+        try std.testing.expectEqual(fixture.budget.bytes_remaining - wire.len - fixture.sent, budget.bytes_remaining);
+        try std.testing.expectEqual(@as(u64, expected.len), slot.c2s_bytes);
+        try std.testing.expectEqual(@as(u64, 3), slot.wedge_forwarded_c2s_seq);
+        try std.testing.expect(clientRelayAtFrameBoundary(&slot));
+
+        // Drain only the artificial socket fill, before checking relay bytes.
+        var fill_read: [4096]u8 = undefined;
+        while (blocked_bytes > 0) {
+            const count = try posix.read(upstream[1], fill_read[0..@min(blocked_bytes, fill_read.len)]);
+            try std.testing.expect(count > 0);
+            try std.testing.expectEqualSlices(u8, fill[0..count], fill_read[0..count]);
+            blocked_bytes -= count;
+        }
+        var actual: [expected.len]u8 = undefined;
+        if (fixture.sent > 0) {
+            try std.testing.expectEqual(fixture.sent, try posix.read(upstream[1], actual[0..fixture.sent]));
+            try std.testing.expectEqualSlices(u8, expected[0..fixture.sent], actual[0..fixture.sent]);
+        } else {
+            try std.testing.expectError(error.WouldBlock, posix.read(upstream[1], &actual));
+        }
+        @memset(loop.relay_read_scratch[0..], 0xa5);
+        try expectRelayTestQueue(&slot.upstream_queue, expected[fixture.sent..]);
+        // A later dispatch flushes owned storage after the read scratch changed.
+        var flush_budget = EventIoBudget{ .operations_remaining = 1 };
+        slot.event_io_budget = &flush_budget;
+        const pending = expected.len - fixture.sent;
+        try std.testing.expectEqual(pending, try flushUpstreamPending(&slot));
+        if (pending > 0) try std.testing.expectEqual(pending, try posix.read(upstream[1], actual[fixture.sent..]));
+        try std.testing.expectEqualSlices(u8, &expected, &actual);
+        try std.testing.expect(slot.upstream_queue.isEmpty());
+    }
+}
+
+test "direct C2S flushes each read without waiting for a complete TLS record" {
+    const client = try relayDrainTestSocketPair();
+    defer closeFd(client[0]);
+    defer closeFd(client[1]);
+    const upstream = try relayDrainTestSocketPair();
+    defer closeFd(upstream[0]);
+    defer closeFd(upstream[1]);
+    const client_key = [_]u8{0x73} ** 32;
+    const upstream_key = [_]u8{0x29} ** 32;
+    const plaintext = "one record forwarded across two body reads";
+    var ciphertext = plaintext.*;
+    var client_cipher = crypto.AesCtr.init(&client_key, 3);
+    client_cipher.apply(&ciphertext);
+    var expected = plaintext.*;
+    var upstream_cipher = crypto.AesCtr.init(&upstream_key, 11);
+    upstream_cipher.apply(&expected);
+    var wire: [5 + plaintext.len]u8 = undefined;
+    @memcpy(wire[0..3], &[_]u8{ 0x17, 3, 3 });
+    std.mem.writeInt(u16, wire[3..5], plaintext.len, .big);
+    @memcpy(wire[5..], &ciphertext);
+    const loop = try std.testing.allocator.create(EventLoop);
+    defer std.testing.allocator.destroy(loop);
+    var slot = ConnectionSlot{
+        .phase = .relaying,
+        .client_fd = client[0],
+        .upstream_fd = upstream[0],
+        .client_decryptor = crypto.AesCtr.init(&client_key, 3),
+        .tg_encryptor = crypto.AesCtr.init(&upstream_key, 11),
+        .upstream_queue = .{ .allocator = std.testing.allocator },
+    };
+    defer slot.upstream_queue.deinit();
+    var wire_off: usize = 0;
+    var payload_off: usize = 0;
+    var pieces: u64 = 0;
+    for ([_]usize{ 2, 5 + 7, wire.len }) |end| {
+        const chunk = wire[wire_off..end];
+        try std.testing.expectEqual(chunk.len, try socket_ops.writeFd(client[1], chunk));
+        var budget = EventIoBudget{ .operations_remaining = 2 };
+        slot.event_io_budget = &budget;
+        const payload_end = end - @min(end, 5);
+        const forwarded = payload_end - payload_off;
+        try std.testing.expectEqual(if (forwarded > 0) RelayProgress.forwarded else .partial, try relayClientToUpstreamStep(loop, &slot));
+        var actual: [expected.len]u8 = undefined;
+        if (forwarded > 0) {
+            pieces += 1;
+            try std.testing.expectEqual(forwarded, try posix.read(upstream[1], actual[0..forwarded]));
+            try std.testing.expectEqualSlices(u8, expected[payload_off..payload_end], actual[0..forwarded]);
+        } else {
+            try std.testing.expectError(error.WouldBlock, posix.read(upstream[1], &actual));
+        }
+        try std.testing.expectEqual(@as(usize, if (forwarded > 0) 0 else 1), budget.operations_remaining);
+        try std.testing.expectEqual(event_io_byte_budget - chunk.len - forwarded, budget.bytes_remaining);
+        try std.testing.expectEqual(@as(u64, @intCast(payload_end)), slot.c2s_bytes);
+        try std.testing.expectEqual(pieces, slot.wedge_forwarded_c2s_seq);
+        try std.testing.expectEqual(end == wire.len, clientRelayAtFrameBoundary(&slot));
+        try std.testing.expect(slot.upstream_queue.isEmpty());
+        wire_off = end;
+        payload_off = payload_end;
+    }
+}
+
+test "direct C2S bounds scatter batches and queues the rest of a consumed chunk" {
+    const client_key = [_]u8{0x18} ** 32;
+    const upstream_key = [_]u8{0xc9} ** 32;
+    var plaintext: [2 * relay_io.max_scatter_parts + 3]u8 = undefined;
+    for (&plaintext, 0..) |*byte, i| byte.* = @truncate(i * 31 + 5);
+    var ciphertext = plaintext;
+    var client_cipher = crypto.AesCtr.init(&client_key, 13);
+    client_cipher.apply(&ciphertext);
+    var expected = plaintext;
+    var upstream_cipher = crypto.AesCtr.init(&upstream_key, 27);
+    upstream_cipher.apply(&expected);
+    var wire: [plaintext.len * 6]u8 = undefined;
+    for (ciphertext, 0..) |byte, i| {
+        @memcpy(wire[i * 6 ..][0..5], &[_]u8{ 0x17, 3, 3, 0, 1 });
+        wire[i * 6 + 5] = byte;
+    }
+    const loop = try std.testing.allocator.create(EventLoop);
+    defer std.testing.allocator.destroy(loop);
+    const fixtures = [_]struct { budget: EventIoBudget, sent: usize, writes: usize }{
+        .{ .budget = .{ .operations_remaining = 4 }, .sent = expected.len, .writes = 3 },
+        .{ .budget = .{ .operations_remaining = 2 }, .sent = relay_io.max_scatter_parts, .writes = 1 },
+        .{ .budget = .{ .bytes_remaining = wire.len + 17, .operations_remaining = 4 }, .sent = 17, .writes = 1 },
+    };
+    for (fixtures) |fixture| {
+        const client = try relayDrainTestSocketPair();
+        defer closeFd(client[0]);
+        defer closeFd(client[1]);
+        const upstream = try relayDrainTestSocketPair();
+        defer closeFd(upstream[0]);
+        defer closeFd(upstream[1]);
+        try std.testing.expectEqual(wire.len, try socket_ops.writeFd(client[1], &wire));
+        var budget = fixture.budget;
+        var slot = ConnectionSlot{
+            .phase = .relaying,
+            .client_fd = client[0],
+            .upstream_fd = upstream[0],
+            .client_decryptor = crypto.AesCtr.init(&client_key, 13),
+            .tg_encryptor = crypto.AesCtr.init(&upstream_key, 27),
+            .upstream_queue = .{ .allocator = std.testing.allocator },
+            .event_io_budget = &budget,
+        };
+        defer slot.upstream_queue.deinit();
+        try std.testing.expectEqual(RelayProgress.forwarded, try relayClientToUpstreamStep(loop, &slot));
+        try std.testing.expectEqual(fixture.budget.operations_remaining - 1 - fixture.writes, budget.operations_remaining);
+        try std.testing.expectEqual(fixture.budget.bytes_remaining - wire.len - fixture.sent, budget.bytes_remaining);
+        try std.testing.expectEqual(@as(u64, expected.len), slot.c2s_bytes);
+        try std.testing.expectEqual(@as(u64, expected.len), slot.wedge_forwarded_c2s_seq);
+        try std.testing.expect(clientRelayAtFrameBoundary(&slot));
+        var actual: [expected.len]u8 = undefined;
+        try std.testing.expectEqual(fixture.sent, try posix.read(upstream[1], actual[0..fixture.sent]));
+        @memset(loop.relay_read_scratch[0..], 0x5a);
+        try expectRelayTestQueue(&slot.upstream_queue, expected[fixture.sent..]);
+        var flush_budget = EventIoBudget{ .operations_remaining = 1 };
+        slot.event_io_budget = &flush_budget;
+        const pending = expected.len - fixture.sent;
+        try std.testing.expectEqual(pending, try flushUpstreamPending(&slot));
+        if (pending > 0) try std.testing.expectEqual(pending, try posix.read(upstream[1], actual[fixture.sent..]));
+        try std.testing.expectEqualSlices(u8, &expected, &actual);
+        try std.testing.expect(slot.upstream_queue.isEmpty());
+    }
+}
+
+test "direct C2S forwards a valid batch before rejecting a later malformed record" {
+    const client = try relayDrainTestSocketPair();
+    defer closeFd(client[0]);
+    defer closeFd(client[1]);
+    const upstream = try relayDrainTestSocketPair();
+    defer closeFd(upstream[0]);
+    defer closeFd(upstream[1]);
+    const client_key = [_]u8{0x24} ** 32;
+    const upstream_key = [_]u8{0x81} ** 32;
+    var ciphertext = "abcdefg".*;
+    var client_cipher = crypto.AesCtr.init(&client_key, 17);
+    client_cipher.apply(&ciphertext);
+    var expected = "abcdefg".*;
+    var upstream_cipher = crypto.AesCtr.init(&upstream_key, 31);
+    upstream_cipher.apply(&expected);
+    var wire = [_]u8{ 0x17, 3, 3, 0, 3, 0, 0, 0, 0x17, 3, 3, 0, 4, 0, 0, 0, 0, 0x16, 3, 3, 0, 1 };
+    @memcpy(wire[5..8], ciphertext[0..3]);
+    @memcpy(wire[13..17], ciphertext[3..]);
+    try std.testing.expectEqual(wire.len, try socket_ops.writeFd(client[1], &wire));
+    const loop = try std.testing.allocator.create(EventLoop);
+    defer std.testing.allocator.destroy(loop);
+    var budget = EventIoBudget{ .operations_remaining = 2 };
+    var slot = ConnectionSlot{
+        .phase = .relaying,
+        .client_fd = client[0],
+        .upstream_fd = upstream[0],
+        .client_decryptor = crypto.AesCtr.init(&client_key, 17),
+        .tg_encryptor = crypto.AesCtr.init(&upstream_key, 31),
+        .upstream_queue = .{ .allocator = std.testing.allocator },
+        .event_io_budget = &budget,
+    };
+    defer slot.upstream_queue.deinit();
+    try std.testing.expectError(error.ConnectionReset, relayClientToUpstreamStep(loop, &slot));
+    var actual: [expected.len]u8 = undefined;
+    try std.testing.expectEqual(actual.len, try posix.read(upstream[1], &actual));
+    try std.testing.expectEqualSlices(u8, &expected, &actual);
+    try std.testing.expect(slot.upstream_queue.isEmpty());
+    try std.testing.expectEqual(@as(u64, expected.len), slot.c2s_bytes);
+    try std.testing.expectEqual(@as(u64, 2), slot.wedge_forwarded_c2s_seq);
+    try std.testing.expectEqual(@as(usize, 0), budget.operations_remaining);
+    try std.testing.expectEqual(event_io_byte_budget - wire.len - expected.len, budget.bytes_remaining);
 }
 
 test "relay drain forwards multiple chunks and respects the shared byte and operation budgets" {
