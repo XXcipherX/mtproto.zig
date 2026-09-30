@@ -122,6 +122,13 @@ absolute stage changes, expiry/close, slot reuse and generation rejection. Nativ
 timerfd tests inspect rearm selection for slots, shutdown, accept backoff and stats
 using supplied timestamps, without sleeping or depending on wall-clock precision.
 
+Mask-lifetime regressions parse omitted/zero/custom settings as 300/0/custom.
+Native timer tests simulate continuous activity with heap refresh/wakeups: ordinary
+masking closes exactly at the default/custom absolute limit, while explicit opt-out,
+WEB carriers and authenticated relays remain active beyond 300 seconds and still
+close later on idle expiry. Config generators omit the key and inherit the runtime
+default; existing explicit values are retained.
+
 Activity regressions cover FakeTLS/direct/mask reads in both directions, partial
 handshake and MP framing, real EAGAIN, exhausted budgets and blocked/empty writes.
 They verify progress semantics and a shared first-byte/activity sample, without

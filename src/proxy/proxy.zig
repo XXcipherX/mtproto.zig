@@ -5283,6 +5283,83 @@ test "relay idle deadlines wake early, recompute live activity and preserve time
     try std.testing.expectEqual(144_000 * ms, loop.armed_deadline_ns);
 }
 
+test "active ordinary masking expires by default while opt-out, WEB and authenticated relays survive" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var cfg = Config{
+        .users = std.StringHashMap([16]u8).init(std.testing.allocator),
+        .direct_users = std.StringHashMap(void).init(std.testing.allocator),
+        .mask = false,
+        .datacenter_override = net.ip4(.{ 127, 0, 0, 1 }, 443),
+    };
+    defer cfg.deinit(std.testing.allocator);
+    var state = try ProxyState.init(std.testing.allocator, std.testing.io, cfg);
+    defer state.deinit();
+    const listener = try relayDrainTestSocketPair();
+    defer closeFd(listener[0]);
+    defer closeFd(listener[1]);
+    const control = try createWorkerEventFd();
+    defer closeFd(control);
+    const loop = try EventLoop.init(&state, listener[0], control, 0, 1, default_managed_buffer_limit_bytes, null);
+    defer {
+        loop.deinit();
+        std.testing.allocator.destroy(loop);
+    }
+    const ms: i128 = std.time.ns_per_ms;
+    loop.stats_next_log_ns = 2_000_000 * ms;
+    for ([_]struct {
+        configured: ?u32 = null,
+        phase: ConnectionPhase = .mask_relaying,
+        web_carrier: bool = false,
+        checkpoint_ms: i64 = 301_000,
+        expires: bool,
+    }{
+        .{ .expires = true },
+        .{ .configured = 0, .expires = false },
+        .{ .configured = 60, .checkpoint_ms = 61_000, .expires = true },
+        .{ .web_carrier = true, .expires = false },
+        .{ .phase = .relaying, .expires = false },
+    }) |fixture| {
+        state.config.mask_relay_max_secs = fixture.configured orelse cfg.mask_relay_max_secs;
+        const slot = loop.pool.acquire().?;
+        slot.phase = fixture.phase;
+        slot.web_carrier = fixture.web_carrier;
+        slot.peer_addr = net.ip4(.{ 127, 0, 0, 1 }, 1234);
+        slot.created_at_ms = 1000;
+        slot.last_activity_ms = 1000;
+        slot.idle_timeout_ms = 120_000;
+        loop.refreshSlotDeadline(slot);
+
+        // Simulate regular progress and real heap wakeups without sleeping.
+        var heartbeat_ms: i64 = 31_000;
+        while (heartbeat_ms < fixture.checkpoint_ms - 1) : (heartbeat_ms += 30_000) {
+            slot.last_activity_ms = heartbeat_ms;
+            loop.refreshSlotDeadline(slot);
+            loop.runTimers(@as(i128, heartbeat_ms) * ms);
+            try std.testing.expectEqual(fixture.phase, slot.phase);
+        }
+        slot.last_activity_ms = fixture.checkpoint_ms - 1;
+        loop.refreshSlotDeadline(slot);
+        loop.runTimers(@as(i128, fixture.checkpoint_ms - 1) * ms);
+        try std.testing.expectEqual(fixture.phase, slot.phase);
+        const selected = loop.nextSlotDeadline(slot).?;
+        try std.testing.expectEqual(fixture.expires, selected.kind == .absolute);
+        const expected_ms = if (fixture.expires) fixture.checkpoint_ms else slot.last_activity_ms + slot.idle_timeout_ms;
+        try std.testing.expectEqual(@as(i128, expected_ms) * ms, selected.deadline_ns);
+
+        loop.runTimers(@as(i128, fixture.checkpoint_ms) * ms);
+        if (fixture.expires) {
+            try std.testing.expectEqual(ConnectionPhase.idle, slot.phase);
+            try std.testing.expectEqual(connection.no_timer_heap_index, slot.timer_heap_index);
+        } else {
+            try std.testing.expectEqual(fixture.phase, slot.phase);
+            // Exempt/opted-out relays still expire if they become idle.
+            loop.runTimers(@as(i128, expected_ms) * ms);
+            try std.testing.expectEqual(ConnectionPhase.idle, slot.phase);
+        }
+        try std.testing.expect(loop.deadline_heap.peek() == null);
+    }
+}
+
 test "absolute slot timers remain immediate across handshake, connect, MP, mask and desync" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     var cfg = Config{

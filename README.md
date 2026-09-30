@@ -1161,7 +1161,7 @@ rate_limit_per_subnet = 30                # Max new connections/sec per /24 subn
 tls_domain = "proxy.example.com"
 mask = true
 mask_port = 8443
-# mask_relay_max_secs = 0                  # Probe-cover lifetime; WEB carriers are exempt
+# mask_relay_max_secs = 300                # Probe-cover lifetime; 0 disables, WEB carriers are exempt
 desync = false                            # Set true to opt into Split-TLS and its handshake delay
 # desync_split_delay_ms = 3                # Base delay, used only with desync=true
 # desync_split_jitter_ms = 2               # Extra 0..N ms, used only with desync=true
@@ -1226,7 +1226,7 @@ alice = true   # direct where possible; CDN DC203 still requires MiddleProxy
 | `[censorship]` | `tls_domain` | `"google.com"` | FakeTLS SNI domain. With `mask_port=443`, unauthenticated clients are forwarded to this domain directly. For self-domain masking, set it to your own domain and point its DNS A record to the VPS. Since June 2026, the real masking endpoint should negotiate X25519MLKEM768 (`0x11ec`) in one round; classical-x25519-only domains can be a passive marker |
 | `[censorship]` | `mask` | `true` | Forward unauthenticated connections to the configured masking target to defeat active probing |
 | `[censorship]` | `mask_port` | `443` | Masking target port. `443` connects to `tls_domain:443`; non-443 values connect to a local address on that port (`127.0.0.1:<mask_port>`, or `10.200.200.1:<mask_port>` inside tunnel netns), so that port must be served by Caddy or another local backend. Use `8443` for self-domain Caddy so public `443` remains owned by `mtproto-proxy` |
-| `[censorship]` | `mask_relay_max_secs` | `0` | Maximum lifetime for ordinary masking/probe connections to the configured backend. WEB-domain HTTPS/WebSocket carriers are exempt; `0` disables the cap for every masking relay |
+| `[censorship]` | `mask_relay_max_secs` | `300` | Maximum lifetime in seconds from accept for ordinary masking/probe connections to the configured backend. WEB-domain HTTPS/WebSocket carriers and authenticated MTProto relays are exempt; explicit `0` disables this cap |
 | `[censorship]` | `desync` | `false` | Opt into splitting fake `ServerHello` into `1 byte + short pause + rest`; the default sends it without an intentional pause |
 | `[censorship]` | `desync_split_delay_ms` | `3` | Base delay between the first fake `ServerHello` byte and the remaining bytes, only with `desync=true` |
 | `[censorship]` | `desync_split_jitter_ms` | `2` | Random extra delay added to `desync_split_delay_ms` (`0..N` ms per connection), only with `desync=true` |
@@ -1241,6 +1241,8 @@ alice = true   # direct where possible; CDN DC203 still requires MiddleProxy
 `client_silence_fast_close_sec` and `client_silence_fast_after_idle_sec` were removed in favor of the single bounded `client_silence_close_sec` policy. Remove the legacy keys before upgrading; strict config parsing rejects unknown keys.
 
 Outbound FakeTLS application payloads are capped at 16367 bytes with either DRS policy. The `16384 - 17` cap uses the TLS 1.3 inner content-type and 16-byte tag margin as a sizing heuristic to avoid repeated bulk `0x4000` wire lengths; FakeTLS does not add that AEAD framing. Real TLS 1.3 permits ciphertext length `0x4000`, so this cap is not a protocol requirement or a guarantee against fingerprinting ([RFC 8446 §5.2](https://www.rfc-editor.org/rfc/rfc8446#section-5.2), [RFC 5116 §5.1](https://www.rfc-editor.org/rfc/rfc5116#section-5.1)).
+
+Ordinary masking/probe relays have a default absolute lifetime of 300 seconds from accept. Activity can extend their idle deadline but never this lifetime cap. An explicit `mask_relay_max_secs = 0` disables the cap; any other explicit value is preserved. Idle timeout still applies independently, including to WEB carriers and authenticated MTProto relays. Source/Compose installers and the Docker entrypoint omit this key and inherit the runtime default; existing explicit settings are preserved.
 
 The default `fake_cert_size = 0` uses one size for every connection and both classical/PQ responses during that process's lifetime; a restart can choose another size. AppData contents remain freshly randomized per response. The `2400..3600` range is a fallback sizing heuristic. Set an explicit size if you have a measured masking-backend profile; the fallback alone does not establish a profile match or anti-DPI effectiveness.
 

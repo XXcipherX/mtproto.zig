@@ -234,10 +234,11 @@ mask = true
 # netns mode, the runtime automatically targets 10.200.200.1:8443.
 mask_port = 8443
 
-# Maximum lifetime for an ordinary masking relay connection. This limits active
-# probes that keep the Caddy 404 backend open. WEB-domain carriers are exempt.
-# 0 disables the cap for all masking relays.
-# mask_relay_max_secs = 0
+# Maximum lifetime for an ordinary masking relay connection, measured from accept.
+# Default 300 seconds limits active probes even when they keep sending traffic.
+# WEB-domain carriers and authenticated MTProto relays are exempt.
+# Explicit 0 disables this cap; idle_timeout_sec still applies independently.
+# mask_relay_max_secs = 300
 
 # Optional Split-TLS: split fake ServerHello into 1-byte + short delay + rest.
 # Disabled by default to avoid adding handshake latency. Set desync = true to opt in.

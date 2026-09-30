@@ -229,9 +229,10 @@ pub const Config = struct {
     mask: bool = true,
     /// Test-only hook to override the mask port
     mask_port: u16 = 443,
-    /// Maximum ordinary masking/probe relay lifetime in seconds; 0 disables.
+    /// Maximum ordinary masking/probe relay lifetime in seconds (300 by default).
+    /// Explicit 0 disables this absolute cap; the idle timeout still applies.
     /// WEB-domain carriers are exempt because their WebSocket is intentionally long-lived.
-    mask_relay_max_secs: u32 = 0,
+    mask_relay_max_secs: u32 = 300,
     /// Optional TCP desync: split ServerHello into 1-byte + delay + rest.
     desync: bool = false,
     /// Base delay between first ServerHello byte and the rest.
@@ -1060,7 +1061,7 @@ test "parse config - missing fields defaults" {
     try std.testing.expectEqualStrings("google.com", cfg.tls_domain);
     try std.testing.expect(!cfg.use_middle_proxy); // Default is false
     try std.testing.expect(cfg.mask); // Default is true
-    try std.testing.expectEqual(@as(u32, 0), cfg.mask_relay_max_secs);
+    try std.testing.expectEqual(@as(u32, 300), cfg.mask_relay_max_secs);
     try std.testing.expect(!cfg.desync); // Split-TLS is opt-in.
     try std.testing.expectEqual(@as(u32, 3), cfg.desync_split_delay_ms);
     try std.testing.expectEqual(@as(u32, 2), cfg.desync_split_jitter_ms);
@@ -1693,18 +1694,18 @@ test "parse config - censorship section booleans" {
     try std.testing.expect(cfg.fast_mode);
 }
 
-test "parse config - mask relay max lifetime" {
-    const content =
-        \\[censorship]
-        \\mask_relay_max_secs = 60
-        \\[access.users]
-        \\alice = "00112233445566778899aabbccddeeff"
-    ;
-
-    var cfg = try Config.parse(std.testing.allocator, content);
-    defer cfg.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(u32, 60), cfg.mask_relay_max_secs);
+test "parse config - mask relay lifetime default, opt-out and explicit value" {
+    for ([_]struct { setting: []const u8, expected: u32 }{
+        .{ .setting = "", .expected = 300 },
+        .{ .setting = "mask_relay_max_secs = 0", .expected = 0 },
+        .{ .setting = "mask_relay_max_secs = 60", .expected = 60 },
+    }) |fixture| {
+        const content = try std.fmt.allocPrint(std.testing.allocator, "[censorship]\n{s}\n[access.users]\nalice = \"00112233445566778899aabbccddeeff\"\n", .{fixture.setting});
+        defer std.testing.allocator.free(content);
+        var cfg = try Config.parse(std.testing.allocator, content);
+        defer cfg.deinit(std.testing.allocator);
+        try std.testing.expectEqual(fixture.expected, cfg.mask_relay_max_secs);
+    }
 }
 
 test "parse config - fake_cert_size bounds" {
