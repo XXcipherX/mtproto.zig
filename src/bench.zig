@@ -375,8 +375,8 @@ fn fillPayload(buf: []u8) void {
 fn buildTlsBenchmarkHandshake(
     secret: *const [16]u8,
     timestamp: u32,
-) [84]u8 {
-    var handshake = [_]u8{0} ** 84;
+) [126]u8 {
+    var handshake = [_]u8{0} ** 126;
     handshake[0] = constants.tls_record_handshake;
     handshake[1] = 0x03;
     handshake[2] = 0x01;
@@ -391,7 +391,9 @@ fn buildTlsBenchmarkHandshake(
     std.mem.writeInt(u16, handshake[78..80], 0x1301, .big);
     handshake[80] = 1;
     handshake[81] = 0;
-    std.mem.writeInt(u16, handshake[82..84], 0, .big);
+    std.mem.writeInt(u16, handshake[82..84], 42, .big);
+    @memcpy(handshake[84..94], &[_]u8{ 0, 0x33, 0, 38, 0, 36, 0, 0x1d, 0, 32 });
+    @memset(handshake[94..126], 0x42);
 
     const canonical = crypto.sha256Hmac(secret, &handshake);
     @memcpy(handshake[constants.tls_digest_pos..][0..28], canonical[0..28]);

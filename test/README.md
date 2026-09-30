@@ -48,6 +48,13 @@ before authentication. Strict parsing still accepts records up to the existing
 TLS limit. A native masking regression forwards the complete oversized record
 to a loopback backend after releasing the original handshake storage.
 
+Key-share regressions cover PQ only, X25519 only, both (PQ priority), neither,
+absent/unknown shares, malformed lengths and the existing duplicate policies.
+The masking test also forwards a correctly signed hello without supported shares.
+Shared Python TLS-auth probes and the Zig authentication benchmark now offer a
+32-byte X25519 share before computing the digest, preserving the fixed digest and
+Session ID offsets.
+
 ServerHello regressions compare allocating and into-builder framing, Session ID,
 cipher, canonical X25519 and HMAC invariants for normal/PQ responses at minimum,
 default, custom and maximum certificate sizes. They check undersized storage,

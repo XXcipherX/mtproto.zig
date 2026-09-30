@@ -18,6 +18,8 @@ pub const max_authenticated_hello_len: usize = 4096;
 
 // ============= TLS Validation Result =============
 
+pub const ClientKeyShare = enum { x25519, x25519_mlkem768 };
+
 pub const TlsValidation = struct {
     /// Username that validated
     user: []const u8,
@@ -31,6 +33,9 @@ pub const TlsValidation = struct {
     timestamp: u32,
     /// The 16-byte user secret that matched (needed for ServerHello HMAC)
     secret: [16]u8,
+    /// ServerHello selection from the authenticated parse, with PQ priority.
+    key_share: ClientKeyShare,
+    first_tls13_cipher: ?u16,
 
     /// Wipe copied authentication material without overwriting the borrowed
     /// username pointer with an invalid pointer representation.
@@ -47,6 +52,7 @@ pub const TlsValidationFailure = enum {
     oversized_client_hello,
     malformed_client_hello,
     invalid_session_id,
+    unsupported_key_share,
     secret_mismatch,
     timestamp_skew,
 };
@@ -64,6 +70,7 @@ const ParsedClientHello = struct {
     sni: ?[]const u8,
     first_tls13_cipher: ?u16,
     offers_pq_key_share: bool,
+    offers_x25519_key_share: bool,
 };
 
 /// Parse the ClientHello record once and enforce all nested outer lengths.
@@ -127,6 +134,7 @@ fn parseClientHello(handshake: []const u8) ?ParsedClientHello {
     var seen_sni = false;
     var seen_key_share = false;
     var offers_pq_key_share = false;
+    var offers_x25519_key_share = false;
     while (ext_pos < extensions.len) {
         if (extensions.len - ext_pos < 4) return null;
         const ext_type = std.mem.readInt(u16, extensions[ext_pos..][0..2], .big);
@@ -168,8 +176,9 @@ fn parseClientHello(handshake: []const u8) ?ParsedClientHello {
                 if (group == pq_named_group) {
                     if (key_len != pq_client_key_share_len or offers_pq_key_share) return null;
                     offers_pq_key_share = true;
-                } else if (group == 0x001d and key_len != 32) {
-                    return null;
+                } else if (group == 0x001d) {
+                    if (key_len != 32) return null;
+                    offers_x25519_key_share = true;
                 }
                 share_pos += key_len;
             }
@@ -183,6 +192,7 @@ fn parseClientHello(handshake: []const u8) ?ParsedClientHello {
         .sni = sni,
         .first_tls13_cipher = first_tls13_cipher,
         .offers_pq_key_share = offers_pq_key_share,
+        .offers_x25519_key_share = offers_x25519_key_share,
     };
 }
 
@@ -228,6 +238,14 @@ pub fn validateTlsHandshakeDetailed(
         diagnostic.failure = .invalid_session_id;
         return null;
     }
+    const key_share: ClientKeyShare = if (parsed.offers_pq_key_share)
+        .x25519_mlkem768
+    else if (parsed.offers_x25519_key_share)
+        .x25519
+    else {
+        diagnostic.failure = .unsupported_key_share;
+        return null;
+    };
     var digest: [constants.tls_digest_len]u8 = parsed.digest[0..constants.tls_digest_len].*;
     defer std.crypto.secureZero(u8, &digest);
 
@@ -278,6 +296,8 @@ pub fn validateTlsHandshakeDetailed(
             .canonical_hmac = computed,
             .timestamp = timestamp,
             .secret = entry.secret,
+            .key_share = key_share,
+            .first_tls13_cipher = parsed.first_tls13_cipher,
         };
     }
 
@@ -875,8 +895,8 @@ pub fn extractFirstTls13Cipher(handshake: []const u8) ?u16 {
 
 // ============= Tests =============
 
-fn buildTestClientHello(comptime session_id_len: usize, session_fill: u8) [52 + session_id_len]u8 {
-    var hello = [_]u8{0} ** (52 + session_id_len);
+fn buildTestClientHello(comptime session_id_len: usize, session_fill: u8) [94 + session_id_len]u8 {
+    var hello = [_]u8{0} ** (94 + session_id_len);
     hello[0] = constants.tls_record_handshake;
     hello[1] = 0x03;
     hello[2] = 0x01;
@@ -895,22 +915,26 @@ fn buildTestClientHello(comptime session_id_len: usize, session_fill: u8) [52 + 
     hello[pos] = 1;
     hello[pos + 1] = 0;
     pos += 2;
-    std.mem.writeInt(u16, hello[pos..][0..2], 0, .big);
+    std.mem.writeInt(u16, hello[pos..][0..2], 42, .big);
+    pos += 2;
+    @memcpy(hello[pos..][0..10], &[_]u8{ 0, 0x33, 0, 38, 0, 36, 0, 0x1d, 0, 32 });
+    @memset(hello[pos + 10 ..][0..32], 0x42);
     return hello;
 }
 
 fn buildSizedTestClientHello(buffer: []u8, pq: bool, x25519: bool, secret: *const [16]u8) []u8 {
-    const base = buildTestClientHello(32, 0xaa);
+    const with_share = buildTestClientHello(32, 0xaa);
+    const base = with_share[0..84];
     const hostname = "example.org";
     const shares_len: usize = (if (pq) @as(usize, 4 + pq_client_key_share_len) else 0) +
         (if (x25519) @as(usize, 4 + 32) else 0);
     std.debug.assert(buffer.len >= base.len + 9 + hostname.len + 6 + shares_len + 4);
     @memset(buffer, 0);
-    @memcpy(buffer[0..base.len], &base);
+    @memcpy(buffer[0..base.len], base);
     std.mem.writeInt(u16, buffer[3..5], @intCast(buffer.len - 5), .big);
     std.mem.writeInt(u24, buffer[6..9], @intCast(buffer.len - 9), .big);
     std.mem.writeInt(u16, buffer[base.len - 2 ..][0..2], @intCast(buffer.len - base.len), .big);
-    var pos = base.len;
+    var pos: usize = base.len;
     std.mem.writeInt(u16, buffer[pos..][0..2], 0, .big);
     std.mem.writeInt(u16, buffer[pos + 2 ..][0..2], @intCast(5 + hostname.len), .big);
     std.mem.writeInt(u16, buffer[pos + 4 ..][0..2], @intCast(3 + hostname.len), .big);
@@ -971,6 +995,73 @@ test "FakeTLS authentication bounds input without lowering the TLS parser limit"
     var diagnostic: TlsValidationDiagnostic = .{};
     try std.testing.expect(try validateTlsHandshakeDetailed(std.testing.allocator, &storage, &.{}, false, &diagnostic) == null);
     try std.testing.expectEqual(TlsValidationFailure.oversized_client_hello, diagnostic.failure);
+}
+
+test "FakeTLS requires a supported share and returns PQ priority and cipher from validation" {
+    const secrets = [_]UserSecret{.{ .name = "alice", .secret = [_]u8{0x1a} ** 16 }};
+    var storage: [1600]u8 = undefined;
+    for ([_]struct { pq: bool, x25519: bool, selected: ?ClientKeyShare }{
+        .{ .pq = true, .x25519 = false, .selected = .x25519_mlkem768 },
+        .{ .pq = false, .x25519 = true, .selected = .x25519 },
+        .{ .pq = true, .x25519 = true, .selected = .x25519_mlkem768 },
+        .{ .pq = false, .x25519 = false, .selected = null },
+    }) |fixture| {
+        const hello = buildSizedTestClientHello(&storage, fixture.pq, fixture.x25519, &secrets[0].secret);
+        var diagnostic: TlsValidationDiagnostic = .{};
+        var result = try validateTlsHandshakeDetailed(std.testing.allocator, hello, &secrets, true, &diagnostic);
+        defer if (result) |*value| value.wipe();
+        if (fixture.selected) |selected| {
+            try std.testing.expect(result != null);
+            try std.testing.expectEqual(selected, result.?.key_share);
+            try std.testing.expectEqual(@as(?u16, 0x1301), result.?.first_tls13_cipher);
+        } else {
+            try std.testing.expect(result == null);
+            try std.testing.expectEqual(TlsValidationFailure.unsupported_key_share, diagnostic.failure);
+        }
+    }
+    const share_pos: usize = 84 + 9 + "example.org".len + 6;
+    for ([_]bool{ false, true }) |pq| {
+        const hello = buildSizedTestClientHello(&storage, pq, !pq, &secrets[0].secret);
+        std.mem.writeInt(u16, hello[share_pos + 2 ..][0..2], @intCast(if (pq) pq_client_key_share_len - 1 else 33), .big);
+        var diagnostic: TlsValidationDiagnostic = .{};
+        try std.testing.expect(try validateTlsHandshakeDetailed(std.testing.allocator, hello, &secrets, true, &diagnostic) == null);
+        try std.testing.expectEqual(TlsValidationFailure.malformed_client_hello, diagnostic.failure);
+    }
+    for ([_]u16{ 0x0017, 0x0015 }) |replacement| {
+        const hello = buildSizedTestClientHello(&storage, false, true, &secrets[0].secret);
+        // Unknown group or no key_share extension, both still structurally valid.
+        const pos = if (replacement == 0x0017) share_pos else share_pos - 6;
+        std.mem.writeInt(u16, hello[pos..][0..2], replacement, .big);
+        @memset(hello[constants.tls_digest_pos..][0..constants.tls_digest_len], 0);
+        const digest = crypto.sha256Hmac(&secrets[0].secret, hello);
+        @memcpy(hello[constants.tls_digest_pos..][0..constants.tls_digest_len], &digest);
+        var diagnostic: TlsValidationDiagnostic = .{};
+        try std.testing.expect(try validateTlsHandshakeDetailed(std.testing.allocator, hello, &secrets, true, &diagnostic) == null);
+        try std.testing.expectEqual(TlsValidationFailure.unsupported_key_share, diagnostic.failure);
+    }
+}
+
+test "FakeTLS retains duplicate key-share extension and group policies" {
+    const secret = [_]u8{0x1a} ** 16;
+    var storage: [3000]u8 = undefined;
+    const share_pos: usize = 84 + 9 + "example.org".len + 6;
+    for ([_]bool{ false, true }) |pq| {
+        const hello = buildSizedTestClientHello(&storage, pq, !pq, &secret);
+        const entry_len: usize = 4 + (if (pq) pq_client_key_share_len else 32);
+        @memcpy(hello[share_pos + entry_len ..][0..entry_len], hello[share_pos..][0..entry_len]);
+        std.mem.writeInt(u16, hello[share_pos - 4 ..][0..2], @intCast(2 + 2 * entry_len), .big);
+        std.mem.writeInt(u16, hello[share_pos - 2 ..][0..2], @intCast(2 * entry_len), .big);
+        const padding_pos = share_pos + 2 * entry_len;
+        std.mem.writeInt(u16, hello[padding_pos..][0..2], 0x0015, .big);
+        std.mem.writeInt(u16, hello[padding_pos + 2 ..][0..2], @intCast(hello.len - padding_pos - 4), .big);
+        // Duplicate PQ entries are rejected; duplicate valid X25519 entries
+        // retain the fork's existing permissive behavior.
+        try std.testing.expectEqual(!pq, parseClientHello(hello) != null);
+    }
+    const hello = buildSizedTestClientHello(&storage, false, true, &secret);
+    const padding_pos = share_pos + 4 + 32;
+    std.mem.writeInt(u16, hello[padding_pos..][0..2], 0x0033, .big);
+    try std.testing.expect(parseClientHello(hello) == null);
 }
 
 test "isTlsHandshake" {

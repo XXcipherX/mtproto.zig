@@ -385,7 +385,7 @@ def read_log_tail(path: Path, max_lines: int = 30) -> list[str]:
 
 
 def build_tls_auth_client_hello(secret: bytes, hostname: str) -> bytes:
-    """Build MTProto TLS-auth ClientHello with valid SNI extension.
+    """Build MTProto TLS-auth ClientHello with SNI and a supported X25519 share.
 
     Keeps MTProto-specific fixed offsets:
     - digest/random field at 11..43
@@ -400,6 +400,7 @@ def build_tls_auth_client_hello(secret: bytes, hostname: str) -> bytes:
     sni_list_len = 1 + 2 + len(host)
     sni_ext_len = 2 + sni_list_len
     supported_versions_ext_len = 3
+    key_share_ext_len = 2 + 4 + 32
 
     body_len = (
         2  # legacy_version
@@ -415,6 +416,8 @@ def build_tls_auth_client_hello(secret: bytes, hostname: str) -> bytes:
         + sni_ext_len
         + 4  # supported_versions ext header
         + supported_versions_ext_len
+        + 4  # key_share ext header
+        + key_share_ext_len
     )
 
     record_payload_len = 4 + body_len
@@ -456,7 +459,7 @@ def build_tls_auth_client_hello(secret: bytes, hostname: str) -> bytes:
     pos += 1
 
     packet[pos : pos + 2] = struct.pack(
-        ">H", 4 + sni_ext_len + 4 + supported_versions_ext_len
+        ">H", 4 + sni_ext_len + 4 + supported_versions_ext_len + 4 + key_share_ext_len
     )
     pos += 2
 
@@ -483,6 +486,12 @@ def build_tls_auth_client_hello(secret: bytes, hostname: str) -> bytes:
     pos += 1
     packet[pos : pos + 2] = b"\x03\x04"
     pos += 2
+
+    # key_share extension: X25519, with the required 32-byte client share.
+    packet[pos : pos + 10] = struct.pack(">HHHHH", 0x0033, key_share_ext_len, 36, 0x001D, 32)
+    pos += 10
+    packet[pos : pos + 32] = os.urandom(32)
+    pos += 32
 
     if pos != len(packet):
         raise RuntimeError("internal tls-auth packet builder length mismatch")

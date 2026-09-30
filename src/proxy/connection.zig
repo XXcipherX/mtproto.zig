@@ -53,6 +53,7 @@ pub const MaskCause = enum {
     web_carrier,
     web_only,
     invalid_session_id,
+    unsupported_key_share,
     secret_mismatch,
     timestamp_skew,
     replay,

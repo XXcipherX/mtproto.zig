@@ -19,7 +19,7 @@ Current proxy runtime defaults to one Linux `epoll` event loop; optional MTProto
 
 Current FakeTLS and MTProto handshake assumptions:
 
-- ClientHello Session ID must be exactly 32 bytes; the proxy echoes it in the synthetic ServerHello. All ClientHello consumers share the same strict record/handshake/extension framing parser.
+- ClientHello Session ID must be exactly 32 bytes; the proxy echoes it in the synthetic ServerHello. Authentication retains its strict parser's cipher and selected key share: PQ `0x11ec` (1216 client bytes) has priority over X25519 `0x001d` (32 bytes), and no supported share goes to masking. This is the proxy's acceptance contract, not a new platform behavior claim. WEB SNI routing keeps its independent bounds-checked walker for unrelated extensions.
 - The 64-byte MTProto obfuscation nonce may be split across TLS appdata records.
 - Extra client appdata bytes after that 64-byte nonce may arrive in the same TLS record; the proxy buffers them and forwards them after upstream setup.
 
