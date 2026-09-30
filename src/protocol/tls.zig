@@ -329,12 +329,29 @@ pub fn buildServerHelloWithTemplateCipher(
     session_id: []const u8,
     cipher: ?u16,
 ) ![]u8 {
-    const cert_payload_size = templateFakeCertPayloadSize(template) orelse return error.BadServerHelloTemplate;
+    _ = templateFakeCertPayloadSize(template) orelse return error.BadServerHelloTemplate;
     if (session_id.len != 32) return error.InvalidSessionIdLength;
-
-    // 1. Copy the pre-built template (random and session_id are zeroed in template)
     const response = try allocator.alloc(u8, template.len);
     errdefer allocator.free(response);
+    return buildServerHelloWithTemplateInto(response, template, secret, client_digest, session_id, cipher);
+}
+
+/// Build in caller-owned storage without allocation or retaining pointers.
+/// The returned borrowed slice excludes spare capacity.
+pub fn buildServerHelloWithTemplateInto(
+    output: []u8,
+    template: []const u8,
+    secret: []const u8,
+    client_digest: *const [constants.tls_digest_len]u8,
+    session_id: []const u8,
+    cipher: ?u16,
+) ![]u8 {
+    const cert_payload_size = templateFakeCertPayloadSize(template) orelse return error.BadServerHelloTemplate;
+    if (session_id.len != 32) return error.InvalidSessionIdLength;
+    if (output.len < template.len) return error.NoSpaceLeft;
+    const response = output[0..template.len];
+
+    // 1. Copy the pre-built template (random and session_id are zeroed in template)
     @memcpy(response, template);
     @memset(response[tmpl_random_offset..][0..32], 0);
 
@@ -423,6 +440,22 @@ pub fn buildServerHelloPq(
     const response_len = pqResponseLen(cert_payload_size);
     const response = try allocator.alloc(u8, response_len);
     errdefer allocator.free(response);
+    return buildServerHelloPqInto(response, secret, client_digest, session_id, cipher, cert_payload_size);
+}
+
+pub fn buildServerHelloPqInto(
+    output: []u8,
+    secret: []const u8,
+    client_digest: *const [constants.tls_digest_len]u8,
+    session_id: []const u8,
+    cipher: ?u16,
+    cert_payload_size: usize,
+) ![]u8 {
+    if (session_id.len != 32) return error.InvalidSessionIdLength;
+    if (!validFakeCertPayloadSize(cert_payload_size)) return error.InvalidFakeCertSize;
+    const response_len = pqResponseLen(cert_payload_size);
+    if (output.len < response_len) return error.NoSpaceLeft;
+    const response = output[0..response_len];
     @memset(response, 0);
 
     // Record 1: ServerHello with a 0x11ec key_share.
@@ -532,6 +565,8 @@ pub const server_hello_template_len: usize = server_template_len;
 /// Fixed ServerHello+CCS+AppData-header prefix length.
 const tmpl_appdata_offset: usize = server_template_len - fake_cert_payload_size;
 pub const server_hello_prefix_len: usize = tmpl_appdata_offset;
+/// Largest supported response, including the larger PQ prefix and maximum cert.
+pub const max_server_hello_len: usize = @max(server_hello_prefix_len, pq_appdata_offset) + max_fake_cert_size;
 
 const default_template_seed: u64 = 0x5365_7276_546C_7331;
 
@@ -990,6 +1025,61 @@ test "buildServerHelloTemplateAlloc supports custom fake cert size" {
     try std.testing.expectEqual(server_hello_prefix_len + cert_size, resp.len);
     try std.testing.expectEqual(@as(?usize, cert_size), firstAppDataRecordLen(resp));
     try std.testing.expectEqual(@as(u16, 0x1302), std.mem.readInt(u16, resp[tmpl_cipher_offset..][0..2], .big));
+}
+
+fn expectServerHelloTestHmac(response: []const u8, secret: []const u8, digest: *const [32]u8) !void {
+    var hmac = std.crypto.auth.hmac.sha2.HmacSha256.init(secret);
+    hmac.update(digest);
+    hmac.update(response[0..tmpl_random_offset]);
+    hmac.update(&([_]u8{0} ** 32));
+    hmac.update(response[tmpl_random_offset + 32 ..]);
+    var expected: [32]u8 = undefined;
+    hmac.final(&expected);
+    try std.testing.expectEqualSlices(u8, &expected, response[tmpl_random_offset..][0..32]);
+}
+
+test "ServerHello into builders preserve allocated wire invariants at every cert size" {
+    const allocator = std.testing.allocator;
+    const secret = [_]u8{0x42} ** 16;
+    const digest = [_]u8{0x71} ** 32;
+    const sid = [_]u8{0x39} ** 32;
+    for ([_]usize{ min_fake_cert_size, default_fake_cert_size, 4096, max_fake_cert_size }) |cert_size| {
+        const template = try buildServerHelloTemplateAlloc(allocator, 42, cert_size);
+        defer allocator.free(template);
+        for ([_]bool{ false, true }) |pq| {
+            var scratch = [_]u8{0xa5} ** (max_server_hello_len + 1);
+            const response = if (pq)
+                try buildServerHelloPqInto(&scratch, &secret, &digest, &sid, 0x1303, cert_size)
+            else
+                try buildServerHelloWithTemplateInto(&scratch, template, &secret, &digest, &sid, 0x1303);
+            const allocated = if (pq)
+                try buildServerHelloPq(allocator, &secret, &digest, &sid, 0x1303, cert_size)
+            else
+                try buildServerHelloWithTemplateCipher(allocator, template, &secret, &digest, &sid, 0x1303);
+            defer allocator.free(allocated);
+            const key_start = if (pq) pq_key_offset else tmpl_x25519_key_offset;
+            const key_len = if (pq) pq_key_share_len else 32;
+            const prefix_len = if (pq) pq_appdata_offset else server_hello_prefix_len;
+            try std.testing.expect(response.ptr == scratch[0..].ptr);
+            try std.testing.expectEqual(prefix_len + cert_size, response.len);
+            try std.testing.expectEqual(allocated.len, response.len);
+            try std.testing.expectEqualSlices(u8, allocated[0..11], response[0..11]);
+            try std.testing.expectEqualSlices(u8, allocated[43..key_start], response[43..key_start]);
+            try std.testing.expectEqualSlices(u8, allocated[key_start + key_len .. prefix_len], response[key_start + key_len .. prefix_len]);
+            try std.testing.expectEqualSlices(u8, &sid, response[tmpl_session_id_offset..][0..32]);
+            try std.testing.expectEqual(@as(?usize, cert_size), firstAppDataRecordLen(response));
+            try std.testing.expectEqual(@as(u8, 0), response[key_start + key_len - 1] & 0x80);
+            try std.testing.expect(!std.mem.eql(u8, allocated[prefix_len..], response[prefix_len..]));
+            try expectServerHelloTestHmac(response, &secret, &digest);
+            try expectServerHelloTestHmac(allocated, &secret, &digest);
+            try std.testing.expectEqual(@as(u8, 0xa5), scratch[response.len]);
+            try std.testing.expectError(error.NoSpaceLeft, if (pq)
+                buildServerHelloPqInto(scratch[0 .. response.len - 1], &secret, &digest, &sid, 0x1303, cert_size)
+            else
+                buildServerHelloWithTemplateInto(scratch[0 .. response.len - 1], template, &secret, &digest, &sid, 0x1303));
+        }
+    }
+    try std.testing.expectEqual(pqResponseLen(max_fake_cert_size), max_server_hello_len);
 }
 
 test "effectiveFakeCertSize clamps explicit values and keeps zero default" {

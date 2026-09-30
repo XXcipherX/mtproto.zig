@@ -320,6 +320,7 @@ allocation, vector or process failures still fail the job.
 
 - FakeTLS ServerHello template with runtime digest patching.
 - FakeTLS uses one strict ClientHello parser for authentication, cipher, and PQ key-share reads. WEB SNI routing has an independent bounds-checked extension walker so unrelated TLS evolution cannot select the wrong Caddy certificate. FakeTLS accepts only 32-byte Session IDs, stores the Session ID by value, and securely releases the full ClientHello as soon as the synthetic ServerHello is built.
+- Ordinary `desync=false` ServerHello uses the heap-owned worker's fixed scratch, sized from `max(X25519 prefix, PQ prefix) + max_fake_cert_size` (17610 bytes). Allocating and into builders share the existing framing, canonical X25519 generation, cipher/session echo and HMAC implementation. The synchronous client queue owns any unsent suffix before scratch wiping/reuse; only explicit desync retains `slot.server_hello` across callbacks, using the existing timer and cleanup phases.
 - Anti-replay cache compares the full canonical HMAC digest, retains entries for the maximum FakeTLS timestamp-validity horizon, and replaces the oldest entry in a saturated bounded probe window so cache pressure cannot masquerade as a proven replay.
 - MTProto obfuscation rejects reserved nonces before decrypting protocol tags.
 - Unknown MTProto DC indices are rejected before endpoint planning; modulo fallback is not part of the connection path.

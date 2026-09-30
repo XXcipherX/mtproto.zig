@@ -1385,6 +1385,7 @@ const EventLoop = struct {
     prev_relay_client_eof_first: u64 = 0,
     prev_relay_upstream_eof_first: u64 = 0,
     relay_read_scratch: [relay_read_scratch_size]u8,
+    server_hello_scratch: [tls.max_server_hello_len]u8 = undefined,
     mp_c2s_scratch: ?[]u8,
     mp_s2c_scratch: ?[]u8,
     pending_close_fds: std.ArrayList(posix.fd_t),
@@ -2478,34 +2479,17 @@ const EventLoop = struct {
             client_ip,
         });
 
-        slot.server_hello = (if (offers_pq)
-            tls.buildServerHelloPq(
-                self.state.allocator,
-                &slot.validation_secret,
-                &slot.validation_digest,
-                slot.validation_session_id[0..slot.validation_session_id_len],
-                echoed_cipher,
-                self.state.tls_server_hello_template.len - tls.server_hello_prefix_len,
-            )
-        else
-            tls.buildServerHelloWithTemplateCipher(
-                self.state.allocator,
-                self.state.tls_server_hello_template,
-                &slot.validation_secret,
-                &slot.validation_digest,
-                slot.validation_session_id[0..slot.validation_session_id_len],
-                echoed_cipher,
-            )) catch {
+        const server_hello = self.prepareServerHello(slot, offers_pq, echoed_cipher) catch {
             self.closeSlot(slot, "build server hello failed");
             return;
         };
+        defer if (!self.state.config.desync) std.crypto.secureZero(u8, server_hello);
         slot.server_hello_off = 0;
         slot.releaseClientHello(self.state.allocator);
 
-        if (self.state.config.desync and slot.server_hello.?.len > 1) {
+        if (self.state.config.desync and server_hello.len > 1) {
             slot.phase = .writing_server_hello_first;
-            const one = slot.server_hello.?[0..1];
-            if (queueClient(slot, one)) |_| {} else |_| {
+            if (queueClient(slot, server_hello[0..1])) |_| {} else |_| {
                 self.closeSlot(slot, "queue first desync byte failed");
                 return;
             }
@@ -2513,13 +2497,46 @@ const EventLoop = struct {
             self.advanceServerHelloWrite(slot);
         } else {
             slot.phase = .writing_server_hello_rest;
-            if (queueClient(slot, slot.server_hello.?)) |_| {} else |_| {
+            if (queueClient(slot, server_hello)) |_| {} else |_| {
                 self.closeSlot(slot, "queue server hello failed");
                 return;
             }
-            slot.server_hello_off = slot.server_hello.?.len;
+            slot.server_hello_off = server_hello.len;
             self.advanceServerHelloWrite(slot);
         }
+    }
+
+    fn prepareServerHello(self: *EventLoop, slot: *ConnectionSlot, offers_pq: bool, cipher: ?u16) ![]u8 {
+        const cert_size = self.state.tls_server_hello_template.len - tls.server_hello_prefix_len;
+        const session_id = slot.validation_session_id[0..slot.validation_session_id_len];
+        if (!self.state.config.desync) {
+            errdefer std.crypto.secureZero(u8, &self.server_hello_scratch);
+            return if (offers_pq)
+                tls.buildServerHelloPqInto(&self.server_hello_scratch, &slot.validation_secret, &slot.validation_digest, session_id, cipher, cert_size)
+            else
+                tls.buildServerHelloWithTemplateInto(&self.server_hello_scratch, self.state.tls_server_hello_template, &slot.validation_secret, &slot.validation_digest, session_id, cipher);
+        }
+        // Split-TLS spans timer callbacks, so its response must remain owned.
+        const response = try (if (offers_pq)
+            tls.buildServerHelloPq(
+                self.state.allocator,
+                &slot.validation_secret,
+                &slot.validation_digest,
+                session_id,
+                cipher,
+                cert_size,
+            )
+        else
+            tls.buildServerHelloWithTemplateCipher(
+                self.state.allocator,
+                self.state.tls_server_hello_template,
+                &slot.validation_secret,
+                &slot.validation_digest,
+                session_id,
+                cipher,
+            ));
+        slot.server_hello = response;
+        return response;
     }
 
     fn readMtprotoHandshake(self: *EventLoop, slot: *ConnectionSlot) void {
@@ -4885,6 +4902,118 @@ test "ServerHello advances only after the queued bytes are fully written" {
     slot.phase = .idle;
     loop.advanceServerHelloWrite(&slot);
     try std.testing.expectEqual(ConnectionPhase.idle, slot.phase);
+}
+
+test "ServerHello preparation borrows worker scratch and preserves desync ownership" {
+    var template = tls.buildServerHelloTemplate(42);
+    const loop = try std.testing.allocator.create(EventLoop);
+    defer std.testing.allocator.destroy(loop);
+    // Only the fields used by preparation are needed; no daemon or updater.
+    var state: ProxyState = undefined;
+    state.tls_server_hello_template = &template;
+    loop.state = &state;
+    for ([_]bool{ false, true }) |desync| {
+        for ([_]bool{ false, true }) |pq| {
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+            state.allocator = if (desync) std.testing.allocator else failing.allocator();
+            state.config.desync = desync;
+            var slot = ConnectionSlot{
+                .validation_secret = [_]u8{0x42} ** 16,
+                .validation_digest = [_]u8{0x71} ** 32,
+                .validation_session_id = [_]u8{0x39} ** 32,
+                .validation_session_id_len = 32,
+            };
+            defer if (slot.server_hello) |response| secureFree(state.allocator, response);
+            const response = try loop.prepareServerHello(&slot, pq, 0x1302);
+            const expected = try std.testing.allocator.dupe(u8, response);
+            defer std.testing.allocator.free(expected);
+            try std.testing.expectEqual(desync, slot.server_hello != null);
+            try std.testing.expectEqual(!desync, response.ptr == loop.server_hello_scratch[0..].ptr);
+            try std.testing.expect(!failing.has_induced_failure);
+            @memset(&loop.server_hello_scratch, 0xa5);
+            if (desync) try std.testing.expectEqualSlices(u8, expected, slot.server_hello.?);
+        }
+    }
+}
+
+test "unsplit ServerHello pending bytes survive worker scratch reuse" {
+    const cert_size = tls.max_fake_cert_size;
+    const template = try tls.buildServerHelloTemplateAlloc(std.testing.allocator, 42, cert_size);
+    defer std.testing.allocator.free(template);
+    const loop = try std.testing.allocator.create(EventLoop);
+    defer std.testing.allocator.destroy(loop);
+    var state: ProxyState = undefined;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    state.allocator = failing.allocator();
+    state.config.desync = false;
+    state.tls_server_hello_template = template;
+    loop.state = &state;
+    for ([_]bool{ false, true }) |pq| {
+        for ([_]struct { prefix: ?usize, blocked: bool }{
+            .{ .prefix = null, .blocked = false },
+            .{ .prefix = 17, .blocked = false },
+            .{ .prefix = 0, .blocked = true },
+        }) |fixture| {
+            const client = try relayDrainTestSocketPair();
+            defer closeFd(client[0]);
+            defer closeFd(client[1]);
+            const fill = [_]u8{0} ** 4096;
+            var filled: usize = 0;
+            if (fixture.blocked) {
+                var blocked = false;
+                for (0..1024) |_| {
+                    filled += writeFd(client[0], &fill) catch |err| {
+                        if (err != error.WouldBlock) return err;
+                        blocked = true;
+                        break;
+                    };
+                }
+                try std.testing.expect(blocked);
+            }
+            var budget = EventIoBudget{
+                .bytes_remaining = if (fixture.blocked) event_io_byte_budget else fixture.prefix orelse event_io_byte_budget,
+                .operations_remaining = 1,
+            };
+            var slot = ConnectionSlot{
+                .phase = .writing_server_hello_rest,
+                .client_fd = client[0],
+                .validation_secret = [_]u8{0x42} ** 16,
+                .validation_digest = [_]u8{0x71} ** 32,
+                .validation_session_id = [_]u8{0x39} ** 32,
+                .validation_session_id_len = 32,
+                .client_queue = .{ .allocator = if (fixture.prefix == null) failing.allocator() else std.testing.allocator },
+                .event_io_budget = &budget,
+            };
+            defer slot.client_queue.deinit();
+            const response = try loop.prepareServerHello(&slot, pq, 0x1303);
+            const expected = try std.testing.allocator.dupe(u8, response);
+            defer std.testing.allocator.free(expected);
+            const prefix = fixture.prefix orelse response.len;
+            try std.testing.expectEqual(prefix == response.len, try queueClient(&slot, response));
+            loop.advanceServerHelloWrite(&slot);
+            try std.testing.expectEqual(if (prefix == response.len) ConnectionPhase.reading_mtproto_tls_header else .writing_server_hello_rest, slot.phase);
+            try std.testing.expect(slot.server_hello == null);
+            try std.testing.expect(!failing.has_induced_failure);
+            @memset(&loop.server_hello_scratch, 0xa5);
+            try expectRelayTestQueue(&slot.client_queue, expected[prefix..]);
+            var drain: [4096]u8 = undefined;
+            while (filled > 0) {
+                const count = try posix.read(client[1], drain[0..@min(filled, drain.len)]);
+                try std.testing.expect(count > 0);
+                filled -= count;
+            }
+            const actual = try std.testing.allocator.alloc(u8, expected.len);
+            defer std.testing.allocator.free(actual);
+            if (prefix > 0) try std.testing.expectEqual(prefix, try posix.read(client[1], actual[0..prefix]));
+            var flush_budget: EventIoBudget = .{};
+            slot.event_io_budget = &flush_budget;
+            try std.testing.expectEqual(expected.len - prefix, try flushClientPending(&slot));
+            if (prefix < expected.len) try std.testing.expectEqual(expected.len - prefix, try posix.read(client[1], actual[prefix..]));
+            try std.testing.expectEqualSlices(u8, expected, actual);
+            loop.advanceServerHelloWrite(&slot);
+            try std.testing.expectEqual(ConnectionPhase.reading_mtproto_tls_header, slot.phase);
+        }
+    }
 }
 
 test "handshake read yields when the event I/O budget is exhausted" {

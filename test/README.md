@@ -42,6 +42,13 @@ succeed. It never contacts Telegram.
 
 ## Real-process relay E2E
 
+ServerHello regressions compare allocating and into-builder framing, Session ID,
+cipher, canonical X25519 and HMAC invariants for normal/PQ responses at minimum,
+default, custom and maximum certificate sizes. They check undersized storage,
+allocation-free normal preparation/full writes with a failing allocator, exact
+partial/EAGAIN queue ownership after scratch overwrite, and persistent explicit
+desync ownership together with the existing split write/timer regression.
+
 Zig relay unit tests cover every pair of TCP split positions through multiple
 FakeTLS application records and an intervening CCS, using the real AES-CTR states.
 They also cover one-byte segmentation, malformed headers, and incomplete framing
