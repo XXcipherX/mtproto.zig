@@ -239,7 +239,8 @@ pub const Config = struct {
     /// Random extra delay added to desync_split_delay_ms.
     desync_split_jitter_ms: u32 = 2,
     /// FakeTLS encrypted certificate AppData size.
-    /// 0 keeps the built-in default that matches the static template.
+    /// 0 chooses 2400..3600 once at process template initialization.
+    /// Explicit sizes take priority and are clamped to 256..16384.
     fake_cert_size: u32 = 0,
     /// Dynamic Record Sizing: ramp S2C FakeTLS records from 1369 to the 16367-byte bulk cap.
     drs: bool = false,

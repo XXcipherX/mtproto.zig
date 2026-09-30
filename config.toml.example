@@ -249,7 +249,9 @@ mask_port = 8443
 # desync_split_jitter_ms = 2
 
 # Fake TLS encrypted-certificate AppData size in bytes.
-# 0 keeps the built-in default (2878). Explicit values are clamped to 256..16384.
+# 0 chooses a random size in 2400..3600 once at process startup, shared by PQ/classical.
+# This fallback is a sizing heuristic; an explicit operator/profile size takes priority.
+# Explicit values are clamped to 256..16384. AppData bytes remain random per response.
 # fake_cert_size = 0
 
 # Dynamic Record Sizing: start S2C FakeTLS records at 1369 bytes, then use the 16367-byte bulk cap.

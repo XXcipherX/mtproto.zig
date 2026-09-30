@@ -1165,7 +1165,7 @@ mask_port = 8443
 desync = false                            # Set true to opt into Split-TLS and its handshake delay
 # desync_split_delay_ms = 3                # Base delay, used only with desync=true
 # desync_split_jitter_ms = 2               # Extra 0..N ms, used only with desync=true
-# fake_cert_size = 0                       # Fake encrypted-cert AppData size; 0 keeps built-in default
+# fake_cert_size = 0                       # 0 chooses 2400..3600 once at process startup
 drs = false
 fast_mode = true
 
@@ -1230,7 +1230,7 @@ alice = true   # direct where possible; CDN DC203 still requires MiddleProxy
 | `[censorship]` | `desync` | `false` | Opt into splitting fake `ServerHello` into `1 byte + short pause + rest`; the default sends it without an intentional pause |
 | `[censorship]` | `desync_split_delay_ms` | `3` | Base delay between the first fake `ServerHello` byte and the remaining bytes, only with `desync=true` |
 | `[censorship]` | `desync_split_jitter_ms` | `2` | Random extra delay added to `desync_split_delay_ms` (`0..N` ms per connection), only with `desync=true` |
-| `[censorship]` | `fake_cert_size` | `0` | Fake TLS encrypted-certificate AppData size in bytes. `0` keeps the built-in 2878-byte default; explicit values are clamped to `256..16384` |
+| `[censorship]` | `fake_cert_size` | `0` | Fake TLS encrypted-certificate AppData size in bytes. `0` chooses one random size in `2400..3600` at process startup; explicit values take priority and are clamped to `256..16384` |
 | `[censorship]` | `drs` | `false` | Dynamic Record Sizing: start S2C FakeTLS records at 1369 bytes, then use the 16367-byte bulk cap after 8 records or 128 KiB |
 | `[censorship]` | `fast_mode` | `false` | **Recommended** for direct-path traffic. Delegates S2C AES encryption to Telegram DC and reduces proxy CPU/RAM pressure |
 | `[access.users]` | `<name>` | -- | 32 hex-char secret (16 bytes) per user |
@@ -1241,6 +1241,8 @@ alice = true   # direct where possible; CDN DC203 still requires MiddleProxy
 `client_silence_fast_close_sec` and `client_silence_fast_after_idle_sec` were removed in favor of the single bounded `client_silence_close_sec` policy. Remove the legacy keys before upgrading; strict config parsing rejects unknown keys.
 
 Outbound FakeTLS application payloads are capped at 16367 bytes with either DRS policy. The `16384 - 17` cap uses the TLS 1.3 inner content-type and 16-byte tag margin as a sizing heuristic to avoid repeated bulk `0x4000` wire lengths; FakeTLS does not add that AEAD framing. Real TLS 1.3 permits ciphertext length `0x4000`, so this cap is not a protocol requirement or a guarantee against fingerprinting ([RFC 8446 §5.2](https://www.rfc-editor.org/rfc/rfc8446#section-5.2), [RFC 5116 §5.1](https://www.rfc-editor.org/rfc/rfc5116#section-5.1)).
+
+The default `fake_cert_size = 0` uses one size for every connection and both classical/PQ responses during that process's lifetime; a restart can choose another size. AppData contents remain freshly randomized per response. The `2400..3600` range is a fallback sizing heuristic. Set an explicit size if you have a measured masking-backend profile; the fallback alone does not establish a profile match or anti-DPI effectiveness.
 
 Built-in Split-TLS is opt-in: set `[censorship].desync = true` to split fake `ServerHello` with the configured delay and jitter (3–5 ms with default timing). Source/Compose installers and the Docker entrypoint omit this key, so their generated configs use the `false` default. Existing configs explicitly setting `true` continue to opt in after an upgrade. The Compose install summary reads this config setting and reports Split-TLS as enabled or disabled, using `false` when the key is absent. This setting is independent of the deployment's OS-level `zapret`/`nfqws` configuration.
 

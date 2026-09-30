@@ -57,7 +57,11 @@ Session ID offsets.
 
 ServerHello regressions compare allocating and into-builder framing, Session ID,
 cipher, canonical X25519 and HMAC invariants for normal/PQ responses at minimum,
-default, custom and maximum certificate sizes. They check undersized storage,
+legacy static, custom and maximum certificate sizes. The zero-setting fallback
+is bounded to 2400..3600; explicit min/max/custom sizes keep their clamp policy.
+Process initialization/preparation checks one stable size across repeated
+classical/PQ connections for default and explicit settings. They check undersized
+storage,
 allocation-free normal preparation/full writes with a failing allocator, exact
 partial/EAGAIN queue ownership after scratch overwrite, and persistent explicit
 desync ownership together with the existing split write/timer regression.

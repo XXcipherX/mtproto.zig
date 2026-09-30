@@ -310,14 +310,14 @@ pub fn validateTlsHandshakeDetailed(
 /// The response consists of three TLS records that the client validates:
 /// 1. ServerHello record (type 0x16) — contains the HMAC digest in the `random` field
 /// 2. Change Cipher Spec record (type 0x14) — fixed 6 bytes
-/// 3. Fake Application Data record (type 0x17) — fixed-size body simulating encrypted cert
+/// 3. Fake Application Data record (type 0x17) — body simulating encrypted cert
 ///
 /// Template approach: use a comptime-built normal TLS 1.3 ServerHello shape:
 /// - Extensions in common server order: supported_versions THEN key_share
-/// - Fixed AppData size (consistent like a real certificate, not random)
-/// - Deterministic pseudo-random AppData body (high entropy, same every time)
+/// - AppData size comes from the template; production chooses it once at startup
+/// - AppData body is filled with fresh random bytes for each response
 ///
-/// Only three fields are patched at runtime:
+/// Fields patched at runtime (the offered cipher is selected by the cipher builder):
 /// - Server Random (offset 11..43): HMAC-SHA256 digest
 /// - Session ID (offset 44..76): echoed from ClientHello
 /// - X25519 key (offset 95..127): fresh random key
@@ -555,11 +555,10 @@ pub fn buildServerHelloPqInto(
 // Pre-built at comptime to match a normal TLS 1.3 server shape.
 // Structure: ServerHello (127 bytes) + CCS (6 bytes) + AppData (5 + 2878 bytes)
 //
-// Key differences from naive FakeTLS that DPI detects:
-// 1. Extension ordering: supported_versions (0x002b) BEFORE key_share (0x0033)
-// 2. AppData size: fixed 2878 bytes (realistic Let's Encrypt ECDSA cert chain),
-//    NOT random in [1024,4096) which is an entropy fingerprint
-// 3. AppData body: deterministic pseudo-random (same across connections, like a real cert)
+// This legacy static shape is used by the fixed-size helper and test fixtures.
+// Production builds a variable-size process template, retaining extension order
+// (supported_versions before key_share). Builders randomize AppData per response;
+// neither the static size nor the random fallback proves a cover-origin match.
 
 /// Offset of Server Random field (32 bytes) — patched with HMAC at runtime
 const tmpl_random_offset: usize = 11;
@@ -577,16 +576,21 @@ fn randomX25519PublicKey() ![32]u8 {
     return std.crypto.dh.X25519.recoverPublicKey(secret_key);
 }
 
-/// Fake encrypted certificate payload size.
-/// 2878 bytes matches a typical Let's Encrypt ECDSA P-256 cert chain:
-///   EncryptedExtensions (~20) + Certificate (~2400) + CertificateVerify (~100) +
-///   Finished (~36) + AEAD tags (~50) + record layer overhead.
-/// Fixed size eliminates the random-range fingerprint that ТСПУ detects.
+/// Legacy static-template size; production resolves its size separately at startup.
 const fake_cert_payload_len: u16 = 2878;
 const fake_cert_payload_size: usize = @as(usize, fake_cert_payload_len);
 pub const default_fake_cert_size: usize = fake_cert_payload_size;
 pub const min_fake_cert_size: usize = 256;
 pub const max_fake_cert_size: usize = 16 * 1024;
+/// Fallback heuristic when the operator has not supplied a certificate size.
+pub const default_fake_cert_min_size: usize = 2400;
+pub const default_fake_cert_max_size: usize = 3600;
+
+comptime {
+    std.debug.assert(min_fake_cert_size <= default_fake_cert_min_size);
+    std.debug.assert(default_fake_cert_min_size <= default_fake_cert_max_size);
+    std.debug.assert(default_fake_cert_max_size <= max_fake_cert_size);
+}
 
 /// Total template size: ServerHello(127) + CCS(6) + AppData(5 + 2878)
 const server_template_len: usize = 127 + 6 + 5 + fake_cert_payload_size;
@@ -610,8 +614,11 @@ pub fn buildServerHelloTemplate(seed: ?u64) [server_template_len]u8 {
     return buildStaticServerTemplate(actual_seed);
 }
 
+/// Resolve once when creating the process template, never per connection.
+/// Nonzero operator/profile sizes take priority over the random fallback.
 pub fn effectiveFakeCertSize(configured: u32) usize {
-    if (configured == 0) return default_fake_cert_size;
+    if (configured == 0) return default_fake_cert_min_size +
+        crypto.randomRange(usize, default_fake_cert_max_size - default_fake_cert_min_size + 1);
     return @min(max_fake_cert_size, @max(min_fake_cert_size, @as(usize, configured)));
 }
 
@@ -772,7 +779,7 @@ fn fillServerHelloTemplate(t: []u8, seed: u64, cert_payload_size: usize) !void {
     pos += 5;
 
     // Fill with deterministic pseudo-random bytes (SplitMix64).
-    // Looks like encrypted data to DPI, same every time like a real cert.
+    // Template filler only; response builders replace it with fresh random bytes.
     var prng_state: u64 = seed;
     for (0..cert_payload_size) |i| {
         prng_state +%= 0x9E3779B97F4A7C15;
@@ -1256,10 +1263,16 @@ test "ServerHello into builders preserve allocated wire invariants at every cert
     try std.testing.expectEqual(pqResponseLen(max_fake_cert_size), max_server_hello_len);
 }
 
-test "effectiveFakeCertSize clamps explicit values and keeps zero default" {
-    try std.testing.expectEqual(default_fake_cert_size, effectiveFakeCertSize(0));
+test "effectiveFakeCertSize uses a bounded fallback and preserves explicit sizes" {
+    for (0..32) |_| {
+        const size = effectiveFakeCertSize(0);
+        try std.testing.expect(size >= default_fake_cert_min_size);
+        try std.testing.expect(size <= default_fake_cert_max_size);
+    }
     try std.testing.expectEqual(min_fake_cert_size, effectiveFakeCertSize(1));
+    try std.testing.expectEqual(min_fake_cert_size, effectiveFakeCertSize(@intCast(min_fake_cert_size)));
     try std.testing.expectEqual(@as(usize, 4096), effectiveFakeCertSize(4096));
+    try std.testing.expectEqual(max_fake_cert_size, effectiveFakeCertSize(@intCast(max_fake_cert_size)));
     try std.testing.expectEqual(max_fake_cert_size, effectiveFakeCertSize(99999));
 }
 

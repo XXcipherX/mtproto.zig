@@ -344,6 +344,8 @@ pub const ProxyState = struct {
         const security = try SecurityState.create(allocator);
         errdefer allocator.destroy(security);
 
+        // Freeze one certificate size for the process; both classical and PQ
+        // responses derive it from this shared template instead of rerolling.
         const tls_template = try tls.buildServerHelloTemplateAlloc(
             allocator,
             null,
@@ -4924,34 +4926,53 @@ test "ServerHello advances only after the queued bytes are fully written" {
     try std.testing.expectEqual(ConnectionPhase.idle, slot.phase);
 }
 
-test "ServerHello preparation borrows worker scratch and preserves desync ownership" {
-    var template = tls.buildServerHelloTemplate(42);
+test "ServerHello preparation freezes process certificate size and preserves scratch ownership" {
     const loop = try std.testing.allocator.create(EventLoop);
     defer std.testing.allocator.destroy(loop);
-    // Only the fields used by preparation are needed; no daemon or updater.
-    var state: ProxyState = undefined;
-    state.tls_server_hello_template = &template;
-    loop.state = &state;
-    for ([_]bool{ false, true }) |desync| {
-        for ([_]bool{ false, true }) |pq| {
-            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-            state.allocator = if (desync) std.testing.allocator else failing.allocator();
+    for ([_]u32{ 0, 4096 }) |configured| {
+        var cfg = Config{
+            .users = std.StringHashMap([16]u8).init(std.testing.allocator),
+            .direct_users = std.StringHashMap(void).init(std.testing.allocator),
+            .mask = false,
+            .fake_cert_size = configured,
+            .datacenter_override = net.ip4(.{ 127, 0, 0, 1 }, 443),
+        };
+        defer cfg.deinit(std.testing.allocator);
+        var state = try ProxyState.init(std.testing.allocator, std.testing.io, cfg);
+        defer state.deinit();
+        loop.state = &state;
+        const cert_size = tls.firstAppDataRecordLen(state.tls_server_hello_template).?;
+        if (configured == 0) {
+            try std.testing.expect(cert_size >= tls.default_fake_cert_min_size);
+            try std.testing.expect(cert_size <= tls.default_fake_cert_max_size);
+        } else {
+            try std.testing.expectEqual(@as(usize, configured), cert_size);
+        }
+        for ([_]bool{ false, true }) |desync| {
             state.config.desync = desync;
-            var slot = ConnectionSlot{
-                .validation_secret = [_]u8{0x42} ** 16,
-                .validation_digest = [_]u8{0x71} ** 32,
-                .validation_session_id = [_]u8{0x39} ** 32,
-                .validation_session_id_len = 32,
-            };
-            defer if (slot.server_hello) |response| secureFree(state.allocator, response);
-            const response = try loop.prepareServerHello(&slot, pq, 0x1302);
-            const expected = try std.testing.allocator.dupe(u8, response);
-            defer std.testing.allocator.free(expected);
-            try std.testing.expectEqual(desync, slot.server_hello != null);
-            try std.testing.expectEqual(!desync, response.ptr == loop.server_hello_scratch[0..].ptr);
-            try std.testing.expect(!failing.has_induced_failure);
-            @memset(&loop.server_hello_scratch, 0xa5);
-            if (desync) try std.testing.expectEqualSlices(u8, expected, slot.server_hello.?);
+            for ([_]bool{ false, true }) |pq| {
+                for (0..3) |_| {
+                    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+                    state.allocator = if (desync) std.testing.allocator else failing.allocator();
+                    defer state.allocator = std.testing.allocator;
+                    var slot = ConnectionSlot{
+                        .validation_secret = [_]u8{0x42} ** 16,
+                        .validation_digest = [_]u8{0x71} ** 32,
+                        .validation_session_id = [_]u8{0x39} ** 32,
+                        .validation_session_id_len = 32,
+                    };
+                    defer if (slot.server_hello) |response| secureFree(state.allocator, response);
+                    const response = try loop.prepareServerHello(&slot, pq, 0x1302);
+                    const expected = try std.testing.allocator.dupe(u8, response);
+                    defer std.testing.allocator.free(expected);
+                    try std.testing.expectEqual(@as(?usize, cert_size), tls.firstAppDataRecordLen(response));
+                    try std.testing.expectEqual(desync, slot.server_hello != null);
+                    try std.testing.expectEqual(!desync, response.ptr == loop.server_hello_scratch[0..].ptr);
+                    try std.testing.expect(!failing.has_induced_failure);
+                    @memset(&loop.server_hello_scratch, 0xa5);
+                    if (desync) try std.testing.expectEqualSlices(u8, expected, slot.server_hello.?);
+                }
+            }
         }
     }
 }
