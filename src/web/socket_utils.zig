@@ -5,6 +5,7 @@ const net = std.Io.net;
 const Address = net.IpAddress;
 const linux_events = @import("../runtime/linux_events.zig");
 const tcp_options = @import("../runtime/tcp_options.zig");
+const net_helpers = @import("../net_helpers.zig");
 
 pub const AcceptError = error{
     ConnectionAborted,
@@ -12,6 +13,7 @@ pub const AcceptError = error{
     ProcessFdQuotaExceeded,
     SystemFdQuotaExceeded,
     SystemResources,
+    BlockedByFirewall,
     UnexpectedAccept,
 };
 
@@ -147,30 +149,17 @@ pub fn acceptClient(listen_fd: posix.fd_t) AcceptError!?AcceptResult {
         var storage: posix.sockaddr.storage = undefined;
         var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
         const rc = linux.accept4(listen_fd, @ptrCast(&storage), &addr_len, posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK);
-        switch (linux.errno(rc)) {
-            .SUCCESS => {
-                const fd: posix.fd_t = @intCast(rc);
-                const addr = addressFromSockaddrStorage(&storage) orelse {
-                    closeFd(fd);
-                    continue;
-                };
-                return .{ .fd = fd, .addr = addr };
-            },
-            .INTR => continue,
-            .AGAIN => return null,
-            .CONNABORTED => return error.ConnectionAborted,
-            .CONNRESET => return error.ConnectionResetByPeer,
-            .MFILE => return error.ProcessFdQuotaExceeded,
-            .NFILE => return error.SystemFdQuotaExceeded,
-            .NOBUFS, .NOMEM => return error.SystemResources,
-            else => |err| {
-                // Keep the operation-specific error while retaining std's
-                // optional unexpected-errno trace.
-                return switch (posix.unexpectedErrno(err)) {
-                    error.Unexpected => error.UnexpectedAccept,
-                };
-            },
-        }
+        if (net_helpers.acceptNeedsRetry(linux.errno(rc)) catch |err| switch (err) {
+            error.WouldBlock => return null,
+            error.Unexpected => return error.UnexpectedAccept,
+            else => |remaining| return remaining,
+        }) continue;
+        const fd: posix.fd_t = @intCast(rc);
+        const addr = addressFromSockaddrStorage(&storage) orelse {
+            closeFd(fd);
+            continue;
+        };
+        return .{ .fd = fd, .addr = addr };
     }
 }
 

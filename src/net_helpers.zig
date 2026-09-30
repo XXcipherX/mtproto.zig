@@ -440,27 +440,48 @@ pub const Accepted = struct {
     peer: Address,
 };
 
+/// Both nonblocking TCP listeners share this Linux errno policy. EINTR retries
+/// the syscall; pending network errors listed by accept(2) end the current
+/// accept round like EAGAIN. Resource exhaustion still reaches caller backoff.
+pub fn acceptNeedsRetry(err: std.os.linux.E) !bool {
+    return switch (err) {
+        .SUCCESS => false,
+        .INTR => true,
+        .AGAIN,
+        .NETDOWN,
+        .PROTO,
+        .NOPROTOOPT,
+        .HOSTDOWN,
+        .NONET,
+        .HOSTUNREACH,
+        .OPNOTSUPP,
+        .NETUNREACH,
+        => error.WouldBlock,
+        .CONNABORTED => error.ConnectionAborted,
+        .CONNRESET => error.ConnectionResetByPeer,
+        .MFILE => error.ProcessFdQuotaExceeded,
+        .NFILE => error.SystemFdQuotaExceeded,
+        .NOBUFS, .NOMEM => error.SystemResources,
+        .PERM => error.BlockedByFirewall,
+        else => posix.unexpectedErrno(err),
+    };
+}
+
 pub fn acceptFd(fd: posix.fd_t) !Accepted {
     if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
     const linux = std.os.linux;
-    var storage: posix.sockaddr.storage = undefined;
-    var len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
-    const rc = linux.accept4(fd, @ptrCast(&storage), &len, linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK);
-    const accepted_fd: posix.fd_t = switch (linux.errno(rc)) {
-        .SUCCESS => @intCast(rc),
-        .AGAIN => return error.WouldBlock,
-        .CONNABORTED => return error.ConnectionAborted,
-        .CONNRESET => return error.ConnectionResetByPeer,
-        .MFILE => return error.ProcessFdQuotaExceeded,
-        .NFILE => return error.SystemFdQuotaExceeded,
-        .NOBUFS, .NOMEM => return error.SystemResources,
-        else => |err| return posix.unexpectedErrno(err),
-    };
-    const peer = addressFromSockaddr(&storage, len) orelse {
-        _ = linux.close(accepted_fd);
-        return error.UnsupportedAddressFamily;
-    };
-    return .{ .fd = accepted_fd, .peer = peer };
+    while (true) {
+        var storage: posix.sockaddr.storage = undefined;
+        var len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+        const rc = linux.accept4(fd, @ptrCast(&storage), &len, linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK);
+        if (try acceptNeedsRetry(linux.errno(rc))) continue;
+        const accepted_fd: posix.fd_t = @intCast(rc);
+        const peer = addressFromSockaddr(&storage, len) orelse {
+            _ = linux.close(accepted_fd);
+            return error.UnsupportedAddressFamily;
+        };
+        return .{ .fd = accepted_fd, .peer = peer };
+    }
 }
 
 pub fn socketTcpNonblocking(addr: Address) !posix.fd_t {
@@ -588,6 +609,22 @@ test "sockaddr conversion rejects truncated addresses and retains mapped IPv6" {
     try std.testing.expect(exactAddressEql(mapped, decoded));
     const normalized = Address.fromIp6(decoded.ip6);
     try std.testing.expect(exactAddressEql(normalized, ip4(.{ 192, 0, 2, 9 }, 1234)));
+}
+
+test "accept errno mapping separates retry wait resource and firewall failures" {
+    const E = std.os.linux.E;
+    try std.testing.expect(!try acceptNeedsRetry(.SUCCESS));
+    try std.testing.expect(try acceptNeedsRetry(.INTR));
+    for ([_]E{ .AGAIN, .NETDOWN, .PROTO, .NOPROTOOPT, .HOSTDOWN, .NONET, .HOSTUNREACH, .OPNOTSUPP, .NETUNREACH }) |err| {
+        try std.testing.expectError(error.WouldBlock, acceptNeedsRetry(err));
+    }
+    try std.testing.expectError(error.ConnectionAborted, acceptNeedsRetry(.CONNABORTED));
+    try std.testing.expectError(error.ConnectionResetByPeer, acceptNeedsRetry(.CONNRESET));
+    try std.testing.expectError(error.ProcessFdQuotaExceeded, acceptNeedsRetry(.MFILE));
+    try std.testing.expectError(error.SystemFdQuotaExceeded, acceptNeedsRetry(.NFILE));
+    try std.testing.expectError(error.SystemResources, acceptNeedsRetry(.NOBUFS));
+    try std.testing.expectError(error.SystemResources, acceptNeedsRetry(.NOMEM));
+    try std.testing.expectError(error.BlockedByFirewall, acceptNeedsRetry(.PERM));
 }
 
 test "Linux socket boundary preserves accept peer and local and remote names" {

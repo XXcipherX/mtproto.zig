@@ -68,6 +68,12 @@ zero and i16 boundaries), big-endian counter carry and u128 wrap. They check
 wrong-secret/malformed-tag rejection, both directional key/IV derivations and
 post-handshake stream continuity across different chunk boundaries.
 
+The shared Linux accept errno regression distinguishes EINTR retry, EAGAIN and
+all eight documented pending TCP network errors, abort/reset, fd quotas, resource
+exhaustion and explicit firewall rejection. Both ordinary and WEB listeners use
+that mapping; existing loopback tests still cover nonblocking accept and peer
+address ownership without needing synthetic kernel failures.
+
 Zig relay unit tests cover every pair of TCP split positions through multiple
 FakeTLS application records and an intervening CCS, using the real AES-CTR states.
 They also cover one-byte segmentation, malformed headers, and incomplete framing
