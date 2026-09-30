@@ -74,6 +74,14 @@ exhaustion and explicit firewall rejection. Both ordinary and WEB listeners use
 that mapping; existing loopback tests still cover nonblocking accept and peer
 address ownership without needing synthetic kernel failures.
 
+Native DNS regressions exercise the production collector with 97 addresses plus
+a canonical name through its 32-result queue, preserving every address and order.
+Injected initial/growth allocation failures still drain and join, release memory,
+and report OOM ahead of a later producer failure. Further cases propagate lookup
+errors, reject empty results, and cancel/join a parked producer through Io events
+without sleeps, real DNS requests or resolver-file changes. Existing resolver
+preflight, preset-stop and separate WEB/getent regressions remain in place.
+
 Zig relay unit tests cover every pair of TCP split positions through multiple
 FakeTLS application records and an intervening CCS, using the real AES-CTR states.
 They also cover one-byte segmentation, malformed headers, and incomplete framing

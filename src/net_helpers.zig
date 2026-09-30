@@ -196,24 +196,56 @@ fn getAddressListWithIo(
     try std.Io.net.HostName.validate(host);
     try validateSystemResolverForHost(allocator, io, host);
 
-    const host_name: std.Io.net.HostName = .{ .bytes = host };
+    return collectLookupAddresses(allocator, io, NativeLookup{
+        .host = .{ .bytes = host },
+        .port = port,
+    });
+}
+
+const NativeLookup = struct {
+    host: std.Io.net.HostName,
+    port: u16,
+
+    fn run(self: NativeLookup, io: std.Io, results: *std.Io.Queue(std.Io.net.HostName.LookupResult)) std.Io.net.HostName.LookupError!void {
+        // HostName.lookup owns closure, including failure and cancellation.
+        return self.host.lookup(io, results, .{ .port = self.port });
+    }
+};
+
+fn collectLookupAddresses(allocator: std.mem.Allocator, io: std.Io, context: anytype) !AddressList {
     var lookup_storage: [32]std.Io.net.HostName.LookupResult = undefined;
     var lookup_queue: std.Io.Queue(std.Io.net.HostName.LookupResult) = .init(&lookup_storage);
 
-    try std.Io.net.HostName.lookup(host_name, io, &lookup_queue, .{ .port = port });
+    // async may run inline, deadlocking before draining a full bounded queue.
+    // Require real concurrency and keep the future owned by this stack scope.
+    var producer = try io.concurrent(@TypeOf(context).run, .{ context, io, &lookup_queue });
+    defer producer.cancel(io) catch {};
 
     var list: std.ArrayList(Address) = .empty;
     defer list.deinit(allocator);
+    var allocation_failed = false;
 
-    while (lookup_queue.getOneUncancelable(io)) |result| {
+    while (lookup_queue.getOne(io)) |result| {
         switch (result) {
-            .address => |addr| try list.append(allocator, addr),
+            .address => |addr| if (!allocation_failed) {
+                list.append(allocator, addr) catch {
+                    // Keep draining without further allocations so the producer
+                    // can finish. External cancellation still interrupts getOne.
+                    allocation_failed = true;
+                };
+            },
             .canonical_name => {},
         }
     } else |err| switch (err) {
         error.Closed => {},
+        error.Canceled => return error.Canceled,
     }
 
+    // Queue closure precedes producer return; join before releasing any borrowed
+    // storage. Never close its queue from the consumer: std lookup forbids it.
+    const produced = producer.await(io);
+    if (allocation_failed) return error.OutOfMemory;
+    try produced;
     if (list.items.len == 0) return error.UnknownHostName;
     return .{ .allocator = allocator, .addrs = try list.toOwnedSlice(allocator) };
 }
@@ -649,6 +681,104 @@ test "Linux socket boundary preserves accept peer and local and remote names" {
     try std.testing.expect(exactAddressEql(try peerAddress(accepted.fd), client_local));
     try std.testing.expect(exactAddressEql(try peerAddress(client_fd), bound));
     try std.testing.expect(exactAddressEql(try localAddress(accepted.fd), bound));
+}
+
+const SyntheticLookup = struct {
+    count: usize = 97,
+    fail: bool = false,
+    sent: *usize,
+    finished: *bool,
+    wait: ?struct { parked: *std.Io.Event, gate: *std.Io.Event } = null,
+
+    fn collect(self: SyntheticLookup, allocator: std.mem.Allocator, io: std.Io) !AddressList {
+        return collectLookupAddresses(allocator, io, self);
+    }
+
+    fn run(self: SyntheticLookup, io: std.Io, results: *std.Io.Queue(std.Io.net.HostName.LookupResult)) !void {
+        defer self.finished.* = true;
+        defer results.close(io);
+        try results.putOne(io, .{ .canonical_name = .{ .bytes = "synthetic.invalid" } });
+        for (0..self.count) |i| {
+            try results.putOne(io, .{ .address = ip4(.{ 192, 0, 2, @intCast(i) }, 443) });
+            self.sent.* += 1;
+        }
+        if (self.wait) |wait| {
+            wait.parked.set(io);
+            try wait.gate.wait(io);
+        }
+        if (self.fail) return error.SyntheticLookupFailure;
+    }
+};
+
+test "native lookup consumer drains 97 addresses through a 32-result queue" {
+    var sent: usize = 0;
+    var finished = false;
+    const list = try collectLookupAddresses(std.testing.allocator, std.testing.io, SyntheticLookup{
+        .sent = &sent,
+        .finished = &finished,
+    });
+    defer list.deinit();
+    try std.testing.expect(finished);
+    try std.testing.expectEqual(@as(usize, 97), sent);
+    try std.testing.expectEqual(sent, list.addrs.len);
+    for (list.addrs, 0..) |addr, i| {
+        try std.testing.expect(exactAddressEql(addr, ip4(.{ 192, 0, 2, @intCast(i) }, 443)));
+    }
+}
+
+test "native lookup joins after consumer OOM and preserves the allocation error" {
+    for ([_]usize{ 0, 1 }) |fail_index| {
+        var sent: usize = 0;
+        var finished = false;
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index, .resize_fail_index = 0 });
+        const result = collectLookupAddresses(failing.allocator(), std.testing.io, SyntheticLookup{
+            .fail = true, // A later lookup error must not hide consumer OOM.
+            .sent = &sent,
+            .finished = &finished,
+        });
+        try std.testing.expectError(error.OutOfMemory, result);
+        try std.testing.expect(finished);
+        try std.testing.expectEqual(@as(usize, 97), sent);
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        if (fail_index == 1) try std.testing.expect(failing.allocated_bytes > 0);
+    }
+}
+
+test "native lookup propagates producer failure and rejects empty results" {
+    var sent: usize = 0;
+    var finished = false;
+    try std.testing.expectError(error.SyntheticLookupFailure, collectLookupAddresses(std.testing.allocator, std.testing.io, SyntheticLookup{
+        .fail = true,
+        .sent = &sent,
+        .finished = &finished,
+    }));
+    try std.testing.expect(finished);
+    sent = 0;
+    finished = false;
+    try std.testing.expectError(error.UnknownHostName, collectLookupAddresses(std.testing.allocator, std.testing.io, SyntheticLookup{
+        .count = 0,
+        .sent = &sent,
+        .finished = &finished,
+    }));
+    try std.testing.expect(finished);
+}
+
+test "native lookup cancellation joins a blocked producer before scope return" {
+    const io = std.testing.io;
+    var sent: usize = 0;
+    var finished = false;
+    var parked: std.Io.Event = .unset;
+    var gate: std.Io.Event = .unset;
+    var consumer = try io.concurrent(SyntheticLookup.collect, .{ SyntheticLookup{
+        .sent = &sent,
+        .finished = &finished,
+        .wait = .{ .parked = &parked, .gate = &gate },
+    }, std.testing.allocator, io });
+    defer if (consumer.cancel(io)) |list| list.deinit() else |_| {};
+    try parked.wait(io);
+    try std.testing.expectError(error.Canceled, consumer.cancel(io));
+    try std.testing.expect(finished);
+    try std.testing.expectEqual(@as(usize, 97), sent);
 }
 
 test "resolver guard rejects zero attempts after last override" {
