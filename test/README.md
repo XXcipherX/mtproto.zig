@@ -90,6 +90,12 @@ disabled, verify the 16367-byte bulk cap and unchanged warmup, and reconstruct a
 payload bytes through the receiving TLS parser. The cap avoids repeated `0x4000`
 FakeTLS lengths; that length is legal in real TLS 1.3, so this is a sizing heuristic.
 
+Activity regressions cover FakeTLS/direct/mask reads in both directions, partial
+handshake and MP framing, real EAGAIN, exhausted budgets and blocked/empty writes.
+They verify progress semantics and a shared first-byte/activity sample, without
+requiring exact clock values. Drain backpressure and duplicate EOF preserve the
+previous activity value; each successful iteration keeps a fresh sample.
+
 Relay-drain socketpair tests exercise multiple chunks in one call, the shared
 read/write byte and operation limits in both directions, unread bytes under queue
 backpressure, and exactly one first-EOF notification with the reverse half still

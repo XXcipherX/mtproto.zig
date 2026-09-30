@@ -2002,8 +2002,6 @@ const EventLoop = struct {
     }
 
     fn onClientReadable(self: *EventLoop, slot: *ConnectionSlot) void {
-        slot.last_activity_ms = runtime_time.monotonicMilli();
-
         switch (slot.phase) {
             .reading_web_prefix => self.readWebPrefix(slot),
             .reading_tls_header => self.readTlsHeader(slot),
@@ -2068,8 +2066,6 @@ const EventLoop = struct {
     }
 
     fn onUpstreamReadable(self: *EventLoop, slot: *ConnectionSlot) void {
-        slot.last_activity_ms = runtime_time.monotonicMilli();
-
         switch (slot.phase) {
             .middle_proxy_handshake => self.middleProxyOnReadable(slot),
             .relaying => self.relayUpstreamToClient(slot),
@@ -2249,12 +2245,13 @@ const EventLoop = struct {
                     return;
                 }
                 slot.web_prefix_pos += @intCast(n);
-                if (slot.first_byte_at_ms == 0) slot.first_byte_at_ms = runtime_time.monotonicMilli();
+                const read_at_ms = runtime_time.monotonicMilli();
+                slot.last_activity_ms = read_at_ms;
+                if (slot.first_byte_at_ms == 0) slot.first_byte_at_ms = read_at_ms;
                 if (!slot.hs_counted and !self.reserveHandshakeBudget(slot)) {
                     self.closeSlot(slot, "handshake budget exhausted");
                     return;
                 }
-                slot.last_activity_ms = runtime_time.monotonicMilli();
                 continue;
             }
         }
@@ -2271,7 +2268,9 @@ const EventLoop = struct {
                 self.closeSlot(slot, "client eof before tls header");
                 return;
             }
-            if (slot.first_byte_at_ms == 0) slot.first_byte_at_ms = runtime_time.monotonicMilli();
+            const read_at_ms = runtime_time.monotonicMilli();
+            slot.last_activity_ms = read_at_ms;
+            if (slot.first_byte_at_ms == 0) slot.first_byte_at_ms = read_at_ms;
             if (!slot.hs_counted) {
                 if (!self.reserveHandshakeBudget(slot)) {
                     self.closeSlot(slot, "handshake budget exhausted");
@@ -2279,7 +2278,6 @@ const EventLoop = struct {
                 }
             }
             slot.tls_hdr_pos += @intCast(n);
-            slot.last_activity_ms = runtime_time.monotonicMilli();
         }
 
         if (!tls.isTlsHandshake(slot.tls_hdr_buf[0..])) {
@@ -2542,6 +2540,10 @@ const EventLoop = struct {
     }
 
     fn readMtprotoHandshake(self: *EventLoop, slot: *ConnectionSlot) void {
+        var read_progress = false;
+        defer if (read_progress and slot.phase != .idle) {
+            slot.last_activity_ms = runtime_time.monotonicMilli();
+        };
         // Phase pair: read TLS header then body, reusing tls_* fields.
         var control_records: usize = 0;
         var control_bytes: usize = 0;
@@ -2558,6 +2560,7 @@ const EventLoop = struct {
                         return;
                     }
                     slot.tls_hdr_pos += @intCast(n);
+                    read_progress = true;
                 }
 
                 slot.tls_record_type = slot.tls_hdr_buf[0];
@@ -2609,6 +2612,7 @@ const EventLoop = struct {
             }
 
             slot.tls_body_pos += @intCast(n);
+            read_progress = true;
             control_bytes += n;
 
             if (slot.tls_record_type == constants.tls_record_change_cipher) {
@@ -3548,6 +3552,7 @@ const EventLoop = struct {
             return;
         };
         slot.mask_c2s_bytes += n;
+        slot.last_activity_ms = runtime_time.monotonicMilli();
     }
 
     fn relayRawUpstreamToClient(self: *EventLoop, slot: *ConnectionSlot) void {
@@ -3570,6 +3575,7 @@ const EventLoop = struct {
             return;
         };
         slot.mask_s2c_bytes += n;
+        slot.last_activity_ms = runtime_time.monotonicMilli();
     }
 
     fn middleProxyBegin(self: *EventLoop, slot: *ConnectionSlot) void {
@@ -3620,15 +3626,24 @@ const EventLoop = struct {
         const step = slot.mp_transport.step;
         if (step != .waiting_rpc_nonce_response and step != .waiting_rpc_handshake_response) return;
         const encrypted = step == .waiting_rpc_handshake_response;
-        const read_adapter = struct {
-            fn read(s: *ConnectionSlot, dest: []u8) !usize {
-                return readSlotFd(s, s.upstream_fd, dest);
+        const ReadContext = struct {
+            slot: *ConnectionSlot,
+            progressed: bool = false,
+
+            fn read(context: *@This(), dest: []u8) !usize {
+                const n = try readSlotFd(context.slot, context.slot.upstream_fd, dest);
+                if (n > 0) context.progressed = true;
+                return n;
             }
-        }.read;
+        };
+        var read_context = ReadContext{ .slot = slot };
+        defer if (read_context.progressed and slot.phase != .idle) {
+            slot.last_activity_ms = runtime_time.monotonicMilli();
+        };
         const payload = slot.mp_transport.tryReadFrame(
             self.state.allocator,
-            slot,
-            read_adapter,
+            &read_context,
+            ReadContext.read,
             encrypted,
         ) catch |err| {
             log.debug("[{d}] mp frame read failed: step={s} err={any}", .{ slot.conn_id, @tagName(step), err });
@@ -5123,6 +5138,120 @@ test "FakeTLS size and key-share refusals mask the complete original record" {
     }
 }
 
+test "readable activity changes only with actual relay or handshake progress" {
+    var cfg = Config{
+        .users = std.StringHashMap([16]u8).init(std.testing.allocator),
+        .direct_users = std.StringHashMap(void).init(std.testing.allocator),
+        .mask = false,
+        .client_silence_close_sec = 0,
+    };
+    defer cfg.deinit(std.testing.allocator);
+    var state = try ProxyState.init(std.testing.allocator, std.testing.io, cfg);
+    defer state.deinit();
+    const loop = try std.testing.allocator.create(EventLoop);
+    defer std.testing.allocator.destroy(loop);
+    loop.state = &state;
+    loop.shutting_down = false;
+    for ([_]struct { phase: ConnectionPhase, role: SlotFdRole, direct: bool = false }{
+        .{ .phase = .relaying, .role = .client },
+        .{ .phase = .relaying, .role = .upstream },
+        .{ .phase = .relaying, .role = .client, .direct = true },
+        .{ .phase = .relaying, .role = .upstream, .direct = true },
+        .{ .phase = .mask_relaying, .role = .client },
+        .{ .phase = .mask_relaying, .role = .upstream },
+        .{ .phase = .reading_web_prefix, .role = .client },
+        .{ .phase = .reading_tls_header, .role = .client },
+        .{ .phase = .reading_direct_obfuscated_handshake, .role = .client },
+        .{ .phase = .reading_mtproto_tls_header, .role = .client },
+        .{ .phase = .middle_proxy_handshake, .role = .upstream },
+    }) |fixture| {
+        const client = try relayDrainTestSocketPair();
+        defer closeFd(client[0]);
+        defer closeFd(client[1]);
+        const upstream = try relayDrainTestSocketPair();
+        defer closeFd(upstream[0]);
+        defer closeFd(upstream[1]);
+        var budget: EventIoBudget = .{};
+        var slot = ConnectionSlot{
+            .phase = fixture.phase,
+            .client_fd = client[0],
+            .upstream_fd = upstream[0],
+            .client_transport = if (fixture.direct) .direct_obfuscated else .fake_tls,
+            .use_fast_mode = true,
+            .tg_encryptor = crypto.AesCtr.init(&([_]u8{0x42} ** 32), 0),
+            .last_activity_ms = 123,
+            .client_queue = .{ .allocator = std.testing.allocator },
+            .upstream_queue = .{ .allocator = std.testing.allocator },
+            .event_io_budget = &budget,
+        };
+        if (fixture.phase == .middle_proxy_handshake) slot.mp_transport.step = .waiting_rpc_nonce_response;
+        defer {
+            loop.releaseHandshakeBudget(&slot);
+            slot.resetOwnedBuffers(std.testing.allocator);
+        }
+        if (fixture.role == .client) loop.onClientReadable(&slot) else loop.onUpstreamReadable(&slot);
+        try std.testing.expectEqual(@as(i64, 123), slot.last_activity_ms); // Real EAGAIN.
+        try std.testing.expectEqual(@as(i64, 0), slot.first_byte_at_ms);
+
+        budget = .{ .operations_remaining = 0 };
+        if (fixture.role == .client) loop.onClientReadable(&slot) else loop.onUpstreamReadable(&slot);
+        try std.testing.expectEqual(@as(i64, 123), slot.last_activity_ms); // Budget exhaustion.
+        budget = .{};
+        const byte = [_]u8{0x17}; // Partial TLS/MP framing also counts as progress.
+        const source = if (fixture.role == .client) client[1] else upstream[1];
+        try std.testing.expectEqual(byte.len, try writeFd(source, &byte));
+        if (fixture.role == .client) loop.onClientReadable(&slot) else loop.onUpstreamReadable(&slot);
+        try std.testing.expect(slot.last_activity_ms > 123);
+        if (fixture.phase == .reading_tls_header) {
+            try std.testing.expectEqual(slot.last_activity_ms, slot.first_byte_at_ms);
+        }
+        const first_byte_ms = slot.first_byte_at_ms;
+        slot.last_activity_ms = 123;
+        budget = .{};
+        if (fixture.role == .client) loop.onClientReadable(&slot) else loop.onUpstreamReadable(&slot);
+        try std.testing.expectEqual(@as(i64, 123), slot.last_activity_ms);
+        try std.testing.expectEqual(first_byte_ms, slot.first_byte_at_ms);
+    }
+}
+
+test "writable activity records sent bytes and ignores a blocked flush" {
+    const client = try relayDrainTestSocketPair();
+    defer closeFd(client[0]);
+    defer closeFd(client[1]);
+    const upstream = try relayDrainTestSocketPair();
+    defer closeFd(upstream[0]);
+    defer closeFd(upstream[1]);
+    const loop = try std.testing.allocator.create(EventLoop);
+    defer std.testing.allocator.destroy(loop);
+    var state: ProxyState = undefined;
+    state.config.client_silence_close_sec = 0;
+    loop.state = &state;
+    loop.shutting_down = false;
+    var budget = EventIoBudget{ .operations_remaining = 0 };
+    var slot = ConnectionSlot{
+        .phase = .mask_relaying,
+        .client_fd = client[0],
+        .upstream_fd = upstream[0],
+        .client_queue = .{ .allocator = std.testing.allocator },
+        .upstream_queue = .{ .allocator = std.testing.allocator },
+        .event_io_budget = &budget,
+    };
+    defer slot.resetOwnedBuffers(std.testing.allocator);
+    for ([_]SlotFdRole{ .client, .upstream }) |role| {
+        budget = .{ .operations_remaining = 0 };
+        if (role == .client) _ = try queueClient(&slot, "abc") else _ = try queueUpstream(&slot, "abc");
+        slot.last_activity_ms = 123;
+        if (role == .client) loop.onClientWritable(&slot) else loop.onUpstreamWritable(&slot);
+        try std.testing.expectEqual(@as(i64, 123), slot.last_activity_ms);
+        budget = .{};
+        if (role == .client) loop.onClientWritable(&slot) else loop.onUpstreamWritable(&slot);
+        try std.testing.expect(slot.last_activity_ms > 123);
+        slot.last_activity_ms = 123;
+        if (role == .client) loop.onClientWritable(&slot) else loop.onUpstreamWritable(&slot);
+        try std.testing.expectEqual(@as(i64, 123), slot.last_activity_ms);
+    }
+}
+
 test "handshake read yields when the event I/O budget is exhausted" {
     var slot = ConnectionSlot{};
     var budget = EventIoBudget{ .bytes_remaining = 0 };
@@ -5573,7 +5702,9 @@ test "relay drain leaves unread bytes under queue backpressure even with a fresh
     try std.testing.expectEqual(@as(u64, relay_read_scratch_size), slot.mask_c2s_bytes);
 
     budget = .{};
+    slot.last_activity_ms = 123;
     loop.drainRelayReads(&slot, source[0]);
+    try std.testing.expectEqual(@as(i64, 123), slot.last_activity_ms);
     try std.testing.expectEqual(event_io_operation_budget, budget.operations_remaining);
     try std.testing.expectEqual(event_io_byte_budget, budget.bytes_remaining);
     var tail: [17]u8 = undefined;
@@ -5615,7 +5746,9 @@ test "relay drain records EOF once and keeps the reverse half open" {
     try std.testing.expectEqual(@as(?RelayEofSide, .client), slot.first_relay_eof);
     try std.testing.expectEqual(@as(u64, 1), state.stats_relay_client_eof_first.load(.monotonic));
     const remaining_operations = budget.operations_remaining;
+    const eof_activity_ms = slot.last_activity_ms;
     loop.drainRelayReads(&slot, client[0]);
+    try std.testing.expectEqual(eof_activity_ms, slot.last_activity_ms);
     try std.testing.expectEqual(remaining_operations, budget.operations_remaining);
     try std.testing.expectEqual(@as(u64, 1), state.stats_relay_client_eof_first.load(.monotonic));
     var got_request: [request.len]u8 = undefined;
