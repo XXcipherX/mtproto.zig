@@ -53,11 +53,12 @@ Telegram connectivity or elevated privileges.
 `zig build e2e -- --workers=2` additionally verifies two live listening
 socket inodes on the same address/port (a real `SO_REUSEPORT` group), completes
 the relay, and checks graceful process shutdown. CI executes the default,
-two-worker, and `zig build -Doptimize=ReleaseFast e2e` variants. Deep CI runs
-the two-worker variant with ThreadSanitizer instrumentation.
-The latter applies the repository's actual shipping policy (`ReleaseSafe` for the
-internet-facing data plane by default), catching runtime-only release defects that
-a cross-compile or binary-exists check cannot detect.
+two-worker, and `zig build -Doptimize=ReleaseFast e2e` variants. The ReleaseFast
+variant matches the default production mode. CI also runs
+`zig build -Doptimize=ReleaseFast -Ddataplane_safety=true e2e` for the optional
+hardened ReleaseSafe mode. These scenarios catch runtime-only release defects that
+a cross-compile or binary-exists check cannot detect. Deep CI retains the explicit
+ReleaseSafe two-worker variant with ThreadSanitizer instrumentation.
 
 ## Offline full-relay Stress CI
 
@@ -75,7 +76,8 @@ gh workflow run stress-ci.yml --repo XXcipherX/mtproto.zig --ref stress-validati
 
 These commands start remote GitHub jobs; they do not build or test on the local
 machine. `zig build -Doptimize=ReleaseFast
-stress-tools` builds the same compile-time-hooked E2E proxy plus a batch-mode
+stress-tools` builds the same compile-time-hooked E2E proxy in genuine ReleaseFast,
+matching the default production optimize mode, plus a batch-mode
 obfuscated-handshake generator. The normal shipping executable has no DC
 override. No Telegram, public endpoint, self-hosted runner, Python package
 installation, or external network is used during the stress run.

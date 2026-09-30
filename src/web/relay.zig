@@ -18,9 +18,9 @@
 //! ## Why its own process, and its own event loop
 //!
 //! Own *process* (`mtproto-proxy web-relay`, unit `mtproto-web-relay.service`): a fault
-//! here must not take the data plane down with it, and the proxy is built ReleaseSafe, so
-//! a bug is a process abort. It remains the same binary, so Docker and source updates
-//! still replace a single proxy artifact.
+//! here must not take the data plane down with it. In optional ReleaseSafe builds,
+//! a runtime safety trap aborts only this process. It remains the same binary, so
+//! Docker and source updates still replace a single proxy artifact.
 //!
 //! Own *event loop*: `std.http.Server` exists in Zig 0.16 and even has `respondWebSocket`,
 //! but it is a blocking `Io.Reader`/`Io.Writer` API (thread-per-connection) and its

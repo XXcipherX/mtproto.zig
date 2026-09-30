@@ -6,6 +6,7 @@
 #   curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/install.sh | sudo bash
 #
 # Optional environment:
+#   DATAPLANE_SAFETY=true  # ReleaseSafe + PIE; default false uses ReleaseFast + PIE
 #   ENABLE_TCPMSS=true  # optional legacy fallback: force tiny MSS ClientHello fragmentation
 #   ENABLE_SYNFIX=true   # install inbound SYN pacing rules for filtered routes
 #   SYNFIX_RATE=30/minute
@@ -36,6 +37,7 @@ REPO_URL="https://github.com/XXcipherX/mtproto.zig.git"
 SERVICE_NAME="mtproto-proxy"
 SERVICE_FILE="/etc/systemd/system/mtproto-proxy.service"
 FORCE_SERVICE_UPDATE="${FORCE_SERVICE_UPDATE:-0}"
+DATAPLANE_SAFETY="${DATAPLANE_SAFETY:-false}"
 ENABLE_TCPMSS="${ENABLE_TCPMSS:-false}"
 ENABLE_SYNFIX="${ENABLE_SYNFIX:-false}"
 SYNFIX_RATE="${SYNFIX_RATE:-30/minute}"
@@ -244,7 +246,7 @@ info "Building mtproto-proxy..."
 TMPBUILD=$(mktemp -d)
 git clone --depth 1 "$REPO_URL" "$TMPBUILD"
 cd "$TMPBUILD"
-zig build -Doptimize=ReleaseFast -Dcpu=native
+zig build -Doptimize=ReleaseFast -Ddataplane_safety="$DATAPLANE_SAFETY" -Dcpu=native
 ok "Build complete"
 
 # ── Install binary ──────────────────────────────────────────

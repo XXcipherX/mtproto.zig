@@ -18,7 +18,7 @@ This workflow documents current build and deploy paths as implemented in `Makefi
 ## Key Commands
 
 - `make build` : debug build
-- `make release` : production proxy (`ReleaseSafe` data plane + PIE); benchmark targets remain `ReleaseFast`
+- `make release [DATAPLANE_SAFETY=true]` : production proxy (`ReleaseFast` + PIE by default; optional `ReleaseSafe` + PIE); benchmark targets retain the requested mode
 - `make run CONFIG=<path>` : run proxy with selected config
 - `make test` : run unit tests
 - `make fuzz [FUZZ_ITERATIONS=100K]` : bounded ReleaseSafe security fuzz campaign (64-bit Linux)
@@ -29,7 +29,7 @@ This workflow documents current build and deploy paths as implemented in `Makefi
 - `make stability-check-load [HOST=127.0.0.1 PORT=443]` : load-only stability smoke
 - `make capacity-probe-idle` : idle-socket capacity probe
 - `make capacity-probe-active` : TLS-auth capacity probe
-- `make deploy SERVER=<ip>` : cross-compile and deploy to VPS
+- `make deploy SERVER=<ip> [DATAPLANE_SAFETY=true]` : cross-compile and deploy to VPS in the selected production mode
 - `make migrate SERVER=<ip> [PASSWORD=<pass>]` : bootstrap + push config + deploy
 - `make update-dns SERVER=<ip>` : run Cloudflare DNS updater helper; `.env` must provide `DNS_NAME`, `CF_TOKEN`, and `CF_ZONE`
 - `make deploy-tunnel SERVER=<ip> AWG_CONF=<path> [PASSWORD=<pass>] [TUNNEL_MODE=direct|preserve|middleproxy]` : full migration + AmneziaWG tunnel
@@ -57,6 +57,8 @@ zig build
 python3 test/daemon_smoke.py --binary zig-out/bin/mtproto-proxy
 zig build e2e
 zig build -Doptimize=ReleaseFast e2e
+zig build -Doptimize=ReleaseFast -Ddataplane_safety=true e2e
+zig build -Doptimize=ReleaseFast -Ddataplane_safety=true
 zig build -Doptimize=ReleaseFast
 zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux
 zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux -Dcpu=x86_64_v3+aes
@@ -67,11 +69,23 @@ zig build -Doptimize=ReleaseFast bench
 zig build -Doptimize=ReleaseFast soak -- --seconds=10
 ```
 
-`-Doptimize=ReleaseFast` is intentionally still used by release/deploy commands:
-the build policy promotes only `mtproto-proxy` to `ReleaseSafe` while leaving
-bench/soak in the requested mode. `-Ddataplane_safety=false` is an explicit unsafe
-benchmark opt-out and must not be used for an exposed production service. The proxy
-ELF is always PIE.
+Production defaults to genuine `ReleaseFast`: `dataplane_safety` defaults to
+`false`, so `zig build -Doptimize=ReleaseFast` and the explicit
+`-Ddataplane_safety=false` form both use that mode. Opt into hardened `ReleaseSafe`
+with `zig build -Doptimize=ReleaseFast -Ddataplane_safety=true`, or request
+`-Doptimize=ReleaseSafe` directly. Other optimize modes are unchanged. Bench/soak
+retain the requested mode regardless of this flag. The proxy ELF remains PIE in
+both production modes.
+
+Make release/deploy targets and the source installer expose `DATAPLANE_SAFETY`
+with default `false`; set it to `true` for `ReleaseSafe`. Docker uses the same
+build argument on generic x86_64, aarch64 and `x86_64_v3+aes` profiles. The publish
+workflow's **Production mode** choice defaults to **ReleaseFast** and maps the
+same selection to both the generic and optional `amd64-v3` image builds.
+
+Stress CI keeps `zig build -Doptimize=ReleaseFast stress-tools`, so its proxy
+matches the default production optimize mode. Debug/ReleaseSafe unit tests,
+ReleaseSafe fuzzing, ThreadSanitizer and Valgrind retain their explicit modes.
 
 The default install graph contains only `mtproto-proxy`. Use `zig build install-bench` only when the standalone `mtproto-bench` binary is required; `bench` and `soak` build it explicitly without coupling `run` to the global install step.
 
@@ -81,7 +95,7 @@ stop immediately on process/system FD exhaustion, resolve callable churn payload
 inside each connection attempt, and retain the bounded hostname cache for the
 realistic TLS template.
 
-The daemon smoke launches a real localhost proxy, verifies a valid FakeTLS handshake, checks that the same SNI with a bad secret does not receive a valid FakeTLS response, and holds an authenticated connection across `SIGTERM` until the configured graceful-shutdown deadline forces a clean exit. `zig build e2e` goes further: a compile-time test-only loopback DC override drives the real daemon through FakeTLS, the obfuscated MTProto nonce, upstream setup, and C2S/S2C relay without exposing that override in the installed binary. CI repeats that process scenario with `-Doptimize=ReleaseFast`, which exercises the effective shipping data-plane mode (`ReleaseSafe` unless explicitly opted out) rather than treating a successful release link as runtime evidence. CI uses a shorter soak for pull requests and a longer soak on pushes. In addition to the aarch64 cross-build, the official `ubuntu-24.04-arm` runner executes unit tests, this daemon smoke and a short four-worker soak natively so architecture-specific runtime defects cannot hide behind successful cross-compilation.
+The daemon smoke launches a real localhost proxy, verifies a valid FakeTLS handshake, checks that the same SNI with a bad secret does not receive a valid FakeTLS response, and holds an authenticated connection across `SIGTERM` until the configured graceful-shutdown deadline forces a clean exit. `zig build e2e` goes further: a compile-time test-only loopback DC override drives the real daemon through FakeTLS, the obfuscated MTProto nonce, upstream setup, and C2S/S2C relay without exposing that override in the installed binary. CI repeats that process scenario with `-Doptimize=ReleaseFast` for the default shipping mode and adds `-Ddataplane_safety=true` for the optional hardened `ReleaseSafe` mode. It also builds the hardened production executable and checks its PIE output. CI uses a shorter soak for pull requests and a longer soak on pushes. In addition to the aarch64 cross-build, the official `ubuntu-24.04-arm` runner executes unit tests, this daemon smoke and a short four-worker soak natively so architecture-specific runtime defects cannot hide behind successful cross-compilation.
 
 The separate `.github/workflows/deep-ci.yml` workflow runs weekly and through `workflow_dispatch`. Its `-Dtsan=true` option applies ThreadSanitizer only to the `src/main.zig` and `src/bench.zig` test artifacts plus the benchmark executable used by soak; it never instruments the normal production proxy build. Keep `TSAN_OPTIONS=halt_on_error=1:exitcode=66` so a reported race fails the job instead of becoming advisory output.
 
@@ -156,7 +170,7 @@ sudo env MTPROTO_DOCKER_INSTALL=1 bash /opt/mtproto-proxy/setup_web.sh --remove
 
 ## `make deploy` (current behavior)
 
-1. Builds Linux target: `zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux -Dcpu=x86_64_v3`.
+1. Builds Linux target: `zig build -Doptimize=ReleaseFast -Ddataplane_safety=false -Dtarget=x86_64-linux -Dcpu=x86_64_v3` by default; `make deploy DATAPLANE_SAFETY=true SERVER=<ip>` selects `ReleaseSafe`. PIE remains enabled in both modes.
 2. Stops remote service (`systemctl stop mtproto-proxy`).
 3. Uploads binary and `deploy/*.sh` via `scp`.
 4. Uploads config when local config file exists.
@@ -232,6 +246,13 @@ curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/in
 ```
 
 The installer is idempotent and preserves `config.toml` on update; existing `env.sh` stays untouched unless install is rerun with fresh `CF_TOKEN` / `CF_ZONE` / `IPV6_PREFIX` settings.
+
+It builds genuine `ReleaseFast` + native CPU + PIE by default. For hardened
+`ReleaseSafe` + native CPU + PIE, pass the setting through `sudo`:
+
+```bash
+curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/install.sh | sudo env DATAPLANE_SAFETY=true bash
+```
 
 For a fresh self-domain masking install, prefer:
 

@@ -67,6 +67,14 @@ jobs:
       - name: Shipping-build real-process relay E2E
         run: zig build -Doptimize=ReleaseFast e2e
 
+      - name: Hardened-build real-process relay E2E
+        run: zig build -Doptimize=ReleaseFast -Ddataplane_safety=true e2e
+
+      - name: Hardened release build (native)
+        run: |
+          zig build -Doptimize=ReleaseFast -Ddataplane_safety=true
+          readelf -h zig-out/bin/mtproto-proxy | grep -Eq 'Type:[[:space:]]+DYN'
+
       - name: Release build (native)
         run: zig build -Doptimize=ReleaseFast
 

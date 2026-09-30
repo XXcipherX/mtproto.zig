@@ -84,7 +84,7 @@ jobs:
       - name: Test stress harness helpers
         run: python3 -m unittest discover -s test -p 'test_stress_helpers.py'
 
-      - name: Build test-hooked proxy and batch nonce generator
+      - name: Build ReleaseFast test-hooked proxy and batch nonce generator
         run: zig build -Doptimize=ReleaseFast stress-tools
 
       - name: Run offline full-relay stress

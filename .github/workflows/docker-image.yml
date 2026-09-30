@@ -15,6 +15,14 @@ on:
         description: Zig version used by the Docker build
         required: true
         default: 0.16.0
+      production_mode:
+        description: Production mode
+        required: true
+        type: choice
+        default: ReleaseFast
+        options:
+          - ReleaseFast
+          - ReleaseSafe
       push_latest:
         description: Also publish the latest tag
         required: true
@@ -44,6 +52,19 @@ jobs:
         shell: bash
         run: |
           echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Select production mode
+        id: production
+        shell: bash
+        env:
+          PRODUCTION_MODE: ${{ inputs.production_mode }}
+        run: |
+          case "$PRODUCTION_MODE" in
+            ReleaseFast) dataplane_safety=false ;;
+            ReleaseSafe) dataplane_safety=true ;;
+            *) echo "Unsupported production mode: $PRODUCTION_MODE" >&2; exit 1 ;;
+          esac
+          echo "dataplane_safety=$dataplane_safety" >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
@@ -87,6 +108,7 @@ jobs:
           push: true
           build-args: |
             ZIG_VERSION=${{ inputs.zig_version }}
+            DATAPLANE_SAFETY=${{ steps.production.outputs.dataplane_safety }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=docker-generic
@@ -101,6 +123,7 @@ jobs:
           push: true
           build-args: |
             ZIG_VERSION=${{ inputs.zig_version }}
+            DATAPLANE_SAFETY=${{ steps.production.outputs.dataplane_safety }}
             MTPROTO_CPU=x86_64_v3+aes
           tags: ${{ steps.meta_amd64_v3.outputs.tags }}
           labels: ${{ steps.meta_amd64_v3.outputs.labels }}
@@ -108,8 +131,12 @@ jobs:
           cache-to: type=gha,scope=docker-amd64-v3,mode=max
 
       - name: Summary
+        env:
+          PRODUCTION_MODE: ${{ inputs.production_mode }}
         run: |
           {
+            echo "Production mode: $PRODUCTION_MODE (PIE enabled for all images)"
+            echo ""
             echo "### Published generic image"
             echo ""
             echo '${{ steps.meta.outputs.tags }}' | sed 's/^/- `/' | sed 's/$/`/'

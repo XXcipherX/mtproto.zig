@@ -4,6 +4,8 @@
 #   docker build -t mtproto-zig .
 #   docker build --platform linux/amd64 --build-arg ZIG_VERSION=0.16.0 -t mtproto-zig .
 #   docker build --platform linux/amd64 --build-arg MTPROTO_CPU=x86_64_v3+aes -t mtproto-zig:amd64-v3 .
+# Production defaults to ReleaseFast + PIE; opt into ReleaseSafe + PIE with:
+#   docker build --build-arg DATAPLANE_SAFETY=true -t mtproto-zig:release-safe .
 #
 # Run (default config from image listens on 443; override with a volume for production):
 #   docker run --rm -p 443:443 mtproto-zig
@@ -14,11 +16,13 @@
 ARG ZIG_VERSION=0.16.0
 ARG ZIG_SHA256=
 ARG MTPROTO_CPU=
+ARG DATAPLANE_SAFETY=false
 
 FROM debian:bookworm-slim AS builder
 ARG ZIG_VERSION
 ARG ZIG_SHA256
 ARG MTPROTO_CPU
+ARG DATAPLANE_SAFETY
 ARG TARGETARCH
 
 RUN apt-get update \
@@ -66,9 +70,9 @@ RUN set -eu \
        esac \
     && cpu="${MTPROTO_CPU:-$default_cpu}" \
     && if [ -n "$cpu" ]; then \
-         zig build -Doptimize=ReleaseFast -Dtarget="$target" -Dcpu="$cpu"; \
+         zig build -Doptimize=ReleaseFast -Ddataplane_safety="$DATAPLANE_SAFETY" -Dtarget="$target" -Dcpu="$cpu"; \
        else \
-         zig build -Doptimize=ReleaseFast -Dtarget="$target"; \
+         zig build -Doptimize=ReleaseFast -Ddataplane_safety="$DATAPLANE_SAFETY" -Dtarget="$target"; \
        fi
 
 FROM debian:bookworm-slim

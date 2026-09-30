@@ -125,14 +125,15 @@ The binary defaults to `config.toml`; the repository intentionally ships `config
 
 The example listens on privileged port `443`. Run locally with sufficient bind permissions (for example, as root) or change `[server].port` to a port above `1024`. The systemd unit uses `CAP_NET_BIND_SERVICE`, but `make run` does not grant that capability.
 
-Production release commands continue to request `ReleaseFast`, but the build policy
-compiles the internet-facing `mtproto-proxy` executable as `ReleaseSafe` by default.
-The parser data plane therefore retains bounds, overflow and null checks, while
-`bench` and `soak` stay genuinely `ReleaseFast`. The proxy is also emitted as PIE so
-Linux ASLR can randomize its load address. A deliberate benchmark-only comparison
-against the unsafe mode is available with
-`zig build -Doptimize=ReleaseFast -Ddataplane_safety=false`; do not use that opt-out
-for an exposed production proxy.
+Production defaults to genuine `ReleaseFast`: `zig build -Doptimize=ReleaseFast`
+and `make release` compile `mtproto-proxy` in that mode. `dataplane_safety` defaults
+to `false`; explicitly passing `-Ddataplane_safety=false` has the same result.
+For the optional hardened `ReleaseSafe` mode with bounds, overflow and null checks,
+use `zig build -Doptimize=ReleaseFast -Ddataplane_safety=true`, or
+`make release DATAPLANE_SAFETY=true`. Direct `-Doptimize=ReleaseSafe` also works;
+other optimize modes are unchanged. `bench` and `soak` retain the requested mode
+regardless of `dataplane_safety`. PIE remains enabled in both production modes so
+Linux ASLR can randomize the proxy's load address.
 
 ### Run Tests
 
@@ -257,7 +258,8 @@ terminates an idle-load attempt, require per-connection payload factories during
 churn, and verify reuse of the expensive realistic ClientHello template. This
 keeps a broken probe from reporting a misleading proxy result.
 
-The GitHub workflow additionally verifies the production safety policy, PIE output,
+The GitHub workflow additionally covers default `ReleaseFast` and optional hardened
+`ReleaseSafe` builds and real-process relay E2E, PIE output,
 Linux `x86_64`, deploy-target `x86_64_v3+aes`, Linux `aarch64`, Docker build smoke,
 and genuine `ReleaseFast` tests and benchmark/soak paths. The benchmark job records
 FakeTLS validation plus single, inline-four and heap-eight handshake candidate paths
@@ -265,6 +267,10 @@ as downloadable artifacts; these are regression signals, not noisy shared-runner
 pass/fail thresholds. The ARM64 job runs the unit tests, real daemon smoke and a short soak natively on GitHub's official
 `ubuntu-24.04-arm` runner; the existing aarch64 cross-build remains as an
 independent portability check.
+
+The separate Stress CI builds its proxy with `-Doptimize=ReleaseFast stress-tools`,
+matching the default production optimize mode. Debug and ReleaseSafe unit tests,
+ReleaseSafe security fuzzing, ThreadSanitizer and Valgrind checks retain their modes.
 
 The separate Debian/Ubuntu installer matrix builds the proxy image from the
 checked-out commit, publishes it only to a registry inside the isolated test host,
@@ -288,7 +294,7 @@ operations per second and a checksum that keeps the measured work observable.
 | Target | Description |
 |--------|-------------|
 | `make build` | Debug build |
-| `make release` | Production build (`ReleaseSafe` data plane + PIE by default) |
+| `make release [DATAPLANE_SAFETY=true]` | Production build (`ReleaseFast` + PIE by default; optional `ReleaseSafe` + PIE) |
 | `make run CONFIG=<path>` | Run proxy (default: `config.toml`) |
 | `make test` | Run unit tests |
 | `make fuzz [FUZZ_ITERATIONS=100K]` | Run bounded ReleaseSafe security fuzzing (64-bit Linux) |
@@ -300,7 +306,7 @@ operations per second and a checksum that keeps the measured work observable.
 | `make stability-check-load [HOST=127.0.0.1 PORT=443]` | Run load-only stability smoke without `/proc` assertions |
 | `make clean` | Remove build artifacts |
 | `make fmt` | Format Zig files under `src/` |
-| `make deploy SERVER=<ip>` | Build `x86_64-linux` with the `x86_64_v3` CPU baseline, upload binary/scripts/config to VPS, restart service |
+| `make deploy SERVER=<ip> [DATAPLANE_SAFETY=true]` | Build `x86_64-linux` with the `x86_64_v3` CPU baseline (`ReleaseFast` + PIE by default), upload binary/scripts/config to VPS, restart service |
 | `make migrate SERVER=<ip> [PASSWORD=<pass>]` | Bootstrap server, push local `config.toml`, then run `make deploy` |
 | `make update-dns SERVER=<ip>` | Run the Cloudflare DNS update helper on demand (`DNS_NAME`, `CF_TOKEN`, `CF_ZONE` come from `.env`) |
 | `make deploy-tunnel SERVER=<ip> AWG_CONF=<path> [PASSWORD=<pass>] [TUNNEL_MODE=direct\|preserve\|middleproxy]` | Full migration + AmneziaWG tunnel for blocked regions |
@@ -334,6 +340,10 @@ The repository includes a **multi-stage Dockerfile**: Zig is bootstrapped from t
 docker build -t mtproto-zig .
 ```
 
+The default image uses `ReleaseFast` + PIE on both `amd64` and `arm64`, including
+the optional `amd64-v3` CPU profile. Set `--build-arg DATAPLANE_SAFETY=true` for
+`ReleaseSafe` + PIE without changing the CPU profile.
+
 ### Build arguments
 
 | Argument       | Default   | Description |
@@ -341,12 +351,14 @@ docker build -t mtproto-zig .
 | `ZIG_VERSION`  | `0.16.0`  | Version string passed to `ziglang.org/download/…/zig-<arch>-linux-<version>.tar.xz`. Must match a published Zig release. |
 | `ZIG_SHA256`   | _(empty)_ | Optional pinned SHA256 for the downloaded Zig tarball. If set, Docker build verifies integrity before extraction. |
 | `MTPROTO_CPU`  | `x86_64` on `amd64`, Zig default on `arm64` | Optional Zig CPU baseline. Use `x86_64_v3+aes` on modern `amd64` hosts to enable hardware AES and avoid software-only AES builds. |
+| `DATAPLANE_SAFETY` | `false` | Production mode: `false` builds genuine `ReleaseFast`; `true` selects `ReleaseSafe`. PIE is enabled in both modes. |
 
 Example:
 
 ```bash
 docker build --build-arg ZIG_VERSION=0.16.0 -t mtproto-zig .
 docker build --platform linux/amd64 --build-arg MTPROTO_CPU=x86_64_v3+aes -t mtproto-zig:amd64-v3 .
+docker build --build-arg DATAPLANE_SAFETY=true -t mtproto-zig:release-safe .
 ```
 
 ### Architecture (`TARGETARCH`)
@@ -380,6 +392,9 @@ docker buildx build \
 ### Publish from GitHub Actions
 
 The repository includes a manual workflow: **Actions -> Publish Docker image -> Run workflow**.
+Its **Production mode** selector defaults to **ReleaseFast**; choose **ReleaseSafe**
+for the hardened mode. The selection applies equally to the generic multi-platform
+image and optional `amd64-v3` image, and appears in the workflow summary.
 It builds the Dockerfile with Buildx and pushes to GitHub Container Registry:
 
 ```text
@@ -662,7 +677,7 @@ curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/in
 
 This will:
 1. Install **Zig 0.16.0** (if not present)
-2. Clone and build the proxy with the production `ReleaseSafe` data-plane policy for the native CPU
+2. Clone and build the proxy as `ReleaseFast` + PIE for the native CPU by default
 3. Generate a random 16-byte secret on first install
 4. Create a `systemd` service (`mtproto-proxy`)
 5. Open the configured proxy port in `ufw` (if active)
@@ -673,6 +688,13 @@ This will:
 10. Attempt OS-level `zapret` / `nfqws` TCP desync setup
 11. Refresh optional monitor files if `proxy-monitor` already exists
 12. Print a ready-to-use `tg://` connection link when `[access.users]` contains a valid 32-hex secret
+
+To install or update in the optional hardened `ReleaseSafe` + PIE mode, pass the
+build setting to the installer:
+
+```bash
+curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/install.sh | sudo env DATAPLANE_SAFETY=true bash
+```
 
 On a fresh source install the generated config omits `[general].use_middle_proxy`, so regular DC1..5 traffic uses the parser default `false`; negative DC1..5 media traffic still prefers MiddleProxy because `force_media_middle_proxy=true` by default, while CDN DC203 always requires MiddleProxy. This differs from `config.toml.example` and the Docker Compose installer, both of which enable regular MiddleProxy routing explicitly.
 
@@ -771,9 +793,9 @@ cd mtproto.zig
 zig build -Doptimize=ReleaseFast
 ```
 
-Although the command requests the common release profile, the default
-`dataplane_safety=true` policy promotes the proxy executable itself to `ReleaseSafe`;
-the same policy applies to the source installer and Docker image.
+This builds genuine `ReleaseFast` + PIE. Add `-Ddataplane_safety=true` to select
+the optional hardened `ReleaseSafe` + PIE mode. The source installer and Docker
+image also default to `ReleaseFast`, with `DATAPLANE_SAFETY=true` as their opt-in.
 
 Or cross-compile on your Mac for a baseline-compatible x86_64 target:
 

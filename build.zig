@@ -9,17 +9,14 @@ pub fn build(b: *std.Build) void {
         "Instrument test, E2E proxy, and soak artifacts with ThreadSanitizer (default: false)",
     ) orelse false;
 
-    // The proxy parses untrusted network input (FakeTLS, obfuscation,
-    // MiddleProxy, WEB, SOCKS5 and TOML). Keep runtime bounds, overflow and null
-    // checks enabled in production: a parser defect must fail closed instead of
-    // becoming unchecked undefined behaviour. Bench and soak retain the requested
-    // mode so ReleaseFast measurements remain meaningful. Operators can explicitly
-    // restore the requested mode with -Ddataplane_safety=false.
+    // The proxy uses the requested optimize mode by default. Operators can opt
+    // into ReleaseSafe for ReleaseFast proxy builds with -Ddataplane_safety=true.
+    // Other optimize modes and the benchmark/soak artifacts remain unchanged.
     const dataplane_safety = b.option(
         bool,
         "dataplane_safety",
-        "Build the internet-facing proxy with runtime safety on (ReleaseSafe) even in release builds (default: true)",
-    ) orelse true;
+        "Use ReleaseSafe for the proxy when optimize=ReleaseFast (default: false)",
+    ) orelse false;
     const dataplane_optimize: std.builtin.OptimizeMode =
         if (dataplane_safety and optimize == .ReleaseFast) .ReleaseSafe else optimize;
 
@@ -40,8 +37,8 @@ pub fn build(b: *std.Build) void {
     });
 
     // Build an ELF position-independent executable so Linux can randomize its
-    // load address with ASLR. Zig already links immediate binding + RELRO by
-    // default; ReleaseSafe supplies the data-plane bounds and overflow checks.
+    // load address with ASLR in every optimize mode. Zig already links immediate
+    // binding + RELRO by default.
     exe.pie = true;
 
     b.installArtifact(exe);
