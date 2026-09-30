@@ -62,6 +62,12 @@ allocation-free normal preparation/full writes with a failing allocator, exact
 partial/EAGAIN queue ownership after scratch overwrite, and persistent explicit
 desync ownership together with the existing split write/timer regression.
 
+Obfuscated-handshake regressions compare one-block secret trials with a full
+64-byte decrypt for every supported protocol tag, signed DC indices (including
+zero and i16 boundaries), big-endian counter carry and u128 wrap. They check
+wrong-secret/malformed-tag rejection, both directional key/IV derivations and
+post-handshake stream continuity across different chunk boundaries.
+
 Zig relay unit tests cover every pair of TCP split positions through multiple
 FakeTLS application records and an intervening CCS, using the real AES-CTR states.
 They also cover one-byte segmentation, malformed headers, and incomplete framing

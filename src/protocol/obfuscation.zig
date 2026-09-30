@@ -8,6 +8,18 @@ const std = @import("std");
 const constants = @import("constants.zig");
 const crypto = @import("../crypto/crypto.zig");
 
+const trial_block_len = 16; // AES block size, independent of the key size.
+const trial_block_start = (constants.proto_tag_pos / trial_block_len) * trial_block_len;
+const trial_block_index = @divExact(trial_block_start, trial_block_len);
+
+comptime {
+    if (trial_block_start + trial_block_len > constants.handshake_len or
+        constants.proto_tag_pos + 4 > trial_block_start + trial_block_len or
+        constants.dc_idx_pos < trial_block_start or
+        constants.dc_idx_pos + 2 > trial_block_start + trial_block_len)
+        @compileError("obfuscated handshake tag and DC must fit in one AES trial block");
+}
+
 /// Obfuscation parameters extracted from a client handshake.
 pub const ObfuscationParams = struct {
     /// Key for decrypting client -> proxy traffic
@@ -57,20 +69,19 @@ pub const ObfuscationParams = struct {
             var decrypt_iv = std.mem.readInt(u128, dec_iv_bytes, .big);
             defer std.crypto.secureZero(u8, std.mem.asBytes(&decrypt_iv));
 
-            // Decrypt the handshake to check proto tag
-            var decryptor = crypto.AesCtr.init(&decrypt_key, decrypt_iv);
+            // AesCtr uses a big-endian u128 counter with wrapping increments.
+            // Only the block containing tag/DC is needed for a trial secret;
+            // keep the original IV in the returned traffic parameters.
+            var decryptor = crypto.AesCtr.init(&decrypt_key, decrypt_iv +% trial_block_index);
             defer decryptor.wipe();
-            var decrypted: [constants.handshake_len]u8 = undefined;
+            var decrypted: [trial_block_len]u8 = handshake[trial_block_start..][0..trial_block_len].*;
             defer std.crypto.secureZero(u8, &decrypted);
-            @memcpy(&decrypted, handshake);
             decryptor.apply(&decrypted);
 
-            // Check proto tag at offset 56
-            const tag_bytes: [4]u8 = decrypted[constants.proto_tag_pos..][0..4].*;
+            const tag_bytes: [4]u8 = decrypted[constants.proto_tag_pos - trial_block_start ..][0..4].*;
             const proto_tag = constants.ProtoTag.fromBytes(tag_bytes) orelse continue;
 
-            // Extract DC index at offset 60
-            const dc_idx = std.mem.readInt(i16, decrypted[constants.dc_idx_pos..][0..2], .little);
+            const dc_idx = std.mem.readInt(i16, decrypted[constants.dc_idx_pos - trial_block_start ..][0..2], .little);
 
             // Derive encrypt key
             var enc_key_input: [constants.prekey_len + 16]u8 = undefined;
@@ -179,6 +190,16 @@ pub fn prepareTgNonce(
 // ============= Tests =============
 
 fn buildTestClientHandshake(first_byte: u8, secret: [16]u8) [constants.handshake_len]u8 {
+    return buildTestClientHandshakeFields(first_byte, secret, .intermediate, 2, 0x1234);
+}
+
+fn buildTestClientHandshakeFields(
+    first_byte: u8,
+    secret: [16]u8,
+    proto_tag: constants.ProtoTag,
+    dc_idx: i16,
+    iv: u128,
+) [constants.handshake_len]u8 {
     var handshake = [_]u8{0x42} ** constants.handshake_len;
     handshake[0] = first_byte;
     handshake[4] = 1;
@@ -188,6 +209,7 @@ fn buildTestClientHandshake(first_byte: u8, secret: [16]u8) [constants.handshake
     for (handshake[constants.skip_len..][0 .. constants.prekey_len + constants.iv_len], 0..) |*byte, idx| {
         byte.* = @intCast((idx * 7 + 11) & 0xff);
     }
+    std.mem.writeInt(u128, handshake[constants.skip_len + constants.prekey_len ..][0..constants.iv_len], iv, .big);
 
     const dec_prekey_iv = handshake[constants.skip_len .. constants.skip_len + constants.prekey_len + constants.iv_len];
     const dec_prekey = dec_prekey_iv[0..constants.prekey_len];
@@ -204,18 +226,81 @@ fn buildTestClientHandshake(first_byte: u8, secret: [16]u8) [constants.handshake
     defer decryptor.wipe();
     decryptor.apply(&stream);
 
-    const tag = constants.ProtoTag.intermediate.toBytes();
+    const tag = proto_tag.toBytes();
     for (0..tag.len) |idx| {
         handshake[constants.proto_tag_pos + idx] = tag[idx] ^ stream[constants.proto_tag_pos + idx];
     }
 
     var dc_bytes: [2]u8 = undefined;
-    std.mem.writeInt(i16, &dc_bytes, 2, .little);
+    std.mem.writeInt(i16, &dc_bytes, dc_idx, .little);
     for (0..dc_bytes.len) |idx| {
         handshake[constants.dc_idx_pos + idx] = dc_bytes[idx] ^ stream[constants.dc_idx_pos + idx];
     }
 
     return handshake;
+}
+
+test "trial block matches full handshake decrypt and preserves traffic counters" {
+    try std.testing.expectEqual(@as(usize, 48), trial_block_start);
+    try std.testing.expectEqual(@as(usize, 3), trial_block_index);
+    try std.testing.expectEqual(@as(usize, 8), constants.proto_tag_pos - trial_block_start);
+    try std.testing.expectEqual(@as(usize, 12), constants.dc_idx_pos - trial_block_start);
+    const secret = [_]u8{0x11} ** 16;
+    const wrong = UserSecret{ .name = "wrong", .secret = [_]u8{0xa5} ** 16 };
+    const secrets = [_]UserSecret{ wrong, .{ .name = "matched", .secret = secret }, wrong };
+    for ([_]constants.ProtoTag{ .abridged, .intermediate, .secure }) |tag| {
+        for ([_]i16{ 0, 1, 5, -1, -5, 203, -203, std.math.minInt(i16), std.math.maxInt(i16) }) |dc_idx| {
+            for ([_]u128{ 0, 0xff, std.math.maxInt(u128) - 2, std.math.maxInt(u128) }) |iv| {
+                const handshake = buildTestClientHandshakeFields(0x42, secret, tag, dc_idx, iv);
+                var key_input: [constants.prekey_len + 16]u8 = undefined;
+                defer std.crypto.secureZero(u8, &key_input);
+                @memcpy(key_input[0..constants.prekey_len], handshake[constants.skip_len..][0..constants.prekey_len]);
+                @memcpy(key_input[constants.prekey_len..], &secret);
+                var key = crypto.sha256(&key_input);
+                defer std.crypto.secureZero(u8, &key);
+                var full = crypto.AesCtr.init(&key, iv);
+                defer full.wipe();
+                var decrypted = handshake;
+                defer std.crypto.secureZero(u8, &decrypted);
+                full.apply(&decrypted); // Reference: the previous full-decrypt path.
+
+                var parsed = ObfuscationParams.fromHandshake(&handshake, &secrets) orelse return error.TestExpectedEqual;
+                defer parsed.params.wipe();
+                try std.testing.expectEqualStrings("matched", parsed.user);
+                try std.testing.expectEqual(tag, constants.ProtoTag.fromBytes(decrypted[constants.proto_tag_pos..][0..4].*).?);
+                try std.testing.expectEqual(tag, parsed.params.proto_tag);
+                try std.testing.expectEqual(std.mem.readInt(i16, decrypted[constants.dc_idx_pos..][0..2], .little), parsed.params.dc_idx);
+                try std.testing.expectEqual(dc_idx, parsed.params.dc_idx);
+                try std.testing.expectEqualSlices(u8, &key, &parsed.params.decrypt_key);
+                try std.testing.expectEqual(iv, parsed.params.decrypt_iv);
+                try std.testing.expect(ObfuscationParams.fromHandshake(&handshake, &.{wrong}) == null);
+
+                var reversed: [constants.prekey_len + constants.iv_len]u8 = undefined;
+                defer std.crypto.secureZero(u8, &reversed);
+                for (&reversed, 0..) |*byte, i| byte.* = handshake[constants.skip_len + reversed.len - 1 - i];
+                @memcpy(key_input[0..constants.prekey_len], reversed[0..constants.prekey_len]);
+                var encrypt_key = crypto.sha256(&key_input);
+                defer std.crypto.secureZero(u8, &encrypt_key);
+                try std.testing.expectEqualSlices(u8, &encrypt_key, &parsed.params.encrypt_key);
+                try std.testing.expectEqual(std.mem.readInt(u128, reversed[constants.prekey_len..][0..constants.iv_len], .big), parsed.params.encrypt_iv);
+
+                var actual = parsed.params.createDecryptor();
+                defer actual.wipe();
+                actual.ctr +%= @divExact(constants.handshake_len, trial_block_len); // EventLoop's unchanged traffic initialization.
+                var expected_bytes = [_]u8{0x67} ** 193;
+                var actual_bytes = expected_bytes;
+                full.apply(expected_bytes[0..31]);
+                full.apply(expected_bytes[31..]);
+                actual.apply(actual_bytes[0..7]);
+                actual.apply(actual_bytes[7..]);
+                try std.testing.expectEqualSlices(u8, &expected_bytes, &actual_bytes);
+
+                var malformed = handshake;
+                malformed[constants.proto_tag_pos] ^= 1;
+                try std.testing.expect(ObfuscationParams.fromHandshake(&malformed, secrets[1..2]) == null);
+            }
+        }
+    }
 }
 
 test "isValidNonce" {
