@@ -3873,8 +3873,8 @@ const EventLoop = struct {
         };
     }
 
-    fn nextSlotDeadlineNs(self: *const EventLoop, slot: *const ConnectionSlot) ?i128 {
-        return timeout_policy.nextSlotDeadlineNs(slot, .{
+    fn nextSlotDeadline(self: *const EventLoop, slot: *const ConnectionSlot) ?timeout_policy.SlotDeadline {
+        return timeout_policy.nextSlotDeadline(slot, .{
             .handshake_timeout_sec = self.state.config.handshake_timeout_sec,
             .mask_relay_max_secs = self.state.config.mask_relay_max_secs,
             .pre_first_byte_timeout_ms = pre_first_byte_timeout_ms,
@@ -3883,13 +3883,16 @@ const EventLoop = struct {
     }
 
     fn refreshSlotDeadline(self: *EventLoop, slot: *ConnectionSlot) void {
-        const next = self.nextSlotDeadlineNs(slot) orelse {
+        const next = self.nextSlotDeadline(slot) orelse {
             self.deadline_heap.remove(self.pool.slots, slot);
             self.rearmTimer() catch |err| log.err("failed to rearm deadline timer: {any}", .{err});
             return;
         };
 
-        self.deadline_heap.update(self.pool.slots, slot, next);
+        switch (next.kind) {
+            .relay_idle => self.deadline_heap.updateRelayIdle(self.pool.slots, slot, next.deadline_ns),
+            .absolute => self.deadline_heap.update(self.pool.slots, slot, next.deadline_ns),
+        }
         self.rearmTimer() catch |err| log.err("failed to rearm deadline timer: {any}", .{err});
     }
 
@@ -5136,6 +5139,213 @@ test "FakeTLS size and key-share refusals mask the complete original record" {
         }
         try std.testing.expectEqualSlices(u8, original, received);
     }
+}
+
+test "relay idle deadlines wake early, recompute live activity and preserve timer ordering" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var cfg = Config{
+        .users = std.StringHashMap([16]u8).init(std.testing.allocator),
+        .direct_users = std.StringHashMap(void).init(std.testing.allocator),
+        .mask = false,
+        .client_silence_close_sec = 0,
+        .handshake_timeout_sec = 15,
+    };
+    defer cfg.deinit(std.testing.allocator);
+    var state = try ProxyState.init(std.testing.allocator, std.testing.io, cfg);
+    defer state.deinit();
+    const listener = try relayDrainTestSocketPair();
+    defer closeFd(listener[0]);
+    defer closeFd(listener[1]);
+    const control = try createWorkerEventFd();
+    defer closeFd(control);
+    const loop = try EventLoop.init(&state, listener[0], control, 0, 4, default_managed_buffer_limit_bytes, null);
+    defer {
+        loop.deinit();
+        std.testing.allocator.destroy(loop);
+    }
+    const ms: i128 = std.time.ns_per_ms;
+    loop.stats_next_log_ns = 1_000_000 * ms;
+    const first = loop.pool.acquire().?;
+    first.phase = .relaying;
+    first.peer_addr = net.ip4(.{ 127, 0, 0, 1 }, 1234);
+    first.last_activity_ms = 1000;
+    first.idle_timeout_ms = 10_000;
+    first.event_generation = 7;
+    first.client_event_generation = 7;
+    const old_token = decodeSlotEventToken(encodeSlotEventToken(first, .client)).?;
+    loop.refreshSlotDeadline(first);
+    try std.testing.expectEqual(11_000 * ms, loop.armed_deadline_ns);
+    first.last_activity_ms = 3000;
+    loop.refreshSlotDeadline(first);
+    try std.testing.expectEqual(11_000 * ms, loop.deadline_heap.peek().?.deadline_ns);
+    try std.testing.expectEqual(11_000 * ms, loop.armed_deadline_ns);
+    try std.testing.expectEqual(13_000 * ms, loop.nextSlotDeadline(first).?.deadline_ns);
+
+    const second = loop.pool.acquire().?;
+    second.phase = .relaying;
+    second.peer_addr = first.peer_addr;
+    second.last_activity_ms = 1500;
+    second.idle_timeout_ms = 10_000;
+    loop.refreshSlotDeadline(second);
+    loop.runTimers(11_000 * ms);
+    try std.testing.expectEqual(ConnectionPhase.relaying, first.phase);
+    try std.testing.expectEqual(13_000 * ms, loop.deadline_heap.entries.items[first.timer_heap_index].deadline_ns);
+    try std.testing.expectEqual(second.index, loop.deadline_heap.peek().?.slot_index);
+    try std.testing.expectEqual(11_500 * ms, loop.armed_deadline_ns);
+
+    first.idle_timeout_ms = 8250; // A nearer idle deadline must update immediately.
+    loop.refreshSlotDeadline(first);
+    try std.testing.expectEqual(first.index, loop.deadline_heap.peek().?.slot_index);
+    try std.testing.expectEqual(11_250 * ms, loop.armed_deadline_ns);
+    loop.runTimers(11_250 * ms);
+    try std.testing.expectEqual(ConnectionPhase.idle, first.phase);
+    try std.testing.expectEqual(connection.no_timer_heap_index, first.timer_heap_index);
+    try std.testing.expectEqual(11_500 * ms, loop.armed_deadline_ns);
+
+    const reused = loop.pool.acquire().?;
+    try std.testing.expectEqual(first, reused);
+    try std.testing.expectEqual(connection.no_timer_heap_index, reused.timer_heap_index);
+    reused.phase = .relaying;
+    reused.peer_addr = second.peer_addr;
+    reused.last_activity_ms = 8000;
+    reused.idle_timeout_ms = 10_000;
+    reused.event_generation = nextSlotGeneration(reused.event_generation);
+    reused.client_event_generation = reused.event_generation;
+    try std.testing.expect(loop.pool.getByToken(old_token) == null);
+    loop.refreshSlotDeadline(reused);
+    try std.testing.expectEqual(18_000 * ms, loop.deadline_heap.entries.items[reused.timer_heap_index].deadline_ns);
+    loop.runTimers(11_500 * ms);
+    try std.testing.expectEqual(ConnectionPhase.idle, second.phase);
+    try std.testing.expectEqual(ConnectionPhase.relaying, reused.phase);
+    try std.testing.expectEqual(18_000 * ms, loop.armed_deadline_ns);
+    loop.closeSlot(reused, "deadline test removal");
+    try std.testing.expect(loop.deadline_heap.peek() == null);
+    try std.testing.expectEqual(loop.stats_next_log_ns, loop.armed_deadline_ns);
+
+    state.config.client_silence_close_sec = 10;
+    const wedge_slot = loop.pool.acquire().?;
+    wedge_slot.phase = .relaying;
+    wedge_slot.peer_addr = net.ip4(.{ 127, 0, 0, 1 }, 1234);
+    wedge_slot.wedge_client_key = 1;
+    wedge_slot.dc_abs = 1;
+    wedge_slot.last_activity_ms = 20_000;
+    wedge_slot.idle_timeout_ms = 120_000;
+    loop.refreshSlotDeadline(wedge_slot);
+    wedge_slot.wedge.phase = .waiting_for_client;
+    wedge_slot.wedge.response_kind = .fresh;
+    wedge_slot.wedge.deadline_ms = 25_000;
+    loop.refreshSlotDeadline(wedge_slot);
+    try std.testing.expectEqual(25_000 * ms, loop.armed_deadline_ns);
+    wedge_slot.wedge.deadline_ms = 26_000;
+    loop.refreshSlotDeadline(wedge_slot);
+    try std.testing.expectEqual(26_000 * ms, loop.armed_deadline_ns); // Absolute, never lazy.
+    wedge_slot.wedge.reset();
+    loop.refreshSlotDeadline(wedge_slot);
+    try std.testing.expectEqual(26_000 * ms, loop.armed_deadline_ns); // Canceled wedge is an early wake.
+    loop.runTimers(26_000 * ms);
+    try std.testing.expectEqual(ConnectionPhase.relaying, wedge_slot.phase);
+    try std.testing.expectEqual(140_000 * ms, loop.armed_deadline_ns);
+    loop.closeSlot(wedge_slot, "deadline test wedge cleanup");
+    state.config.client_silence_close_sec = 0;
+
+    // Shutdown, accept backoff and stats remain independent absolute timers.
+    loop.shutting_down = true;
+    loop.shutdown_deadline_ns = 150_000 * ms;
+    try loop.rearmTimer();
+    try std.testing.expectEqual(150_000 * ms, loop.armed_deadline_ns);
+    loop.accept_paused = true;
+    loop.accept_resume_ns = 145_000 * ms;
+    try loop.rearmTimer();
+    try std.testing.expectEqual(145_000 * ms, loop.armed_deadline_ns);
+    loop.stats_next_log_ns = 144_000 * ms;
+    try loop.rearmTimer();
+    try std.testing.expectEqual(144_000 * ms, loop.armed_deadline_ns);
+}
+
+test "absolute slot timers remain immediate across handshake, connect, MP, mask and desync" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var cfg = Config{
+        .users = std.StringHashMap([16]u8).init(std.testing.allocator),
+        .direct_users = std.StringHashMap(void).init(std.testing.allocator),
+        .mask = false,
+        .client_silence_close_sec = 0,
+        .handshake_timeout_sec = 15,
+        .mask_relay_max_secs = 12,
+    };
+    defer cfg.deinit(std.testing.allocator);
+    var state = try ProxyState.init(std.testing.allocator, std.testing.io, cfg);
+    defer state.deinit();
+    const listener = try relayDrainTestSocketPair();
+    defer closeFd(listener[0]);
+    defer closeFd(listener[1]);
+    const control = try createWorkerEventFd();
+    defer closeFd(control);
+    const loop = try EventLoop.init(&state, listener[0], control, 0, 1, default_managed_buffer_limit_bytes, null);
+    defer {
+        loop.deinit();
+        std.testing.allocator.destroy(loop);
+    }
+    const ms: i128 = std.time.ns_per_ms;
+    loop.stats_next_log_ns = 1_000_000 * ms;
+    for ([_]struct { phase: ConnectionPhase, first_byte_ms: i64 = 2000, deadline_ms: i64 }{
+        .{ .phase = .reading_tls_header, .deadline_ms = 17_000 },
+        .{ .phase = .reading_tls_header, .first_byte_ms = 0, .deadline_ms = 11_000 },
+        .{ .phase = .connecting_upstream, .deadline_ms = 6000 },
+        .{ .phase = .middle_proxy_handshake, .deadline_ms = 6000 },
+        .{ .phase = .mask_relaying, .deadline_ms = 13_000 },
+    }) |fixture| {
+        const slot = loop.pool.acquire().?;
+        slot.phase = fixture.phase;
+        slot.peer_addr = net.ip4(.{ 127, 0, 0, 1 }, 1234);
+        slot.created_at_ms = 1000;
+        slot.first_byte_at_ms = fixture.first_byte_ms;
+        slot.last_activity_ms = 2000;
+        slot.idle_timeout_ms = 120_000;
+        slot.upstream_connect_deadline_ms = 6000;
+        slot.mp_step_deadline_ms = 6000;
+        loop.refreshSlotDeadline(slot);
+        try std.testing.expectEqual(@as(i128, fixture.deadline_ms) * ms, loop.armed_deadline_ns);
+        slot.last_activity_ms = 4000;
+        loop.refreshSlotDeadline(slot);
+        try std.testing.expectEqual(@as(i128, fixture.deadline_ms) * ms, loop.armed_deadline_ns);
+        var expires_ms = fixture.deadline_ms;
+        if (fixture.phase == .connecting_upstream or fixture.phase == .middle_proxy_handshake) {
+            if (fixture.phase == .connecting_upstream) slot.upstream_connect_deadline_ms = 7000 else slot.mp_step_deadline_ms = 7000;
+            loop.refreshSlotDeadline(slot);
+            try std.testing.expectEqual(7000 * ms, loop.armed_deadline_ns); // Later absolute stage.
+            if (fixture.phase == .connecting_upstream) slot.upstream_connect_deadline_ms = 6500 else slot.mp_step_deadline_ms = 6500;
+            loop.refreshSlotDeadline(slot);
+            try std.testing.expectEqual(6500 * ms, loop.armed_deadline_ns);
+            expires_ms = 6500;
+        }
+        loop.runTimers(@as(i128, expires_ms) * ms);
+        try std.testing.expectEqual(ConnectionPhase.idle, slot.phase);
+        try std.testing.expectEqual(connection.no_timer_heap_index, slot.timer_heap_index);
+        try std.testing.expect(loop.deadline_heap.peek() == null);
+        try std.testing.expectEqual(loop.stats_next_log_ns, loop.armed_deadline_ns);
+    }
+
+    const slot = loop.pool.acquire().?;
+    slot.phase = .desync_wait;
+    slot.peer_addr = net.ip4(.{ 127, 0, 0, 1 }, 1234);
+    slot.created_at_ms = 1000;
+    slot.first_byte_at_ms = 2000;
+    slot.desync_deadline_ns = 5000 * ms;
+    slot.server_hello = try std.testing.allocator.dupe(u8, "hello");
+    slot.server_hello_off = 1;
+    var blocked = EventIoBudget{ .operations_remaining = 0 };
+    slot.event_io_budget = &blocked;
+    loop.refreshSlotDeadline(slot);
+    try std.testing.expectEqual(5000 * ms, loop.armed_deadline_ns);
+    loop.runTimers(5000 * ms);
+    try std.testing.expectEqual(ConnectionPhase.writing_server_hello_rest, slot.phase);
+    try expectRelayTestQueue(&slot.client_queue, "ello");
+    try std.testing.expect(slot.server_hello != null);
+    try std.testing.expectEqual(17_000 * ms, loop.armed_deadline_ns);
+    loop.runTimers(17_000 * ms);
+    try std.testing.expectEqual(ConnectionPhase.idle, slot.phase);
+    try std.testing.expect(slot.server_hello == null);
+    try std.testing.expect(loop.deadline_heap.peek() == null);
 }
 
 test "readable activity changes only with actual relay or handshake progress" {

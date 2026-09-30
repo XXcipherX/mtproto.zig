@@ -106,6 +106,18 @@ pub const DeadlineQueue = struct {
         self.removeAt(slots, 0);
         return first.slot_index;
     }
+
+    /// Only for a selected sliding relay-idle deadline. Retaining an earlier
+    /// wakeup is safe: EventLoop pops it and rechecks live activity before close.
+    /// Absolute deadlines must use update(), even when they move later.
+    pub fn updateRelayIdle(self: *DeadlineQueue, slots: []const ?*ConnectionSlot, slot: *ConnectionSlot, next: i128) void {
+        if (slot.timer_heap_index != connection.no_timer_heap_index) {
+            const previous = self.entries.items[slot.timer_heap_index];
+            std.debug.assert(previous.slot_index == slot.index);
+            if (next >= previous.deadline_ns) return;
+        }
+        self.update(slots, slot, next);
+    }
 };
 
 test "deadline queue updates earlier/later and removes root, middle and last" {
@@ -135,6 +147,36 @@ test "deadline queue updates earlier/later and removes root, middle and last" {
     queue.remove(&slots, &slots_storage[1]);
     try std.testing.expectEqual(@as(?u32, null), queue.popExpired(&slots, 19));
     try std.testing.expectEqual(@as(?u32, 3), queue.popExpired(&slots, 20));
+    try std.testing.expect(queue.peek() == null);
+}
+
+test "lazy relay idle retains early ordering but earlier and absolute updates are immediate" {
+    var storage = [_]ConnectionSlot{ .{ .index = 0 }, .{ .index = 1 }, .{ .index = 2 } };
+    const slots = [_]?*ConnectionSlot{ &storage[0], &storage[1], &storage[2] };
+    var queue: DeadlineQueue = .empty;
+    try queue.ensureTotalCapacity(std.testing.allocator, slots.len);
+    defer queue.deinit(std.testing.allocator);
+    queue.updateRelayIdle(&slots, &storage[0], 10);
+    queue.update(&slots, &storage[1], 30);
+    queue.updateRelayIdle(&slots, &storage[2], 20);
+    const original_index = storage[0].timer_heap_index;
+    queue.updateRelayIdle(&slots, &storage[0], 50);
+    try std.testing.expectEqual(original_index, storage[0].timer_heap_index);
+    try std.testing.expectEqual(@as(i128, 10), queue.peek().?.deadline_ns);
+    queue.updateRelayIdle(&slots, &storage[2], 5);
+    try std.testing.expectEqual(@as(u32, 2), queue.peek().?.slot_index);
+    try std.testing.expectEqual(@as(?u32, 2), queue.popExpired(&slots, 5));
+    try std.testing.expectEqual(connection.no_timer_heap_index, storage[2].timer_heap_index);
+    queue.updateRelayIdle(&slots, &storage[2], 60);
+    try std.testing.expectEqual(@as(?u32, 0), queue.popExpired(&slots, 10));
+    queue.updateRelayIdle(&slots, &storage[0], 50); // Popped entries get the live deadline.
+    try std.testing.expectEqual(@as(i128, 30), queue.peek().?.deadline_ns);
+    queue.update(&slots, &storage[1], 70); // Absolute extensions are not lazy.
+    try std.testing.expectEqual(@as(i128, 50), queue.peek().?.deadline_ns);
+    queue.remove(&slots, &storage[0]);
+    try std.testing.expectEqual(@as(i128, 60), queue.peek().?.deadline_ns);
+    try std.testing.expectEqual(@as(?u32, 2), queue.popExpired(&slots, 60));
+    try std.testing.expectEqual(@as(?u32, 1), queue.popExpired(&slots, 70));
     try std.testing.expect(queue.peek() == null);
 }
 

@@ -90,6 +90,14 @@ disabled, verify the 16367-byte bulk cap and unchanged warmup, and reconstruct a
 payload bytes through the receiving TLS parser. The cap avoids repeated `0x4000`
 FakeTLS lengths; that length is legal in real TLS 1.3, so this is a sizing heuristic.
 
+Deterministic deadline tests distinguish the selected sliding idle minimum from
+absolute admission/handshake, connect, MP-stage, desync, mask-lifetime and wedge
+deadlines, with absolute priority on ties. They check idle extension and shortening,
+early wakeup/recomputation without premature close, multiple heap entries, exact
+absolute stage changes, expiry/close, slot reuse and generation rejection. Native
+timerfd tests inspect rearm selection for slots, shutdown, accept backoff and stats
+using supplied timestamps, without sleeping or depending on wall-clock precision.
+
 Activity regressions cover FakeTLS/direct/mask reads in both directions, partial
 handshake and MP framing, real EAGAIN, exhausted budgets and blocked/empty writes.
 They verify progress semantics and a shared first-byte/activity sample, without

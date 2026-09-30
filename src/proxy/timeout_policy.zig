@@ -103,9 +103,16 @@ fn deadlineMsToNs(deadline_ms: i64) i128 {
     return @as(i128, deadline_ms) * std.time.ns_per_ms;
 }
 
-pub fn nextSlotDeadlineNs(slot: *const ConnectionSlot, inputs: SlotDeadlineInputs) ?i128 {
+pub const SlotDeadline = struct {
+    deadline_ns: i128,
+    kind: enum { absolute, relay_idle },
+};
+
+/// Classify the selected minimum, not merely the connection phase. Absolute
+/// deadlines win ties so idle extension cannot defer a mandatory stage/wedge.
+pub fn nextSlotDeadline(slot: *const ConnectionSlot, inputs: SlotDeadlineInputs) ?SlotDeadline {
     if (slot.phase == .idle) return null;
-    if (slot.phase == .closing) return 1;
+    if (slot.phase == .closing) return .{ .deadline_ns = 1, .kind = .absolute };
 
     var deadline: ?i128 = null;
     if (slot.phase == .desync_wait) {
@@ -125,7 +132,6 @@ pub fn nextSlotDeadlineNs(slot: *const ConnectionSlot, inputs: SlotDeadlineInput
             slot.first_byte_at_ms + secondsToMs(inputs.handshake_timeout_sec);
         deadline = earlierDeadline(deadline, deadlineMsToNs(handshake_deadline_ms));
     } else if (slot.phase == .relaying or slot.phase == .mask_relaying) {
-        deadline = earlierDeadline(deadline, deadlineMsToNs(slot.last_activity_ms + slot.idle_timeout_ms));
         if (slot.phase == .mask_relaying and !slot.web_carrier and inputs.mask_relay_max_secs > 0) {
             deadline = earlierDeadline(
                 deadline,
@@ -137,8 +143,16 @@ pub fn nextSlotDeadlineNs(slot: *const ConnectionSlot, inputs: SlotDeadlineInput
                 deadline = earlierDeadline(deadline, deadlineMsToNs(wedge_deadline_ms));
             }
         }
+        const idle_deadline = deadlineMsToNs(slot.last_activity_ms + slot.idle_timeout_ms);
+        if (deadline == null or idle_deadline < deadline.?) {
+            return .{ .deadline_ns = idle_deadline, .kind = .relay_idle };
+        }
     }
-    return deadline;
+    return if (deadline) |value| .{ .deadline_ns = value, .kind = .absolute } else null;
+}
+
+pub fn nextSlotDeadlineNs(slot: *const ConnectionSlot, inputs: SlotDeadlineInputs) ?i128 {
+    return if (nextSlotDeadline(slot, inputs)) |deadline| deadline.deadline_ns else null;
 }
 
 pub fn idleTimeoutSeed(slot: *const ConnectionSlot) u64 {
@@ -232,6 +246,82 @@ test "connect and MiddleProxy step deadline keep candidate and fallback shares" 
     try std.testing.expectEqual(@as(i64, 9000), upstreamConnectDeadlineMs(&slot, 10_000, 15_000, 2000));
     try std.testing.expectEqual(@as(i64, 15_000), middleProxyStepDeadlineMs(&slot, .sending_rpc_nonce, 15_000, 5000, 14_000));
     try std.testing.expectEqual(@as(i64, 0), middleProxyStepDeadlineMs(&slot, .done, 15_000, 5000, 6000));
+}
+
+test "only a selected sliding relay idle deadline permits lazy extension" {
+    var slot = ConnectionSlot{
+        .created_at_ms = 1000,
+        .first_byte_at_ms = 2000,
+        .last_activity_ms = 3000,
+        .idle_timeout_ms = 10_000,
+        .desync_deadline_ns = 5000 * std.time.ns_per_ms,
+        .upstream_connect_deadline_ms = 6000,
+        .mp_step_deadline_ms = 7000,
+        .client_queue = .{ .allocator = std.testing.allocator },
+    };
+    defer slot.client_queue.deinit();
+    var inputs: SlotDeadlineInputs = .{
+        .handshake_timeout_sec = 15,
+        .mask_relay_max_secs = 60,
+        .pre_first_byte_timeout_ms = 10_000,
+        .wedge_eligible = false,
+    };
+    for ([_]@import("connection.zig").ConnectionPhase{
+        .reading_web_prefix,        .reading_tls_header,         .reading_direct_obfuscated_handshake,
+        .reading_client_hello_body, .writing_server_hello_first, .desync_wait,
+        .writing_server_hello_rest, .reading_mtproto_tls_header, .reading_mtproto_tls_body,
+        .connecting_upstream,       .writing_dc_nonce,           .middle_proxy_handshake,
+    }) |phase| {
+        slot.phase = phase;
+        const expected_ms: i64 = switch (phase) {
+            .desync_wait => 5000,
+            .connecting_upstream => 6000,
+            .middle_proxy_handshake => 7000,
+            else => 17_000,
+        };
+        const selected = nextSlotDeadline(&slot, inputs).?;
+        try std.testing.expect(selected.kind == .absolute);
+        try std.testing.expectEqual(@as(i128, expected_ms) * std.time.ns_per_ms, selected.deadline_ns);
+    }
+    slot.phase = .reading_tls_header;
+    slot.first_byte_at_ms = 0;
+    try std.testing.expect(nextSlotDeadline(&slot, inputs).?.kind == .absolute);
+    try std.testing.expectEqual(@as(?i128, 11_000 * std.time.ns_per_ms), nextSlotDeadlineNs(&slot, inputs));
+
+    slot.phase = .relaying;
+    try std.testing.expect(nextSlotDeadline(&slot, inputs).?.kind == .relay_idle);
+    try std.testing.expectEqual(@as(?i128, 13_000 * std.time.ns_per_ms), nextSlotDeadlineNs(&slot, inputs));
+    inputs.wedge_eligible = true;
+    slot.wedge.phase = .waiting_for_client;
+    for ([_]i64{ 12_000, 13_000, 14_000 }) |wedge_ms| {
+        slot.wedge.deadline_ms = wedge_ms;
+        const selected = nextSlotDeadline(&slot, inputs).?;
+        try std.testing.expectEqual(@as(i128, @min(wedge_ms, 13_000)) * std.time.ns_per_ms, selected.deadline_ns);
+        try std.testing.expectEqual(wedge_ms > 13_000, selected.kind == .relay_idle);
+    }
+    slot.last_activity_ms = 5000; // Idle extension crosses the absolute wedge.
+    try std.testing.expect(nextSlotDeadline(&slot, inputs).?.kind == .absolute);
+    try std.testing.expectEqual(@as(?i128, 14_000 * std.time.ns_per_ms), nextSlotDeadlineNs(&slot, inputs));
+    try slot.client_queue.appendCopy("pending reply");
+    try std.testing.expect(nextSlotDeadline(&slot, inputs).?.kind == .relay_idle);
+    slot.client_queue.clear();
+
+    inputs.wedge_eligible = false;
+    slot.phase = .mask_relaying;
+    inputs.mask_relay_max_secs = 14; // Equal to the 15-second idle deadline.
+    try std.testing.expect(nextSlotDeadline(&slot, inputs).?.kind == .absolute);
+    slot.last_activity_ms = 6000;
+    try std.testing.expectEqual(@as(?i128, 15_000 * std.time.ns_per_ms), nextSlotDeadlineNs(&slot, inputs));
+    slot.web_carrier = true;
+    try std.testing.expect(nextSlotDeadline(&slot, inputs).?.kind == .relay_idle);
+    slot.web_carrier = false;
+    inputs.mask_relay_max_secs = 0;
+    try std.testing.expect(nextSlotDeadline(&slot, inputs).?.kind == .relay_idle);
+    slot.phase = .closing;
+    try std.testing.expect(nextSlotDeadline(&slot, inputs).?.kind == .absolute);
+    try std.testing.expectEqual(@as(?i128, 1), nextSlotDeadlineNs(&slot, inputs));
+    slot.phase = .idle;
+    try std.testing.expect(nextSlotDeadline(&slot, inputs) == null);
 }
 
 test "jittered idle timeout stays bounded" {
