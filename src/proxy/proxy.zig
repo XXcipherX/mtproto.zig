@@ -4565,64 +4565,17 @@ fn pipelinedCapacity(current_capacity: usize, required_len: usize) usize {
 
 fn relayClientToUpstreamStep(self: *EventLoop, slot: *ConnectionSlot) !RelayProgress {
     const read_buf = self.relay_read_scratch[0..];
-    var consumed_any = false;
+    const n = readSlotFd(slot, slot.client_fd, read_buf) catch |err| {
+        if (err == error.WouldBlock) return .none;
+        return err;
+    };
+    if (n == 0) return error.EndOfStream;
 
-    while (true) {
-        if (slot.relay_tls_hdr_pos < tls_header_len) {
-            const n = readSlotFd(slot, slot.client_fd, slot.relay_tls_hdr[slot.relay_tls_hdr_pos..]) catch |err| {
-                if (err == error.WouldBlock) return if (consumed_any) .partial else .none;
-                return err;
-            };
-            if (n == 0) return error.EndOfStream;
-            consumed_any = true;
-            slot.relay_tls_hdr_pos += @intCast(n);
-
-            if (slot.relay_tls_hdr_pos < tls_header_len) return .partial;
-
-            slot.relay_record_type = slot.relay_tls_hdr[0];
-            slot.relay_tls_body_len = std.mem.readInt(u16, slot.relay_tls_hdr[3..5], .big);
-            slot.relay_tls_body_pos = 0;
-
-            if (slot.relay_record_type == constants.tls_record_alert) return error.ConnectionReset;
-            if (slot.relay_record_type != constants.tls_record_change_cipher and
-                slot.relay_record_type != constants.tls_record_application)
-            {
-                return error.ConnectionReset;
-            }
-            if (slot.relay_tls_body_len == 0 or slot.relay_tls_body_len > constants.max_tls_ciphertext_size) {
-                return error.ConnectionReset;
-            }
-        }
-
-        const remaining = slot.relay_tls_body_len - slot.relay_tls_body_pos;
-        if (remaining == 0) {
-            slot.relay_tls_hdr_pos = 0;
-            slot.relay_tls_body_pos = 0;
-            slot.relay_tls_body_len = 0;
-            if (consumed_any) return .partial;
-            continue;
-        }
-
-        const want = @min(@as(usize, remaining), read_buf.len);
-        const n = readSlotFd(slot, slot.client_fd, read_buf[0..want]) catch |err| {
-            if (err == error.WouldBlock) return if (consumed_any) .partial else .none;
-            return err;
-        };
-        if (n == 0) return error.EndOfStream;
-
-        consumed_any = true;
-        slot.relay_tls_body_pos += @intCast(n);
-
-        if (slot.relay_record_type == constants.tls_record_change_cipher) {
-            if (slot.relay_tls_body_pos == slot.relay_tls_body_len) {
-                slot.relay_tls_hdr_pos = 0;
-                slot.relay_tls_body_pos = 0;
-                slot.relay_tls_body_len = 0;
-            }
-            return .partial;
-        }
-
-        const payload = read_buf[0..n];
+    var remaining = read_buf[0..n];
+    var forwarded = false;
+    // Finish this bounded chunk even if output becomes queued: all slices borrow
+    // read scratch and queueUpstream copies unsent bytes before the next read.
+    while (try relay_io.nextClientTlsPayload(slot, &remaining)) |payload| {
         if (slot.client_decryptor) |*dec| dec.apply(payload);
 
         if (slot.middle_ctx) |*mp| {
@@ -4640,16 +4593,9 @@ fn relayClientToUpstreamStep(self: *EventLoop, slot: *ConnectionSlot) !RelayProg
         }
 
         slot.c2s_bytes += payload.len;
-
-        if (slot.relay_tls_body_pos == slot.relay_tls_body_len) {
-            slot.relay_tls_hdr_pos = 0;
-            slot.relay_tls_body_pos = 0;
-            slot.relay_tls_body_len = 0;
-            return .forwarded;
-        }
-
-        return .partial;
+        forwarded = true;
     }
+    return if (forwarded) .forwarded else .partial;
 }
 
 fn relayUpstreamToClientStep(self: *EventLoop, slot: *ConnectionSlot) !RelayProgress {
@@ -5035,6 +4981,41 @@ test "immediate direct nonce and promotion tail reach relay without another writ
     try seekFdToStart(upstream_file.handle);
     var bytes: [89]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 88), try posix.read(upstream_file.handle, &bytes));
+}
+
+test "multiple client TLS records consume one read operation before queue backpressure" {
+    if (builtin.os.tag != .linux) return;
+    var fds: [2]i32 = undefined;
+    const rc = linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0, &fds);
+    if (linux.errno(rc) != .SUCCESS) return posix.unexpectedErrno(linux.errno(rc));
+    defer closeFd(fds[0]);
+    defer closeFd(fds[1]);
+
+    const wire = [_]u8{ 0x17, 3, 3, 0, 3, 'a', 'b', 'c', 0x14, 3, 3, 0, 1, 1, 0x17, 3, 3, 0, 2, 'd', 'e' };
+    try std.testing.expectEqual(wire.len, try socket_ops.writeFd(fds[1], &wire));
+    // The direct step only uses read scratch. Allocate the large EventLoop on
+    // the heap, without starting listeners, updater threads, or a full daemon.
+    const loop = try std.testing.allocator.create(EventLoop);
+    defer std.testing.allocator.destroy(loop);
+    const key = [_]u8{0x37} ** 32;
+    var budget = EventIoBudget{ .operations_remaining = 1 };
+    var slot = ConnectionSlot{
+        .phase = .relaying,
+        .client_fd = fds[0],
+        .client_decryptor = crypto.AesCtr.init(&key, 7),
+        .tg_encryptor = crypto.AesCtr.init(&key, 7),
+        .upstream_queue = .{ .allocator = std.testing.allocator },
+        .event_io_budget = &budget,
+    };
+    defer slot.upstream_queue.deinit();
+    try std.testing.expectEqual(RelayProgress.forwarded, try relayClientToUpstreamStep(loop, &slot));
+    try std.testing.expectEqual(@as(usize, 0), budget.operations_remaining);
+    try std.testing.expectEqual(event_io_byte_budget - wire.len, budget.bytes_remaining);
+    try std.testing.expectEqual(@as(u64, 5), slot.c2s_bytes);
+    try std.testing.expect(clientRelayAtFrameBoundary(&slot));
+    var iovecs: [1]posix.iovec_const = undefined;
+    try std.testing.expectEqual(@as(usize, 1), slot.upstream_queue.prepareIovecs(&iovecs, 5));
+    try std.testing.expectEqualStrings("abcde", iovecs[0].base[0..iovecs[0].len]);
 }
 
 test "pipelined handshake capacity stays independent of relay scratch size" {

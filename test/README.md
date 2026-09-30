@@ -42,6 +42,11 @@ succeed. It never contacts Telegram.
 
 ## Real-process relay E2E
 
+Zig relay unit tests cover every pair of TCP split positions through multiple
+FakeTLS application records and an intervening CCS, using the real AES-CTR states.
+They also cover one-byte segmentation, malformed headers, and incomplete framing
+at EOF. C2S consumes all records in one bounded read chunk before reusing scratch.
+
 `zig build e2e` builds a dedicated non-shipping proxy executable and a small
 obfuscated-handshake generator. The Python harness starts both the real proxy and
 a deterministic loopback DC, authenticates with FakeTLS, supplies a valid
