@@ -12,6 +12,10 @@ const obfuscation = @import("obfuscation.zig");
 /// Re-export for convenience
 pub const UserSecret = obfuscation.UserSecret;
 
+/// Authentication work is bounded independently of the TLS record/read limit.
+/// Includes the five-byte record header; PQ + X25519 ClientHellos fit below 2 KiB.
+pub const max_authenticated_hello_len: usize = 4096;
+
 // ============= TLS Validation Result =============
 
 pub const TlsValidation = struct {
@@ -40,6 +44,7 @@ pub const TlsValidation = struct {
 };
 
 pub const TlsValidationFailure = enum {
+    oversized_client_hello,
     malformed_client_hello,
     invalid_session_id,
     secret_mismatch,
@@ -213,6 +218,10 @@ pub fn validateTlsHandshakeDetailed(
     _ = allocator;
 
     diagnostic.* = .{};
+    if (handshake.len > max_authenticated_hello_len) {
+        diagnostic.failure = .oversized_client_hello;
+        return null;
+    }
     const parsed = parseClientHello(handshake) orelse return null;
     if (parsed.digest.ptr != handshake[constants.tls_digest_pos..].ptr) return null;
     if (parsed.session_id.len != 32) {
@@ -888,6 +897,80 @@ fn buildTestClientHello(comptime session_id_len: usize, session_fill: u8) [52 + 
     pos += 2;
     std.mem.writeInt(u16, hello[pos..][0..2], 0, .big);
     return hello;
+}
+
+fn buildSizedTestClientHello(buffer: []u8, pq: bool, x25519: bool, secret: *const [16]u8) []u8 {
+    const base = buildTestClientHello(32, 0xaa);
+    const hostname = "example.org";
+    const shares_len: usize = (if (pq) @as(usize, 4 + pq_client_key_share_len) else 0) +
+        (if (x25519) @as(usize, 4 + 32) else 0);
+    std.debug.assert(buffer.len >= base.len + 9 + hostname.len + 6 + shares_len + 4);
+    @memset(buffer, 0);
+    @memcpy(buffer[0..base.len], &base);
+    std.mem.writeInt(u16, buffer[3..5], @intCast(buffer.len - 5), .big);
+    std.mem.writeInt(u24, buffer[6..9], @intCast(buffer.len - 9), .big);
+    std.mem.writeInt(u16, buffer[base.len - 2 ..][0..2], @intCast(buffer.len - base.len), .big);
+    var pos = base.len;
+    std.mem.writeInt(u16, buffer[pos..][0..2], 0, .big);
+    std.mem.writeInt(u16, buffer[pos + 2 ..][0..2], @intCast(5 + hostname.len), .big);
+    std.mem.writeInt(u16, buffer[pos + 4 ..][0..2], @intCast(3 + hostname.len), .big);
+    buffer[pos + 6] = 0;
+    std.mem.writeInt(u16, buffer[pos + 7 ..][0..2], @intCast(hostname.len), .big);
+    @memcpy(buffer[pos + 9 ..][0..hostname.len], hostname);
+    pos += 9 + hostname.len;
+    std.mem.writeInt(u16, buffer[pos..][0..2], 0x0033, .big);
+    std.mem.writeInt(u16, buffer[pos + 2 ..][0..2], @intCast(2 + shares_len), .big);
+    std.mem.writeInt(u16, buffer[pos + 4 ..][0..2], @intCast(shares_len), .big);
+    pos += 6;
+    for ([_]struct { offered: bool, group: u16, len: usize }{
+        .{ .offered = pq, .group = pq_named_group, .len = pq_client_key_share_len },
+        .{ .offered = x25519, .group = 0x001d, .len = 32 },
+    }) |share| {
+        if (!share.offered) continue;
+        std.mem.writeInt(u16, buffer[pos..][0..2], share.group, .big);
+        std.mem.writeInt(u16, buffer[pos + 2 ..][0..2], @intCast(share.len), .big);
+        @memset(buffer[pos + 4 ..][0..share.len], 0x42);
+        pos += 4 + share.len;
+    }
+    std.mem.writeInt(u16, buffer[pos..][0..2], 0x0015, .big); // padding
+    std.mem.writeInt(u16, buffer[pos + 2 ..][0..2], @intCast(buffer.len - pos - 4), .big);
+    const digest = crypto.sha256Hmac(secret, buffer);
+    @memcpy(buffer[constants.tls_digest_pos..][0..constants.tls_digest_len], &digest);
+    return buffer;
+}
+
+test "FakeTLS authentication bounds input without lowering the TLS parser limit" {
+    const secrets = [_]UserSecret{.{ .name = "alice", .secret = [_]u8{0x1a} ** 16 }};
+    var storage: [constants.max_tls_plaintext_size + 5]u8 = undefined;
+    for ([_]struct { pq: bool, x25519: bool, len: usize }{
+        .{ .pq = false, .x25519 = true, .len = 256 },
+        .{ .pq = true, .x25519 = false, .len = 1500 },
+        .{ .pq = true, .x25519 = true, .len = 1600 },
+        .{ .pq = true, .x25519 = true, .len = max_authenticated_hello_len },
+        .{ .pq = true, .x25519 = true, .len = max_authenticated_hello_len + 1 },
+        .{ .pq = true, .x25519 = true, .len = storage.len },
+    }) |fixture| {
+        const hello = buildSizedTestClientHello(storage[0..fixture.len], fixture.pq, fixture.x25519, &secrets[0].secret);
+        try std.testing.expectEqualStrings("example.org", extractSni(hello).?);
+        try std.testing.expectEqual(fixture.pq, clientOffersPqKeyShare(hello));
+        var diagnostic = TlsValidationDiagnostic{ .failure = .timestamp_skew, .timestamp_skew_s = 123 };
+        var result = try validateTlsHandshakeDetailed(std.testing.allocator, hello, &secrets, true, &diagnostic);
+        defer if (result) |*value| value.wipe();
+        if (fixture.len <= max_authenticated_hello_len) {
+            try std.testing.expect(result != null);
+            try std.testing.expectEqualStrings("alice", result.?.user);
+        } else {
+            // A correctly signed input would authenticate if the HMAC scan ran.
+            try std.testing.expect(result == null);
+            try std.testing.expectEqual(TlsValidationFailure.oversized_client_hello, diagnostic.failure);
+            try std.testing.expect(diagnostic.timestamp_skew_s == null);
+        }
+    }
+    // The size gate also precedes structural parsing and cannot inspect secrets.
+    @memset(&storage, 0xff);
+    var diagnostic: TlsValidationDiagnostic = .{};
+    try std.testing.expect(try validateTlsHandshakeDetailed(std.testing.allocator, &storage, &.{}, false, &diagnostic) == null);
+    try std.testing.expectEqual(TlsValidationFailure.oversized_client_hello, diagnostic.failure);
 }
 
 test "isTlsHandshake" {

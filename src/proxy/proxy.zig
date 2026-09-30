@@ -2435,6 +2435,7 @@ const EventLoop = struct {
 
         const v = if (validation) |*value| value else {
             const mask_cause: MaskCause = switch (validation_diagnostic.failure) {
+                .oversized_client_hello => .oversized_client_hello,
                 .malformed_client_hello => .malformed_client_hello,
                 .invalid_session_id => .invalid_session_id,
                 .secret_mismatch => .secret_mismatch,
@@ -5014,6 +5015,92 @@ test "unsplit ServerHello pending bytes survive worker scratch reuse" {
             try std.testing.expectEqual(ConnectionPhase.reading_mtproto_tls_header, slot.phase);
         }
     }
+}
+
+test "oversized ClientHello is masked with the complete original record" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const hostname = "example.org";
+    var cfg = Config{
+        .users = std.StringHashMap([16]u8).init(std.testing.allocator),
+        .direct_users = std.StringHashMap(void).init(std.testing.allocator),
+        .use_middle_proxy = false,
+        .force_media_middle_proxy = false,
+        .mask = false,
+        .tls_domain = hostname,
+        .datacenter_override = net.ip4(.{ 127, 0, 0, 1 }, 443),
+    };
+    defer cfg.deinit(std.testing.allocator);
+    var state = try ProxyState.init(std.testing.allocator, std.testing.io, cfg);
+    defer state.deinit();
+    var backend = try net.listen(net.ip4(.{ 127, 0, 0, 1 }, 0), .{});
+    defer backend.deinit();
+    state.mask_addrs = try std.testing.allocator.alloc(net.Address, 1);
+    state.mask_addrs[0] = try net.localAddress(backend.handle);
+    state.config.mask = true;
+    const client = try relayDrainTestSocketPair();
+    defer closeFd(client[0]);
+    defer closeFd(client[1]);
+    const control = try createWorkerEventFd();
+    defer closeFd(control);
+    const loop = try EventLoop.init(&state, client[0], control, 0, 1, default_managed_buffer_limit_bytes, null);
+    defer {
+        loop.deinit();
+        std.testing.allocator.destroy(loop);
+    }
+
+    var original = [_]u8{0} ** (tls.max_authenticated_hello_len + 1);
+    @memcpy(original[0..11], &[_]u8{ 0x16, 0x03, 0x01, 0, 0, 0x01, 0, 0, 0, 0x03, 0x03 });
+    std.mem.writeInt(u16, original[3..5], @intCast(original.len - 5), .big);
+    std.mem.writeInt(u24, original[6..9], @intCast(original.len - 9), .big);
+    original[43] = 32;
+    @memset(original[44..76], 0xaa);
+    @memcpy(original[76..82], &[_]u8{ 0, 2, 0x13, 0x01, 1, 0 });
+    std.mem.writeInt(u16, original[82..84], @intCast(original.len - 84), .big);
+    std.mem.writeInt(u16, original[86..88], @intCast(5 + hostname.len), .big);
+    std.mem.writeInt(u16, original[88..90], @intCast(3 + hostname.len), .big);
+    std.mem.writeInt(u16, original[91..93], @intCast(hostname.len), .big);
+    @memcpy(original[93..][0..hostname.len], hostname);
+    const padding_pos = 93 + hostname.len;
+    std.mem.writeInt(u16, original[padding_pos..][0..2], 0x0015, .big);
+    std.mem.writeInt(u16, original[padding_pos + 2 ..][0..2], @intCast(original.len - padding_pos - 4), .big);
+    try std.testing.expectEqualStrings(hostname, tls.extractSni(&original).?);
+
+    const now_ms = runtime_time.monotonicMilli();
+    var slot = ConnectionSlot{
+        .phase = .reading_client_hello_body,
+        .client_fd = client[0],
+        .client_hello_heap = try std.testing.allocator.dupe(u8, &original),
+        .client_hello_len = original.len,
+        .tls_body_len = @intCast(original.len - tls_header_len),
+        .tls_body_pos = @intCast(original.len - tls_header_len),
+        .created_at_ms = now_ms,
+        .last_activity_ms = now_ms,
+        .client_queue = .{ .allocator = std.testing.allocator },
+        .upstream_queue = .{ .allocator = std.testing.allocator },
+    };
+    defer {
+        if (!isInvalidFd(slot.upstream_fd)) closeFd(slot.upstream_fd);
+        slot.resetOwnedBuffers(std.testing.allocator);
+    }
+    loop.readClientHelloBody(&slot);
+    try std.testing.expectEqual(MaskCause.oversized_client_hello, slot.mask_cause);
+    try std.testing.expect(slot.phase == .connecting_upstream or slot.phase == .mask_relaying);
+    if (slot.mask_prebuffer) |pre| try std.testing.expectEqualSlices(u8, &original, pre);
+    slot.releaseClientHello(std.testing.allocator); // Masking owns its own copy.
+    const accepted = try net.acceptFd(backend.handle);
+    defer closeFd(accepted.fd);
+    if (slot.phase == .connecting_upstream) loop.onUpstreamConnectComplete(&slot);
+    try std.testing.expectEqual(ConnectionPhase.mask_relaying, slot.phase);
+    try std.testing.expectEqual(original.len, slot.mask_c2s_bytes);
+    try std.testing.expect(slot.mask_prebuffer == null);
+    var received: [original.len]u8 = undefined;
+    var received_len: usize = 0;
+    while (received_len < received.len) {
+        const n = try posix.read(accepted.fd, received[received_len..]);
+        try std.testing.expect(n > 0);
+        received_len += n;
+    }
+    try std.testing.expectEqualSlices(u8, &original, &received);
 }
 
 test "handshake read yields when the event I/O budget is exhausted" {

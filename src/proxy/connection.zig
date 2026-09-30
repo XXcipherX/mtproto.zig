@@ -46,6 +46,7 @@ pub const MaskCause = enum {
     none,
     non_tls,
     invalid_tls_length,
+    oversized_client_hello,
     missing_sni,
     malformed_client_hello,
     sni_mismatch,

@@ -42,6 +42,12 @@ succeed. It never contacts Telegram.
 
 ## Real-process relay E2E
 
+FakeTLS size regressions authenticate X25519, PQ and combined-share fixtures,
+including exactly 4096 bytes; correctly signed larger inputs are classified
+before authentication. Strict parsing still accepts records up to the existing
+TLS limit. A native masking regression forwards the complete oversized record
+to a loopback backend after releasing the original handshake storage.
+
 ServerHello regressions compare allocating and into-builder framing, Session ID,
 cipher, canonical X25519 and HMAC invariants for normal/PQ responses at minimum,
 default, custom and maximum certificate sizes. They check undersized storage,
