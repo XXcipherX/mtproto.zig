@@ -218,15 +218,19 @@ fn queueOrWriteParts(slot: *ConnectionSlot, fd: posix.fd_t, queue: *MessageQueue
 
     var written: usize = 0;
     if (queue.isEmpty()) {
-        var iovecs: [max_scatter_parts]posix.iovec_const = undefined;
-        var n_iov: usize = 0;
-        for (parts) |part| {
-            if (part.len == 0) continue;
-            iovecs[n_iov] = .{ .base = part.ptr, .len = part.len };
-            n_iov += 1;
-        }
-
-        written = writevSlotFd(slot, fd, iovecs[0..n_iov]) catch |err| {
+        // Keep one cap check and one atomic suffix path for both primitives.
+        written = (if (parts.len == 1)
+            writeSlotFd(slot, fd, parts[0])
+        else scatter: {
+            var iovecs: [max_scatter_parts]posix.iovec_const = undefined;
+            var n_iov: usize = 0;
+            for (parts) |part| {
+                if (part.len == 0) continue;
+                iovecs[n_iov] = .{ .base = part.ptr, .len = part.len };
+                n_iov += 1;
+            }
+            break :scatter writevSlotFd(slot, fd, iovecs[0..n_iov]);
+        }) catch |err| {
             if (err == error.WouldBlock) {
                 try queue.appendParts(parts);
                 return false;
@@ -446,6 +450,92 @@ fn copyTestQueue(queue: *MessageQueue, destination: []u8) !void {
         try queue.consume(copied);
         off += copied;
     }
+}
+
+test "upstream single and multipart batches share budgets and exact suffix ownership" {
+    const expected = "abcdefghij";
+    for ([_]bool{ false, true }) |multipart| {
+        for (0..expected.len + 1) |prefix| {
+            const fds = try relayTestSocketPair();
+            defer _ = std.os.linux.close(fds[0]);
+            defer _ = std.os.linux.close(fds[1]);
+            var budget = connection.EventIoBudget{ .bytes_remaining = prefix, .operations_remaining = 1 };
+            var slot = ConnectionSlot{
+                .upstream_fd = fds[0],
+                .upstream_queue = .{ .allocator = std.testing.allocator },
+                .event_io_budget = &budget,
+            };
+            defer slot.upstream_queue.deinit();
+            var source: [expected.len]u8 = undefined;
+            @memcpy(&source, expected);
+            const single = [_][]const u8{&source};
+            const scatter = [_][]const u8{ source[0..2], "", source[2..7], source[7..] };
+            const parts: []const []const u8 = if (multipart) &scatter else &single;
+            try std.testing.expectEqual(prefix == expected.len, try queueUpstreamParts(&slot, parts));
+            try std.testing.expectEqual(@as(usize, if (prefix == 0) 1 else 0), budget.operations_remaining);
+            try std.testing.expectEqual(@as(usize, 0), budget.bytes_remaining);
+            @memset(&source, 0xff);
+            var actual: [expected.len]u8 = undefined;
+            if (prefix > 0) try std.testing.expectEqual(prefix, try posix.read(fds[1], actual[0..prefix]));
+            try copyTestQueue(&slot.upstream_queue, actual[prefix..]);
+            try std.testing.expectEqualSlices(u8, expected, &actual);
+        }
+    }
+}
+
+test "one-part upstream EAGAIN owns bytes without charging progress" {
+    const fds = try relayTestSocketPair();
+    defer _ = std.os.linux.close(fds[0]);
+    defer _ = std.os.linux.close(fds[1]);
+    const fill = [_]u8{0} ** 4096;
+    var blocked = false;
+    for (0..1024) |_| {
+        _ = writeFd(fds[0], &fill) catch |err| {
+            if (err != error.WouldBlock) return err;
+            blocked = true;
+            break;
+        };
+    }
+    try std.testing.expect(blocked);
+    var budget: connection.EventIoBudget = .{};
+    var slot = ConnectionSlot{
+        .upstream_fd = fds[0],
+        .upstream_queue = .{ .allocator = std.testing.allocator },
+        .event_io_budget = &budget,
+    };
+    defer slot.upstream_queue.deinit();
+    var source = [_]u8{ 'a', 'b', 'c', 'd' };
+    try std.testing.expect(!try queueUpstreamParts(&slot, &.{&source}));
+    @memset(&source, 0xff);
+    var actual: [4]u8 = undefined;
+    try copyTestQueue(&slot.upstream_queue, &actual);
+    try std.testing.expectEqualStrings("abcd", &actual);
+    try std.testing.expectEqual(connection.event_io_operation_budget - 1, budget.operations_remaining);
+    try std.testing.expectEqual(event_io_byte_budget, budget.bytes_remaining);
+}
+
+test "one-part upstream batching preserves atomic queue errors and empty input" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    var budget: connection.EventIoBudget = .{};
+    var slot = ConnectionSlot{
+        .upstream_queue = .{ .allocator = failing.allocator() },
+        .event_io_budget = &budget,
+    };
+    defer slot.upstream_queue.deinit();
+    try std.testing.expect(try queueUpstreamParts(&slot, &.{}));
+    try std.testing.expect(try queueUpstreamParts(&slot, &.{""}));
+    try std.testing.expectEqual(connection.event_io_operation_budget, budget.operations_remaining);
+    try slot.upstream_queue.appendCopy("pre");
+    const source = [_]u8{0x42} ** 4096;
+    try std.testing.expectError(error.OutOfMemory, queueUpstreamParts(&slot, &.{&source}));
+    var actual: [3]u8 = undefined;
+    try copyTestQueue(&slot.upstream_queue, &actual);
+    try std.testing.expectEqualStrings("pre", &actual);
+    // The existing cap is checked before attempting any write, including one part.
+    slot.upstream_queue.total_len = 4 * 1024 * 1024;
+    try std.testing.expectError(error.PendingQueueOverflow, queueUpstreamParts(&slot, &.{"x"}));
+    slot.upstream_queue.total_len = 0;
+    try std.testing.expectEqual(connection.event_io_operation_budget, budget.operations_remaining);
 }
 
 test "TLS records use one budgeted scatter write with exact wire output" {

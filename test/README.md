@@ -67,6 +67,11 @@ FakeTLS application records and an intervening CCS, using the real AES-CTR state
 They also cover one-byte segmentation, malformed headers, and incomplete framing
 at EOF. C2S consumes all records in one bounded read chunk before reusing scratch.
 
+One-part C2S batches use `writeSlotFd`; multipart batches use `writevSlotFd` inside
+the same suffix-owning helper. Regressions compare their exact streams and budget
+charges at every partial prefix, plus empty input, real one-part EAGAIN, queue
+overflow and atomic OOM preservation of existing queued bytes.
+
 Direct C2S socketpair regressions use different client/upstream AES keys and a
 two-operation budget to require one read plus one scatter write for three records
 with an intervening CCS. They check a partial write inside the second payload,
