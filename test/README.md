@@ -63,6 +63,10 @@ usable. They need no daemon, listener or updater. The existing stress scenarios
 cover burst, slow client/DC, queue pressure, half-close, and endurance traffic;
 the drain keeps their existing queue, crypto and lifecycle handlers.
 
+Config regressions cover the disabled Split-TLS default, explicit `desync=true`,
+and timing settings that leave it disabled. The ServerHello write/timer regression
+opts in explicitly and retains the existing split-delay behavior.
+
 `zig build e2e` builds a dedicated non-shipping proxy executable and a small
 obfuscated-handshake generator. The Python harness starts both the real proxy and
 a deterministic loopback DC, authenticates with FakeTLS, supplies a valid

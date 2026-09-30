@@ -4820,6 +4820,7 @@ test "ServerHello advances only after the queued bytes are fully written" {
     var cfg = Config{
         .users = std.StringHashMap([16]u8).init(std.testing.allocator),
         .direct_users = std.StringHashMap(void).init(std.testing.allocator),
+        .desync = true,
         .desync_split_delay_ms = 3,
         .desync_split_jitter_ms = 0,
     };

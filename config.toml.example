@@ -239,11 +239,11 @@ mask_port = 8443
 # 0 disables the cap for all masking relays.
 # mask_relay_max_secs = 0
 
-# Split ServerHello into 1-byte + short delay + rest (defeats passive DPI signatures).
-# Enabled by default.
-# desync = true
+# Optional Split-TLS: split fake ServerHello into 1-byte + short delay + rest.
+# Disabled by default to avoid adding handshake latency. Set desync = true to opt in.
+# desync = false
 
-# Base delay and random extra delay for the Split ServerHello path.
+# Base delay and random extra delay, used only when desync = true.
 # Effective delay is desync_split_delay_ms + random(0..desync_split_jitter_ms).
 # desync_split_delay_ms = 3
 # desync_split_jitter_ms = 2

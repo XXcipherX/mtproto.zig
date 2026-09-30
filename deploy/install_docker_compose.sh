@@ -747,7 +747,11 @@ print_summary() {
     else
         echo -e "  ${RED}!${RESET} Self-domain Caddy Masking"
     fi
-    echo -e "  ${GREEN}+${RESET} Split-TLS"
+    if is_true "$(get_config_value "$CONFIG_FILE" "censorship" "desync" "false")"; then
+        echo -e "  ${GREEN}+${RESET} Split-TLS"
+    else
+        echo -e "  ${DIM}o Split-TLS (disabled; set [censorship].desync=true to enable)${RESET}"
+    fi
     if $NFQWS_OK; then
         echo -e "  ${GREEN}+${RESET} TCP Desync nfqws"
     else

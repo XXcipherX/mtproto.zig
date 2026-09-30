@@ -116,7 +116,7 @@ from a low-level module into `EventLoop`.
 2. Proxy reads TLS record header/body and validates FakeTLS digest against configured user secrets. The current FakeTLS template requires a 32-byte ClientHello Session ID and echoes it in ServerHello.
 3. On valid auth:
 - Builds fake `ServerHello` from template.
-- Optional desync mode enables `TCP_NODELAY` immediately after admission, then splits the write into `1 byte + ~3ms + rest`.
+- `desync=false` by default sends the complete fake ServerHello without an intentional pause. Explicit `desync=true` splits it into `1 byte + delay/jitter + rest` (3–5 ms with default timing). `TCP_NODELAY` is configured immediately after admission for either mode.
 4. Proxy assembles 64-byte MTProto obfuscation handshake from TLS appdata records. Extra client appdata bytes pipelined after the nonce are buffered up to one max TLS ciphertext and forwarded after upstream setup.
 5. Proxy derives MTProto crypto params and chooses upstream strategy:
 - Direct DC path.
@@ -326,7 +326,7 @@ allocation, vector or process failures still fail the job.
 - Masking target selection for unauthenticated clients: `mask_port=443` resolves every address for `tls_domain:443` in the background, prefers IPv4, and fails over across candidates; non-443 `mask_port` connects to a local address on that port (`127.0.0.1` in the init namespace, `10.200.200.1` inside the tunnel netns). Hostname candidates are re-resolved hourly.
 - Config parsing is strict for proxy-owned sections/keys and malformed lines; `[monitor].host`/`port` remain accepted for the external dashboard. Config load errors propagate as a non-zero process exit.
 - TCPMSS clamping, SYN pacing, and zapret/nfqws integration are external-path mitigations; deploy rules exclude loopback so WEB relay streams never enter pacing, tiny-MSS, or NFQUEUE processing.
-- Split-TLS desync (`desync=true`) as split write of fake ServerHello.
+- Split-TLS desync remains opt-in (`desync=true`, default false), with its existing delay/jitter and timer phases. Source/Compose installers and the Docker entrypoint omit the key and inherit the default; an existing explicit true value stays enabled. The Compose installer summary reads the actual config key with fallback false and reports enabled/disabled accordingly. OS-level zapret/nfqws policy is separate.
 - FakeTLS C2S parses all TLS records in each bounded 32 KiB socket read in userspace; only partial framing positions survive between reads. AES and MiddleProxy process borrowed payload slices before scratch reuse, while pending upstream output stops the next read and frame-boundary EOF rules remain authoritative.
 - FakeTLS S2C groups up to 32 TLS records into one bounded scatter write. Queued suffixes own their bytes in the existing page-block queue; multipart reservation preserves queue contents on OOM/overflow and charges the worker's managed allocator, including retained pool blocks.
 - The S2C encoder caps FakeTLS application payloads at 16367 bytes for both DRS policies, avoiding repeated bulk wire length `0x4000`. DRS still requests 16384 after its unchanged warmup. The 17-byte content-type/tag margin is a sizing heuristic, not a TLS restriction: real TLS 1.3 can legally produce ciphertext length `0x4000`. General inbound TLS limits and encrypted-certificate sizing remain separate.

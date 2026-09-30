@@ -232,8 +232,8 @@ pub const Config = struct {
     /// Maximum ordinary masking/probe relay lifetime in seconds; 0 disables.
     /// WEB-domain carriers are exempt because their WebSocket is intentionally long-lived.
     mask_relay_max_secs: u32 = 0,
-    /// TCP desync: split ServerHello into 1-byte + rest to evade DPI
-    desync: bool = true,
+    /// Optional TCP desync: split ServerHello into 1-byte + delay + rest.
+    desync: bool = false,
     /// Base delay between first ServerHello byte and the rest.
     desync_split_delay_ms: u32 = 3,
     /// Random extra delay added to desync_split_delay_ms.
@@ -1060,7 +1060,7 @@ test "parse config - missing fields defaults" {
     try std.testing.expect(!cfg.use_middle_proxy); // Default is false
     try std.testing.expect(cfg.mask); // Default is true
     try std.testing.expectEqual(@as(u32, 0), cfg.mask_relay_max_secs);
-    try std.testing.expect(cfg.desync); // Default is true
+    try std.testing.expect(!cfg.desync); // Split-TLS is opt-in.
     try std.testing.expectEqual(@as(u32, 3), cfg.desync_split_delay_ms);
     try std.testing.expectEqual(@as(u32, 2), cfg.desync_split_jitter_ms);
     try std.testing.expectEqual(@as(u32, 0), cfg.fake_cert_size);
@@ -1589,6 +1589,7 @@ test "parse config - full production-like config" {
     try std.testing.expect(cfg.fast_mode);
     try std.testing.expectEqual(@as(u16, 8443), cfg.mask_port);
     try std.testing.expectEqual(@as(u32, 45), cfg.mask_relay_max_secs);
+    try std.testing.expect(!cfg.desync);
     try std.testing.expectEqual(@as(u32, 3), cfg.desync_split_delay_ms);
     try std.testing.expectEqual(@as(u32, 2), cfg.desync_split_jitter_ms);
     try std.testing.expectEqual(@as(u32, 0), cfg.fake_cert_size);
@@ -1749,6 +1750,8 @@ test "parse config - desync split timing" {
     var cfg = try Config.parse(std.testing.allocator, content);
     defer cfg.deinit(std.testing.allocator);
 
+    // Setting timing alone does not enable the optional split path.
+    try std.testing.expect(!cfg.desync);
     try std.testing.expectEqual(@as(u32, 5), cfg.desync_split_delay_ms);
     try std.testing.expectEqual(@as(u32, 9), cfg.desync_split_jitter_ms);
 }

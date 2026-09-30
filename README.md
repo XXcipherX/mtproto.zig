@@ -48,7 +48,7 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 | **IPv6 Hopping** | DPI Evasion | Rotates IPv6 from a routed /64 and updates Cloudflare AAAA records; installers schedule a hop every 5 minutes, while `--auto` provides foreground ban-detection mode |
 | **Optional TCPMSS=88** | Legacy DPI fallback | Disabled by default; can force tiny ClientHello fragmentation on external traffic when explicitly enabled; loopback is always excluded |
 | **TCP Desync** | DPI Evasion | Integrated `zapret` (`nfqws`) OS-level desynchronization (fake packets + TTL spoofing); NFQUEUE queue-bypass preserves traffic while `nfqws` restarts, and loopback never enters the queue |
-| **Split-TLS** | DPI Evasion | Enables `TCP_NODELAY` before handshake processing, then splits fake `ServerHello` into `1 byte + short pause + rest` so Nagle buffering does not delay or coalesce the deliberate small write |
+| **Split-TLS** | DPI Evasion | Opt-in `desync=true` (default `false`) splits fake `ServerHello` into `1 byte + short pause + rest`; `TCP_NODELAY` is set before handshake processing to prevent Nagle buffering of the small write |
 | **Zero-RTT** | DPI Evasion | Local self-domain Caddy 404 masking (`127.0.0.1:8443`, with tunnel netns auto-routing and PQ TLS groups) to defeat active probing timing analysis |
 | **0 deps** | Stdlib Only | No third-party Zig packages (proxy core uses Zig standard library only) |
 | **Explicit State** | Runtime Ownership | Proxy state is passed explicitly; runtime log level is the only mutable global knob |
@@ -1153,9 +1153,9 @@ tls_domain = "proxy.example.com"
 mask = true
 mask_port = 8443
 # mask_relay_max_secs = 0                  # Probe-cover lifetime; WEB carriers are exempt
-desync = true
-# desync_split_delay_ms = 3                # Base delay between first ServerHello byte and the rest
-# desync_split_jitter_ms = 2               # Random extra delay, 0..N ms, added to the base
+desync = false                            # Set true to opt into Split-TLS and its handshake delay
+# desync_split_delay_ms = 3                # Base delay, used only with desync=true
+# desync_split_jitter_ms = 2               # Extra 0..N ms, used only with desync=true
 # fake_cert_size = 0                       # Fake encrypted-cert AppData size; 0 keeps built-in default
 drs = false
 fast_mode = true
@@ -1218,9 +1218,9 @@ alice = true   # direct where possible; CDN DC203 still requires MiddleProxy
 | `[censorship]` | `mask` | `true` | Forward unauthenticated connections to the configured masking target to defeat active probing |
 | `[censorship]` | `mask_port` | `443` | Masking target port. `443` connects to `tls_domain:443`; non-443 values connect to a local address on that port (`127.0.0.1:<mask_port>`, or `10.200.200.1:<mask_port>` inside tunnel netns), so that port must be served by Caddy or another local backend. Use `8443` for self-domain Caddy so public `443` remains owned by `mtproto-proxy` |
 | `[censorship]` | `mask_relay_max_secs` | `0` | Maximum lifetime for ordinary masking/probe connections to the configured backend. WEB-domain HTTPS/WebSocket carriers are exempt; `0` disables the cap for every masking relay |
-| `[censorship]` | `desync` | `true` | Split fake `ServerHello` into `1 byte + short pause + rest` to desynchronize passive DPI |
-| `[censorship]` | `desync_split_delay_ms` | `3` | Base delay between the first fake `ServerHello` byte and the remaining bytes |
-| `[censorship]` | `desync_split_jitter_ms` | `2` | Random extra delay in milliseconds added to `desync_split_delay_ms` (`0..N` per connection) |
+| `[censorship]` | `desync` | `false` | Opt into splitting fake `ServerHello` into `1 byte + short pause + rest`; the default sends it without an intentional pause |
+| `[censorship]` | `desync_split_delay_ms` | `3` | Base delay between the first fake `ServerHello` byte and the remaining bytes, only with `desync=true` |
+| `[censorship]` | `desync_split_jitter_ms` | `2` | Random extra delay added to `desync_split_delay_ms` (`0..N` ms per connection), only with `desync=true` |
 | `[censorship]` | `fake_cert_size` | `0` | Fake TLS encrypted-certificate AppData size in bytes. `0` keeps the built-in 2878-byte default; explicit values are clamped to `256..16384` |
 | `[censorship]` | `drs` | `false` | Dynamic Record Sizing: start S2C FakeTLS records at 1369 bytes, then use the 16367-byte bulk cap after 8 records or 128 KiB |
 | `[censorship]` | `fast_mode` | `false` | **Recommended** for direct-path traffic. Delegates S2C AES encryption to Telegram DC and reduces proxy CPU/RAM pressure |
@@ -1232,6 +1232,8 @@ alice = true   # direct where possible; CDN DC203 still requires MiddleProxy
 `client_silence_fast_close_sec` and `client_silence_fast_after_idle_sec` were removed in favor of the single bounded `client_silence_close_sec` policy. Remove the legacy keys before upgrading; strict config parsing rejects unknown keys.
 
 Outbound FakeTLS application payloads are capped at 16367 bytes with either DRS policy. The `16384 - 17` cap uses the TLS 1.3 inner content-type and 16-byte tag margin as a sizing heuristic to avoid repeated bulk `0x4000` wire lengths; FakeTLS does not add that AEAD framing. Real TLS 1.3 permits ciphertext length `0x4000`, so this cap is not a protocol requirement or a guarantee against fingerprinting ([RFC 8446 §5.2](https://www.rfc-editor.org/rfc/rfc8446#section-5.2), [RFC 5116 §5.1](https://www.rfc-editor.org/rfc/rfc5116#section-5.1)).
+
+Built-in Split-TLS is opt-in: set `[censorship].desync = true` to split fake `ServerHello` with the configured delay and jitter (3–5 ms with default timing). Source/Compose installers and the Docker entrypoint omit this key, so their generated configs use the `false` default. Existing configs explicitly setting `true` continue to opt in after an upgrade. The Compose install summary reads this config setting and reports Split-TLS as enabled or disabled, using `false` when the key is absent. This setting is independent of the deployment's OS-level `zapret`/`nfqws` configuration.
 
 > **Operational note** &nbsp; High-churn mobile networks can produce many normal disconnects (`ConnectionResetByPeer`/`EndOfStream`). In release builds these are logged at debug level to keep production logs signal-focused.
 
