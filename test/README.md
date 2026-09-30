@@ -56,6 +56,13 @@ disabled, verify the 16367-byte bulk cap and unchanged warmup, and reconstruct a
 payload bytes through the receiving TLS parser. The cap avoids repeated `0x4000`
 FakeTLS lengths; that length is legal in real TLS 1.3, so this is a sizing heuristic.
 
+Relay-drain socketpair tests exercise multiple chunks in one call, the shared
+read/write byte and operation limits in both directions, unread bytes under queue
+backpressure, and exactly one first-EOF notification with the reverse half still
+usable. They need no daemon, listener or updater. The existing stress scenarios
+cover burst, slow client/DC, queue pressure, half-close, and endurance traffic;
+the drain keeps their existing queue, crypto and lifecycle handlers.
+
 `zig build e2e` builds a dedicated non-shipping proxy executable and a small
 obfuscated-handshake generator. The Python harness starts both the real proxy and
 a deterministic loopback DC, authenticates with FakeTLS, supplies a valid

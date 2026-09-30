@@ -1608,12 +1608,16 @@ const EventLoop = struct {
 
             const relay_phase = slot.phase == .relaying or slot.phase == .mask_relaying;
             if (relay_phase and graceful_rdhup and !slot.client_read_closed and !io_budget.exhausted()) {
-                self.drainRelayRdhup(slot, fd);
+                self.drainRelayReads(slot, fd);
             } else if ((events & linux.EPOLL.IN) != 0 and
                 !io_budget.exhausted() and
                 (!relay_phase or !slot.client_read_closed))
             {
-                self.onClientReadable(slot);
+                if (relay_phase) {
+                    self.drainRelayReads(slot, fd);
+                } else {
+                    self.onClientReadable(slot);
+                }
             }
         } else if (fd == slot.upstream_fd) {
             if ((events & linux.EPOLL.OUT) != 0 or
@@ -1626,12 +1630,16 @@ const EventLoop = struct {
 
             const relay_phase = slot.phase == .relaying or slot.phase == .mask_relaying;
             if (relay_phase and graceful_rdhup and !slot.upstream_read_closed and !io_budget.exhausted()) {
-                self.drainRelayRdhup(slot, fd);
+                self.drainRelayReads(slot, fd);
             } else if ((events & linux.EPOLL.IN) != 0 and
                 !io_budget.exhausted() and
                 (!relay_phase or !slot.upstream_read_closed))
             {
-                self.onUpstreamReadable(slot);
+                if (relay_phase) {
+                    self.drainRelayReads(slot, fd);
+                } else {
+                    self.onUpstreamReadable(slot);
+                }
             }
         }
 
@@ -4208,118 +4216,38 @@ const EventLoop = struct {
         }
     }
 
-    fn drainRelayRdhup(self: *EventLoop, slot: *ConnectionSlot, hung_fd: posix.fd_t) void {
-        const from_client = hung_fd == slot.client_fd;
-        const from_upstream = hung_fd == slot.upstream_fd;
+    /// IN and RDHUP share the ordinary transport handlers and dispatch budget.
+    /// Level-triggered epoll preserves readiness after yielding for fairness or
+    /// backpressure; RDHUP becomes EOF only when the handler actually reads zero.
+    fn drainRelayReads(self: *EventLoop, slot: *ConnectionSlot, fd: posix.fd_t) void {
+        if (isInvalidFd(fd)) return;
+        const from_client = fd == slot.client_fd;
+        const from_upstream = fd == slot.upstream_fd;
         if (!from_client and !from_upstream) return;
-        if ((from_client and slot.client_read_closed) or
-            (from_upstream and slot.upstream_read_closed))
-        {
-            return;
-        }
-        if ((from_client and slot.hasUpstreamPending()) or
-            (from_upstream and slot.hasClientPending()))
-        {
-            return;
-        }
+        const phase = slot.phase;
+        if (phase != .relaying and phase != .mask_relaying) return;
+        const generation = slot.event_generation;
+        const budget = slot.event_io_budget orelse return;
 
-        // The ordinary relay-step helpers below parse FakeTLS records. WEB backend
-        // streams carry the client's direct-obfuscated transport instead, so their
-        // final RDHUP read must stay on the same crypto/framing path as a normal IN
-        // event. Level-triggered RDHUP will notify us again after any queued output
-        // drains and read interest is restored, until read() returns zero and the
-        // regular half-close machinery records EOF.
-        if (slot.phase == .relaying and slot.client_transport == .direct_obfuscated) {
+        // Pool release marks a slot idle but does not free its allocation. None
+        // of these handlers accepts another connection; still recheck phase,
+        // fd and registration generation before every subsequent read.
+        while (slot.phase == phase and slot.event_generation == generation and
+            fd == (if (from_client) slot.client_fd else slot.upstream_fd) and
+            !(if (from_client) slot.client_read_closed else slot.upstream_read_closed) and
+            !(if (from_client) slot.hasUpstreamPending() else slot.hasClientPending()) and
+            !budget.exhausted())
+        {
+            const bytes_before = budget.bytes_remaining;
             if (from_client) {
-                self.relayObfuscatedClientToUpstream(slot);
+                self.onClientReadable(slot);
             } else {
-                self.relayObfuscatedUpstreamToClient(slot);
+                self.onUpstreamReadable(slot);
             }
-            return;
-        }
-
-        if (slot.phase == .relaying) {
-            var operations: usize = 0;
-            var processed_bytes: usize = 0;
-            while (slot.phase == .relaying and operations < event_io_operation_budget and processed_bytes < event_io_byte_budget) {
-                const forwarded_before = slot.wedge_forwarded_c2s_seq;
-                const s2c_before = slot.s2c_bytes;
-                const progress = if (from_client)
-                    relayClientToUpstreamStep(self, slot)
-                else
-                    relayUpstreamToClientStep(self, slot);
-
-                const step = progress catch |err| {
-                    if (err == error.EndOfStream) {
-                        self.noteRelayReadEof(
-                            slot,
-                            if (from_client) .client else .upstream,
-                        );
-                        return;
-                    }
-                    self.closeSlot(slot, if (from_client) "relay client rdhup drain failed" else "relay upstream rdhup drain failed");
-                    return;
-                };
-
-                if (step == .none) break;
-                operations += 1;
-                processed_bytes += relay_read_scratch_size;
-                const now_ms = runtime_time.monotonicMilli();
-                slot.last_activity_ms = now_ms;
-                if (from_client) {
-                    if (slot.wedge_forwarded_c2s_seq > forwarded_before) {
-                        self.noteClientRelayPayload(slot, now_ms);
-                    } else {
-                        self.noteClientRelayProgress(slot, now_ms);
-                    }
-                } else if (slot.s2c_bytes > s2c_before) {
-                    self.noteServerRelayPayload(slot, now_ms);
-                }
-                if ((from_client and slot.hasUpstreamPending()) or
-                    (from_upstream and slot.hasClientPending()))
-                {
-                    break;
-                }
-            }
-        } else {
-            const read_buf = self.relay_read_scratch[0..];
-            var operations: usize = 0;
-            var processed_bytes: usize = 0;
-            while (slot.phase == .mask_relaying and operations < event_io_operation_budget and processed_bytes < event_io_byte_budget) {
-                const n = readSlotFd(slot, hung_fd, read_buf) catch |err| {
-                    if (err == error.WouldBlock) break;
-                    self.closeSlot(slot, "mask rdhup drain failed");
-                    return;
-                };
-                if (n == 0) {
-                    self.noteRelayReadEof(
-                        slot,
-                        if (from_client) .client else .upstream,
-                    );
-                    return;
-                }
-                operations += 1;
-                processed_bytes += n;
-                if (from_client) {
-                    _ = queueUpstream(slot, read_buf[0..n]) catch {
-                        self.closeSlot(slot, "mask rdhup queue upstream failed");
-                        return;
-                    };
-                    slot.mask_c2s_bytes += n;
-                } else {
-                    _ = queueClient(slot, read_buf[0..n]) catch {
-                        self.closeSlot(slot, "mask rdhup queue client failed");
-                        return;
-                    };
-                    slot.mask_s2c_bytes += n;
-                }
-                slot.last_activity_ms = runtime_time.monotonicMilli();
-                if ((from_client and slot.hasUpstreamPending()) or
-                    (from_upstream and slot.hasClientPending()))
-                {
-                    break;
-                }
-            }
+            // WouldBlock or a handler doing no I/O must yield even though a failed
+            // read used an operation. Successful reads charge bytes, including partial
+            // TLS/MP framing that has not produced an output payload yet.
+            if (budget.bytes_remaining == bytes_before) break;
         }
     }
 
@@ -5016,6 +4944,150 @@ test "multiple client TLS records consume one read operation before queue backpr
     var iovecs: [1]posix.iovec_const = undefined;
     try std.testing.expectEqual(@as(usize, 1), slot.upstream_queue.prepareIovecs(&iovecs, 5));
     try std.testing.expectEqualStrings("abcde", iovecs[0].base[0..iovecs[0].len]);
+}
+
+fn relayDrainTestSocketPair() ![2]posix.fd_t {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var fds: [2]posix.fd_t = undefined;
+    const rc = linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0, &fds);
+    if (linux.errno(rc) != .SUCCESS) return posix.unexpectedErrno(linux.errno(rc));
+    return fds;
+}
+
+test "relay drain forwards multiple chunks and respects the shared byte and operation budgets" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const payload = try std.testing.allocator.alloc(u8, 3 * relay_read_scratch_size);
+    defer std.testing.allocator.free(payload);
+    for (payload, 0..) |*byte, i| byte.* = @truncate(i * 29 + 7);
+    const received = try std.testing.allocator.alloc(u8, payload.len);
+    defer std.testing.allocator.free(received);
+    // Successful mask handlers only use the worker scratch, without needing
+    // listeners, epoll registrations, timers, discovery or a full ProxyState.
+    const loop = try std.testing.allocator.create(EventLoop);
+    defer std.testing.allocator.destroy(loop);
+    const fixtures = [_]struct { budget: EventIoBudget, forwarded: usize, operations_left: usize }{
+        .{ .budget = .{}, .forwarded = payload.len, .operations_left = event_io_operation_budget - 7 },
+        .{ .budget = .{ .bytes_remaining = 4 * relay_read_scratch_size }, .forwarded = 2 * relay_read_scratch_size, .operations_left = event_io_operation_budget - 4 },
+        .{ .budget = .{ .operations_remaining = 4 }, .forwarded = 2 * relay_read_scratch_size, .operations_left = 0 },
+    };
+    for ([_]SlotFdRole{ .client, .upstream }) |role| {
+        for (fixtures) |fixture| {
+            const source = try relayDrainTestSocketPair();
+            defer closeFd(source[0]);
+            defer closeFd(source[1]);
+            const destination = try relayDrainTestSocketPair();
+            defer closeFd(destination[0]);
+            defer closeFd(destination[1]);
+            try std.testing.expectEqual(payload.len, try socket_ops.writeFd(source[1], payload));
+            var budget = fixture.budget;
+            var slot = ConnectionSlot{
+                .phase = .mask_relaying,
+                .client_fd = if (role == .client) source[0] else destination[0],
+                .upstream_fd = if (role == .upstream) source[0] else destination[0],
+                .event_io_budget = &budget,
+            };
+            defer slot.client_queue.deinit();
+            defer slot.upstream_queue.deinit();
+
+            loop.drainRelayReads(&slot, source[0]);
+            try std.testing.expectEqual(@as(u64, @intCast(fixture.forwarded)), if (role == .client) slot.mask_c2s_bytes else slot.mask_s2c_bytes);
+            try std.testing.expectEqual(fixture.operations_left, budget.operations_remaining);
+            // Both the source read and destination write consume the same byte budget.
+            try std.testing.expectEqual(fixture.budget.bytes_remaining - 2 * fixture.forwarded, budget.bytes_remaining);
+            try std.testing.expect(slot.client_queue.isEmpty() and slot.upstream_queue.isEmpty());
+            try std.testing.expectEqual(fixture.forwarded, try posix.read(destination[1], received[0..fixture.forwarded]));
+            try std.testing.expectEqualSlices(u8, payload[0..fixture.forwarded], received[0..fixture.forwarded]);
+            if (fixture.forwarded < payload.len) {
+                const left = payload.len - fixture.forwarded;
+                try std.testing.expectEqual(left, try posix.read(source[0], received[0..left]));
+                try std.testing.expectEqualSlices(u8, payload[fixture.forwarded..], received[0..left]);
+            }
+        }
+    }
+}
+
+test "relay drain leaves unread bytes under queue backpressure even with a fresh budget" {
+    const source = try relayDrainTestSocketPair();
+    defer closeFd(source[0]);
+    defer closeFd(source[1]);
+    const payload = try std.testing.allocator.alloc(u8, relay_read_scratch_size + 17);
+    defer std.testing.allocator.free(payload);
+    @memset(payload, 0x5a);
+    try std.testing.expectEqual(payload.len, try socket_ops.writeFd(source[1], payload));
+    const loop = try std.testing.allocator.create(EventLoop);
+    defer std.testing.allocator.destroy(loop);
+    var budget = EventIoBudget{ .operations_remaining = 1 };
+    var slot = ConnectionSlot{
+        .phase = .mask_relaying,
+        .client_fd = source[0],
+        .event_io_budget = &budget,
+        .upstream_queue = .{ .allocator = std.testing.allocator },
+    };
+    defer slot.upstream_queue.deinit();
+    loop.drainRelayReads(&slot, source[0]);
+    try std.testing.expectEqual(@as(usize, relay_read_scratch_size), slot.upstream_queue.total_len);
+    try std.testing.expectEqual(@as(u64, relay_read_scratch_size), slot.mask_c2s_bytes);
+
+    budget = .{};
+    loop.drainRelayReads(&slot, source[0]);
+    try std.testing.expectEqual(event_io_operation_budget, budget.operations_remaining);
+    try std.testing.expectEqual(event_io_byte_budget, budget.bytes_remaining);
+    var tail: [17]u8 = undefined;
+    try std.testing.expectEqual(tail.len, try posix.read(source[0], &tail));
+    try std.testing.expectEqualSlices(u8, payload[relay_read_scratch_size..], &tail);
+}
+
+test "relay drain records EOF once and keeps the reverse half open" {
+    const client = try relayDrainTestSocketPair();
+    defer closeFd(client[0]);
+    defer closeFd(client[1]);
+    const upstream = try relayDrainTestSocketPair();
+    defer closeFd(upstream[0]);
+    defer closeFd(upstream[1]);
+    const loop = try std.testing.allocator.create(EventLoop);
+    defer std.testing.allocator.destroy(loop);
+    // Only the EOF counters are needed by this mask-relay path; no background
+    // workers or production network discovery are started by the fixture.
+    const state = try std.testing.allocator.create(ProxyState);
+    defer std.testing.allocator.destroy(state);
+    state.stats_relay_client_eof_first = .init(0);
+    state.stats_relay_upstream_eof_first = .init(0);
+    loop.state = state;
+    var budget = EventIoBudget{};
+    var slot = ConnectionSlot{
+        .phase = .mask_relaying,
+        .client_fd = client[0],
+        .upstream_fd = upstream[0],
+        .event_io_budget = &budget,
+    };
+    defer slot.client_queue.deinit();
+    defer slot.upstream_queue.deinit();
+    const request = "request";
+    try std.testing.expectEqual(request.len, try socket_ops.writeFd(client[1], request));
+    try shutdownWriteFd(client[1]);
+    loop.drainRelayReads(&slot, client[0]);
+    try std.testing.expect(slot.client_read_closed and slot.upstream_write_shutdown);
+    try std.testing.expect(!slot.upstream_read_closed and !slot.client_write_shutdown);
+    try std.testing.expectEqual(@as(?RelayEofSide, .client), slot.first_relay_eof);
+    try std.testing.expectEqual(@as(u64, 1), state.stats_relay_client_eof_first.load(.monotonic));
+    const remaining_operations = budget.operations_remaining;
+    loop.drainRelayReads(&slot, client[0]);
+    try std.testing.expectEqual(remaining_operations, budget.operations_remaining);
+    try std.testing.expectEqual(@as(u64, 1), state.stats_relay_client_eof_first.load(.monotonic));
+    var got_request: [request.len]u8 = undefined;
+    try std.testing.expectEqual(request.len, try posix.read(upstream[1], &got_request));
+    try std.testing.expectEqualStrings(request, &got_request);
+    var eof_byte: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try posix.read(upstream[1], &eof_byte));
+
+    const response = "reverse half is still open";
+    try std.testing.expectEqual(response.len, try socket_ops.writeFd(upstream[1], response));
+    loop.drainRelayReads(&slot, upstream[0]);
+    var got_response: [response.len]u8 = undefined;
+    try std.testing.expectEqual(response.len, try posix.read(client[1], &got_response));
+    try std.testing.expectEqualStrings(response, &got_response);
+    try std.testing.expectEqual(ConnectionPhase.mask_relaying, slot.phase);
+    try std.testing.expectEqual(@as(u64, 0), state.stats_relay_upstream_eof_first.load(.monotonic));
 }
 
 test "pipelined handshake capacity stays independent of relay scratch size" {
