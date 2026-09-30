@@ -159,6 +159,58 @@ pub const MessageQueue = struct {
         }
     }
 
+    /// Copy a scatter suffix atomically with respect to allocation and byte-cap
+    /// failures. Reserve through the existing pool/managed allocator before
+    /// changing even the current tail; no borrowed part survives this call.
+    pub fn appendParts(self: *MessageQueue, parts: []const []const u8) !void {
+        var total: usize = 0;
+        for (parts) |part| total = std.math.add(usize, total, part.len) catch return error.PendingQueueOverflow;
+        try self.ensureCanAppend(total);
+        if (total == 0) return;
+
+        const tail_space = if (self.tail) |tail| msg_block_payload_size - tail.len else 0;
+        var unreserved = total - @min(total, tail_space);
+        var reserved_head: ?*MsgBlock = null;
+        var reserved_tail: ?*MsgBlock = null;
+        errdefer {
+            var current = reserved_head;
+            while (current) |blk| {
+                const next = blk.next;
+                self.recycleBlock(blk);
+                current = next;
+            }
+        }
+        while (unreserved > 0) {
+            const blk = try self.acquireBlock();
+            if (reserved_tail) |tail| tail.next = blk else reserved_head = blk;
+            reserved_tail = blk;
+            unreserved -= @min(unreserved, msg_block_payload_size);
+        }
+
+        var reserved = reserved_head;
+        var destination = self.tail;
+        for (parts) |part| {
+            var off: usize = 0;
+            while (off < part.len) {
+                if (destination == null or destination.?.len == msg_block_payload_size) {
+                    const blk = reserved.?;
+                    reserved = blk.next;
+                    blk.next = null;
+                    if (self.tail) |tail| tail.next = blk else self.head = blk;
+                    self.tail = blk;
+                    destination = blk;
+                }
+                const blk = destination.?;
+                const take = @min(part.len - off, msg_block_payload_size - blk.len);
+                @memcpy(blk.data[blk.len..][0..take], part[off..][0..take]);
+                blk.len += take;
+                off += take;
+            }
+        }
+        std.debug.assert(reserved == null);
+        self.total_len += total;
+    }
+
     pub fn prepareIovecs(self: *const MessageQueue, out: []posix.iovec_const, max_bytes: usize) usize {
         if (self.head == null or max_bytes == 0) return 0;
 
@@ -397,4 +449,42 @@ test "queue memory budget covers two queues and the shared pool" {
         @as(u64, @intCast(MessageBlockPool.max_free_blocks * runtime_page_size)),
         budget.shared_pool_bytes,
     );
+}
+
+test "multipart append leaves the existing queue intact on every reservation failure" {
+    const payload = [_]u8{0xa5} ** (msg_block_payload_size * 2);
+    for ([_]usize{ 1, 2 }) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        var queue = MessageQueue{ .allocator = failing.allocator() };
+        defer queue.deinit();
+        try queue.appendCopy("prefix");
+        const head = queue.head.?;
+        try std.testing.expectError(error.OutOfMemory, queue.appendParts(&.{ payload[0..7], payload[7..] }));
+        try std.testing.expectEqual(@as(usize, 6), queue.total_len);
+        try std.testing.expect(queue.head.? == head and queue.tail.? == head);
+        try std.testing.expect(head.next == null);
+        try std.testing.expectEqualStrings("prefix", head.data[0..head.len]);
+    }
+}
+
+test "multipart reservation retains managed accounting and rejects overflow before mutation" {
+    var budget = ManagedBufferAllocator.init(std.testing.allocator, 2 * @sizeOf(MsgBlock));
+    var pool = MessageBlockPool{ .allocator = budget.allocator() };
+    defer pool.deinit();
+    var queue = MessageQueue{ .allocator = budget.allocator(), .pool = &pool };
+    defer queue.deinit();
+    try queue.appendCopy("prefix");
+    const payload = [_]u8{0x91} ** (msg_block_payload_size * 2);
+    try std.testing.expectError(error.OutOfMemory, queue.appendParts(&.{&payload}));
+    try std.testing.expectEqual(@as(usize, 6), queue.total_len);
+    try std.testing.expectEqual(@as(usize, 1), pool.free_count);
+    try std.testing.expectEqual(2 * @sizeOf(MsgBlock), budget.used_bytes);
+
+    queue.total_len = MessageQueue.max_pending_bytes - 1;
+    try std.testing.expectError(error.PendingQueueOverflow, queue.appendParts(&.{ "a", "b" }));
+    try std.testing.expectEqual(MessageQueue.max_pending_bytes - 1, queue.total_len);
+    try std.testing.expectEqualStrings("prefix", queue.head.?.data[0..queue.head.?.len]);
+    queue.total_len = 6;
+    try queue.appendParts(&.{ "", "end" });
+    try std.testing.expectEqualStrings("prefixend", queue.head.?.data[0..queue.head.?.len]);
 }

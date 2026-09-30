@@ -47,6 +47,11 @@ FakeTLS application records and an intervening CCS, using the real AES-CTR state
 They also cover one-byte segmentation, malformed headers, and incomplete framing
 at EOF. C2S consumes all records in one bounded read chunk before reusing scratch.
 
+S2C unit tests check exact multi-record wire bytes, a single budgeted scatter
+write, partial writes at every iovec boundary, ordered fallback, and stack-header
+reuse across batches. Queue tests inject allocation failures during multipart
+reservation and preserve existing data, the byte cap, and managed pool accounting.
+
 `zig build e2e` builds a dedicated non-shipping proxy executable and a small
 obfuscated-handshake generator. The Python harness starts both the real proxy and
 a deterministic loopback DC, authenticates with FakeTLS, supplies a valid

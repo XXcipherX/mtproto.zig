@@ -154,20 +154,30 @@ fn writevSlotFd(slot: *ConnectionSlot, fd: posix.fd_t, iovecs: []const posix.iov
 
 pub fn queueTlsAppRecords(slot: *ConnectionSlot, payload: []u8) !void {
     var off: usize = 0;
-    var header: [tls_header_len]u8 = undefined;
+    var headers: [max_scatter_parts / 2][tls_header_len]u8 = undefined;
+    var parts: [max_scatter_parts][]const u8 = undefined;
+    var count: usize = 0;
 
     while (off < payload.len) {
         const chunk_len = @min(payload.len - off, slot.drs.nextRecordSize());
 
+        const header = &headers[count / 2];
         header[0] = constants.tls_record_application;
         header[1] = constants.tls_version[0];
         header[2] = constants.tls_version[1];
         std.mem.writeInt(u16, header[3..5], @intCast(chunk_len), .big);
 
-        _ = try queueClientPair(slot, header[0..], payload[off .. off + chunk_len]);
+        parts[count] = header[0..];
+        parts[count + 1] = payload[off .. off + chunk_len];
+        count += 2;
         slot.drs.recordSent(chunk_len);
         off += chunk_len;
+        if (count == parts.len) {
+            _ = try queueOrWriteParts(slot, slot.client_fd, &slot.client_queue, &parts);
+            count = 0;
+        }
     }
+    if (count > 0) _ = try queueOrWriteParts(slot, slot.client_fd, &slot.client_queue, parts[0..count]);
 }
 
 fn queueOrWriteMsg(slot: *ConnectionSlot, fd: posix.fd_t, queue: *MessageQueue, data: []const u8) !bool {
@@ -192,51 +202,47 @@ fn queueOrWriteMsg(slot: *ConnectionSlot, fd: posix.fd_t, queue: *MessageQueue, 
 }
 
 fn queueOrWriteMsgPair(slot: *ConnectionSlot, fd: posix.fd_t, queue: *MessageQueue, first: []const u8, second: []const u8) !bool {
-    if (first.len == 0 and second.len == 0) return true;
+    return queueOrWriteParts(slot, fd, queue, &.{ first, second });
+}
 
+fn queueOrWriteParts(slot: *ConnectionSlot, fd: posix.fd_t, queue: *MessageQueue, parts: []const []const u8) !bool {
+    if (parts.len > max_scatter_parts) return error.TooManyParts;
+    var total: usize = 0;
+    for (parts) |part| total = std.math.add(usize, total, part.len) catch return error.PendingQueueOverflow;
+    if (total == 0) return true;
+    try queue.ensureCanAppend(total);
+
+    var written: usize = 0;
     if (queue.isEmpty()) {
-        var iovecs: [2]posix.iovec_const = undefined;
+        var iovecs: [max_scatter_parts]posix.iovec_const = undefined;
         var n_iov: usize = 0;
-        if (first.len > 0) {
-            iovecs[n_iov] = .{ .base = first.ptr, .len = first.len };
-            n_iov += 1;
-        }
-        if (second.len > 0) {
-            iovecs[n_iov] = .{ .base = second.ptr, .len = second.len };
+        for (parts) |part| {
+            if (part.len == 0) continue;
+            iovecs[n_iov] = .{ .base = part.ptr, .len = part.len };
             n_iov += 1;
         }
 
-        const total_len = first.len + second.len;
-        const n = writevSlotFd(slot, fd, iovecs[0..n_iov]) catch |err| {
+        written = writevSlotFd(slot, fd, iovecs[0..n_iov]) catch |err| {
             if (err == error.WouldBlock) {
-                try queue.ensureCanAppend(total_len);
-                try queue.appendCopy(first);
-                try queue.appendCopy(second);
+                try queue.appendParts(parts);
                 return false;
             }
             return err;
         };
-
-        if (n == 0) return error.ConnectionReset;
-        if (n == total_len) return true;
-
-        if (n < first.len) {
-            try queue.ensureCanAppend(first.len - n + second.len);
-            try queue.appendCopy(first[n..]);
-            try queue.appendCopy(second);
-            return false;
-        }
-
-        const consumed_second = n - first.len;
-        if (consumed_second < second.len) {
-            try queue.appendCopy(second[consumed_second..]);
-        }
-        return false;
+        if (written == 0) return error.ConnectionReset;
+        if (written == total) return true;
     }
 
-    try queue.ensureCanAppend(first.len + second.len);
-    try queue.appendCopy(first);
-    try queue.appendCopy(second);
+    var suffix: [max_scatter_parts][]const u8 = undefined;
+    var suffix_count: usize = 0;
+    for (parts) |part| {
+        const skip = @min(written, part.len);
+        written -= skip;
+        if (skip == part.len) continue;
+        suffix[suffix_count] = part[skip..];
+        suffix_count += 1;
+    }
+    try queue.appendParts(suffix[0..suffix_count]);
     return false;
 }
 
@@ -404,4 +410,116 @@ test "client TLS framing rejects invalid records and retains truncated EOF state
         while (try nextClientTlsPayload(&slot, &remaining)) |_| {}
     }
     try std.testing.expect(clientRelayAtFrameBoundary(&slot));
+}
+
+fn relayTestSocketPair() ![2]posix.fd_t {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const linux = std.os.linux;
+    var fds: [2]posix.fd_t = undefined;
+    const rc = linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0, &fds);
+    if (linux.errno(rc) != .SUCCESS) return posix.unexpectedErrno(linux.errno(rc));
+    return fds;
+}
+
+fn copyTestQueue(queue: *MessageQueue, destination: []u8) !void {
+    try std.testing.expectEqual(destination.len, queue.total_len);
+    var off: usize = 0;
+    while (!queue.isEmpty()) {
+        var iovecs: [max_scatter_parts]posix.iovec_const = undefined;
+        const count = queue.prepareIovecs(&iovecs, destination.len - off);
+        var copied: usize = 0;
+        for (iovecs[0..count]) |iov| {
+            @memcpy(destination[off + copied ..][0..iov.len], iov.base[0..iov.len]);
+            copied += iov.len;
+        }
+        try std.testing.expect(copied > 0);
+        try queue.consume(copied);
+        off += copied;
+    }
+}
+
+test "TLS records use one budgeted scatter write with exact wire output" {
+    const fds = try relayTestSocketPair();
+    defer _ = std.os.linux.close(fds[0]);
+    defer _ = std.os.linux.close(fds[1]);
+    var budget = connection.EventIoBudget{ .operations_remaining = 1 };
+    var slot = ConnectionSlot{ .client_fd = fds[0], .event_io_budget = &budget };
+    slot.drs.current_size = 7;
+    var payload = "abcdefghijklmnopqrst".*;
+    try queueTlsAppRecords(&slot, &payload);
+    const expected = "\x17\x03\x03\x00\x07abcdefg" ++ "\x17\x03\x03\x00\x07hijklmn" ++ "\x17\x03\x03\x00\x06opqrst";
+    var actual: [expected.len]u8 = undefined;
+    try std.testing.expectEqual(actual.len, try posix.read(fds[1], &actual));
+    try std.testing.expectEqualSlices(u8, expected, &actual);
+    try std.testing.expect(slot.client_queue.isEmpty());
+    try std.testing.expectEqual(@as(usize, 0), budget.operations_remaining);
+    try std.testing.expectEqual(event_io_byte_budget - expected.len, budget.bytes_remaining);
+}
+
+test "scatter partial writes preserve the suffix at every iovec boundary" {
+    const parts = [_][]const u8{ "ab", "", "cde", "f", "ghij" };
+    const expected = "abcdefghij";
+    for (1..expected.len) |prefix| {
+        const fds = try relayTestSocketPair();
+        defer _ = std.os.linux.close(fds[0]);
+        defer _ = std.os.linux.close(fds[1]);
+        var budget = connection.EventIoBudget{ .bytes_remaining = prefix, .operations_remaining = 1 };
+        var slot = ConnectionSlot{ .client_fd = fds[0], .event_io_budget = &budget };
+        slot.client_queue.allocator = std.testing.allocator;
+        defer slot.client_queue.deinit();
+        try std.testing.expect(!try queueOrWriteParts(&slot, fds[0], &slot.client_queue, &parts));
+        try std.testing.expect(budget.exhausted());
+        var actual: [expected.len]u8 = undefined;
+        try std.testing.expectEqual(prefix, try posix.read(fds[1], actual[0..prefix]));
+        try copyTestQueue(&slot.client_queue, actual[prefix..]);
+        try std.testing.expectEqualSlices(u8, expected, &actual);
+    }
+}
+
+test "scatter fallback preserves ordering and copies reused TLS headers" {
+    var budget = connection.EventIoBudget{ .operations_remaining = 0 };
+    var slot = ConnectionSlot{ .event_io_budget = &budget };
+    slot.client_queue.allocator = std.testing.allocator;
+    defer slot.client_queue.deinit();
+    try std.testing.expect(!try queueOrWriteParts(&slot, slot.client_fd, &slot.client_queue, &.{ "pre", "fix" }));
+    slot.drs.current_size = 1; // Force more than one 64-part batch without large fixtures.
+    var payload: [73]u8 = undefined;
+    for (&payload, 0..) |*byte, i| byte.* = @intCast(i);
+    try queueTlsAppRecords(&slot, &payload);
+    var actual: [6 + payload.len * 6]u8 = undefined;
+    try copyTestQueue(&slot.client_queue, &actual);
+    try std.testing.expectEqualStrings("prefix", actual[0..6]);
+    for (payload, 0..) |byte, i| {
+        const offset = 6 + i * 6;
+        try std.testing.expectEqualSlices(u8, &[_]u8{ 0x17, 3, 3, 0, 1 }, actual[offset..][0..5]);
+        try std.testing.expectEqual(byte, actual[offset + 5]);
+    }
+    const too_many = [_][]const u8{""} ** (max_scatter_parts + 1);
+    try std.testing.expectError(error.TooManyParts, queueOrWriteParts(&slot, slot.client_fd, &slot.client_queue, &too_many));
+}
+
+test "scatter EAGAIN queues all parts without charging unsent bytes" {
+    const fds = try relayTestSocketPair();
+    defer _ = std.os.linux.close(fds[0]);
+    defer _ = std.os.linux.close(fds[1]);
+    const fill = [_]u8{0} ** 4096;
+    var blocked = false;
+    for (0..1024) |_| {
+        _ = writeFd(fds[0], &fill) catch |err| {
+            if (err != error.WouldBlock) return err;
+            blocked = true;
+            break;
+        };
+    }
+    try std.testing.expect(blocked);
+    var budget = connection.EventIoBudget{};
+    var slot = ConnectionSlot{ .client_fd = fds[0], .event_io_budget = &budget };
+    slot.client_queue.allocator = std.testing.allocator;
+    defer slot.client_queue.deinit();
+    try std.testing.expect(!try queueOrWriteParts(&slot, fds[0], &slot.client_queue, &.{ "ab", "cd" }));
+    var actual: [4]u8 = undefined;
+    try copyTestQueue(&slot.client_queue, &actual);
+    try std.testing.expectEqualStrings("abcd", &actual);
+    try std.testing.expectEqual(connection.event_io_operation_budget - 1, budget.operations_remaining);
+    try std.testing.expectEqual(event_io_byte_budget, budget.bytes_remaining);
 }
