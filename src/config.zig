@@ -241,7 +241,7 @@ pub const Config = struct {
     /// FakeTLS encrypted certificate AppData size.
     /// 0 keeps the built-in default that matches the static template.
     fake_cert_size: u32 = 0,
-    /// Dynamic Record Sizing: ramp TLS records from 1369→16384 bytes
+    /// Dynamic Record Sizing: ramp S2C FakeTLS records from 1369 to the 16367-byte bulk cap.
     drs: bool = false,
     /// Fast mode: skip S2C encryption by passing client keys to DC directly
     fast_mode: bool = false,

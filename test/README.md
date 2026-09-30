@@ -51,6 +51,10 @@ S2C unit tests check exact multi-record wire bytes, a single budgeted scatter
 write, partial writes at every iovec boundary, ordered fallback, and stack-header
 reuse across batches. Queue tests inject allocation failures during multipart
 reservation and preserve existing data, the byte cap, and managed pool accounting.
+Large-payload tests also cross the 32-record batch boundary with DRS enabled and
+disabled, verify the 16367-byte bulk cap and unchanged warmup, and reconstruct all
+payload bytes through the receiving TLS parser. The cap avoids repeated `0x4000`
+FakeTLS lengths; that length is legal in real TLS 1.3, so this is a sizing heuristic.
 
 `zig build e2e` builds a dedicated non-shipping proxy executable and a small
 obfuscated-handshake generator. The Python harness starts both the real proxy and

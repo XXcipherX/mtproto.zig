@@ -8,6 +8,10 @@ const socket_ops = @import("socket_ops.zig");
 const writeFd = socket_ops.writeFd;
 const writevFd = socket_ops.writevFd;
 const max_scatter_parts: usize = 64;
+// Outbound FakeTLS sizing heuristic: reserve the TLS 1.3 content-type/tag
+// margin (1 + 16 bytes) to avoid repeated bulk 0x4000 records. This is not a
+// TLS legality limit, and FakeTLS does not actually add TLS AEAD overhead.
+const max_faketls_app_payload_size: usize = constants.max_tls_plaintext_size - 17;
 const queue_flush_operation_budget: usize = 8;
 const event_io_byte_budget = connection.event_io_byte_budget;
 const tls_header_len = connection.tls_header_len;
@@ -159,7 +163,7 @@ pub fn queueTlsAppRecords(slot: *ConnectionSlot, payload: []u8) !void {
     var count: usize = 0;
 
     while (off < payload.len) {
-        const chunk_len = @min(payload.len - off, slot.drs.nextRecordSize());
+        const chunk_len = @min(payload.len - off, slot.drs.nextRecordSize(), max_faketls_app_payload_size);
 
         const header = &headers[count / 2];
         header[0] = constants.tls_record_application;
@@ -522,4 +526,59 @@ test "scatter EAGAIN queues all parts without charging unsent bytes" {
     try std.testing.expectEqualStrings("abcd", &actual);
     try std.testing.expectEqual(connection.event_io_operation_budget - 1, budget.operations_remaining);
     try std.testing.expectEqual(event_io_byte_budget, budget.bytes_remaining);
+}
+
+test "bulk FakeTLS records avoid 0x4000 and roundtrip with either DRS policy" {
+    const payload = try std.testing.allocator.alloc(u8, 40 * 16_384 + 137);
+    defer std.testing.allocator.free(payload);
+    for (payload, 0..) |*byte, i| byte.* = @truncate(i * 131 + 17);
+
+    for ([_]bool{ false, true }) |enabled| {
+        var budget = connection.EventIoBudget{ .operations_remaining = 0 };
+        var slot = ConnectionSlot{
+            .phase = .relaying,
+            .event_io_budget = &budget,
+            .drs = connection.DynamicRecordSizer.init(enabled),
+        };
+        slot.client_queue.allocator = std.testing.allocator;
+        defer slot.client_queue.deinit();
+        try queueTlsAppRecords(&slot, payload);
+        const wire = try std.testing.allocator.alloc(u8, slot.client_queue.total_len);
+        defer std.testing.allocator.free(wire);
+        try copyTestQueue(&slot.client_queue, wire);
+
+        var wire_pos: usize = 0;
+        var payload_pos: usize = 0;
+        var records: usize = 0;
+        while (wire_pos < wire.len) {
+            try std.testing.expect(wire.len - wire_pos >= tls_header_len);
+            const header = wire[wire_pos..][0..tls_header_len];
+            try std.testing.expectEqualSlices(u8, &.{ 0x17, 3, 3 }, header[0..3]);
+            const body_len: usize = std.mem.readInt(u16, header[3..5], .big);
+            try std.testing.expect(body_len > 0 and body_len < 0x4000);
+            // DRS still warms up for eight records; only the encoded bulk cap changes.
+            const expected_limit: usize = if (enabled and records < 8) 1369 else 16_367;
+            try std.testing.expectEqual(@min(expected_limit, payload.len - payload_pos), body_len);
+            wire_pos += tls_header_len;
+            try std.testing.expect(wire.len - wire_pos >= body_len);
+            try std.testing.expectEqualSlices(u8, payload[payload_pos..][0..body_len], wire[wire_pos..][0..body_len]);
+            wire_pos += body_len;
+            payload_pos += body_len;
+            records += 1;
+        }
+        try std.testing.expect(records > max_scatter_parts / 2);
+        try std.testing.expectEqual(payload.len, payload_pos);
+        try std.testing.expectEqual(connection.DynamicRecordSizer.full_size, slot.drs.nextRecordSize());
+
+        // Reassemble through the receiving parser as well as checking the wire above.
+        var receiver = ConnectionSlot{ .phase = .relaying };
+        var remaining = wire;
+        payload_pos = 0;
+        while (try nextClientTlsPayload(&receiver, &remaining)) |part| {
+            try std.testing.expectEqualSlices(u8, payload[payload_pos..][0..part.len], part);
+            payload_pos += part.len;
+        }
+        try std.testing.expectEqual(payload.len, payload_pos);
+        try std.testing.expect(clientRelayAtFrameBoundary(&receiver));
+    }
 }

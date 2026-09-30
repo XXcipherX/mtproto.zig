@@ -1222,7 +1222,7 @@ alice = true   # direct where possible; CDN DC203 still requires MiddleProxy
 | `[censorship]` | `desync_split_delay_ms` | `3` | Base delay between the first fake `ServerHello` byte and the remaining bytes |
 | `[censorship]` | `desync_split_jitter_ms` | `2` | Random extra delay in milliseconds added to `desync_split_delay_ms` (`0..N` per connection) |
 | `[censorship]` | `fake_cert_size` | `0` | Fake TLS encrypted-certificate AppData size in bytes. `0` keeps the built-in 2878-byte default; explicit values are clamped to `256..16384` |
-| `[censorship]` | `drs` | `false` | Dynamic Record Sizing: ramp TLS records from 1369→16384 bytes after warmup (mimics Chrome/Firefox) |
+| `[censorship]` | `drs` | `false` | Dynamic Record Sizing: start S2C FakeTLS records at 1369 bytes, then use the 16367-byte bulk cap after 8 records or 128 KiB |
 | `[censorship]` | `fast_mode` | `false` | **Recommended** for direct-path traffic. Delegates S2C AES encryption to Telegram DC and reduces proxy CPU/RAM pressure |
 | `[access.users]` | `<name>` | -- | 32 hex-char secret (16 bytes) per user |
 | `[access.direct_users]` | `<name> = true` | _(none)_ | Optional per-user MiddleProxy bypass. `<name>` must match a user from `[access.users]`; the bypass covers regular and media paths with real direct endpoints, but CDN DC203 always uses its required MiddleProxy. Values `false`/`0`/`no` remove a previous duplicate entry. Alias section: `[access.admins]` |
@@ -1230,6 +1230,8 @@ alice = true   # direct where possible; CDN DC203 still requires MiddleProxy
 </details>
 
 `client_silence_fast_close_sec` and `client_silence_fast_after_idle_sec` were removed in favor of the single bounded `client_silence_close_sec` policy. Remove the legacy keys before upgrading; strict config parsing rejects unknown keys.
+
+Outbound FakeTLS application payloads are capped at 16367 bytes with either DRS policy. The `16384 - 17` cap uses the TLS 1.3 inner content-type and 16-byte tag margin as a sizing heuristic to avoid repeated bulk `0x4000` wire lengths; FakeTLS does not add that AEAD framing. Real TLS 1.3 permits ciphertext length `0x4000`, so this cap is not a protocol requirement or a guarantee against fingerprinting ([RFC 8446 §5.2](https://www.rfc-editor.org/rfc/rfc8446#section-5.2), [RFC 5116 §5.1](https://www.rfc-editor.org/rfc/rfc5116#section-5.1)).
 
 > **Operational note** &nbsp; High-churn mobile networks can produce many normal disconnects (`ConnectionResetByPeer`/`EndOfStream`). In release builds these are logged at debug level to keep production logs signal-focused.
 

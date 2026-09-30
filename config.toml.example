@@ -252,8 +252,8 @@ mask_port = 8443
 # 0 keeps the built-in default (2878). Explicit values are clamped to 256..16384.
 # fake_cert_size = 0
 
-# Dynamic Record Sizing: ramp TLS records from 1369 → 16384 bytes to mimic browser behavior.
-# Improves throughput after initial handshake, may help evade statistical traffic analysis.
+# Dynamic Record Sizing: start S2C FakeTLS records at 1369 bytes, then use the 16367-byte bulk cap.
+# Warmup ends after 8 records or 128 KiB; the encoder caps the full-size DRS request.
 # drs = false
 
 # Delegate S2C AES encryption to the Telegram DC (reduces CPU and memory usage).
