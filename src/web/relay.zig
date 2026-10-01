@@ -59,6 +59,7 @@ const proxy_protocol = @import("proxy_protocol.zig");
 const trusted_peers = @import("trusted_peers.zig");
 
 const capability = @import("capability.zig");
+const credential_index = @import("credential_index.zig");
 const frame = @import("frame.zig");
 const http = @import("http.zig");
 const page = @import("page.zig");
@@ -207,6 +208,13 @@ const UserCapability = struct {
     value: capability.Capability,
     user: []const u8,
 };
+
+fn buildCapabilityIndex(allocator: std.mem.Allocator, io: std.Io, caps: []const UserCapability) !credential_index.PrefixIndex {
+    var index = try credential_index.PrefixIndex.init(io);
+    errdefer index.deinit(allocator);
+    for (caps) |cap| try index.add(allocator, &cap.value);
+    return index;
+}
 
 /// Precompute the bridge capability for every configured user, in both secret encodings
 /// tdesktop accepts for a WEB proxy (`dd…` random-padding, which our links use, and a
@@ -372,6 +380,7 @@ pub const Relay = struct {
     backend_dns: ?*dns_cache.Cache = null,
     backend_dns_id: usize = 0,
     caps: []UserCapability,
+    cap_prefixes: credential_index.PrefixIndex = .{},
     bridge_path: []u8,
     websocket_path: []u8,
     site: public_site.Site = .{},
@@ -408,6 +417,8 @@ pub const Relay = struct {
     pub fn init(allocator: std.mem.Allocator, io: std.Io, opts: Options, cfg: *const config.Config) !Relay {
         const caps = try buildCapabilities(allocator, cfg, opts.domain, opts.base_path);
         errdefer allocator.free(caps);
+        var cap_prefixes = try buildCapabilityIndex(allocator, io, caps);
+        errdefer cap_prefixes.deinit(allocator);
 
         const bridge_path = try prefixedPath(allocator, opts.base_path, "/");
         errdefer allocator.free(bridge_path);
@@ -451,6 +462,7 @@ pub const Relay = struct {
             .backend_dns = cache,
             .backend_dns_id = dns_id,
             .caps = caps,
+            .cap_prefixes = cap_prefixes,
             .bridge_path = bridge_path,
             .websocket_path = websocket_path,
             .site = site,
@@ -492,6 +504,7 @@ pub const Relay = struct {
         closeFd(self.listen_fd);
         closeFd(self.epoll_fd);
         self.allocator.free(self.caps);
+        self.cap_prefixes.deinit(self.allocator);
         self.allocator.free(self.bridge_path);
         self.allocator.free(self.websocket_path);
         self.site.deinit(self.allocator);
@@ -1078,6 +1091,10 @@ pub const Relay = struct {
     }
 
     fn hasPresentedCapability(self: *Relay, request: *const http.Request) bool {
+        return self.hasPresentedCapabilityCounted(request, null);
+    }
+
+    fn hasPresentedCapabilityCounted(self: *Relay, request: *const http.Request, comparisons: ?*usize) bool {
         const q = std.mem.indexOfScalar(u8, request.target, '?') orelse return false;
         var pairs = std.mem.splitScalar(u8, request.target[q + 1 ..], '&');
         var found = false;
@@ -1085,7 +1102,7 @@ pub const Relay = struct {
             const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
             const key = pair[0..eq];
             if (!std.mem.eql(u8, key, "bridge") and !std.mem.eql(u8, key, "b")) continue;
-            if (self.matchCapability(pair[eq + 1 ..]) != null) found = true;
+            if (self.matchCapabilityCounted(pair[eq + 1 ..], comparisons) != null) found = true;
         }
         return found;
     }
@@ -1105,11 +1122,18 @@ pub const Relay = struct {
             "# TYPE mtproto_web_bytes_out_total counter\nmtproto_web_bytes_out_total {d}\n", .{ self.session_count, streams, self.streams_refused, self.accepts_refused, @intFromBool(self.throttled), self.buffered_bytes, self.bytes_out.load(.monotonic) });
     }
 
-    /// Constant-time match of a presented capability against every configured user.
-    /// Iterating the whole set regardless of an early hit keeps the timing flat.
+    /// Unknown 64-bit prefixes never scan the user snapshot. After a prefix hit,
+    /// compare the whole set with the existing constant-time authentication.
     fn matchCapability(self: *Relay, presented: []const u8) ?[]const u8 {
+        return self.matchCapabilityCounted(presented, null);
+    }
+
+    /// Optional counter measures full comparisons in deterministic regressions.
+    fn matchCapabilityCounted(self: *Relay, presented: []const u8, comparisons: ?*usize) ?[]const u8 {
+        if (!self.cap_prefixes.contains(presented)) return null;
         var found: ?[]const u8 = null;
         for (self.caps) |cap| {
+            if (comparisons) |count| count.* += 1;
             if (capability.matches(presented, cap.value)) found = cap.user;
         }
         return found;
@@ -2821,6 +2845,105 @@ test "capabilities cover both accepted secret encodings for every user" {
     try std.testing.expect(saw_path_padded and saw_path_plain);
 }
 
+fn testCapabilityValue(first_eight_bytes: u64, remainder: u8) capability.Capability {
+    var bytes: [32]u8 = undefined;
+    @memset(&bytes, remainder);
+    std.mem.writeInt(u64, bytes[0..8], first_eight_bytes, .big);
+    var value: capability.Capability = undefined;
+    _ = std.base64.url_safe_no_pad.Encoder.encode(&value, &bytes);
+    return value;
+}
+
+test "indexed capabilities retain padded and bare user authentication at root and base path" {
+    const allocator = std.testing.allocator;
+    var cfg = config.Config{
+        .users = std.StringHashMap([16]u8).init(allocator),
+        .direct_users = std.StringHashMap(void).init(allocator),
+    };
+    defer cfg.deinit(allocator);
+    for ([_][]const u8{ "alice", "bob", "carol" }, 0..) |user, i| {
+        const name = try allocator.dupe(u8, user);
+        errdefer allocator.free(name);
+        var secret: [16]u8 = undefined;
+        @memset(&secret, @intCast(i + 1));
+        try cfg.users.put(name, secret);
+    }
+    for ([_][]const u8{ "", "relay/Path_1" }) |base_path| {
+        const caps = try buildCapabilities(allocator, &cfg, "proxy.example.com", base_path);
+        defer allocator.free(caps);
+        var relay = testRelay(allocator, 1024 * 1024);
+        relay.caps = caps;
+        relay.cap_prefixes = try buildCapabilityIndex(allocator, std.testing.io, caps);
+        defer relay.cap_prefixes.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 6), caps.len);
+        for (caps) |cap| {
+            var comparisons: usize = 0;
+            try std.testing.expectEqualStrings(cap.user, relay.matchCapabilityCounted(&cap.value, &comparisons).?);
+            try std.testing.expectEqual(caps.len, comparisons);
+        }
+    }
+}
+
+test "capability prefix collisions require full comparison of the remainder" {
+    const allocator = std.testing.allocator;
+    var caps = [_]UserCapability{
+        .{ .value = testCapabilityValue(0x1234_5678_9abc_def0, 0), .user = "alice" },
+        .{ .value = testCapabilityValue(0x1234_5678_9abc_def0, 0xff), .user = "bob" },
+    };
+    var relay = testRelay(allocator, 1024 * 1024);
+    relay.caps = &caps;
+    relay.cap_prefixes = try buildCapabilityIndex(allocator, std.testing.io, &caps);
+    defer relay.cap_prefixes.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), relay.cap_prefixes.counts.count());
+    for (caps) |cap| try std.testing.expectEqualStrings(cap.user, relay.matchCapability(&cap.value).?);
+    const wrong = testCapabilityValue(0x1234_5678_9abc_def0, 0x71);
+    var comparisons: usize = 0;
+    try std.testing.expect(relay.matchCapabilityCounted(&wrong, &comparisons) == null);
+    try std.testing.expectEqual(caps.len, comparisons);
+}
+
+test "negative capability prefixes perform zero full comparisons for large snapshots and query batches" {
+    const allocator = std.testing.allocator;
+    const missing = [_]u8{'A'} ** capability.capability_len; // decoded prefix zero
+    for ([_]usize{ 1, 100, 1000 }) |users| {
+        const caps = try allocator.alloc(UserCapability, users * 2);
+        defer allocator.free(caps);
+        for (caps, 0..) |*cap, i| cap.* = .{ .value = testCapabilityValue(@intCast(i + 1), 0x71), .user = "user" };
+        var relay = testRelay(allocator, 1024 * 1024);
+        relay.caps = caps;
+        relay.cap_prefixes = try buildCapabilityIndex(allocator, std.testing.io, caps);
+        defer relay.cap_prefixes.deinit(allocator);
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+        relay.allocator = failing.allocator();
+        var comparisons: usize = 0;
+        try std.testing.expect(relay.matchCapabilityCounted(&missing, &comparisons) == null);
+        try std.testing.expect(relay.matchCapabilityCounted(missing[0..42], &comparisons) == null);
+        try std.testing.expectEqual(@as(usize, 0), comparisons);
+
+        var head: [http.max_head_bytes]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&head);
+        try writer.writeAll("GET /public?");
+        for (0..200) |_| try writer.print("b={s}&", .{missing});
+        try writer.print("bridge={s} HTTP/1.1\r\nHost: proxy.example.com\r\n\r\n", .{missing});
+        const request = try http.parse(writer.buffered());
+        try std.testing.expect(!relay.hasPresentedCapabilityCounted(&request, &comparisons));
+        try std.testing.expectEqual(@as(usize, 0), comparisons);
+        try std.testing.expect(!failing.has_induced_failure);
+    }
+}
+
+fn capabilityIndexAllocationTest(allocator: std.mem.Allocator, caps: []const UserCapability) !void {
+    var index = try buildCapabilityIndex(allocator, std.testing.io, caps);
+    defer index.deinit(allocator);
+    for (caps) |cap| try std.testing.expect(index.contains(&cap.value));
+}
+
+test "capability index allocation failures clean up the complete startup snapshot" {
+    var caps: [96]UserCapability = undefined;
+    for (&caps, 0..) |*cap, i| cap.* = .{ .value = testCapabilityValue(@intCast(i + 1), 0), .user = "user" };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, capabilityIndexAllocationTest, .{@as([]const UserCapability, &caps)});
+}
+
 test "genuine capabilities in malformed requests fail closed while random values stay public" {
     const text = "IpJrt3e7sKtzPyoXy6w-Zj6GGEvsvclN66JzQEfPYLA";
     var value: capability.Capability = undefined;
@@ -2828,14 +2951,19 @@ test "genuine capabilities in malformed requests fail closed while random values
     var caps = [_]UserCapability{.{ .value = value, .user = "alice" }};
     var relay = testRelay(std.testing.allocator, 1024 * 1024);
     relay.caps = &caps;
+    relay.cap_prefixes = try buildCapabilityIndex(std.testing.allocator, std.testing.io, &caps);
+    defer relay.cap_prefixes.deinit(std.testing.allocator);
 
     const extra = try http.parse("GET /?bridge=" ++ text ++ "&x=1 HTTP/1.1\r\nHost: relay.example.com\r\n\r\n");
     const alias = try http.parse("GET /?b=" ++ text ++ " HTTP/1.1\r\nHost: relay.example.com\r\n\r\n");
     const wrong_path = try http.parse("GET /public?bridge=" ++ text ++ " HTTP/1.1\r\nHost: relay.example.com\r\n\r\n");
+    const multiple = try http.parse("GET /?bridge=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&bridge=" ++ text ++ "&b=bad HTTP/1.1\r\nHost: relay.example.com\r\n\r\n");
     const random = try http.parse("GET /?bridge=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&x=1 HTTP/1.1\r\nHost: relay.example.com\r\n\r\n");
     try std.testing.expect(relay.hasPresentedCapability(&extra));
     try std.testing.expect(relay.hasPresentedCapability(&alias));
     try std.testing.expect(relay.hasPresentedCapability(&wrong_path));
+    try std.testing.expect(relay.hasPresentedCapability(&multiple));
+    try std.testing.expect(http.bridgeValue(&multiple, "/", "relay.example.com") == null);
     try std.testing.expect(!relay.hasPresentedCapability(&random));
 }
 

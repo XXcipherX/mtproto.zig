@@ -34,6 +34,17 @@ downlink frame validation/splitting, byte/item bounds, `pagehide`, and terminal 
 This is an offline browser-contract check, not a live Telegram connectivity test.
 The existing GitHub CI WEB-bridge step runs it separately from Zig unit tests.
 
+WEB credential lookup unit regressions live in `src/web/credential_index.zig`,
+`src/web/relay.zig` and `src/web/tokens.zig`, reached by the existing `zig build test`
+target. They cover the decoded 64-bit/base64 boundary, genuine padded/bare root and
+path capabilities for several users, shared-prefix collisions, wrong remainders,
+and malformed/multiple bridge queries. Deterministic counters require zero full
+comparisons on misses at 1/100/1000 users and 1/64/4096 tokens; no wall-clock threshold
+is used. Token cases retain expiry, active-fd ownership, retry before WELCOME,
+consumption, capacity reclamation and swap-removal consistency. Allocation-failure
+sweeps exercise capability-index cleanup and transactional token/index growth;
+repeated churn retains live collision references across in-place tombstone cleanup.
+
 `python3 -m unittest discover -s test -p 'test_web_setup_probe.py'` exercises the installer gate against
 local TLS/WSS fixtures. It proves that an ordinary HTTP 200, a wrong subprotocol,
 WELCOME with a dead backend, an untrusted certificate, a wrong `resPQ` nonce and a

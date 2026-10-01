@@ -231,6 +231,26 @@ Trust is fixed from the kernel-reported peer at `accept()`: only loopback plus e
   Host and without forwarding/Origin headers; never publish it through Caddy.
 - WEB capabilities/config are startup snapshots. Restart both processes for access
   changes; relay SIGHUP only reports that a restart is required.
+- WEB credential lookup uses `credential_index.PrefixIndex`, a membership-only
+  `HashMapUnmanaged(u64, usize)` with independently seeded SipHash-2-4 context. Its
+  keys are the first 64 decoded credential bits, not eleven complete base64 symbols.
+  `Relay.init` builds the immutable capability index; the existing `caps` array
+  remains authoritative. Unknown prefixes do zero full comparisons without lookup
+  allocations; every hit retains the complete constant-time scan and user selection.
+  This permits whole-prefix hit/miss timing, never prefix-only authentication.
+- The token Store owns a separate mutable prefix index on the same relay thread.
+  Reference counts preserve prefix collisions. Reserve entry capacity before adding
+  a prefix, then append without failure; expiry and consumed release share
+  `removeEntry`, which removes one reference after `swapRemove`. No entry positions
+  or credential slices are borrowed by either index. Preserve expiry, active fd,
+  failed-upgrade retry and post-WELCOME consumption. Both indices release their maps
+  and erase their ephemeral hash salts at teardown; these salts are not token MAC
+  keys and do not alter wire credentials.
+- Token-prefix deletions bound native-map tombstones: in-place `rehash` after at
+  most `max(1, capacity / 16)` distinct-key removals, or `clearRetainingCapacity` when
+  empty. Maintenance runs only on mutation and allocates nothing; keep collision
+  references and the hash context intact through rehash. Long-running Store churn
+  must not degrade random misses into full-table probes.
 
 ## MiddleProxy Routing and Refresh
 

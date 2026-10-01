@@ -109,6 +109,33 @@ retain those bytes across candidate retries. Never retry an established stream.
 - Legacy `writeAll` assumptions are outdated for this codebase.
 - Avoid owned-slice queue helpers that require later freeing; current queue paths copy into block storage and keep ownership local.
 
+## WEB Credential Lookup
+
+- Keep the authoritative capability/token arrays and full `timing_safe.eql` scans
+  after a prefix hit. The prefilter rejects unknown 64-bit decoded prefixes only;
+  hash membership never authenticates or selects a user. Do not short-circuit the
+  full scan or weaken malformed/multiple-query fail-closed behavior.
+- Eleven base64url characters encode 66 bits. Decode ten complete symbols plus the
+  high four bits of symbol eleven; its low two bits belong to byte nine. Capabilities
+  sharing the first eight decoded bytes must share a key regardless of those bits.
+- `PrefixIndex` uses an owned native hash map with an independently random SipHash
+  key. Lookups accept no allocator. Capability membership is frozen after startup;
+  token membership changes only on the event-loop thread. The hash salt has no wire
+  or persistent signing role. Expected O(1) misses are not a hard worst-case hash
+  probe bound, and known-prefix hits still scan the authoritative array.
+- Native `HashMapUnmanaged` deletions retain tombstones. Keep the bounded, in-place
+  mutation-side rehash/empty-clear policy; otherwise token churn can make misses
+  probe an entire retained table. Its `rehash` context parameter is `anytype`, so
+  pass an explicit `Context` value rather than an anonymous `.key` struct without
+  hash/eql methods. No borrowed map pointer may survive that rehash.
+- Token insertion must reserve array capacity before adding its prefix and use
+  `appendAssumeCapacity` afterwards. Route every expiry/consumed removal through
+  `removeEntry`; one reference is removed even when `swapRemove` moves another token.
+  Shared-prefix counts must survive until the last member disappears. Keep mutation
+  side effects outside `std.debug.assert`, including `removeContext`, so ReleaseFast
+  preserves them. Maintain the collision, comparison-counter and all-allocation-
+  failure regressions when changing ownership or lifecycle.
+
 ## WEB DNS and Child Processes
 
 WEB DNS is separate from the ordinary proxy updater. Its joinable cache worker

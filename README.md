@@ -528,6 +528,12 @@ Without `[web].public_dir`, an ordinary request to the WEB hostname receives the
 
 The permanent HMAC capability authenticates only the exact origin-form bootstrap `GET /?bridge=<capability>` (or `GET /P/?bridge=…` with `[web].base_path = "P"`). Each successful bootstrap mints a random 32-byte, 43-character carrier token valid for about two minutes. The WebSocket then uses the exact path `/api/v1/socket` (or `/P/api/v1/socket`) with no bearer in its URI and sends the token only as `Sec-WebSocket-Protocol: tproxy-v1.<token>`. Tokens are bounded, single-attach credentials: a failed pre-WELCOME carrier may retry, while an adopted carrier consumes its token. Random invalid capabilities behave like ordinary public traffic, but a genuine capability in a malformed/duplicated request fails closed instead of selecting public content. `/P` without the trailing slash is deliberately not redirected.
 
+WEB credential lookup first checks an index of the first 64 decoded bits. Unknown
+prefixes require no full credential comparisons or lookup allocations, with expected
+constant lookup cost even for large user/token sets. A prefix hit still performs the
+complete constant-time comparison scan; colliding prefixes retain every credential.
+Capability derivation, existing links and carrier-token lifecycle remain unchanged.
+
 Base paths follow the official WEB-proxy contract. Empty/omitted `base_path` keeps the frozen v1 HMAC context byte-for-byte. A non-empty path selects v2 and binds the capability to both the normalized hostname and the exact case-sensitive path, so a token minted for the root or another prefix cannot authenticate. Segments must match `[A-Za-z0-9][A-Za-z0-9_-]*`, joined by `/`, with a 128-byte total limit and no leading/trailing slash, escapes, dot segments or empty segments. The link address is `domain%2Fpath`; its secret is unpadded base64url of `0x70 || <complete decoded MTProxy secret>`. The marker makes clients without path parsing reject the new secret type instead of silently accepting an empty/pathless host. Root links retain their existing `dd<secret>` representation.
 
 Requirements:

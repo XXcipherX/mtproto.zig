@@ -131,8 +131,10 @@ pub fn encodeMarkedPaddedSecret(secret: [16]u8) [24]u8 {
 
 /// Constant-time comparison of a presented capability against an expected one.
 ///
-/// Presented capabilities come from an untrusted query string; comparing them in
-/// constant time keeps the relay from leaking a per-user oracle through timing.
+/// After the relay's 64-bit prefix prefilter, retain full comparison of every
+/// configured capability. The prefilter may distinguish whole-prefix hits, but
+/// this comparison must not reveal which remaining byte differed or exit early
+/// on a particular user. A prefix alone never authenticates a request.
 pub fn matches(presented: []const u8, expected: Capability) bool {
     if (presented.len != capability_len) return false;
     return std.crypto.timing_safe.eql([capability_len]u8, presented[0..capability_len].*, expected);
