@@ -337,6 +337,10 @@ curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/in
 
 The script is **idempotent**: it rebuilds from latest source, replaces the binary, and preserves your existing `config.toml`. Host installs keep `config.toml` as `mtproto:mtproto` with mode `0640`; `env.sh` stays root-only (`0600`) and is untouched unless you rerun install with new `CF_TOKEN` / `CF_ZONE` / `IPV6_PREFIX` settings. User secrets and connection links remain unchanged.
 
+Every source install/update sets `/opt/mtproto-proxy` and its proxy binary to
+`root:root`, mode `0755`, so the `mtproto` services can traverse the directory and
+execute the binary even under an inherited `umask 077`.
+
 For a fresh self-domain install, pass `MASK_DOMAIN` as shown below or enter the domain at the installer prompt. Non-interactive bootstrap paths must pass `MASK_DOMAIN` explicitly.
 
 ## Docker image

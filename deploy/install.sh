@@ -251,12 +251,13 @@ ok "Build complete"
 
 # ── Install binary ──────────────────────────────────────────
 info "Installing to $INSTALL_DIR..."
-mkdir -p "$INSTALL_DIR"
+# Normalize existing installs too: the mtproto services need directory traversal
+# and executable access even when the caller inherited umask 077.
+install -d -o root -g root -m 0755 "$INSTALL_DIR"
 if systemctl is-active --quiet "$SERVICE_NAME"; then
     systemctl stop "$SERVICE_NAME"
 fi
-cp zig-out/bin/mtproto-proxy "$INSTALL_DIR/mtproto-proxy"
-chmod +x "$INSTALL_DIR/mtproto-proxy"
+install -o root -g root -m 0755 zig-out/bin/mtproto-proxy "$INSTALL_DIR/mtproto-proxy"
 
 # Keep helper scripts locally for future maintenance/update operations
 cp "$TMPBUILD/deploy"/*.sh "$INSTALL_DIR/"

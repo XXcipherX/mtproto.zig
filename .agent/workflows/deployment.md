@@ -247,6 +247,15 @@ curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/in
 
 The installer is idempotent and preserves `config.toml` on update; existing `env.sh` stays untouched unless install is rerun with fresh `CF_TOKEN` / `CF_ZONE` / `IPV6_PREFIX` settings.
 
+Source install/update explicitly normalizes `/opt/mtproto-proxy` with
+`install -d -o root -g root -m 0755` and installs its binary with the same owner/group
+and mode. Apply this to existing installations as well as fresh ones; `mkdir -p`
+and `chmod +x` alone inherit restrictive umask behavior and can deny access to the
+`mtproto` proxy/WEB services under `umask 077`. Keep this normalization limited to
+the directory and binary: config remains `mtproto:mtproto`/`0640`, and `env.sh`
+remains `root:root`/`0600`. Do not use recursive permission widening or relax umask
+globally to repair executable access.
+
 It builds genuine `ReleaseFast` + native CPU + PIE by default. For hardened
 `ReleaseSafe` + native CPU + PIE, pass the setting through `sudo`:
 
