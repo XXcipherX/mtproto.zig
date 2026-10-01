@@ -110,6 +110,12 @@ errors, reject empty results, and cancel/join a parked producer through Io event
 without sleeps, real DNS requests or resolver-file changes. Existing resolver
 preflight, preset-stop and separate WEB/getent regressions remain in place.
 
+The regression in `src/web/child_process.zig` blocks SIGTERM before initializing
+the Io backend, then requires the child to terminate by that signal. This checks
+GNU `env` signal unblocking through `/usr/bin/gnuenv` on Ubuntu 26.04 and
+`/usr/bin/env` on Debian/Ubuntu 24.04; a normal exit is a failure, even if its
+status encodes SIGTERM.
+
 Zig relay unit tests cover every pair of TCP split positions through multiple
 FakeTLS application records and an intervening CCS, using the real AES-CTR states.
 They also cover one-byte segmentation, malformed headers, and incomplete framing
@@ -190,7 +196,7 @@ ReleaseSafe two-worker variant with ThreadSanitizer instrumentation.
 
 ## Offline full-relay Stress CI
 
-`.github/workflows/stress-ci.yml` is a separate Ubuntu 24.04 job; it is **not**
+`.github/workflows/stress-ci.yml` is a separate Ubuntu 26.04 job; it is **not**
 part of each push/PR test. While this workflow lives only on the validation
 branch, GitHub does not show its `Run workflow` button or run its weekly schedule:
 those triggers require a workflow file on the default branch. The registered
@@ -327,6 +333,8 @@ the amd64-v3 publishing workflow and compiles `hardware_aes_probe.zig` for that
 target. Its compile-time assertion requires Zig's hardware AES backend. This is
 stronger than checking that the CPU-profile text contains `aes`, while keeping the
 generic amd64/arm64 images free to target baseline-compatible CPUs.
+The optimized publishing job runs in parallel with the native generic-image
+matrix. Keep its literal `MTPROTO_CPU` build argument discoverable by this check.
 
 ## Tools
 

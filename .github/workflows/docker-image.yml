@@ -7,10 +7,6 @@ on:
         description: Docker tag to publish
         required: true
         default: latest
-      platforms:
-        description: Target platforms
-        required: true
-        default: linux/amd64,linux/arm64
       zig_version:
         description: Zig version used by the Docker build
         required: true
@@ -38,10 +34,22 @@ permissions:
   contents: read
   packages: write
 
+concurrency:
+  group: docker-image
+  cancel-in-progress: false
+
 jobs:
-  publish:
-    name: Build and push
-    runs-on: ubuntu-latest
+  prepare:
+    name: Prepare image metadata
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    outputs:
+      image_name: ${{ steps.image.outputs.name }}
+      dataplane_safety: ${{ steps.production.outputs.dataplane_safety }}
+      generic_tags: ${{ steps.meta.outputs.tags }}
+      generic_labels: ${{ steps.meta.outputs.labels }}
+      amd64_v3_tags: ${{ steps.meta_amd64_v3.outputs.tags }}
+      amd64_v3_labels: ${{ steps.meta_amd64_v3.outputs.labels }}
 
     steps:
       - name: Checkout
@@ -59,25 +67,13 @@ jobs:
         env:
           PRODUCTION_MODE: ${{ inputs.production_mode }}
         run: |
+          set -euo pipefail
           case "$PRODUCTION_MODE" in
             ReleaseFast) dataplane_safety=false ;;
             ReleaseSafe) dataplane_safety=true ;;
             *) echo "Unsupported production mode: $PRODUCTION_MODE" >&2; exit 1 ;;
           esac
           echo "dataplane_safety=$dataplane_safety" >> "$GITHUB_OUTPUT"
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Login to GHCR
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Docker metadata
         id: meta
@@ -100,50 +96,228 @@ jobs:
             type=raw,value=latest-amd64-v3,enable=${{ inputs.push_latest }}
             type=sha,prefix=sha-,suffix=-amd64-v3
 
-      - name: Build and push generic image
+  build:
+    name: Build generic ${{ matrix.arch }} image
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-26.04
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-26.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push generic image by digest
+        id: build
         uses: docker/build-push-action@v7
         with:
           context: .
-          platforms: ${{ inputs.platforms }}
-          push: true
+          platforms: ${{ matrix.platform }}
           build-args: |
             ZIG_VERSION=${{ inputs.zig_version }}
-            DATAPLANE_SAFETY=${{ steps.production.outputs.dataplane_safety }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=docker-generic
-          cache-to: type=gha,scope=docker-generic,mode=max
+            DATAPLANE_SAFETY=${{ needs.prepare.outputs.dataplane_safety }}
+          outputs: type=image,name=${{ needs.prepare.outputs.image_name }},push-by-digest=true,name-canonical=true,push=true
+          labels: ${{ needs.prepare.outputs.generic_labels }}
+          cache-from: type=gha,scope=docker-generic-${{ matrix.arch }}
+          cache-to: type=gha,scope=docker-generic-${{ matrix.arch }},mode=max
 
-      - name: Build and push amd64-v3 image
-        if: ${{ inputs.publish_amd64_v3 }}
+      - name: Export image digest
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "Invalid image digest: $DIGEST" >&2; exit 1; }
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+
+      - name: Upload image digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: digests-generic-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
+
+  build_amd64_v3:
+    name: Build amd64-v3 image
+    needs: prepare
+    if: ${{ inputs.publish_amd64_v3 }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push amd64-v3 image by digest
+        id: build
         uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64
-          push: true
           build-args: |
             ZIG_VERSION=${{ inputs.zig_version }}
-            DATAPLANE_SAFETY=${{ steps.production.outputs.dataplane_safety }}
+            DATAPLANE_SAFETY=${{ needs.prepare.outputs.dataplane_safety }}
             MTPROTO_CPU=x86_64_v3+aes
-          tags: ${{ steps.meta_amd64_v3.outputs.tags }}
-          labels: ${{ steps.meta_amd64_v3.outputs.labels }}
+          outputs: type=image,name=${{ needs.prepare.outputs.image_name }},push-by-digest=true,name-canonical=true,push=true
+          labels: ${{ needs.prepare.outputs.amd64_v3_labels }}
           cache-from: type=gha,scope=docker-amd64-v3
           cache-to: type=gha,scope=docker-amd64-v3,mode=max
 
+      - name: Export image digest
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "Invalid image digest: $DIGEST" >&2; exit 1; }
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+
+      - name: Upload image digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: digests-amd64-v3
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
+
+  publish:
+    name: Publish image tags
+    needs: [prepare, build, build_amd64_v3]
+    if: >-
+      ${{ !cancelled() && needs.prepare.result == 'success'
+          && needs.build.result == 'success'
+          && (needs.build_amd64_v3.result == 'success'
+              || (!inputs.publish_amd64_v3 && needs.build_amd64_v3.result == 'skipped')) }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Download generic image digests
+        uses: actions/download-artifact@v8
+        with:
+          pattern: digests-generic-*
+          path: ${{ runner.temp }}/digests/generic
+          merge-multiple: true
+
+      - name: Download amd64-v3 image digest
+        if: ${{ inputs.publish_amd64_v3 }}
+        uses: actions/download-artifact@v8
+        with:
+          name: digests-amd64-v3
+          path: ${{ runner.temp }}/digests/amd64-v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify platforms and publish image tags
+        shell: bash
+        env:
+          IMAGE_NAME: ${{ needs.prepare.outputs.image_name }}
+          GENERIC_TAGS: ${{ needs.prepare.outputs.generic_tags }}
+          AMD64_V3_TAGS: ${{ needs.prepare.outputs.amd64_v3_tags }}
+          PUBLISH_AMD64_V3: ${{ inputs.publish_amd64_v3 }}
+        run: |
+          set -euo pipefail
+
+          process_image() {
+            local phase="$1" profile="$2" expected_count="$3" expected_platforms="$4" image_tags="$5"
+            local -a digests=() tags=() sources=() tag_args=()
+            mapfile -t digests < <(find "$RUNNER_TEMP/digests/$profile" -maxdepth 1 -type f -printf '%f\n' | sort)
+            if [ "${#digests[@]}" -ne "$expected_count" ]; then
+              echo "Expected $expected_count $profile digests, found ${#digests[@]}" >&2
+              exit 1
+            fi
+            for digest in "${digests[@]}"; do
+              [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || { echo "Invalid digest: $digest" >&2; exit 1; }
+              sources+=("${IMAGE_NAME}@sha256:${digest}")
+            done
+            mapfile -t tags <<< "$image_tags"
+            for tag in "${tags[@]}"; do
+              if [ -n "$tag" ]; then tag_args+=(--tag "$tag"); fi
+            done
+            [ "${#tag_args[@]}" -gt 0 ] || { echo "No $profile tags were prepared" >&2; exit 1; }
+
+            if [ "$phase" = "verify" ]; then
+              # Attestation manifests are metadata, not runnable platforms.
+              docker buildx imagetools create --dry-run "${sources[@]}" | jq -e --argjson expected "$expected_platforms" '
+                [.manifests[] | select(.annotations["vnd.docker.reference.type"] != "attestation-manifest")
+                  | "\(.platform.os)/\(.platform.architecture)"] | sort == ($expected | sort)
+              ' > /dev/null
+            else
+              docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
+              docker buildx imagetools inspect "${tags[0]}"
+            fi
+          }
+
+          # Validate every requested image before advancing any public tag.
+          for phase in verify publish; do
+            process_image "$phase" generic 2 '["linux/amd64","linux/arm64"]' "$GENERIC_TAGS"
+            if [ "$PUBLISH_AMD64_V3" = "true" ]; then
+              process_image "$phase" amd64-v3 1 '["linux/amd64"]' "$AMD64_V3_TAGS"
+            fi
+          done
+
       - name: Summary
+        shell: bash
         env:
           PRODUCTION_MODE: ${{ inputs.production_mode }}
+          GENERIC_TAGS: ${{ needs.prepare.outputs.generic_tags }}
+          AMD64_V3_TAGS: ${{ needs.prepare.outputs.amd64_v3_tags }}
+          PUBLISH_AMD64_V3: ${{ inputs.publish_amd64_v3 }}
         run: |
+          set -euo pipefail
           {
             echo "Production mode: $PRODUCTION_MODE (PIE enabled for all images)"
             echo ""
             echo "### Published generic image"
             echo ""
-            echo '${{ steps.meta.outputs.tags }}' | sed 's/^/- `/' | sed 's/$/`/'
-            if [ "${{ inputs.publish_amd64_v3 }}" = "true" ]; then
+            echo "Platforms: linux/amd64, linux/arm64 (native runners)"
+            printf '%s\n' "$GENERIC_TAGS" | sed 's/^/- `/' | sed 's/$/`/'
+            if [ "$PUBLISH_AMD64_V3" = "true" ]; then
               echo ""
               echo "### Published amd64-v3 image"
               echo ""
-              echo '${{ steps.meta_amd64_v3.outputs.tags }}' | sed 's/^/- `/' | sed 's/$/`/'
+              printf '%s\n' "$AMD64_V3_TAGS" | sed 's/^/- `/' | sed 's/$/`/'
             fi
           } >> "$GITHUB_STEP_SUMMARY"

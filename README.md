@@ -63,7 +63,7 @@ Connection-capacity methodology and command profiles: `test/README.md`.
 - `SIGINT` and `SIGTERM` use a non-blocking `eventfd`; the async signal handler only writes a notification. In multi-worker mode one control thread reads it and broadcasts to separate worker eventfds, so every sleeping `epoll_wait` wakes. The first signal disables new accepts and drains each worker's active slots for `graceful_shutdown_timeout_sec`; a second signal or each deadline closes remaining slots before all workers are joined and the discovery updater stops.
 - External discovery never delays the listening socket: MiddleProxy metadata/NAT detection and hostname-based masking resolution run in a joinable background worker. Metadata and masking candidates refresh hourly, reachability probes run in cancellable batches of at most four sockets, in-flight DNS/HTTPS/curl work is canceled cooperatively during shutdown, and stalled MiddleProxy handshakes can request an early refresh.
 - Zig 0.16's `main(init).io` owns high-level startup and background file/DNS/HTTPS I/O. The discovery updater and WEB DNS workers borrow it only while their owning process is alive and are joined before shutdown. The proxy relay path deliberately stays on Linux epoll/timerfd/eventfd and its own low-level clock, logging, and thread-local CSPRNG.
-- Native hostname resolution runs its producer with `std.Io.concurrent` while draining the bounded result queue. Allocation failure still drains without more allocations; cancellation joins the producer before releasing borrowed state. Resolver preflight and literal-address handling are retained. WEB's existing bounded Linux getent path remains separate.
+- Native hostname resolution runs its producer with `std.Io.concurrent` while draining the bounded result queue. Allocation failure still drains without more allocations; cancellation joins the producer before releasing borrowed state. Resolver preflight and literal-address handling are retained. WEB's bounded Linux getent path remains separate and requires GNU `env` to unblock inherited signals in the child. Ubuntu 26.04 provides it as `/usr/bin/gnuenv`; Debian and Ubuntu 24.04 use `/usr/bin/env`.
 - Startup keeps capacity policy in `main.zig`; host/cgroup memory detection and the signal/eventfd bridge live in focused runtime modules. This separation does not change `init.io` ownership or shutdown order.
 - FakeTLS validation expects Telegram-style 32-byte ClientHello Session IDs and copies the Session ID into the synthetic ServerHello.
 - Obfuscated-handshake secret trials decrypt only the 16-byte AES block containing the protocol tag and signed DC index. The big-endian CTR counter skips three blocks with wrapping arithmetic; successful traffic ciphers retain their original IVs and the existing four-block client offset.
@@ -274,8 +274,11 @@ and genuine `ReleaseFast` tests and benchmark/soak paths. The benchmark job reco
 FakeTLS validation plus single, inline-four and heap-eight handshake candidate paths
 as downloadable artifacts; these are regression signals, not noisy shared-runner
 pass/fail thresholds. The ARM64 job runs the unit tests, real daemon smoke and a short soak natively on GitHub's official
-`ubuntu-24.04-arm` runner; the existing aarch64 cross-build remains as an
+`ubuntu-26.04-arm` runner; the existing aarch64 cross-build remains as an
 independent portability check.
+All Ubuntu CI jobs use explicit `ubuntu-26.04` or `ubuntu-26.04-arm` runner
+labels. The installer E2E still covers its Debian 12/13 and Ubuntu 24.04/26.04
+container matrix on the Ubuntu 26.04 runner.
 
 The separate Stress CI builds its proxy with `-Doptimize=ReleaseFast stress-tools`,
 matching the default production optimize mode. Debug and ReleaseSafe unit tests,
@@ -410,7 +413,17 @@ The repository includes a manual workflow: **Actions -> Publish Docker image -> 
 Its **Production mode** selector defaults to **ReleaseFast**; choose **ReleaseSafe**
 for the hardened mode. The selection applies equally to the generic multi-platform
 image and optional `amd64-v3` image, and appears in the workflow summary.
-It builds the Dockerfile with Buildx and pushes to GitHub Container Registry:
+The generic image always includes both `linux/amd64` and `linux/arm64`.
+A Buildx matrix builds them in parallel on native `ubuntu-26.04` and
+`ubuntu-26.04-arm` runners, without QEMU. Each architecture has a separate build
+cache and uploads its image to GHCR by digest. The optional `amd64-v3` job runs
+in parallel on `ubuntu-26.04` with its own cache.
+
+After both generic builds and any requested `amd64-v3` build succeed, the publish
+job verifies the digest counts and runnable platforms, then assembles the image
+indexes and applies the existing tags. Disabling `amd64-v3` still publishes the
+generic image. Concurrent publishing runs are serialized to avoid overlapping
+tag updates. The resulting GitHub Container Registry tags are:
 
 ```text
 ghcr.io/<owner>/<repo>:latest

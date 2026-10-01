@@ -14,7 +14,7 @@ This file tracks practical pitfalls and current runtime constraints for `mtproto
 - `src/proxy/proxy.zig` owns orchestration; `connection.zig` owns slot reset/wipe paths, `connection_pool.zig` owns generation tokens, `timeout_policy.zig` calculates deadlines from narrow inputs, and `deadline_queue.zig` owns only heap ordering/index updates. Do not put timerfd policy into the heap or import `EventLoop` from those modules.
 - `middle_proxy_handshake.zig` only prepares KDF keys and outgoing frames. `MiddleProxyTransport` owns nonce/auth framing, CBC/sequence state, and bounded nonblocking frame parsing; the cold slot embeds it until authentication transfers state once to `MiddleProxyContext`. Keep fd/epoll ownership, socket address queries, the versioned-secret lock, deadlines, fallback, and phase transitions in `EventLoop`. The caller must wipe KDF outputs and frame scratch even on fallback/error paths.
 - Production release/deploy builds default to genuine ReleaseFast + PIE (`dataplane_safety=false`). Opt into ReleaseSafe + PIE with `-Ddataplane_safety=true` when requesting ReleaseFast; this also applies to the E2E/stress proxy, while other optimize modes and bench/soak retain their requested mode. Docker, Make and the source installer expose `DATAPLANE_SAFETY=false` by default. Security fuzzing, ThreadSanitizer and Valgrind must retain their explicit ReleaseSafe modes.
-- The Valgrind profile must use a baseline-CPU ReleaseSafe build plus `--max-stackframe=8388608`. Native GitHub CPUs can select SHA-NI instructions unsupported by Ubuntu 24.04's Valgrind 3.22, while the proxy's legitimate multi-MiB initialization frame otherwise looks like a stack switch and creates false invalid-access reports.
+- The Valgrind profile must use a baseline-CPU ReleaseSafe build plus `--max-stackframe=8388608`, including on the Ubuntu 26.04 runner. Baseline keeps the probe independent of Valgrind support for host-specific instructions such as SHA-NI; the proxy's legitimate multi-MiB initialization frame otherwise looks like a stack switch and creates false invalid-access reports.
 - Non-blocking writes are queue-based (`MessageQueue`) and flushed with `writev`.
 - FakeTLS S2C batches up to 32 header/payload pairs in the existing 64-iovec limit. `writevSlotFd` charges the shared event budget; partial or blocked sends copy the exact suffix through atomic `MessageQueue.appendParts`, which reserves all pool/managed blocks before tail mutation. Stack headers must never outlive the batch call; a successfully written kernel prefix cannot be rolled back after allocation failure, so the caller still closes on error.
 - Cap S2C FakeTLS application payloads in the encoder at `max_tls_plaintext_size - 17` (16367), including when DRS is disabled or has ramped to full size. Do not lower shared TLS constants or rewrite the DRS state machine for this heuristic. TLS 1.3 ciphertext length `0x4000` is legal; the cap only removes that repeated FakeTLS bulk length and does not prove traffic indistinguishability.
@@ -141,10 +141,16 @@ retain those bytes across candidate retries. Never retry an established stream.
 WEB DNS is separate from the ordinary proxy updater. Its joinable cache worker
 resolves hostname targets through a bounded NSS child on Linux and publishes
 immutable address snapshots. Literal targets require no worker. The WEB relay
-uses signalfd, so its child-process wrapper must reset inherited TERM/INT/HUP/USR1
-signal handling with `/usr/bin/env --default-signal` before running getent; without
-this, timeout cancellation can hang. Do not remove that wrapper or move DNS work
-into the epoll callbacks. SIGHUP does not reload WEB capabilities: restart both
+uses signalfd, so its child-process wrapper must unblock and reset inherited
+TERM/INT/HUP/USR1 signals with GNU `env --default-signal` before running getent;
+without this, timeout cancellation can hang. Prefer `/usr/bin/gnuenv` on Ubuntu
+26.04: its default Rust `env` resets handlers but leaves the inherited mask
+blocked. Select the path before spawning, falling back to `/usr/bin/env` only
+on `FileNotFound` from its executable-access check, as on Debian and Ubuntu 24.04.
+Do not probe by failed execution: Zig 0.16's POSIX spawn-error path does not close
+the child's stdio pipes or reap it. Preserve the strict child SIGTERM regression
+and never unblock the live parent's signalfd mask. Do not remove that wrapper or
+move DNS work into the epoll callbacks. SIGHUP does not reload WEB capabilities: restart both
 processes after changing shared access settings.
 
 ## MiddleProxy Specific Notes

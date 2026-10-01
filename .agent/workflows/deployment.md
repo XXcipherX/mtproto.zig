@@ -11,6 +11,7 @@ This workflow documents current build and deploy paths as implemented in `Makefi
 - Zig 0.16.0 for local builds
 - SSH access to VPS
 - systemd on target host
+- GNU coreutils `env` for Linux WEB DNS children; use the existing `/usr/bin/gnuenv` on Ubuntu 26.04 or `/usr/bin/env` on Debian/Ubuntu 24.04. The Rust implementation does not unblock the relay's inherited signal mask.
 - Caddy 2.10+ masking enabled when the optional WEB carrier is deployed
 - Ubuntu 24.04 + root access for blocked-region tunnel mode
 - AmneziaWG client config (`.conf`) when using tunnel deploys
@@ -42,6 +43,10 @@ The capacity-probe targets expect the external `/root/benchmarks` layout used by
 ## CI-Parity Validation
 
 Before merging behavior changes, match the GitHub workflow as closely as practical:
+
+All Ubuntu jobs use explicit `ubuntu-26.04` or `ubuntu-26.04-arm` runner labels,
+including Deep CI and Stress CI. The installer E2E's Debian/Ubuntu container
+matrix remains separate from its Ubuntu 26.04 runner selection.
 
 ```bash
 zig fmt --check build.zig src test/hardware_aes_probe.zig
@@ -95,11 +100,11 @@ stop immediately on process/system FD exhaustion, resolve callable churn payload
 inside each connection attempt, and retain the bounded hostname cache for the
 realistic TLS template.
 
-The daemon smoke launches a real localhost proxy, verifies a valid FakeTLS handshake, checks that the same SNI with a bad secret does not receive a valid FakeTLS response, and holds an authenticated connection across `SIGTERM` until the configured graceful-shutdown deadline forces a clean exit. `zig build e2e` goes further: a compile-time test-only loopback DC override drives the real daemon through FakeTLS, the obfuscated MTProto nonce, upstream setup, and C2S/S2C relay without exposing that override in the installed binary. CI repeats that process scenario with `-Doptimize=ReleaseFast` for the default shipping mode and adds `-Ddataplane_safety=true` for the optional hardened `ReleaseSafe` mode. It also builds the hardened production executable and checks its PIE output. CI uses a shorter soak for pull requests and a longer soak on pushes. In addition to the aarch64 cross-build, the official `ubuntu-24.04-arm` runner executes unit tests, this daemon smoke and a short four-worker soak natively so architecture-specific runtime defects cannot hide behind successful cross-compilation.
+The daemon smoke launches a real localhost proxy, verifies a valid FakeTLS handshake, checks that the same SNI with a bad secret does not receive a valid FakeTLS response, and holds an authenticated connection across `SIGTERM` until the configured graceful-shutdown deadline forces a clean exit. `zig build e2e` goes further: a compile-time test-only loopback DC override drives the real daemon through FakeTLS, the obfuscated MTProto nonce, upstream setup, and C2S/S2C relay without exposing that override in the installed binary. CI repeats that process scenario with `-Doptimize=ReleaseFast` for the default shipping mode and adds `-Ddataplane_safety=true` for the optional hardened `ReleaseSafe` mode. It also builds the hardened production executable and checks its PIE output. CI uses a shorter soak for pull requests and a longer soak on pushes. In addition to the aarch64 cross-build, the official `ubuntu-26.04-arm` runner executes unit tests, this daemon smoke and a short four-worker soak natively so architecture-specific runtime defects cannot hide behind successful cross-compilation.
 
 The separate `.github/workflows/deep-ci.yml` workflow runs weekly and through `workflow_dispatch`. Its `-Dtsan=true` option applies ThreadSanitizer only to the `src/main.zig` and `src/bench.zig` test artifacts plus the benchmark executable used by soak; it never instruments the normal production proxy build. Keep `TSAN_OPTIONS=halt_on_error=1:exitcode=66` so a reported race fails the job instead of becoming advisory output.
 
-Deep CI also runs the real ReleaseSafe daemon smoke under Valgrind Memcheck. It deliberately builds with `-Dcpu=baseline`: GitHub hosts can expose SHA-NI while Ubuntu 24.04's Valgrind 3.22 cannot decode `SHA256RNDS2`, so a native-CPU build would die inside Valgrind despite being valid on the host. `--max-stackframe=8388608` classifies the proxy's roughly 3.6 MiB initialization frame as a normal Linux stack frame instead of producing false invalid-access reports. The harness's `--launcher` option consumes the remainder of the command line and must therefore be last; it prepends those arguments without a shell. Memcheck reports every leak category to an artifact and uses `--errors-for-leak-kinds=definite,indirect --error-exitcode=97`, so invalid accesses and actionable leaks fail without treating `possible` or `reachable` runtime allocations as proven project defects. Do not add suppressions without a reproduced and documented toolchain false positive.
+Deep CI also runs the real ReleaseSafe daemon smoke under Valgrind Memcheck. It deliberately builds with `-Dcpu=baseline` so the probe does not depend on Valgrind support for host-specific instructions such as SHA-NI (`SHA256RNDS2`). Keep this profile when updating runner images. `--max-stackframe=8388608` classifies the proxy's roughly 3.6 MiB initialization frame as a normal Linux stack frame instead of producing false invalid-access reports. The harness's `--launcher` option consumes the remainder of the command line and must therefore be last; it prepends those arguments without a shell. Memcheck reports every leak category to an artifact and uses `--errors-for-leak-kinds=definite,indirect --error-exitcode=97`, so invalid accesses and actionable leaks fail without treating `possible` or `reachable` runtime allocations as proven project defects. Do not add suppressions without a reproduced and documented toolchain false positive.
 
 The third Deep CI job runs `bash test/run_fuzz.sh 1M deep-fuzz-artifacts 40m`. The wrapper exists because Zig 0.16 bounded fuzzing can leave `.zig-cache/f/crash` while returning a successful build status. It treats that file or the corresponding crash message as a failure, copies the crash input plus available fuzzer logs into a non-hidden artifact directory, and rejects a pre-existing crash instead of deleting evidence or misattributing it to a later campaign. Keep the inner 40-minute limit below the 50-minute job timeout so the artifact upload step can still run.
 
@@ -116,6 +121,19 @@ to the same multiarch image-index digest. Keep both stages aligned and preserve
 linux/amd64 and linux/arm64 coverage; a single-platform manifest digest would
 break the other architecture. Existing Zig, CPU and production-mode build
 arguments apply to both supported architectures.
+
+`.github/workflows/docker-image.yml` always builds generic `linux/amd64` and
+`linux/arm64` images in a native Ubuntu 26.04 runner matrix, with separate
+`docker-generic-amd64` and `docker-generic-arm64` GHA cache scopes. Its optional
+`amd64-v3` job runs in parallel and retains the `docker-amd64-v3` cache and
+literal `MTPROTO_CPU=x86_64_v3+aes` argument read by `check_hardware_aes.sh`.
+Build jobs push by digest and upload distinct artifacts; only the final job
+applies public tags. Keep its status-function dependency guard: disabling v3
+must allow publishing, while failed or cancelled requested builds must prevent
+it. Verify two generic digests and one requested v3 digest, plus the exact
+runnable platforms (excluding attestation descriptors), before any tag update.
+The workflow-wide concurrency group serializes publishing runs. Preserve
+`zig_version`, production-mode selection, metadata labels and all existing tags.
 
 Dependabot has separate weekly Docker entries: `/` allows only `debian`, while
 `/test/installer-e2e` allows only the digest-pinned `docker:dind` tooling image.
