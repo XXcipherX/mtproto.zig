@@ -18,7 +18,7 @@ ARG ZIG_SHA256=
 ARG MTPROTO_CPU=
 ARG DATAPLANE_SAFETY=false
 
-FROM debian:bookworm-slim AS builder
+FROM debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a AS builder
 ARG ZIG_VERSION
 ARG ZIG_SHA256
 ARG MTPROTO_CPU
@@ -75,7 +75,7 @@ RUN set -eu \
          zig build -Doptimize=ReleaseFast -Ddataplane_safety="$DATAPLANE_SAFETY" -Dtarget="$target"; \
        fi
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl ca-certificates \

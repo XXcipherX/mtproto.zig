@@ -11,6 +11,11 @@ masking, SYN pacing, NFQUEUE loopback exclusions, persisted boot rules, and
 reinstall idempotency.
 GitHub Actions runs the scenario on Debian 12/13 and Ubuntu 24.04/26.04.
 
+The Docker engine, CLI and Compose plugin are copied from the official
+`docker:dind` image pinned by its multiarch image-index digest. Dependabot checks
+this tooling image weekly; host distributions are selected separately by the
+CI matrix or `MTPROTO_INSTALLER_E2E_IMAGE`.
+
 The test uses a local short-lived certificate issuer and a sleeping `nfqws`
 stand-in so it does not depend on public DNS, Let's Encrypt, or a source build
 of zapret. Caddy, the proxy image, Docker Compose, systemd, and iptables remain

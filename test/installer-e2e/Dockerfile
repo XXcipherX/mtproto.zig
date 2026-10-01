@@ -2,7 +2,7 @@ ARG BASE_IMAGE=debian:12
 
 # Reuse the Docker Official Image's static engine/CLI binaries, but exercise all
 # installer logic and package interactions in the distribution named above.
-FROM docker:dind AS docker_dist
+FROM docker:dind@sha256:7dcdfc4a20246236f558175182ccace1eb15a41bd3eb119dd2284f393498b7c1 AS docker_dist
 
 FROM ${BASE_IMAGE}
 
