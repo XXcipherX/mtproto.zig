@@ -1,6 +1,6 @@
 [general]
 # Route regular DC traffic via Telegram MiddleProxy transport.
-# Required when using a promotion tag from @MTProxybot.
+# Enable for promotion tags on regular DC1..5 connections through MiddleProxy.
 use_middle_proxy = true
 
 # This example enables regular MiddleProxy routing explicitly. The parser and
@@ -33,6 +33,7 @@ port = 443
 # middle_proxy_nat_ip = "203.0.113.10"
 
 # 32 hex-char promotion tag from @MTProxybot (enables sponsored channels).
+# Carried only in MiddleProxy RPC_PROXY_REQ; direct DC and fallback omit it.
 # tag = "1234567890abcdef1234567890abcdef"
 
 # TCP listen queue depth. Higher values absorb connection bursts better.
@@ -271,6 +272,7 @@ user2 = "ffeeddccbbaa99887766554433221100"
 
 [access.direct_users]
 # Optional: users that bypass MiddleProxy when a real direct DC path exists.
+# These direct connections omit promotion even if a global tag is configured.
 # CDN DC 203 always uses MiddleProxy because it has no direct endpoint.
 # Useful for admin/service accounts that should always use fast mode.
 # Names here must match keys from [access.users].

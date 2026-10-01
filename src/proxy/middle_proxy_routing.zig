@@ -703,6 +703,51 @@ test "direct users bypass middle-proxy routing except CDN DC 203" {
     try std.testing.expect(net.exactAddressEql(mandatory_cdn_direct_user.candidates[0], mp_dc203));
 }
 
+test "promotion tag preserves direct-user bypass for regular and media DCs except CDN" {
+    const cfg_text =
+        \\[general]
+        \\use_middle_proxy = true
+        \\ad_tag = "1234567890abcdef1234567890abcdef"
+        \\[access.users]
+        \\direct = "00112233445566778899aabbccddeeff"
+        \\regular = "ffeeddccbbaa99887766554433221100"
+        \\[access.direct_users]
+        \\direct = true
+    ;
+    var cfg = try Config.parse(std.testing.allocator, cfg_text);
+    defer cfg.deinit(std.testing.allocator);
+    try std.testing.expect(cfg.tag != null);
+    const bypass = cfg.userBypassesMiddleProxy("direct");
+    try std.testing.expect(bypass);
+    try std.testing.expect(!cfg.userBypassesMiddleProxy("regular"));
+    const mp_dc4 = net.ip4(.{ 11, 11, 11, 11 }, 443);
+    const snapshot = MiddleProxySnapshot{
+        .candidates = [_]net.Address{mp_dc4} ** 16,
+        .candidate_len = 1,
+        .secret_version = 1,
+    };
+    for ([_]i16{ 4, -4 }) |dc_idx| {
+        const direct = buildDcConnectPlan(&cfg, 4, dc_idx, &snapshot, bypass);
+        try std.testing.expect(!direct.use_middle_proxy);
+        try std.testing.expectEqual(@as(usize, 1), direct.count);
+        try std.testing.expect(direct.direct_fallback == null);
+        try std.testing.expect(net.exactAddressEql(direct.candidates[0], constants.getDirectDcAddressV4(4).?));
+        const regular = buildDcConnectPlan(&cfg, 4, dc_idx, &snapshot, false);
+        try std.testing.expect(regular.use_middle_proxy);
+    }
+    cfg.use_middle_proxy = false;
+    cfg.force_media_middle_proxy = false;
+    const cdn_snapshot = MiddleProxySnapshot{
+        .candidates = [_]net.Address{constants.tg_cdn_middle_proxy_v4} ** 16,
+        .candidate_len = 1,
+        .secret_version = 1,
+    };
+    const cdn = buildDcConnectPlan(&cfg, 203, -203, &cdn_snapshot, bypass);
+    try std.testing.expect(cdn.use_middle_proxy);
+    try std.testing.expectEqual(@as(usize, 1), cdn.count);
+    try std.testing.expect(cdn.direct_fallback == null);
+}
+
 test "unknown datacenter indices produce no connect plan" {
     var cfg = Config{
         .users = std.StringHashMap([16]u8).init(std.testing.allocator),

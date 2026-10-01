@@ -58,6 +58,14 @@ succeed. It never contacts Telegram.
 
 ## Real-process relay E2E
 
+The direct nonce regression in `src/proxy/proxy.zig` checks nonce-only output and
+pipelined AES-CTR continuity with and without a promotion tag, for all three
+transport modes, fast mode on/off and signed media DC indices. Slot cleanup runs
+after each case. `src/proxy/middle_proxy_routing.zig` separately covers
+`direct_users` plus a tag, preserving the media bypass and mandatory MiddleProxy
+for CDN DC203. Existing `src/protocol/middleproxy.zig` wire tests verify both the
+tagged `RPC_PROXY_REQ` extension and its absence when no tag is configured.
+
 FakeTLS size regressions authenticate X25519, PQ and combined-share fixtures,
 including exactly 4096 bytes; correctly signed larger inputs are classified
 before authentication. Strict parsing still accepts records up to the existing

@@ -266,6 +266,11 @@ Important behavior:
 - Each MiddleProxy handshake stage has a 5-second deadline. A stalled or malformed endpoint is cooled for 60 seconds, triggers reactive refresh, and falls back directly when possible, except for DC203.
 - `force_media_middle_proxy=true` is the default preference for negative DC1..5 media paths. Disabling it makes those paths direct but never changes DC203 routing.
 - `[access.direct_users]` / `[access.admins]` bypass MiddleProxy for regular and media paths with real direct endpoints. DC203 always uses MiddleProxy.
+- Promotion tags are metadata in MiddleProxy `RPC_PROXY_REQ` only. Direct DC
+  nonce/relay, per-user bypass and direct fallback omit them. Keep direct users
+  eligible when a global tag is configured; do not restore a synthetic promotion
+  RPC or an owned nonce-tail buffer on the direct path. A MiddleProxy media/CDN
+  route carries the same configured tag as a regular MiddleProxy route.
 - `datacenter_override` is test-only and disables MiddleProxy snapshot/updater routing.
 - `server.middle_proxy_nat_ip` can pin the IPv4 used for MiddleProxy NAT/AES derivation. `server.public_ip` is client-facing link metadata and is never assumed to be DC egress. Automatic detection trusts an AWG endpoint only while the proxy runs inside the active tunnel network namespace; direct mode probes the process's public egress instead.
 - `middleproxy_buffer_kb` is a per-direction cap. Each MiddleProxy context starts with 16 KiB C2S/S2C buffers and grows on demand up to `min(middleproxy_buffer_kb, 3840)` KiB; event-loop scratch buffers are lazy and reused. The effective cap reserves 256 KiB for MP/TLS framing before the 4 MiB relay-queue limit.

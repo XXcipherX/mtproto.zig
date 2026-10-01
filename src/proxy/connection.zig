@@ -240,9 +240,6 @@ pub const ConnectionSlot = struct {
     direct_fallback_used: bool = false,
     current_upstream_addr: ?net.Address = null,
 
-    // Pending initial bytes for direct DC path (promotion tag)
-    dc_initial_tail: ?[]u8 = null,
-
     // Relay parsing state (C2S TLS records)
     relay_tls_hdr: [tls_header_len]u8 = undefined,
     relay_tls_hdr_pos: u8 = 0,
@@ -364,9 +361,6 @@ pub const ConnectionSlot = struct {
 
         if (self.mask_prebuffer) |buf| secureFree(allocator, buf);
         self.mask_prebuffer = null;
-
-        if (self.dc_initial_tail) |buf| secureFree(allocator, buf);
-        self.dc_initial_tail = null;
 
         if (self.middle_ctx) |*mp| mp.deinit();
         self.middle_ctx = null;

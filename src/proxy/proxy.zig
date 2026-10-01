@@ -2123,18 +2123,7 @@ const EventLoop = struct {
     }
 
     fn onDcNonceWritable(self: *EventLoop, slot: *ConnectionSlot) void {
-        if (slot.dc_initial_tail) |tail| {
-            if (queueUpstream(slot, tail)) |_| {
-                secureFree(self.state.allocator, tail);
-                slot.dc_initial_tail = null;
-            } else |err| {
-                log.debug("[{d}] dc tail write error: {any}", .{ slot.conn_id, err });
-                self.closeSlot(slot, "dc tail write error");
-                return;
-            }
-        }
-
-        if (!slot.hasUpstreamPending() and slot.dc_initial_tail == null) {
+        if (!slot.hasUpstreamPending()) {
             self.startRelay(slot);
         }
     }
@@ -3128,42 +3117,9 @@ const EventLoop = struct {
             return;
         }
 
-        // Promotion tag (optional), only for primary DC1..5
-        if (self.state.config.tag) |*tag| {
-            const dc_abs: usize = slot.dc_abs;
-            if (dc_abs >= 1 and dc_abs <= constants.tg_datacenters_v4.len and dc_abs != 203) {
-                var promote_buf: [32]u8 = undefined;
-                defer std.crypto.secureZero(u8, &promote_buf);
-                var packet_len: usize = 0;
-
-                const rpc_id: u32 = 0xaeaf0c42;
-                var rpc_payload: [20]u8 = undefined;
-                defer std.crypto.secureZero(u8, &rpc_payload);
-                std.mem.writeInt(u32, rpc_payload[0..4], rpc_id, .little);
-                @memcpy(rpc_payload[4..20], tag);
-
-                switch (params.proto_tag) {
-                    .abridged => {
-                        promote_buf[0] = 5;
-                        @memcpy(promote_buf[1..21], &rpc_payload);
-                        packet_len = 21;
-                    },
-                    .intermediate, .secure => {
-                        std.mem.writeInt(u32, promote_buf[0..4], 20, .little);
-                        @memcpy(promote_buf[4..24], &rpc_payload);
-                        packet_len = 24;
-                    },
-                }
-
-                const tail = self.state.allocator.alloc(u8, packet_len) catch {
-                    self.closeSlot(slot, "alloc promotion tail failed");
-                    return;
-                };
-                @memcpy(tail, promote_buf[0..packet_len]);
-                tg_encryptor.apply(tail);
-                slot.dc_initial_tail = tail;
-            }
-        }
+        // Promotion metadata belongs to MiddleProxy RPC_PROXY_REQ. A direct
+        // stream contains only the nonce followed by the client's MTProto data,
+        // including when a configured tag coexists with a direct-user bypass.
 
         slot.tg_encryptor = tg_encryptor;
         slot.tg_decryptor = crypto.AesCtr.init(&tg_dec_key, tg_dec_iv);
@@ -3834,10 +3790,6 @@ const EventLoop = struct {
             (slot.dc_abs >= 1 and slot.dc_abs <= constants.tg_datacenters_v4.len);
 
         // Reset nonce path state to cleanly re-send direct nonce.
-        if (slot.dc_initial_tail) |tail| {
-            secureFree(self.state.allocator, tail);
-            slot.dc_initial_tail = null;
-        }
         if (slot.tg_encryptor) |*enc| enc.wipe();
         if (slot.tg_decryptor) |*dec| dec.wipe();
         slot.tg_encryptor = null;
@@ -5569,44 +5521,76 @@ test "handshake read yields when the event I/O budget is exhausted" {
     try std.testing.expectEqual(@as(usize, 0), budget.bytes_remaining);
 }
 
-test "immediate direct nonce and promotion tail reach relay without another writable event" {
+test "direct nonce ignores promotion and preserves pipelined cipher continuity" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     var cfg = Config{
         .users = std.StringHashMap([16]u8).init(std.testing.allocator),
         .direct_users = std.StringHashMap(void).init(std.testing.allocator),
-        .tag = [_]u8{0x42} ** 16,
     };
     defer cfg.deinit(std.testing.allocator);
     var state = try ProxyState.init(std.testing.allocator, std.testing.io, cfg);
     defer state.deinit();
     var loop: EventLoop = undefined;
     loop.state = &state;
+    loop.shutting_down = false;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var upstream_file = try tmp.dir.createFile(std.testing.io, "direct-startup", .{ .read = true });
-    defer upstream_file.close(std.testing.io);
+    // The opaque client bytes also exercise a partial AES block. Decode the
+    // emitted stream as a DC would, without relying on the slot's cipher state.
+    const client_payload = "client payload immediately after nonce";
+    for ([_]bool{ false, true }) |with_tag| {
+        state.config.tag = if (with_tag) [_]u8{0x42} ** 16 else null;
+        for ([_]constants.ProtoTag{ .abridged, .intermediate, .secure }) |proto_tag| {
+            for ([_]bool{ false, true }) |fast_mode| {
+                for ([_]i16{ 4, -4 }) |dc_idx| {
+                    for ([_]bool{ false, true }) |with_payload| {
+                        var upstream_file = try tmp.dir.createFile(std.testing.io, "direct-startup", .{ .read = true });
+                        defer upstream_file.close(std.testing.io);
+                        var slot = ConnectionSlot{
+                            .upstream_fd = upstream_file.handle,
+                            .dc_abs = 4,
+                            .proto_tag = proto_tag,
+                            .use_fast_mode = fast_mode,
+                            .is_media_path = dc_idx < 0,
+                            .obf_params = .{
+                                .decrypt_key = [_]u8{0} ** constants.key_len,
+                                .decrypt_iv = 0,
+                                .encrypt_key = [_]u8{0x37} ** constants.key_len,
+                                .encrypt_iv = 0x1234,
+                                .proto_tag = proto_tag,
+                                .dc_idx = dc_idx,
+                            },
+                        };
+                        defer slot.resetOwnedBuffers(std.testing.allocator);
+                        if (with_payload) {
+                            slot.pipelined_data = try std.testing.allocator.dupe(u8, client_payload);
+                            slot.pipelined_len = client_payload.len;
+                        }
 
-    var slot = ConnectionSlot{};
-    defer slot.upstream_queue.deinit();
-    slot.upstream_fd = upstream_file.handle;
-    slot.dc_abs = 4;
-    slot.obf_params = .{
-        .decrypt_key = [_]u8{0} ** constants.key_len,
-        .decrypt_iv = 0,
-        .encrypt_key = [_]u8{0} ** constants.key_len,
-        .encrypt_iv = 0,
-        .proto_tag = .intermediate,
-        .dc_idx = 4,
-    };
-
-    loop.sendDcNonce(&slot);
-    try std.testing.expectEqual(ConnectionPhase.relaying, slot.phase);
-    try std.testing.expect(slot.dc_initial_tail == null);
-    try std.testing.expect(!slot.hasUpstreamPending());
-    try seekFdToStart(upstream_file.handle);
-    var bytes: [89]u8 = undefined;
-    try std.testing.expectEqual(@as(usize, 88), try posix.read(upstream_file.handle, &bytes));
+                        loop.sendDcNonce(&slot);
+                        try std.testing.expectEqual(ConnectionPhase.relaying, slot.phase);
+                        try std.testing.expect(!slot.hasUpstreamPending());
+                        try std.testing.expect(slot.pipelined_data == null);
+                        try seekFdToStart(upstream_file.handle);
+                        var bytes: [constants.handshake_len + client_payload.len + 32]u8 = undefined;
+                        const expected_len = constants.handshake_len + (if (with_payload) client_payload.len else @as(usize, 0));
+                        try std.testing.expectEqual(expected_len, try posix.read(upstream_file.handle, &bytes));
+                        var dc_decryptor = crypto.AesCtr.init(
+                            bytes[constants.skip_len..][0..constants.key_len],
+                            std.mem.readInt(u128, bytes[constants.skip_len + constants.key_len ..][0..constants.iv_len], .big),
+                        );
+                        defer dc_decryptor.wipe();
+                        dc_decryptor.apply(bytes[0..expected_len]);
+                        const proto_bytes = proto_tag.toBytes();
+                        try std.testing.expectEqualSlices(u8, &proto_bytes, bytes[constants.proto_tag_pos..][0..4]);
+                        try std.testing.expectEqual(dc_idx, std.mem.readInt(i16, bytes[constants.dc_idx_pos..][0..2], .little));
+                        try std.testing.expectEqualSlices(u8, if (with_payload) client_payload else "", bytes[constants.handshake_len..expected_len]);
+                    }
+                }
+            }
+        }
+    }
 }
 
 test "multiple client TLS records consume one read operation before queue backpressure" {

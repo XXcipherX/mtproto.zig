@@ -44,7 +44,7 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 | **Fast Mode** | Direct-Path S2C Offload | Reduces CPU usage by delegating S2C AES work to Telegram DCs on direct paths (non-MiddleProxy) |
 | **MiddleProxy** | Telemt-Compatible ME | Optional ME transport for DC1..5 (`use_middle_proxy`); retries candidates after TCP or endpoint-specific protocol failures within the global handshake deadline, applies a 5-second per-stage deadline, cools failed endpoints for 60 seconds, learns from successful TCP/auth latency, and falls back directly only when a real DC endpoint exists (never for CDN DC203) |
 | **Auto Refresh** | Runtime Discovery | Periodically updates regular/media MiddleProxy metadata and re-resolves all masking DNS candidates without delaying listener startup |
-| **Promotion** | Tag Support | Optional promotion tag for sponsored proxy channel registration |
+| **Promotion** | Tag Support | Optional promotion tag for sponsored proxy channel registration, carried only through MiddleProxy `RPC_PROXY_REQ` |
 | **IPv6 Hopping** | DPI Evasion | Rotates IPv6 from a routed /64 and updates Cloudflare AAAA records; installers schedule a hop every 5 minutes, while `--auto` provides foreground ban-detection mode |
 | **Optional TCPMSS=88** | Legacy DPI fallback | Disabled by default; can force tiny ClientHello fragmentation on external traffic when explicitly enabled; loopback is always excluded |
 | **TCP Desync** | DPI Evasion | Integrated `zapret` (`nfqws`) OS-level desynchronization (fake packets + TTL spoofing); NFQUEUE queue-bypass preserves traffic while `nfqws` restarts, and loopback never enters the queue |
@@ -1211,7 +1211,7 @@ alice = true   # direct where possible; CDN DC203 still requires MiddleProxy
 | `[server]` | `graceful_shutdown_timeout_sec` | `15` | Drain deadline after the first SIGINT/SIGTERM (parser lower bound 1). New accepts stop immediately; a second signal or expiry forcibly closes remaining connections |
 | `[server]` | `dc_connect_timeout_sec` | `10` | Per-endpoint TCP connect ceiling for Telegram DC and MiddleProxy candidates. Every attempt is also capped by its share of the remaining global handshake budget, including the final MiddleProxy candidate and reserved direct fallback. `0` disables only the configured ceiling; global budget sharing remains active |
 | `[server]` | `middleproxy_buffer_kb` | `2048` | MiddleProxy per-direction buffer cap in KiB. Active ME connections start with 16 KiB C2S/S2C buffers and grow on demand up to `min(middleproxy_buffer_kb, 3840)` KiB; each event loop also keeps lazy shared scratch buffers. The effective cap leaves 256 KiB for MP/TLS framing inside the 4 MiB relay-queue limit. Default 2048 leaves headroom for 1 MiB media parts; values below 1024 may still cause `MiddleProxyBufferOverflow` on media-heavy traffic (Stories, video messages). Parser lower bound is 64 KiB |
-| `[server]` | `tag` | _(none)_ | Optional 32 hex-char promotion tag from [@MTProxybot](https://t.me/MTProxybot) |
+| `[server]` | `tag` | _(none)_ | Optional 32 hex-char promotion tag from [@MTProxybot](https://t.me/MTProxybot), carried only in MiddleProxy `RPC_PROXY_REQ`. Direct DC connections and direct fallback omit it |
 | `[server]` | `log_level` | `"info"` | Runtime log verbosity: `debug` (authenticated client IPs plus all DC routing, relay, and close details), `info` (default — connection stats, warnings), `warn`, `err`. Change without recompilation; takes effect on restart |
 | `[server]` | `rate_limit_per_subnet` | `30` | Max new connections per second per /24 (IPv4) or /48 (IPv6) subnet. Blocks scanner/DPI-probe flood. Set `0` to disable |
 | `[server]` | `unsafe_override_limits` | `false` | Disable auto-clamping of `max_connections` to the baseline RAM admission ceiling. The shared dynamic-buffer hard limit remains enforced. Use only when the container/service limit as well as host RAM are sufficient |
@@ -1246,7 +1246,7 @@ alice = true   # direct where possible; CDN DC203 still requires MiddleProxy
 | `[censorship]` | `drs` | `false` | Dynamic Record Sizing: start S2C FakeTLS records at 1369 bytes, then use the 16367-byte bulk cap after 8 records or 128 KiB |
 | `[censorship]` | `fast_mode` | `false` | **Recommended** for direct-path traffic. Delegates S2C AES encryption to Telegram DC and reduces proxy CPU/RAM pressure |
 | `[access.users]` | `<name>` | -- | 32 hex-char secret (16 bytes) per user |
-| `[access.direct_users]` | `<name> = true` | _(none)_ | Optional per-user MiddleProxy bypass. `<name>` must match a user from `[access.users]`; the bypass covers regular and media paths with real direct endpoints, but CDN DC203 always uses its required MiddleProxy. Values `false`/`0`/`no` remove a previous duplicate entry. Alias section: `[access.admins]` |
+| `[access.direct_users]` | `<name> = true` | _(none)_ | Optional per-user MiddleProxy bypass. `<name>` must match a user from `[access.users]`; the bypass covers regular and media paths with real direct endpoints, without promotion even if a global tag is configured. CDN DC203 always uses its required MiddleProxy. Values `false`/`0`/`no` remove a previous duplicate entry. Alias section: `[access.admins]` |
 
 </details>
 

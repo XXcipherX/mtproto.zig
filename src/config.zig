@@ -211,6 +211,8 @@ pub const Config = struct {
     /// Zero disables this configured ceiling; the remaining global handshake
     /// budget is still divided across candidates and direct fallback.
     dc_connect_timeout_sec: u32 = 10,
+    /// Promotion metadata for MiddleProxy RPC_PROXY_REQ only. Direct DC paths,
+    /// including per-user bypass and fallback, do not send promotion tags.
     tag: ?[16]u8 = null,
     /// FakeTLS SNI / fronting domain. Since the June-2026 TSPU rollout, the
     /// real masking endpoint for this domain should negotiate X25519MLKEM768
