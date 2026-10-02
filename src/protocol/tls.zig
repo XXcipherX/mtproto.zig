@@ -380,8 +380,8 @@ pub fn buildServerHelloWithTemplateInto(
     if (output.len < template.len) return error.NoSpaceLeft;
     const response = output[0..template.len];
 
-    // 1. Copy the pre-built template (random and session_id are zeroed in template)
-    @memcpy(response, template);
+    // AppData is filled with fresh randomness below; copy only the wire prefix.
+    @memcpy(response[0..server_hello_prefix_len], template[0..server_hello_prefix_len]);
     @memset(response[tmpl_random_offset..][0..32], 0);
 
     // 1b. Echo a client-offered TLS 1.3 cipher when known. Real servers negotiate
@@ -485,7 +485,9 @@ pub fn buildServerHelloPqInto(
     const response_len = pqResponseLen(cert_payload_size);
     if (output.len < response_len) return error.NoSpaceLeft;
     const response = output[0..response_len];
-    @memset(response, 0);
+    // Every other byte is assigned below before hashing. Only server_random
+    // must start at zero for the FakeTLS HMAC construction.
+    @memset(response[tmpl_random_offset..][0..32], 0);
 
     // Record 1: ServerHello with a 0x11ec key_share.
     response[0] = constants.tls_record_handshake;
@@ -1247,6 +1249,29 @@ test "ServerHello into builders preserve allocated wire invariants at every cert
             try std.testing.expectEqualSlices(u8, allocated[0..11], response[0..11]);
             try std.testing.expectEqualSlices(u8, allocated[43..key_start], response[43..key_start]);
             try std.testing.expectEqualSlices(u8, allocated[key_start + key_len .. prefix_len], response[key_start + key_len .. prefix_len]);
+            // Independent legacy wire reference, supplied with this response's
+            // fresh public-key/certificate randomness. Compare every wire byte.
+            var legacy: [max_server_hello_len]u8 = undefined;
+            const expected = legacy[0..response.len];
+            if (pq) {
+                @memset(expected, 0);
+                @memcpy(expected[0..95], template[0..95]);
+                std.mem.writeInt(u16, expected[3..5], 1210, .big);
+                std.mem.writeInt(u24, expected[6..9], 1206, .big);
+                std.mem.writeInt(u16, expected[79..81], 1134, .big);
+                std.mem.writeInt(u16, expected[89..91], 1124, .big);
+                std.mem.writeInt(u16, expected[91..93], 0x11ec, .big);
+                std.mem.writeInt(u16, expected[93..95], 1120, .big);
+                @memcpy(expected[1215..1226], template[127..138]);
+            } else {
+                @memcpy(expected, template);
+            }
+            @memcpy(expected[11..43], response[11..43]);
+            @memcpy(expected[44..76], &sid);
+            std.mem.writeInt(u16, expected[76..78], 0x1303, .big);
+            @memcpy(expected[key_start..][0..key_len], response[key_start..][0..key_len]);
+            @memcpy(expected[prefix_len..], response[prefix_len..]);
+            try std.testing.expectEqualSlices(u8, expected, response);
             try std.testing.expectEqualSlices(u8, &sid, response[tmpl_session_id_offset..][0..32]);
             try std.testing.expectEqual(@as(?usize, cert_size), firstAppDataRecordLen(response));
             try std.testing.expectEqual(@as(u8, 0), response[key_start + key_len - 1] & 0x80);

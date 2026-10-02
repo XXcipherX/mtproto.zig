@@ -64,6 +64,11 @@ The existing 8-byte aggregate-budget fixtures keep testing tight-budget growth.
 The DATA/WINDOW emitter checks retained batch capacity, including spare space
 after clearing its live bytes, and verifies that idle reclamation releases it.
 
+ServerHello builder fixtures compare every emitted byte with an independent
+legacy layout using the response's fresh public randomness, at minimum/default/
+4096/maximum certificate sizes in both X25519 and PQ paths. They also verify the
+full-response HMAC, session echo, framing and untouched poisoned spare storage.
+
 `zig build web-bridge` needs Python 3, Node.js and the configured Zig compiler. It
 runs `web-bridge/render.zig` to render the production bridge and HELLO/WELCOME
 vectors, then passes the actual script to the Node harness. Missing tools fail the
