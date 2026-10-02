@@ -39,6 +39,10 @@ downlink frame validation/splitting, byte/item bounds, `pagehide`, and terminal 
 This is an offline browser-contract check, not a live Telegram connectivity test.
 The existing GitHub CI WEB-bridge step runs it separately from Zig unit tests.
 
+WEB backend diagnostic regressions start read/stall counters just below their
+maximum and exercise both zero-window and carrier-high-water guards twice. Totals
+saturate while the recorded credit and backpressure behavior remain correct.
+
 WEB credential lookup unit regressions live in `src/web/credential_index.zig`,
 `src/web/relay.zig` and `src/web/tokens.zig`, reached by the existing `zig build test`
 target. They cover the decoded 64-bit/base64 boundary, genuine padded/bare root and

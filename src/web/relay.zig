@@ -277,6 +277,7 @@ const Conn = struct {
     /// `s2c=` for the same connection localises a stall to one side of the socket in a
     /// single log line, and the stall counters say which backpressure rule parked it.
     rx_bytes: u64 = 0,
+    /// Lifetime diagnostic totals saturate; they must never affect relay safety.
     rx_passes: u32 = 0,
     stall_window: u32 = 0,
     stall_carrier: u32 = 0,
@@ -1966,17 +1967,17 @@ pub const Relay = struct {
         };
         if (conn.connecting) return;
         const session = stream.session;
-        conn.rx_passes += 1;
+        conn.rx_passes +|= 1;
         if (session.conn.close_after_flush or self.throttled) return;
         conn.last_window = stream.send_window;
         while (true) {
             const budget = @min(@as(usize, stream.send_window), data_frame_size);
             if (budget == 0) {
-                conn.stall_window += 1;
+                conn.stall_window +|= 1;
                 return;
             }
             if (session.conn.out.total_len >= carrier_high_water) {
-                conn.stall_carrier += 1;
+                conn.stall_carrier +|= 1;
                 return;
             }
 
@@ -2003,10 +2004,10 @@ pub const Relay = struct {
             }
 
             if (filled > 0) {
-                conn.rx_bytes += filled;
+                conn.rx_bytes +|= filled;
                 stream.send_window -= @intCast(filled);
-                session.data_frames += 1;
-                session.data_bytes += filled;
+                session.data_frames +|= 1;
+                session.data_bytes +|= filled;
                 // Deliver before acting on EOF: bytes read alongside a graceful close are
                 // still the client's.
                 self.sendFrame(session, .data, stream.id, self.read_buf[0..filled]) catch return;
@@ -2163,6 +2164,38 @@ fn expectQueuedBodylessStatus(conn: *const Conn, status: []const u8) !void {
     try std.testing.expect(std.mem.startsWith(u8, response, prefix));
     try std.testing.expect(std.mem.indexOf(u8, response, "Content-Length: 0\r\n") != null);
     try std.testing.expect(std.mem.endsWith(u8, response, "\r\n\r\n"));
+}
+
+test "backend diagnostic counters saturate without disrupting backpressure" {
+    const allocator = std.testing.allocator;
+    var relay = testRelay(allocator, 4096);
+    var carrier = Conn{ .fd = -1, .kind = .websocket, .peer = net_helpers.ip4(.{ 127, 0, 0, 1 }, 0), .out = .{ .allocator = allocator } };
+    var session = Session{ .conn = &carrier, .user = "alice", .client_addr = null };
+    var stream = Stream{ .id = 1, .session = &session, .send_window = 0 };
+    const max = std.math.maxInt(u32);
+    var backend = Conn{
+        .fd = -1,
+        .kind = .backend,
+        .peer = carrier.peer,
+        .out = .{ .allocator = allocator },
+        .stream = &stream,
+        .rx_passes = max - 1,
+        .stall_window = max - 1,
+        .stall_carrier = max - 1,
+    };
+    relay.onBackendReadable(&backend);
+    relay.onBackendReadable(&backend);
+    try std.testing.expectEqual(@as(u32, max), backend.rx_passes);
+    try std.testing.expectEqual(@as(u32, max), backend.stall_window);
+    try std.testing.expectEqual(@as(u32, 0), backend.last_window);
+
+    stream.send_window = 1;
+    carrier.out.total_len = carrier_high_water;
+    relay.onBackendReadable(&backend);
+    relay.onBackendReadable(&backend);
+    try std.testing.expectEqual(@as(u32, max), backend.stall_carrier);
+    try std.testing.expectEqual(@as(u32, 1), backend.last_window);
+    try std.testing.expectEqual(@as(u32, 1), stream.send_window);
 }
 
 test "aggregate budget includes retained input and fragment capacity" {
