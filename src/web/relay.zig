@@ -750,16 +750,31 @@ pub const Relay = struct {
     fn writePair(self: *Relay, conn: *Conn, first: []const u8, second: []const u8) !bool {
         const total = std.math.add(usize, first.len, second.len) catch return error.BufferBudgetExceeded;
         defer self.accountConn(conn);
-        try self.reserveQueueGrowth(conn, total);
+        if (total == 0) return !conn.connecting;
+        // Preflight the entire possible suffix before emitting any bytes, without
+        // allocating queue metadata for the common fully successful write.
+        const reservation = conn.out.planAppend(total) catch return error.BufferBudgetExceeded;
+        if (!self.canBuffer(reservation.retained_growth)) return error.BufferBudgetExceeded;
         // Until SO_ERROR confirms the connection, keep every byte available for retry.
-        if (conn.connecting) {
+        if (conn.connecting or !conn.out.isEmpty()) {
+            try conn.out.reserveAppend(reservation);
             try conn.out.appendCopy(first);
             try conn.out.appendCopy(second);
             return false;
         }
-        const drained = try queue_io.queueOrWriteMsgPair(conn.fd, &conn.out, first, second, &self.bytes_out, null);
-        if (drained) releaseEmptyQueue(conn);
-        return drained;
+        const written = try queue_io.writeMsgPair(conn.fd, first, second, &self.bytes_out, null);
+        if (written == total) {
+            releaseEmptyQueue(conn);
+            return true;
+        }
+        try self.reserveQueueGrowth(conn, total - written);
+        if (written < first.len) {
+            try conn.out.appendCopy(first[written..]);
+            try conn.out.appendCopy(second);
+        } else {
+            try conn.out.appendCopy(second[written - first.len ..]);
+        }
+        return false;
     }
 
     fn appendInput(self: *Relay, conn: *Conn, data: []const u8, fragmented: bool) !void {
@@ -2260,6 +2275,67 @@ test "aggregate budget charges retained byte-list capacity and rejects growth be
     const capacity = conn.in.capacity;
     try std.testing.expectError(error.BufferBudgetExceeded, relay.appendInput(&conn, "23456789", false));
     try std.testing.expectEqual(capacity, conn.in.capacity);
+}
+
+test "WEB full writes allocate no queue metadata and reject budget before writing" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var fds: [2]posix.fd_t = undefined;
+    const rc = linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0, &fds);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+    defer closeFd(fds[0]);
+    defer closeFd(fds[1]);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var relay = testRelay(failing.allocator(), 64 * 1024);
+    var conn = Conn{ .fd = fds[0], .kind = .backend, .peer = net_helpers.ip4(.{ 127, 0, 0, 1 }, 0), .out = .{ .allocator = failing.allocator() } };
+    defer conn.out.deinit();
+    var received: [16]u8 = undefined;
+    for (0..16) |_| {
+        try std.testing.expect(try relay.writePair(&conn, "head", "payload"));
+        const n = try posix.read(fds[1], &received);
+        try std.testing.expectEqualStrings("headpayload", received[0..n]);
+    }
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 0), relay.buffered_bytes);
+    try std.testing.expectEqual(@as(u64, 16 * 11), relay.bytes_out.load(.monotonic));
+    relay.opts.max_buffer_bytes = 0;
+    try std.testing.expectError(error.BufferBudgetExceeded, relay.writePair(&conn, "head", "payload"));
+    try std.testing.expectError(error.WouldBlock, posix.read(fds[1], &received));
+}
+
+test "WEB partial pair writes retain only an owned ordered suffix" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    for ([_]usize{ 32, 32 * 1024 }) |prefix_len| {
+        var fds: [2]posix.fd_t = undefined;
+        const rc = linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0, &fds);
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+        defer closeFd(fds[0]);
+        defer closeFd(fds[1]);
+        const send_size: c_int = 4096;
+        try posix.setsockopt(fds[0], linux.SOL.SOCKET, linux.SO.SNDBUF, std.mem.asBytes(&send_size));
+        var relay = testRelay(allocator, 256 * 1024);
+        var conn = Conn{ .fd = fds[0], .kind = .backend, .peer = net_helpers.ip4(.{ 127, 0, 0, 1 }, 0), .out = .{ .allocator = allocator } };
+        defer conn.out.deinit();
+        var input: [64 * 1024]u8 = undefined;
+        @memset(input[0..prefix_len], 0x11);
+        @memset(input[prefix_len..], 0x22);
+        try std.testing.expect(!try relay.writePair(&conn, input[0..prefix_len], input[prefix_len..]));
+        const written: usize = @intCast(relay.bytes_out.load(.monotonic));
+        try std.testing.expect(written > 0 and written < input.len);
+        try std.testing.expectEqual(input.len - written, conn.out.total_len);
+        @memset(&input, 0xaa); // The unsent suffix must not borrow this storage.
+        var iovecs: [64]posix.iovec_const = undefined;
+        const count = conn.out.prepareIovecs(&iovecs);
+        var offset = written;
+        for (iovecs[0..count]) |iov| {
+            for (iov.base[0..iov.len]) |byte| {
+                try std.testing.expectEqual(@as(u8, if (offset < prefix_len) 0x11 else 0x22), byte);
+                offset += 1;
+            }
+        }
+        try std.testing.expectEqual(input.len, offset);
+        try std.testing.expectEqual(conn.out.retainedBytes(), relay.buffered_bytes);
+    }
 }
 
 test "aggregate budget charges retained message queue blocks and reserves before growth" {

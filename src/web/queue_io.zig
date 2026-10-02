@@ -70,6 +70,35 @@ pub fn queueOrWriteMsg(
     return false;
 }
 
+/// A zero result means WouldBlock (or empty input); the caller owns the suffix.
+pub fn writeMsgPair(
+    fd: posix.fd_t,
+    first: []const u8,
+    second: []const u8,
+    counter: *std.atomic.Value(u64),
+    user_counter: ?*std.atomic.Value(u64),
+) !usize {
+    var iovecs: [2]posix.iovec_const = undefined;
+    var n_iov: usize = 0;
+    if (first.len > 0) {
+        iovecs[n_iov] = .{ .base = first.ptr, .len = first.len };
+        n_iov += 1;
+    }
+    if (second.len > 0) {
+        iovecs[n_iov] = .{ .base = second.ptr, .len = second.len };
+        n_iov += 1;
+    }
+    if (n_iov == 0) return 0;
+    const n = writevFd(fd, iovecs[0..n_iov]) catch |err| {
+        if (err == error.WouldBlock) return 0;
+        return err;
+    };
+    if (n == 0) return error.ConnectionReset;
+    noteTraffic(counter, n);
+    noteTrafficOptional(user_counter, n);
+    return n;
+}
+
 pub fn queueOrWriteMsgPair(
     fd: posix.fd_t,
     queue: *MessageQueue,
@@ -81,30 +110,8 @@ pub fn queueOrWriteMsgPair(
     if (first.len == 0 and second.len == 0) return true;
 
     if (queue.isEmpty()) {
-        var iovecs: [2]posix.iovec_const = undefined;
-        var n_iov: usize = 0;
-        if (first.len > 0) {
-            iovecs[n_iov] = .{ .base = first.ptr, .len = first.len };
-            n_iov += 1;
-        }
-        if (second.len > 0) {
-            iovecs[n_iov] = .{ .base = second.ptr, .len = second.len };
-            n_iov += 1;
-        }
-
         const total_len = first.len + second.len;
-        const n = writevFd(fd, iovecs[0..n_iov]) catch |err| {
-            if (err == error.WouldBlock) {
-                try queue.appendCopy(first);
-                try queue.appendCopy(second);
-                return false;
-            }
-            return err;
-        };
-
-        if (n == 0) return error.ConnectionReset;
-        noteTraffic(counter, n);
-        noteTrafficOptional(user_counter, n);
+        const n = try writeMsgPair(fd, first, second, counter, user_counter);
         if (n == total_len) return true;
 
         if (n < first.len) {

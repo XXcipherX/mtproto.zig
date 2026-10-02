@@ -30,6 +30,12 @@ MTPROTO_INSTALLER_E2E_IMAGE=debian:12 test/installer-e2e/run.sh
 
 ## WEB bridge contract
 
+WEB output regressions use real nonblocking sockets to require zero queue
+allocations for fully accepted pairs, reject insufficient budget before any
+bytes are written, and verify ordered owned suffixes across partial header and
+payload writes after source storage is overwritten. Connecting-backend retry
+and retained-capacity regressions remain in place.
+
 `zig build web-bridge` needs Python 3, Node.js and the configured Zig compiler. It
 runs `web-bridge/render.zig` to render the production bridge and HELLO/WELCOME
 vectors, then passes the actual script to the Node harness. Missing tools fail the
