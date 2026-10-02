@@ -47,6 +47,11 @@ alive while reclaiming only the required cached queue pages. It checks normal
 cache reuse, zeroed recycled payloads, exact accounting and a failed replacement
 growth that leaves the original bytes owned and unchanged.
 
+MiddleProxy reachability regressions reserve an unlistened loopback TCP port,
+reject every candidate, and bound poll calls by candidate count instead of a
+wall-clock threshold. Preset cancellation issues no poll; deterministic deadline
+checks retain the correct remaining wait after an early wakeup.
+
 `zig build web-bridge` needs Python 3, Node.js and the configured Zig compiler. It
 runs `web-bridge/render.zig` to render the production bridge and HELLO/WELCOME
 vectors, then passes the actual script to the Node harness. Missing tools fail the

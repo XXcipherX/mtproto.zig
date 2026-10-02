@@ -5,6 +5,7 @@ const net = @import("../net_helpers.zig");
 const constants = @import("../protocol/constants.zig");
 const Config = @import("../config.zig").Config;
 const runtime_sync = @import("../runtime/sync.zig");
+const runtime_time = @import("../runtime/time.zig");
 const socketConnectSucceeded = @import("socket_ops.zig").socketConnectSucceeded;
 
 pub const DcConnectPlan = struct {
@@ -502,6 +503,12 @@ pub fn trySelectReachableMiddleProxy(
     return null;
 }
 
+threadlocal var probe_polls_for_test: usize = 0;
+
+fn probeWaitMs(deadline_ms: i64, now_ms: i64) i32 {
+    return @intCast(@min(@max(deadline_ms -| now_ms, 0), 100));
+}
+
 fn trySelectReachableMiddleProxyBatch(
     candidates: []const net.Address,
     timeout_ms: i32,
@@ -536,15 +543,20 @@ fn trySelectReachableMiddleProxyBatch(
     }
     if (count == 0) return null;
 
-    var remaining_ms = @max(timeout_ms, 0);
+    const deadline_ms = runtime_time.monotonicMilli() +| @as(i64, @max(timeout_ms, 0));
+    var pending = count;
     while (true) {
         if (stop) |flag| if (flag.load(.acquire)) return null;
-        const chunk_ms = @min(remaining_ms, 100);
+        const chunk_ms = probeWaitMs(deadline_ms, runtime_time.monotonicMilli());
         for (fds[0..count]) |*poll_fd| poll_fd.revents = 0;
+        if (builtin.is_test) probe_polls_for_test += 1;
         const poll_rc = linux.poll(&fds, count, chunk_ms);
         const ready = switch (linux.errno(poll_rc)) {
             .SUCCESS => poll_rc,
-            .INTR => continue,
+            .INTR => {
+                if (runtime_time.monotonicMilli() >= deadline_ms) return null;
+                continue;
+            },
             else => return null,
         };
 
@@ -554,10 +566,10 @@ fn trySelectReachableMiddleProxyBatch(
                 if (socketConnectSucceeded(poll_fd.fd)) return addr;
                 _ = linux.close(poll_fd.fd);
                 poll_fd.fd = -1;
+                pending -= 1;
             }
         }
-        if (remaining_ms <= chunk_ms) return null;
-        remaining_ms -= chunk_ms;
+        if (pending == 0 or runtime_time.monotonicMilli() >= deadline_ms) return null;
     }
 }
 
@@ -575,6 +587,37 @@ fn parseMiddleProxyAddressForDc(config_text: []const u8, target_dc: i16) ?net.Ad
     const n = parseMiddleProxyAddressesForDc(config_text, target_dc, sign, &one);
     if (n == 0) return null;
     return one[0];
+}
+
+test "MiddleProxy probe waits use elapsed deadline time" {
+    try std.testing.expectEqual(@as(i32, 100), probeWaitMs(1_100, 1_000));
+    try std.testing.expectEqual(@as(i32, 90), probeWaitMs(1_100, 1_010));
+    try std.testing.expectEqual(@as(i32, 1), probeWaitMs(1_100, 1_099));
+    try std.testing.expectEqual(@as(i32, 0), probeWaitMs(1_100, 1_100));
+    try std.testing.expectEqual(@as(i32, 0), probeWaitMs(1_100, 1_101));
+}
+
+test "MiddleProxy probes stop polling after all sockets fail" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const fd = try net.socketTcpNonblocking(net.ip4(.{ 127, 0, 0, 1 }, 0));
+    defer _ = linux.close(fd);
+    // Reserve a loopback TCP port without listening: connects must be refused,
+    // and another process cannot claim it while this fixture is alive.
+    const address = std.posix.sockaddr.in{
+        .family = linux.AF.INET,
+        .port = 0,
+        .addr = @bitCast([_]u8{ 127, 0, 0, 1 }),
+        .zero = [_]u8{0} ** 8,
+    };
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.bind(fd, @ptrCast(&address), @sizeOf(@TypeOf(address)))));
+    const target = try net.localAddress(fd);
+    probe_polls_for_test = 0;
+    try std.testing.expect(trySelectReachableMiddleProxy(&.{ target, target, target, target }, 5_000, null) == null);
+    try std.testing.expect(probe_polls_for_test <= 4);
+    var stop = std.atomic.Value(bool).init(true);
+    probe_polls_for_test = 0;
+    try std.testing.expect(trySelectReachableMiddleProxy(&.{target}, 5_000, &stop) == null);
+    try std.testing.expectEqual(@as(usize, 0), probe_polls_for_test);
 }
 
 test "parse middle proxy address for dc203" {
