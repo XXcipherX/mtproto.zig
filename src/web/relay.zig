@@ -715,12 +715,20 @@ pub const Relay = struct {
         return extra <= self.opts.max_buffer_bytes -| self.buffered_bytes;
     }
 
-    fn reserveByteList(self: *Relay, list: *std.ArrayList(u8), additional: usize) !void {
+    fn reserveByteList(self: *Relay, list: *std.ArrayList(u8), additional: usize, capacity_limit: usize) !void {
         const needed = std.math.add(usize, list.items.len, additional) catch return error.BufferBudgetExceeded;
+        if (needed > capacity_limit) return error.BufferBudgetExceeded;
         if (needed <= list.capacity) return;
-        const growth = needed - list.capacity;
-        if (!self.canBuffer(growth)) return error.BufferBudgetExceeded;
-        try list.ensureTotalCapacityPrecise(self.allocator, needed);
+        if (!self.canBuffer(needed - list.capacity)) return error.BufferBudgetExceeded;
+        // 1.5x growth for small lists; no more than one read of spare capacity.
+        const step = @min(@max(list.capacity / 2, 256), read_buf_size);
+        const preferred = @min(capacity_limit, @max(needed, list.capacity +| step));
+        const target = if (self.canBuffer(preferred - list.capacity)) preferred else needed;
+        list.ensureTotalCapacityPrecise(self.allocator, target) catch |err| {
+            if (target == needed) return err;
+            // Optional slack must not turn an otherwise possible allocation into OOM.
+            try list.ensureTotalCapacityPrecise(self.allocator, needed);
+        };
     }
 
     fn reserveQueueGrowth(self: *Relay, conn: *Conn, additional: usize) !void {
@@ -780,7 +788,13 @@ pub const Relay = struct {
     fn appendInput(self: *Relay, conn: *Conn, data: []const u8, fragmented: bool) !void {
         defer self.accountConn(conn);
         const buffer = if (fragmented) &conn.msg else &conn.in;
-        try self.reserveByteList(buffer, data.len);
+        const capacity_limit = if (fragmented)
+            ws.max_message
+        else if (conn.kind == .http)
+            http.max_head_bytes + read_buf_size
+        else
+            ws.max_message + ws.max_server_header + 4 + read_buf_size;
+        try self.reserveByteList(buffer, data.len, capacity_limit);
         buffer.appendSliceAssumeCapacity(data);
     }
 
@@ -1735,7 +1749,7 @@ pub const Relay = struct {
             }
             var relay_header: [frame.header_size]u8 = undefined;
             frame.writeHeader(&relay_header, kind, stream_id, @intCast(payload.len));
-            self.reserveByteList(&conn.batch, relay_header.len + payload.len) catch {
+            self.reserveByteList(&conn.batch, relay_header.len + payload.len, ws.max_message) catch {
                 self.closeConn(conn, "out of memory");
                 return error.CarrierClosed;
             };
@@ -2249,6 +2263,38 @@ test "backend diagnostic counters saturate without disrupting backpressure" {
     try std.testing.expectEqual(@as(u32, 1), stream.send_window);
 }
 
+test "WEB byte lists amortize small appends and charge chosen capacity" {
+    var counting = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    const allocator = counting.allocator();
+    var relay = testRelay(allocator, 4 * 1024 * 1024);
+    var conn = Conn{ .fd = -1, .kind = .websocket, .peer = net_helpers.ip4(.{ 127, 0, 0, 1 }, 0), .out = .{ .allocator = allocator } };
+    defer conn.msg.deinit(allocator);
+    for (0..64 * 1024) |_| try relay.appendInput(&conn, "x", true);
+    try std.testing.expect(counting.allocations < 32);
+    try std.testing.expectEqual(conn.msg.capacity, relay.buffered_bytes);
+    try std.testing.expect(conn.msg.capacity <= conn.msg.items.len + read_buf_size);
+    for (conn.msg.items) |byte| try std.testing.expectEqual(@as(u8, 'x'), byte);
+    const capacity = conn.msg.capacity;
+    try std.testing.expectError(error.BufferBudgetExceeded, relay.reserveByteList(&conn.msg, ws.max_message, ws.max_message));
+    try std.testing.expectEqual(capacity, conn.msg.capacity);
+}
+
+test "WEB optional byte-list slack falls back to exact growth on allocator pressure" {
+    var storage: [4096]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    const allocator = fixed.allocator();
+    var relay = testRelay(allocator, 16 * 1024);
+    var conn = Conn{ .fd = -1, .kind = .websocket, .peer = net_helpers.ip4(.{ 127, 0, 0, 1 }, 0), .out = .{ .allocator = allocator } };
+    defer conn.msg.deinit(allocator);
+    const first = [_]u8{0xa5} ** 3000;
+    try relay.appendInput(&conn, &first, true);
+    try relay.appendInput(&conn, &([_]u8{0x5a} ** 100), true);
+    try std.testing.expectEqual(@as(usize, 3100), conn.msg.capacity);
+    try std.testing.expectEqual(conn.msg.capacity, relay.buffered_bytes);
+    try std.testing.expectEqualSlices(u8, &first, conn.msg.items[0..3000]);
+    for (conn.msg.items[3000..]) |byte| try std.testing.expectEqual(@as(u8, 0x5a), byte);
+}
+
 test "aggregate budget includes retained input and fragment capacity" {
     const allocator = std.testing.allocator;
     var relay = testRelay(allocator, 8);
@@ -2576,10 +2622,18 @@ test "production emitter batches exact DATA and WINDOW bytes and refuses condemn
     try std.testing.expectEqualSlices(u8, &.{ 2, 0, 0, 7, 0, 0, 0, 3, 'a', 'b', 'c', 4, 0, 0, 7, 0, 0, 0, 4, 0, 0, 16, 0 }, conn.batch.items);
     try std.testing.expectEqual(@as(usize, 2), conn.batch_frames);
     try std.testing.expectEqual(@as(usize, 1), relay.batch_fds.items.len);
-    try std.testing.expectEqual(conn.batch.items.len, relay.buffered_bytes);
+    try std.testing.expect(conn.batch.capacity > conn.batch.items.len);
+    try std.testing.expectEqual(conn.batch.capacity, conn.accounted_bytes);
+    try std.testing.expectEqual(conn.accounted_bytes, relay.buffered_bytes);
     conn.close_after_flush = true;
     try std.testing.expectError(error.CarrierClosed, relay.sendFrame(&session, .data, 7, "ignored"));
     try std.testing.expectEqual(@as(usize, 2), conn.batch_frames);
+    conn.batch.clearRetainingCapacity();
+    relay.accountConn(&conn);
+    try std.testing.expectEqual(conn.batch.capacity, relay.buffered_bytes);
+    relay.reclaimIdleBuffers(&conn, true);
+    try std.testing.expectEqual(@as(usize, 0), conn.batch.capacity);
+    try std.testing.expectEqual(@as(usize, 0), relay.buffered_bytes);
 }
 
 test "backend credit excludes PROXY header debt and grants only drained client bytes" {

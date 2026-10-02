@@ -57,6 +57,13 @@ queued response and incomplete-head continuation, stop at Connection: close,
 and exercise authenticated upgrade with complete and partial WebSocket bytes
 already following its head. Upgrade runs one HTTP and one WebSocket compaction.
 
+WEB byte-list regressions force remap failure and count fewer than 32 allocations
+for 65536 single-byte fragment appends, check copied bytes and retained capacity,
+and exercise exact-size fallback when geometric slack exceeds a fixed allocator.
+The existing 8-byte aggregate-budget fixtures keep testing tight-budget growth.
+The DATA/WINDOW emitter checks retained batch capacity, including spare space
+after clearing its live bytes, and verifies that idle reclamation releases it.
+
 `zig build web-bridge` needs Python 3, Node.js and the configured Zig compiler. It
 runs `web-bridge/render.zig` to render the production bridge and HELLO/WELCOME
 vectors, then passes the actual script to the Node harness. Missing tools fail the
