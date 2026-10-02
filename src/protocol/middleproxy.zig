@@ -157,6 +157,7 @@ pub const MiddleProxyContext = struct {
     s2c_buf: []u8,
     s2c_len: usize = 0,
     s2c_decrypted_len: usize = 0,
+    s2c_small_drains: u8 = 0,
     /// Set only while parsing an RPC_PROXY_ANS frame so relay error logs can
     /// include the advisory flags without exposing payload or secret data.
     diagnostic_proxy_ans_flags: ?u32 = null,
@@ -168,6 +169,7 @@ pub const MiddleProxyContext = struct {
     // For C2S fragment parsing
     c2s_buf: []u8,
     c2s_len: usize = 0,
+    c2s_small_drains: u8 = 0,
 
     buffer_limit: usize,
 
@@ -175,6 +177,8 @@ pub const MiddleProxyContext = struct {
     pub const initial_stream_buffer_size: usize =
         limits.middle_proxy_initial_stream_buffer_bytes;
     pub const shrink_stream_buffer_threshold: usize = initial_stream_buffer_size * 4;
+    pub const retained_stream_buffer_limit: usize = initial_stream_buffer_size * 8;
+    const small_drains_before_shrink: u8 = 16;
     pub const max_stream_buffer_size: usize = limits.middle_proxy_stream_buffer_cap_bytes;
     pub const min_client_payload_size: usize = 20;
     const C2sPayloadInfo = struct {
@@ -290,6 +294,7 @@ pub const MiddleProxyContext = struct {
     }
 
     fn ensureC2sCapacity(self: *MiddleProxyContext, min_capacity: usize) !void {
+        if (min_capacity > initial_stream_buffer_size) self.c2s_small_drains = 0;
         if (self.c2s_buf.len >= min_capacity) return;
         const next_capacity = nextBufferCapacity(self.c2s_buf.len, min_capacity, self.buffer_limit);
         const next = try self.allocator.alloc(u8, next_capacity);
@@ -299,6 +304,7 @@ pub const MiddleProxyContext = struct {
     }
 
     fn ensureS2cCapacity(self: *MiddleProxyContext, min_capacity: usize) !void {
+        if (min_capacity > initial_stream_buffer_size) self.s2c_small_drains = 0;
         if (self.s2c_buf.len >= min_capacity) return;
         const next_capacity = nextBufferCapacity(self.s2c_buf.len, min_capacity, self.buffer_limit);
         const next = try self.allocator.alloc(u8, next_capacity);
@@ -315,17 +321,31 @@ pub const MiddleProxyContext = struct {
         return self.s2c_len == 0 and self.s2c_decrypted_len == 0;
     }
 
-    fn shrinkC2sIfIdle(self: *MiddleProxyContext) void {
+    fn shouldShrink(capacity: usize, small_pass: bool, small_drains: *u8) bool {
+        if (capacity <= shrink_stream_buffer_threshold or !small_pass) {
+            small_drains.* = 0;
+        } else {
+            small_drains.* +|= 1;
+        }
+        if (capacity > retained_stream_buffer_limit or small_drains.* >= small_drains_before_shrink) {
+            // Back off another full small-traffic interval if the optional alloc fails.
+            small_drains.* = 0;
+            return true;
+        }
+        return false;
+    }
+
+    fn shrinkC2sIfIdle(self: *MiddleProxyContext, small_pass: bool) void {
         if (self.c2s_len != 0) return;
-        if (self.c2s_buf.len <= shrink_stream_buffer_threshold) return;
+        if (!shouldShrink(self.c2s_buf.len, small_pass, &self.c2s_small_drains)) return;
         const next = self.allocator.alloc(u8, initial_stream_buffer_size) catch return;
         secureFree(self.allocator, self.c2s_buf);
         self.c2s_buf = next;
     }
 
-    fn shrinkS2cIfIdle(self: *MiddleProxyContext) void {
+    fn shrinkS2cIfIdle(self: *MiddleProxyContext, small_pass: bool) void {
         if (self.s2c_len != 0) return;
-        if (self.s2c_buf.len <= shrink_stream_buffer_threshold) return;
+        if (!shouldShrink(self.s2c_buf.len, small_pass, &self.s2c_small_drains)) return;
         const next = self.allocator.alloc(u8, initial_stream_buffer_size) catch return;
         secureFree(self.allocator, self.s2c_buf);
         self.s2c_buf = next;
@@ -473,7 +493,7 @@ pub const MiddleProxyContext = struct {
                 std.mem.copyForwards(u8, self.c2s_buf[0..remaining], self.c2s_buf[pos..self.c2s_len]);
             }
             self.c2s_len = remaining;
-            self.shrinkC2sIfIdle();
+            self.shrinkC2sIfIdle(total_input_len <= initial_stream_buffer_size);
         }
 
         return out_buf[0..total_written];
@@ -742,7 +762,7 @@ pub const MiddleProxyContext = struct {
             }
             self.s2c_len = remaining;
             self.s2c_decrypted_len -= parse_pos;
-            self.shrinkS2cIfIdle();
+            self.shrinkS2cIfIdle(total_input_len <= initial_stream_buffer_size);
         }
 
         return out_buf[0..out_pos];
@@ -1701,11 +1721,12 @@ test "encapsulate c2s supports payloads larger than 64KiB" {
 
 test "middle proxy context grows c2s buffer on demand within configured cap" {
     const allocator = std.testing.allocator;
+    var counting = std.testing.FailingAllocator.init(allocator, .{});
     const key = [_]u8{0} ** 32;
     const iv = [_]u8{0} ** 16;
 
     var ctx = try MiddleProxyContext.initWithBuffer(
-        allocator,
+        counting.allocator(),
         crypto.AesCbc.init(&key, &iv),
         crypto.AesCbc.init(&key, &iv),
         [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 },
@@ -1714,7 +1735,7 @@ test "middle proxy context grows c2s buffer on demand within configured cap" {
         net.ip4(.{ 91, 105, 192, 110 }, 443),
         .intermediate,
         null,
-        128 * 1024,
+        256 * 1024,
     );
     defer ctx.deinit();
 
@@ -1730,9 +1751,44 @@ test "middle proxy context grows c2s buffer on demand within configured cap" {
     const out_buf = try allocator.alloc(u8, required);
     defer allocator.free(out_buf);
 
-    const out = try ctx.encapsulateC2S(packet, out_buf);
-    try std.testing.expect(out.len > payload_len);
-    try std.testing.expectEqual(@as(usize, 0), ctx.c2s_len);
+    var decoder = crypto.AesCbc.init(&key, &iv);
+    for (0..2) |i| {
+        const out = try ctx.encapsulateC2S(packet, out_buf);
+        try std.testing.expect(out.len > payload_len);
+        try std.testing.expectEqual(@as(usize, 0), ctx.c2s_len);
+        try std.testing.expectEqual(MiddleProxyContext.retained_stream_buffer_limit, ctx.c2s_buf.len);
+        try std.testing.expectEqual(@as(usize, 3), counting.allocations); // two initial buffers + one growth
+        try decoder.decryptInPlace(out_buf[0..out.len]);
+        const frame_len = std.mem.readInt(u32, out_buf[0..4], .little);
+        try std.testing.expectEqual(@as(i32, -2) + @as(i32, @intCast(i)), std.mem.readInt(i32, out_buf[4..8], .little));
+        try std.testing.expectEqual(crc32(out_buf[0 .. frame_len - 4]), std.mem.readInt(u32, out_buf[frame_len - 4 ..][0..4], .little));
+        try std.testing.expectEqualSlices(u8, packet[4..], out_buf[64..][0..payload_len]);
+    }
+    var small: [24]u8 = [_]u8{0x42} ** 24;
+    std.mem.writeInt(u32, small[0..4], 20, .little);
+    for (0..MiddleProxyContext.small_drains_before_shrink - 1) |_| {
+        _ = try ctx.encapsulateC2S(&small, out_buf);
+        try std.testing.expectEqual(MiddleProxyContext.retained_stream_buffer_limit, ctx.c2s_buf.len);
+    }
+    const retained = ctx.c2s_buf.ptr;
+    counting.fail_index = counting.alloc_index;
+    _ = try ctx.encapsulateC2S(&small, out_buf); // optional shrink fails, relay output still succeeds
+    try std.testing.expect(counting.has_induced_failure);
+    try std.testing.expectEqual(retained, ctx.c2s_buf.ptr);
+    try std.testing.expect(ctx.c2sAtFrameBoundary());
+    counting.has_induced_failure = false;
+    _ = try ctx.encapsulateC2S(&small, out_buf);
+    try std.testing.expect(!counting.has_induced_failure); // no immediate retry churn
+    counting.fail_index = std.math.maxInt(usize);
+    for (0..MiddleProxyContext.small_drains_before_shrink - 1) |_| _ = try ctx.encapsulateC2S(&small, out_buf);
+    try std.testing.expectEqual(MiddleProxyContext.initial_stream_buffer_size, ctx.c2s_buf.len);
+
+    // A larger burst must not turn into an indefinitely retained multi-megabyte cache.
+    const larger = try allocator.alloc(u8, 4 + 192 * 1024);
+    defer allocator.free(larger);
+    std.mem.writeInt(u32, larger[0..4], 192 * 1024, .little);
+    @memset(larger[4..], 0x42);
+    _ = try ctx.encapsulateC2S(larger, out_buf);
     try std.testing.expectEqual(MiddleProxyContext.initial_stream_buffer_size, ctx.c2s_buf.len);
 }
 
@@ -1766,11 +1822,12 @@ test "middle proxy context still enforces configured c2s cap" {
 
 test "middle proxy context grows s2c buffer on demand within configured cap" {
     const allocator = std.testing.allocator;
+    var counting = std.testing.FailingAllocator.init(allocator, .{});
     const key = [_]u8{0} ** 32;
     const iv = [_]u8{0} ** 16;
 
     var ctx = try MiddleProxyContext.initWithBuffer(
-        allocator,
+        counting.allocator(),
         crypto.AesCbc.init(&key, &iv),
         crypto.AesCbc.init(&key, &iv),
         [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 },
@@ -1805,6 +1862,10 @@ test "middle proxy context grows s2c buffer on demand within configured cap" {
         std.mem.writeInt(u32, plain[pad_off..][0..4], 4, .little);
     }
 
+    const second_plain = try allocator.dupe(u8, plain);
+    defer allocator.free(second_plain);
+    std.mem.writeInt(i32, second_plain[4..8], 1, .little);
+    std.mem.writeInt(u32, second_plain[total_len - 4 ..][0..4], crc32(second_plain[0 .. total_len - 4]), .little);
     var enc = crypto.AesCbc.init(&key, &iv);
     try enc.encryptInPlace(plain);
 
@@ -1822,7 +1883,24 @@ test "middle proxy context grows s2c buffer on demand within configured cap" {
     try std.testing.expectEqual(@as(usize, 0), ctx.s2c_len);
     try std.testing.expectEqual(@as(usize, 0), ctx.s2c_decrypted_len);
     try std.testing.expect(ctx.s2cAtFrameBoundary());
+    try std.testing.expectEqual(MiddleProxyContext.retained_stream_buffer_limit, ctx.s2c_buf.len);
+    try std.testing.expectEqual(@as(usize, 3), counting.allocations);
+    try enc.encryptInPlace(second_plain);
+    const second = try ctx.decapsulateS2C(second_plain, out_buf);
+    try std.testing.expectEqual(@as(usize, 4 + conn_data_len), second.len);
+    for (second[4..]) |byte| try std.testing.expectEqual(@as(u8, 0x5a), byte);
+    try std.testing.expectEqual(@as(usize, 3), counting.allocations);
+    for (0..MiddleProxyContext.small_drains_before_shrink) |i| {
+        var noop: [16]u8 = undefined;
+        for (0..4) |j| std.mem.writeInt(u32, noop[j * 4 ..][0..4], 4, .little);
+        try enc.encryptInPlace(&noop);
+        try std.testing.expectEqual(@as(usize, 0), (try ctx.decapsulateS2C(&noop, out_buf)).len);
+        if (i + 1 < MiddleProxyContext.small_drains_before_shrink) {
+            try std.testing.expectEqual(MiddleProxyContext.retained_stream_buffer_limit, ctx.s2c_buf.len);
+        }
+    }
     try std.testing.expectEqual(MiddleProxyContext.initial_stream_buffer_size, ctx.s2c_buf.len);
+    try std.testing.expect(ctx.s2cAtFrameBoundary());
 }
 
 test "middle proxy KDF rejects inputs beyond its fixed buffer" {

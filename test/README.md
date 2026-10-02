@@ -52,6 +52,11 @@ reject every candidate, and bound poll calls by candidate count instead of a
 wall-clock threshold. Preset cancellation issues no poll; deterministic deadline
 checks retain the correct remaining wait after an early wakeup.
 
+MiddleProxy buffer regressions send two consecutive 96 KiB messages in each
+direction and count one buffer-growth allocation. They verify CBC/sequence/CRC
+continuity, eventual shrink after 16 small passes, optional-shrink OOM ownership
+and retry backoff, and immediate reclamation for a burst above the retained cap.
+
 HTTP pipeline regressions count one compaction for 128 requests, check every
 queued response and incomplete-head continuation, stop at Connection: close,
 and exercise authenticated upgrade with complete and partial WebSocket bytes

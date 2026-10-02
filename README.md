@@ -1307,6 +1307,14 @@ and new storage. The cache remains available when allocations fit the budget.
 
 > **Operational note** &nbsp; Relay reads drain available 32 KiB chunks within one epoll dispatch until blocked, backpressured or stopped by a phase/EOF change. Reads and writes share a 256 KiB and 64-operation budget per dispatch, including pending-output flushes, so a busy connection yields to other ready connections. Ordinary IN and graceful RDHUP use the same handlers; epoll remains level-triggered for the next dispatch.
 
+MiddleProxy retains empty buffers between 64 and 128 KiB during a burst, avoiding
+repeated grow/shrink allocations for consecutive large messages. Sixteen completed
+passes with at most 16 KiB of buffered input shrink that direction to 16 KiB; large
+or accumulating input resets the count. Empty buffers above 128 KiB shrink immediately.
+Silent burst connections may retain 128 KiB per direction until further traffic or
+teardown. Retained storage stays charged to the worker budget; optional shrink OOM
+keeps the existing buffer and does not interrupt relay output.
+
 > **Operational note** &nbsp; The proxy limits new connections to 30/sec per /24 subnet by default (`rate_limit_per_subnet`). Native IPv6 keys retain all 48 prefix bits, while IPv4-mapped IPv6 shares the native IPv4 `/24` key. This blocks ТСПУ scanners and DPI replay probes without affecting legitimate Telegram clients.
 
 > **Operational note** &nbsp; Self-domain masking expects DNS `A proxy.example.com -> <VPS_IP>`, Cloudflare DNS-only mode if used, public TCP `80` for Let's Encrypt, public TCP `443` for `mtproto-proxy`, and local Caddy TLS on `127.0.0.1:8443` returning `404` for non-proxy requests. Docker Compose installs serve that local Caddy endpoint from the `mtproto-mask-caddy` container; source installs serve it from `mtproto-mask-caddy.service`. `setup_masking.sh` serves ACME HTTP-01 on `:80` and configures Caddy with `x25519mlkem768 x25519` curves. The `ee` link secret changes when `tls_domain` changes, so regenerate client links after changing the domain.
