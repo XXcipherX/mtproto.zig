@@ -49,7 +49,7 @@ pub fn upstreamConnectDeadlineMs(
 ) i64 {
     const candidates = slot.upstreamCandidates();
     var candidate_count = if (candidates.len > 0) blk: {
-        const next_index = @min(@as(usize, @intCast(slot.upstream_candidate_next)), candidates.len);
+        const next_index = @min(slot.upstream_candidate_next, candidates.len);
         break :blk candidates.len - next_index + 1;
     } else 1;
     if (slot.use_middle_proxy and !slot.direct_fallback_used and slot.direct_fallback_addr != null) {

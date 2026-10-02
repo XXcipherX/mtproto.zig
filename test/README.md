@@ -115,6 +115,11 @@ errors, reject empty results, and cancel/join a parked producer through Io event
 without sleeps, real DNS requests or resolver-file changes. Existing resolver
 preflight, preset-stop and separate WEB/getent regressions remain in place.
 
+Candidate traversal regressions retain all 255/256/257 snapshot addresses in order,
+then check repeated exhaustion and empty replacement. Mask retries use an iterative
+path bounded by the snapshot and original handshake deadline, without retrying
+local socket/epoll resource failures.
+
 The regression in `src/web/child_process.zig` blocks SIGTERM before initializing
 the Io backend, then requires the child to terminate by that signal. This checks
 GNU `env` signal unblocking through `/usr/bin/gnuenv` on Ubuntu 26.04 and

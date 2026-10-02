@@ -235,7 +235,7 @@ pub const ConnectionSlot = struct {
     upstream_candidates_inline: [upstream_candidates_inline_cap]net.Address = undefined,
     upstream_candidates_heap: ?[]net.Address = null,
     upstream_candidate_count: usize = 0,
-    upstream_candidate_next: u8 = 0,
+    upstream_candidate_next: usize = 0,
     direct_fallback_addr: ?net.Address = null,
     direct_fallback_used: bool = false,
     current_upstream_addr: ?net.Address = null,
@@ -460,6 +460,14 @@ pub const ConnectionSlot = struct {
         self.upstream_candidate_next = 0;
     }
 
+    pub fn takeNextUpstreamCandidate(self: *ConnectionSlot) ?net.Address {
+        const candidates = self.upstreamCandidates();
+        if (self.upstream_candidate_next >= candidates.len) return null;
+        const candidate = candidates[self.upstream_candidate_next];
+        self.upstream_candidate_next += 1;
+        return candidate;
+    }
+
     pub fn setUpstreamCandidates(
         self: *ConnectionSlot,
         allocator: std.mem.Allocator,
@@ -597,6 +605,27 @@ test "connection slot stores common candidate sets inline" {
 
     try slot.setUpstreamCandidates(std.testing.allocator, &.{});
     try std.testing.expectEqual(@as(usize, 0), slot.upstreamCandidates().len);
+}
+
+test "candidate traversal preserves order across 255 256 and 257 addresses" {
+    var candidates: [257]net.Address = undefined;
+    for (&candidates, 0..) |*candidate, index| {
+        candidate.* = net.ip4(.{ 192, 0, 2, 1 }, @intCast(1000 + index));
+    }
+    var slot = ConnectionSlot{};
+    defer slot.clearUpstreamCandidates(std.testing.allocator);
+    for ([_]usize{ 255, 256, 257 }) |count| {
+        try slot.setUpstreamCandidates(std.testing.allocator, candidates[0..count]);
+        for (candidates[0..count]) |expected| {
+            const actual = slot.takeNextUpstreamCandidate() orelse return error.TestUnexpectedResult;
+            try std.testing.expect(net.exactAddressEql(expected, actual));
+        }
+        try std.testing.expect(slot.takeNextUpstreamCandidate() == null);
+        try std.testing.expect(slot.takeNextUpstreamCandidate() == null);
+        try std.testing.expectEqual(count, slot.upstream_candidate_next);
+    }
+    slot.clearUpstreamCandidates(std.testing.allocator);
+    try std.testing.expect(slot.takeNextUpstreamCandidate() == null);
 }
 
 test "DRS disabled skips ramp and uses full TLS record size" {

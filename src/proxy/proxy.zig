@@ -2968,10 +2968,8 @@ const EventLoop = struct {
             now_ms - slot.first_byte_at_ms < secondsToMs(self.state.config.handshake_timeout_sec);
         if (!has_time) return false;
 
-        if (slot.upstream_candidate_next < candidates.len) {
-            const next_idx = slot.upstream_candidate_next;
-            const next_addr = candidates[next_idx];
-            slot.upstream_candidate_next += 1;
+        if (slot.takeNextUpstreamCandidate()) |next_addr| {
+            const next_idx = slot.upstream_candidate_next - 1;
             self.startConnectUpstream(slot, next_addr, .dc) catch |next_err| {
                 log.warn("[{d}] dc connect candidate {d}/{d} failed immediately: {any}", .{
                     slot.conn_id,
@@ -3039,27 +3037,37 @@ const EventLoop = struct {
 
     fn tryNextMaskEndpoint(self: *EventLoop, slot: *ConnectionSlot, err: anyerror, attempt_addr: ?net.Address) bool {
         const candidates = slot.upstreamCandidates();
-        if (candidates.len == 0) return false;
-        if (slot.upstream_candidate_next >= candidates.len) return false;
+        var previous_err = err;
+        var previous_addr = attempt_addr;
+        // DNS snapshots can exceed 255 entries. Immediate failures must not
+        // turn a large candidate list into recursive stack growth.
+        while (true) {
+            if (previous_err == error.OutOfMemory or previous_err == error.SystemResources or
+                previous_err == error.ProcessFdQuotaExceeded or previous_err == error.SystemFdQuotaExceeded)
+                return false;
+            if (slot.first_byte_at_ms != 0 and
+                runtime_time.monotonicMilli() - slot.first_byte_at_ms >= secondsToMs(self.state.config.handshake_timeout_sec))
+                return false;
+            const next_addr = slot.takeNextUpstreamCandidate() orelse return false;
+            const next_index = slot.upstream_candidate_next;
+            self.startConnectUpstream(slot, next_addr, .mask) catch |next_err| {
+                previous_err = next_err;
+                previous_addr = next_addr;
+                continue;
+            };
 
-        const next_idx = slot.upstream_candidate_next;
-        const next_addr = candidates[next_idx];
-        slot.upstream_candidate_next += 1;
-        self.startConnectUpstream(slot, next_addr, .mask) catch |next_err| {
-            return self.tryNextMaskEndpoint(slot, next_err, next_addr);
-        };
-
-        if (attempt_addr) |addr| {
-            var prev_buf: [64]u8 = undefined;
-            log.debug("[{d}] mask connect failed ({any}), retry candidate {d}/{d} after {s}", .{
-                slot.conn_id,
-                err,
-                next_idx + 1,
-                candidates.len,
-                formatAddress(addr, &prev_buf),
-            });
+            if (previous_addr) |addr| {
+                var prev_buf: [64]u8 = undefined;
+                log.debug("[{d}] mask connect failed ({any}), retry candidate {d}/{d} after {s}", .{
+                    slot.conn_id,
+                    previous_err,
+                    next_index,
+                    candidates.len,
+                    formatAddress(addr, &prev_buf),
+                });
+            }
+            return true;
         }
-        return true;
     }
 
     fn sendDcNonce(self: *EventLoop, slot: *ConnectionSlot) void {

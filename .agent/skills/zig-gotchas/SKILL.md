@@ -51,6 +51,7 @@ Do not reintroduce thread-per-connection or blocking relay loops.
 - `releaseHandshakeOnly()` and `resetOwnedBuffers()` live with `ConnectionSlot`; do not copy a slot to move it between modules or lengthen secret lifetime while editing the event loop. `message_queue.zig` retains the exact one-page block invariant and size ceilings guard the embedded slot/queue/wedge structures.
 - Avoid hidden allocations inside event callbacks when possible.
 - Keep one-to-four DC/mask candidates in `ConnectionSlot` inline storage. Candidate replacement must free only an owned heap fallback, preserve allocation-failure cleanup, and continue supporting bounded larger DNS sets.
+- Candidate count and cursor are `usize`; use the slot's checked traversal helper, including exhaustion. Native masking snapshots have no 255-address cap. Mask retries iterate after immediate failures, stop on local resource failures, and respect the original handshake deadline.
 
 ## Socket and I/O Realities
 
