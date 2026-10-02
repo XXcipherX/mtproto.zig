@@ -36,6 +36,12 @@ bytes are written, and verify ordered owned suffixes across partial header and
 payload writes after source storage is overwritten. Connecting-backend retry
 and retained-capacity regressions remain in place.
 
+WEB queue coverage checks minimum-page block layout, block counts for 1 MiB,
+tail packing, partial consumption and bounded recycling. On targets with a
+4 KiB minimum page and 64-bit `usize`, each block carries 4088 bytes, so 1 MiB
+needs 257 blocks instead of the former 512; these are layout counts, not an RSS
+benchmark. Larger runtime pages can still round allocations further.
+
 `zig build web-bridge` needs Python 3, Node.js and the configured Zig compiler. It
 runs `web-bridge/render.zig` to render the production bridge and HELLO/WELCOME
 vectors, then passes the actual script to the Node harness. Missing tools fail the

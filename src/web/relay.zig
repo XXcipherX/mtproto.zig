@@ -2340,16 +2340,16 @@ test "WEB partial pair writes retain only an owned ordered suffix" {
 
 test "aggregate budget charges retained message queue blocks and reserves before growth" {
     const allocator = std.testing.allocator;
-    var relay = testRelay(allocator, 4096);
+    var relay = testRelay(allocator, 2 * message_queue.block_allocation_bytes);
     var conn = Conn{ .fd = -1, .kind = .backend, .peer = net_helpers.ip4(.{ 127, 0, 0, 1 }, 0), .out = .{ .allocator = allocator }, .connecting = true };
     defer conn.out.deinit();
     _ = try relay.writePair(&conn, "x", "");
-    try std.testing.expect(relay.buffered_bytes >= 2056);
+    try std.testing.expect(relay.buffered_bytes >= message_queue.block_allocation_bytes);
     try conn.out.consume(1);
     relay.accountConn(&conn);
-    try std.testing.expect(relay.buffered_bytes >= 2056);
+    try std.testing.expect(relay.buffered_bytes >= message_queue.block_allocation_bytes);
 
-    var tight = testRelay(allocator, 2055);
+    var tight = testRelay(allocator, message_queue.block_allocation_bytes - 1);
     var rejected = Conn{ .fd = -1, .kind = .backend, .peer = conn.peer, .out = .{ .allocator = allocator }, .connecting = true };
     defer rejected.out.deinit();
     try std.testing.expectError(error.BufferBudgetExceeded, tight.writePair(&rejected, "x", ""));
@@ -2751,8 +2751,8 @@ test "backend retry freezes candidates and preserves queued bytes while retiring
         .signal_fd = -1,
         .old_sigmask = undefined,
     };
-    // A queued byte owns a complete 2 KiB message block plus queue indices.
-    relay.opts.max_buffer_bytes = 4096;
+    // A queued byte owns a complete minimum-page block plus queue indices.
+    relay.opts.max_buffer_bytes = 2 * message_queue.block_allocation_bytes;
     defer closeFd(relay.epoll_fd);
     defer relay.conns.deinit(allocator);
     defer relay.pending_close.deinit(allocator);

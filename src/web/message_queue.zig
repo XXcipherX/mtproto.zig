@@ -1,14 +1,20 @@
 const std = @import("std");
 const posix = std.posix;
 
-const msg_block_size: usize = 2048;
+const msg_block_size: usize = std.heap.page_size_min - @sizeOf(usize);
 // Retain one complete 32 KiB relay read to avoid churn under backpressure.
-const msg_free_cap_per_queue: usize = 16;
+const msg_free_cap_per_queue: usize = (32 * 1024 + msg_block_size - 1) / msg_block_size;
 
 const MsgBlock = struct {
     len: usize,
     data: [msg_block_size]u8,
 };
+
+comptime {
+    if (@sizeOf(MsgBlock) != std.heap.page_size_min) {
+        @compileError("WEB MsgBlock must occupy exactly one minimum target page");
+    }
+}
 
 pub const block_payload_bytes: usize = msg_block_size;
 pub const block_allocation_bytes: usize = @sizeOf(MsgBlock);
@@ -250,4 +256,32 @@ test "message queue owns retained-allocation accounting policy" {
 
     try std.testing.expectEqual(reservation.retained_growth, q.retainedBytes());
     try std.testing.expectEqual(retained_free_blocks, q.free.capacity);
+}
+
+test "WEB queue packs minimum pages and preserves partial consumption and recycling" {
+    const allocator = std.testing.allocator;
+    const data = try allocator.alloc(u8, 1024 * 1024);
+    defer allocator.free(data);
+    @memset(data, 0x5a);
+    var q = MessageQueue{ .allocator = allocator };
+    defer q.deinit();
+    const reservation = try q.planAppend(data.len);
+    try q.reserveAppend(reservation);
+    try q.appendCopy(data[0 .. block_payload_bytes - 1]);
+    try q.appendCopy(data[block_payload_bytes - 1 ..]);
+    const blocks = (data.len + block_payload_bytes - 1) / block_payload_bytes;
+    try std.testing.expectEqual(std.heap.page_size_min, block_allocation_bytes);
+    try std.testing.expectEqual(blocks, q.blocks.items.len);
+    try std.testing.expectEqual(reservation.retained_growth, q.retainedBytes());
+    try q.consume(block_payload_bytes - 1);
+    var iovecs: [2]posix.iovec_const = undefined;
+    _ = q.prepareIovecs(&iovecs);
+    try std.testing.expectEqual(@as(usize, 1), iovecs[0].len);
+    try std.testing.expectEqual(@as(u8, 0x5a), iovecs[0].base[0]);
+    try q.consume(q.total_len);
+    try std.testing.expect(q.isEmpty());
+    try std.testing.expectEqual(@min(blocks, retained_free_blocks), q.free.items.len);
+    const retained = q.retainedBytes();
+    try q.appendCopy("reuse");
+    try std.testing.expectEqual(retained, q.retainedBytes());
 }

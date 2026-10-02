@@ -629,6 +629,10 @@ input, fragmented messages, outbound batches, queue blocks, queue freelists and 
 capacity. Growth is reserved against the budget before allocation, while drained idle
 capacity is reclaimed so throttling can clear. It is still **not** a whole-process RSS
 limit and excludes metadata outside these queues and kernel socket buffers.
+WEB output blocks fit their header and payload into one minimum target page,
+with a free cache sized for one 32 KiB read. On a 4 KiB-page 64-bit Linux host,
+1 MiB of queued payload uses 257 blocks instead of 512; larger runtime pages
+and pointer-array allocations can add rounding beyond the retained-byte gauge.
 
 Forwarded browser identity is accepted only from loopback or explicit IP literals in
 `[web].trusted_http_sources`, using the right-most value of the last matching header
