@@ -96,6 +96,11 @@ zero and i16 boundaries), big-endian counter carry and u128 wrap. They check
 wrong-secret/malformed-tag rejection, both directional key/IV derivations and
 post-handshake stream continuity across different chunk boundaries.
 
+ClientHello ownership regressions drive the real TLS-header handler with a failing
+allocator at the inline boundary and maximum TLS record. Inline storage remains
+allocation-free; heap OOM closes and releases the slot without publishing a length
+that exceeds the available storage or wiping unrelated inline bytes.
+
 The shared Linux accept errno regression distinguishes EINTR retry, EAGAIN and
 all eight documented pending TCP network errors, abort/reset, fd quotas, resource
 exhaustion and explicit firewall rejection. Both ordinary and WEB listeners use

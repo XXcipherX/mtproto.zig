@@ -2294,13 +2294,15 @@ const EventLoop = struct {
             return;
         }
 
-        slot.client_hello_len = tls_header_len + record_len;
-        if (slot.client_hello_len > slot.client_hello_inline.len) {
-            slot.client_hello_heap = self.state.allocator.alloc(u8, slot.client_hello_len) catch {
+        const hello_len = tls_header_len + @as(usize, record_len);
+        if (hello_len > slot.client_hello_inline.len) {
+            slot.client_hello_heap = self.state.allocator.alloc(u8, hello_len) catch {
                 self.closeSlot(slot, "client_hello alloc failed");
                 return;
             };
         }
+        // Cleanup may use this length only after its backing storage exists.
+        slot.client_hello_len = hello_len;
 
         const hello_buf = slot.clientHelloBuf();
         @memcpy(hello_buf[0..tls_header_len], slot.tls_hdr_buf[0..]);
@@ -5509,6 +5511,65 @@ test "writable activity records sent bytes and ignores a blocked flush" {
         slot.last_activity_ms = 123;
         if (role == .client) loop.onClientWritable(&slot) else loop.onUpstreamWritable(&slot);
         try std.testing.expectEqual(@as(i64, 123), slot.last_activity_ms);
+    }
+}
+
+test "ClientHello allocation failure preserves cleanup ownership at the inline boundary" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var cfg = Config{
+        .users = std.StringHashMap([16]u8).init(std.testing.allocator),
+        .direct_users = std.StringHashMap(void).init(std.testing.allocator),
+        .mask = false,
+    };
+    defer cfg.deinit(std.testing.allocator);
+    var state = try ProxyState.init(std.testing.allocator, std.testing.io, cfg);
+    defer state.deinit();
+    const listener = try relayDrainTestSocketPair();
+    defer closeFd(listener[0]);
+    defer closeFd(listener[1]);
+    const control = try createWorkerEventFd();
+    defer closeFd(control);
+    const loop = try EventLoop.init(&state, listener[0], control, 0, 1, default_managed_buffer_limit_bytes, null);
+    defer {
+        loop.deinit();
+        std.testing.allocator.destroy(loop);
+    }
+    try loop.pending_close_fds.ensureTotalCapacity(std.testing.allocator, 1);
+
+    const inline_len = (ConnectionSlot{}).client_hello_inline.len;
+    for ([_]usize{ inline_len, inline_len + 1, tls_header_len + constants.max_tls_plaintext_size }) |hello_len| {
+        const client = try relayDrainTestSocketPair();
+        defer closeFd(client[1]);
+        const slot = loop.pool.acquire() orelse return error.TestUnexpectedResult;
+        slot.phase = .reading_tls_header;
+        slot.client_fd = client[0];
+        slot.peer_addr = net.ip4(.{ 127, 0, 0, 1 }, 12345);
+        defer if (slot.phase != .idle) loop.closeSlot(slot, "ClientHello test cleanup");
+        slot.tls_hdr_buf = .{ 0x16, 0x03, 0x01, 0, 0 };
+        std.mem.writeInt(u16, slot.tls_hdr_buf[3..5], @intCast(hello_len - tls_header_len), .big);
+        slot.tls_hdr_pos = tls_header_len;
+        @memset(&slot.client_hello_inline, 0xaa);
+
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+        state.allocator = failing.allocator();
+        defer state.allocator = std.testing.allocator;
+        loop.readTlsHeader(slot);
+        if (hello_len <= inline_len) {
+            try std.testing.expect(!failing.has_induced_failure);
+            try std.testing.expectEqual(ConnectionPhase.reading_client_hello_body, slot.phase);
+            try std.testing.expectEqual(hello_len, slot.client_hello_len);
+            loop.closeSlot(slot, "inline ClientHello test cleanup");
+            for (slot.client_hello_inline) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+        } else {
+            try std.testing.expect(failing.has_induced_failure);
+            try std.testing.expectEqual(ConnectionPhase.idle, slot.phase);
+            // No inline bytes were acquired, so failed heap ownership must not wipe them.
+            for (slot.client_hello_inline) |byte| try std.testing.expectEqual(@as(u8, 0xaa), byte);
+        }
+        try std.testing.expectEqual(@as(usize, 0), slot.client_hello_len);
+        try std.testing.expect(slot.client_hello_heap == null);
+        try std.testing.expectEqual(@as(u32, 1), loop.pool.free_count);
+        loop.drainPendingCloses();
     }
 }
 

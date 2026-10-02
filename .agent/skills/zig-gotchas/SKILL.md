@@ -47,6 +47,7 @@ Do not reintroduce thread-per-connection or blocking relay loops.
 - Runtime uses `std.heap.page_allocator` to avoid allocator mutex contention seen with GPA under heavy connection churn.
 - AES-CTR processes aligned bulk in eight-block batches and then a `4/2/1` cascade before its partial-block tail. Keep cross-call keystream continuity and counter wraparound covered by the byte-at-a-time equivalence test; a plain `4` to `8` threshold change would regress 64–127-byte inputs to scalar AES.
 - Keep ownership boundaries explicit and wipe crypto material on teardown (`resetOwnedBuffers` paths).
+- Publish `client_hello_len` only after inline/heap backing storage is available. Heap OOM must leave the length zero so `closeSlot` cannot build an oversized inline slice; the header-path regression covers the inline boundary and maximum TLS record.
 - `releaseHandshakeOnly()` and `resetOwnedBuffers()` live with `ConnectionSlot`; do not copy a slot to move it between modules or lengthen secret lifetime while editing the event loop. `message_queue.zig` retains the exact one-page block invariant and size ceilings guard the embedded slot/queue/wedge structures.
 - Avoid hidden allocations inside event callbacks when possible.
 - Keep one-to-four DC/mask candidates in `ConnectionSlot` inline storage. Candidate replacement must free only an owned heap fallback, preserve allocation-failure cleanup, and continue supporting bounded larger DNS sets.
