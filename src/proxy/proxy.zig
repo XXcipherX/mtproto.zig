@@ -214,6 +214,26 @@ fn freeUserSecrets(allocator: std.mem.Allocator, secrets: []obfuscation.UserSecr
     allocator.free(secrets);
 }
 
+fn prepareUserHmacs(allocator: std.mem.Allocator, secrets: []const obfuscation.UserSecret) ![]tls.PreparedHmacState {
+    const contexts = try allocator.alloc(tls.PreparedHmacState, secrets.len);
+    for (secrets, contexts) |*secret, *context| {
+        var prepared = tls.PreparedHmacState.init(&secret.secret);
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&prepared));
+        context.* = prepared;
+    }
+    return contexts;
+}
+
+fn wipeUserHmacs(contexts: []tls.PreparedHmacState) void {
+    // HmacSha256 and its Sha256 state contain no pointers or enums in Zig 0.16.
+    std.crypto.secureZero(u8, std.mem.sliceAsBytes(contexts));
+}
+
+fn freeUserHmacs(allocator: std.mem.Allocator, contexts: []tls.PreparedHmacState) void {
+    wipeUserHmacs(contexts);
+    allocator.free(contexts);
+}
+
 /// Slots and managed queue/block bytes are partitioned rather than cloned.
 /// MiddleProxy scratch is lazy but can consume most of an 8 MiB partition
 /// with a large configured MP stream cap. Keep queue/stream headroom when
@@ -260,6 +280,7 @@ pub const ProxyState = struct {
     config: Config,
     managed_buffer_limit_bytes: u64,
     user_secrets: []obfuscation.UserSecret,
+    user_tls_hmacs: []tls.PreparedHmacState,
     connection_count: std.atomic.Value(u64),
     active_connections: std.atomic.Value(u32),
     handshakes_inflight: std.atomic.Value(u32),
@@ -341,6 +362,8 @@ pub const ProxyState = struct {
         const user_secrets = try secrets.toOwnedSlice(allocator);
         secrets = .empty;
         errdefer freeUserSecrets(allocator, user_secrets);
+        const user_tls_hmacs = try prepareUserHmacs(allocator, user_secrets);
+        errdefer freeUserHmacs(allocator, user_tls_hmacs);
 
         const security = try SecurityState.create(allocator);
         errdefer allocator.destroy(security);
@@ -433,6 +456,7 @@ pub const ProxyState = struct {
             .config = cfg,
             .managed_buffer_limit_bytes = managed_buffer_limit_bytes,
             .user_secrets = user_secrets,
+            .user_tls_hmacs = user_tls_hmacs,
             .connection_count = .init(0),
             .active_connections = .init(0),
             .handshakes_inflight = .init(0),
@@ -491,6 +515,7 @@ pub const ProxyState = struct {
         self.allocator.free(self.tls_server_hello_template);
         if (self.mask_addrs.len > 0) self.allocator.free(self.mask_addrs);
         if (self.trusted_web_peers.extra.len > 0) self.allocator.free(self.trusted_web_peers.extra);
+        freeUserHmacs(self.allocator, self.user_tls_hmacs);
         freeUserSecrets(self.allocator, self.user_secrets);
     }
 
@@ -2419,10 +2444,11 @@ const EventLoop = struct {
         }
 
         var validation_diagnostic: tls.TlsValidationDiagnostic = .{};
-        var validation = tls.validateTlsHandshakeDetailed(
+        var validation = tls.validateTlsHandshakePrepared(
             self.state.allocator,
             client_hello,
             self.state.user_secrets,
+            self.state.user_tls_hmacs,
             false,
             &validation_diagnostic,
         ) catch {
@@ -6294,6 +6320,35 @@ test "pipelined handshake capacity stays independent of relay scratch size" {
 fn initProxyStateAndDeinit(allocator: std.mem.Allocator, cfg: Config) !void {
     var state = try ProxyState.init(allocator, std.testing.io, cfg);
     defer state.deinit();
+}
+
+test "prepared user HMACs preserve key order, wipe storage and propagate allocation failure" {
+    const secrets = [_]obfuscation.UserSecret{
+        .{ .name = "alice", .secret = [_]u8{0x11} ** 16 },
+        .{ .name = "bob", .secret = [_]u8{0x22} ** 16 },
+    };
+    const cache_bytes = secrets.len * @sizeOf(tls.PreparedHmacState);
+    var backing: [cache_bytes + @alignOf(tls.PreparedHmacState)]u8 = @splat(0xa5);
+    var fixed = std.heap.FixedBufferAllocator.init(&backing);
+    const contexts = try prepareUserHmacs(fixed.allocator(), &secrets);
+    defer freeUserHmacs(fixed.allocator(), contexts);
+    for (&secrets, contexts) |*secret, context| {
+        var clone = context;
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&clone));
+        clone.update("snapshot reuse");
+        var digest: [32]u8 = undefined;
+        defer std.crypto.secureZero(u8, &digest);
+        clone.final(&digest);
+        var expected = crypto.sha256Hmac(&secret.secret, "snapshot reuse");
+        defer std.crypto.secureZero(u8, &expected);
+        try std.testing.expectEqualSlices(u8, &expected, &digest);
+    }
+    wipeUserHmacs(contexts);
+    // Check while owned: Allocator.free may replace wiped bytes with undefined.
+    for (std.mem.sliceAsBytes(contexts)) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, prepareUserHmacs(failing.allocator(), &secrets));
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
 }
 
 test "proxy state init propagates user secret allocation failures" {

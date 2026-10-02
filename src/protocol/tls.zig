@@ -11,6 +11,7 @@ const obfuscation = @import("obfuscation.zig");
 
 /// Re-export for convenience
 pub const UserSecret = obfuscation.UserSecret;
+pub const PreparedHmacState = std.crypto.auth.hmac.sha2.HmacSha256;
 
 /// Authentication work is bounded independently of the TLS record/read limit.
 /// Includes the five-byte record header; PQ + X25519 ClientHellos fit below 2 KiB.
@@ -225,6 +226,31 @@ pub fn validateTlsHandshakeDetailed(
     ignore_time_skew: bool,
     diagnostic: *TlsValidationDiagnostic,
 ) !?TlsValidation {
+    return validateTlsHandshakeImpl(allocator, handshake, secrets, null, ignore_time_skew, diagnostic);
+}
+
+/// The immutable startup snapshot owns these keyed contexts in secret order.
+/// Zig 0.16 HmacSha256/Sha256 contain only by-value arrays and integer state.
+pub fn validateTlsHandshakePrepared(
+    allocator: std.mem.Allocator,
+    handshake: []const u8,
+    secrets: []const UserSecret,
+    prepared_hmacs: []const PreparedHmacState,
+    ignore_time_skew: bool,
+    diagnostic: *TlsValidationDiagnostic,
+) !?TlsValidation {
+    if (prepared_hmacs.len != secrets.len) return error.InvalidPreparedSecrets;
+    return validateTlsHandshakeImpl(allocator, handshake, secrets, prepared_hmacs, ignore_time_skew, diagnostic);
+}
+
+fn validateTlsHandshakeImpl(
+    allocator: std.mem.Allocator,
+    handshake: []const u8,
+    secrets: []const UserSecret,
+    prepared_hmacs: ?[]const PreparedHmacState,
+    ignore_time_skew: bool,
+    diagnostic: *TlsValidationDiagnostic,
+) !?TlsValidation {
     _ = allocator;
 
     diagnostic.* = .{};
@@ -258,8 +284,8 @@ pub fn validateTlsHandshakeDetailed(
         0;
 
     var saw_matching_hmac = false;
-    for (secrets) |*entry| {
-        var hmac = HmacSha256.init(&entry.secret);
+    for (secrets, 0..) |*entry, i| {
+        var hmac = if (prepared_hmacs) |contexts| contexts[i] else HmacSha256.init(&entry.secret);
         defer std.crypto.secureZero(u8, std.mem.asBytes(&hmac));
         hmac.update(handshake[0..constants.tls_digest_pos]);
         hmac.update(zero_digest[0..]);
@@ -970,6 +996,83 @@ fn buildSizedTestClientHello(buffer: []u8, pq: bool, x25519: bool, secret: *cons
     const digest = crypto.sha256Hmac(secret, buffer);
     @memcpy(buffer[constants.tls_digest_pos..][0..constants.tls_digest_len], &digest);
     return buffer;
+}
+
+test "prepared FakeTLS HMAC snapshots preserve cold validation and remain reusable" {
+    const secrets = [_]UserSecret{
+        .{ .name = "alice", .secret = [_]u8{0x11} ** 16 },
+        .{ .name = "bob", .secret = [_]u8{0x22} ** 16 },
+        .{ .name = "carol", .secret = [_]u8{0x33} ** 16 },
+    };
+    var prepared: [secrets.len]PreparedHmacState = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&prepared));
+    for (&secrets, &prepared) |*secret, *context| context.* = PreparedHmacState.init(&secret.secret);
+    var no_alloc = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const allocator = no_alloc.allocator();
+    var storage: [max_authenticated_hello_len]u8 = undefined;
+    for ([_]struct { len: usize, pq: bool, x25519: bool }{
+        .{ .len = 512, .pq = false, .x25519 = true },
+        .{ .len = 1600, .pq = true, .x25519 = false },
+        .{ .len = max_authenticated_hello_len, .pq = true, .x25519 = true },
+    }) |fixture| {
+        const hello = buildSizedTestClientHello(storage[0..fixture.len], fixture.pq, fixture.x25519, &secrets[2].secret);
+        var cold_diagnostic: TlsValidationDiagnostic = .{};
+        var cached_diagnostic: TlsValidationDiagnostic = .{};
+        // The last key forces all three trials; reuse must not advance a shared state.
+        for (0..2) |_| {
+            var cold = try validateTlsHandshakeDetailed(allocator, hello, &secrets, true, &cold_diagnostic);
+            defer if (cold) |*value| value.wipe();
+            var cached = try validateTlsHandshakePrepared(allocator, hello, &secrets, &prepared, true, &cached_diagnostic);
+            defer if (cached) |*value| value.wipe();
+            try std.testing.expect(cold != null and cached != null);
+            try std.testing.expectEqualDeep(cold.?, cached.?);
+            try std.testing.expectEqualStrings("carol", cached.?.user);
+            try std.testing.expectEqualDeep(cold_diagnostic, cached_diagnostic);
+        }
+
+        // The fixture signs timestamp zero: both paths must reject it as stale.
+        try std.testing.expect(try validateTlsHandshakeDetailed(allocator, hello, &secrets, false, &cold_diagnostic) == null);
+        try std.testing.expect(try validateTlsHandshakePrepared(allocator, hello, &secrets, &prepared, false, &cached_diagnostic) == null);
+        try std.testing.expectEqual(TlsValidationFailure.timestamp_skew, cold_diagnostic.failure);
+        try std.testing.expectEqual(cold_diagnostic.failure, cached_diagnostic.failure);
+        try std.testing.expect(cached_diagnostic.timestamp_skew_s.? > constants.time_skew_max);
+
+        var timestamp: [4]u8 = undefined;
+        std.mem.writeInt(u32, &timestamp, @intCast(runtime_time.realtimeSeconds()), .little);
+        for (hello[constants.tls_digest_pos + 28 ..][0..4], timestamp) |*byte, stamp| byte.* ^= stamp;
+        var cold = try validateTlsHandshakeDetailed(allocator, hello, &secrets, false, &cold_diagnostic);
+        defer if (cold) |*value| value.wipe();
+        var cached = try validateTlsHandshakePrepared(allocator, hello, &secrets, &prepared, false, &cached_diagnostic);
+        defer if (cached) |*value| value.wipe();
+        try std.testing.expect(cold != null and cached != null);
+        try std.testing.expectEqualDeep(cold.?, cached.?);
+
+        hello[hello.len - 1] ^= 1; // Valid padding framing, invalid authentication.
+        try std.testing.expect(try validateTlsHandshakeDetailed(allocator, hello, &secrets, true, &cold_diagnostic) == null);
+        try std.testing.expect(try validateTlsHandshakePrepared(allocator, hello, &secrets, &prepared, true, &cached_diagnostic) == null);
+        try std.testing.expectEqual(TlsValidationFailure.secret_mismatch, cold_diagnostic.failure);
+        try std.testing.expectEqualDeep(cold_diagnostic, cached_diagnostic);
+    }
+
+    var diagnostic: TlsValidationDiagnostic = .{};
+    try std.testing.expectError(error.InvalidPreparedSecrets, validateTlsHandshakePrepared(allocator, &storage, &secrets, prepared[0..2], true, &diagnostic));
+    try std.testing.expectEqual(@as(usize, 0), no_alloc.allocations);
+    try std.testing.expect(!no_alloc.has_induced_failure);
+
+    // A restarted user configuration prepares a new snapshot, independent of the old one.
+    const replacement = [_]UserSecret{.{ .name = "carol", .secret = [_]u8{0x44} ** 16 }};
+    var replacement_contexts = [_]PreparedHmacState{PreparedHmacState.init(&replacement[0].secret)};
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&replacement_contexts));
+    const old_hello = buildSizedTestClientHello(&storage, true, true, &secrets[2].secret);
+    try std.testing.expect(try validateTlsHandshakePrepared(allocator, old_hello, &replacement, &replacement_contexts, true, &diagnostic) == null);
+    var old_result = try validateTlsHandshakePrepared(allocator, old_hello, &secrets, &prepared, true, &diagnostic);
+    defer if (old_result) |*value| value.wipe();
+    try std.testing.expect(old_result != null);
+    const new_hello = buildSizedTestClientHello(&storage, true, true, &replacement[0].secret);
+    var new_result = try validateTlsHandshakePrepared(allocator, new_hello, &replacement, &replacement_contexts, true, &diagnostic);
+    defer if (new_result) |*value| value.wipe();
+    try std.testing.expect(new_result != null);
+    try std.testing.expect(try validateTlsHandshakePrepared(allocator, new_hello, &secrets, &prepared, true, &diagnostic) == null);
 }
 
 test "FakeTLS authentication bounds input without lowering the TLS parser limit" {

@@ -80,6 +80,14 @@ legacy layout using the response's fresh public randomness, at minimum/default/
 4096/maximum certificate sizes in both X25519 and PQ paths. They also verify the
 full-response HMAC, session echo, framing and untouched poisoned spare storage.
 
+Prepared-HMAC regressions compare complete cold/cached FakeTLS results for
+X25519, PQ and combined-share ClientHellos up to 4096 bytes, including last-key
+selection, repeated reuse, fresh/stale timestamps and a corrupt signed payload.
+They reject a mismatched cache length and verify independent replacement user
+snapshots. Cache lifecycle fixtures check key order, erasure while still owned,
+allocation failure and the existing exhaustive startup allocation-failure path.
+These check correctness and allocation behavior; they are not throughput results.
+
 `zig build web-bridge` needs Python 3, Node.js and the configured Zig compiler. It
 runs `web-bridge/render.zig` to render the production bridge and HELLO/WELCOME
 vectors, then passes the actual script to the Node harness. Missing tools fail the
