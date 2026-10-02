@@ -186,6 +186,12 @@ usable. They need no daemon, listener or updater. The existing stress scenarios
 cover burst, slow client/DC, queue pressure, half-close, and endurance traffic;
 the drain keeps their existing queue, crypto and lifecycle handlers.
 
+The TCP HUP regression receives a response larger than a dispatch budget after
+client FIN and upstream FIN, then drives actual epoll events through slot dispatch.
+It covers raw masking and direct-obfuscated relay, with and without a restricted
+client send buffer. It checks exact delivery, HUP parking under queued-output
+backpressure, resumption with generation tokens, and final graceful slot release.
+
 Config regressions cover the disabled Split-TLS default, explicit `desync=true`,
 and timing settings that leave it disabled. The ServerHello write/timer regression
 opts in explicitly and retains the existing split-delay behavior.

@@ -182,9 +182,9 @@ fn hasFatalEpollHangup(events: u32) bool {
     return (events & (linux.EPOLL.ERR | linux.EPOLL.HUP)) != 0;
 }
 
-fn hasGracefulEpollRdhup(events: u32) bool {
-    return (events & linux.EPOLL.RDHUP) != 0 and
-        (events & (linux.EPOLL.ERR | linux.EPOLL.HUP)) == 0;
+fn hasGracefulEpollReadHangup(events: u32) bool {
+    return (events & (linux.EPOLL.RDHUP | linux.EPOLL.HUP)) != 0 and
+        (events & linux.EPOLL.ERR) == 0;
 }
 
 fn shouldCloseOnFatalHangup(phase: ConnectionPhase, event_fd: posix.fd_t, upstream_fd: posix.fd_t) bool {
@@ -1600,7 +1600,7 @@ const EventLoop = struct {
             self.refreshSlotDeadline(slot);
         }
 
-        const graceful_rdhup = hasGracefulEpollRdhup(events);
+        const graceful_read_hangup = hasGracefulEpollReadHangup(events);
 
         if (fd == slot.client_fd) {
             if ((events & linux.EPOLL.OUT) != 0) {
@@ -1610,7 +1610,7 @@ const EventLoop = struct {
             if (fd != slot.client_fd and fd != slot.upstream_fd) return;
 
             const relay_phase = slot.phase == .relaying or slot.phase == .mask_relaying;
-            if (relay_phase and graceful_rdhup and !slot.client_read_closed and !io_budget.exhausted()) {
+            if (relay_phase and graceful_read_hangup and !slot.client_read_closed and !io_budget.exhausted()) {
                 self.drainRelayReads(slot, fd);
             } else if ((events & linux.EPOLL.IN) != 0 and
                 !io_budget.exhausted() and
@@ -1632,7 +1632,7 @@ const EventLoop = struct {
             if (fd != slot.client_fd and fd != slot.upstream_fd) return;
 
             const relay_phase = slot.phase == .relaying or slot.phase == .mask_relaying;
-            if (relay_phase and graceful_rdhup and !slot.upstream_read_closed and !io_budget.exhausted()) {
+            if (relay_phase and graceful_read_hangup and !slot.upstream_read_closed and !io_budget.exhausted()) {
                 self.drainRelayReads(slot, fd);
             } else if ((events & linux.EPOLL.IN) != 0 and
                 !io_budget.exhausted() and
@@ -1649,9 +1649,9 @@ const EventLoop = struct {
         if (slot.phase == .idle) return;
         if (fd != slot.client_fd and fd != slot.upstream_fd) return;
 
-        const fatal_hangup = hasFatalEpollHangup(events) or
-            ((events & linux.EPOLL.RDHUP) != 0 and
-                slot.phase != .relaying and slot.phase != .mask_relaying);
+        const relay_phase = slot.phase == .relaying or slot.phase == .mask_relaying;
+        const fatal_hangup = (events & linux.EPOLL.ERR) != 0 or
+            ((events & (linux.EPOLL.HUP | linux.EPOLL.RDHUP)) != 0 and !relay_phase);
         if (fatal_hangup and shouldCloseOnFatalHangup(slot.phase, fd, slot.upstream_fd)) {
             if (shouldRecoverMiddleProxyOnFatalHangup(slot.phase, fd, slot.upstream_fd) and
                 self.recoverMiddleProxyFailure(slot, .endpoint, error.ConnectionReset))
@@ -1660,6 +1660,10 @@ const EventLoop = struct {
             }
             self.closeSlot(slot, "epoll hup/err");
             return;
+        }
+
+        if (relay_phase and (events & linux.EPOLL.HUP) != 0) {
+            if (fd == slot.client_fd) slot.client_hup = true else slot.upstream_hup = true;
         }
 
         if (slot.phase != .idle) {
@@ -4078,43 +4082,38 @@ const EventLoop = struct {
             else => {},
         }
 
-        if (!isInvalidFd(slot.client_fd)) {
-            if (slot.client_interest_in != want_client_in or
-                slot.client_interest_out != want_client_out or
-                slot.client_interest_rdhup != want_client_rdhup)
-            {
-                try self.modSlotFd(
-                    slot,
-                    slot.client_fd,
-                    .client,
-                    want_client_in,
-                    want_client_out,
-                    want_client_rdhup,
-                );
-                slot.client_interest_in = want_client_in;
-                slot.client_interest_out = want_client_out;
-                slot.client_interest_rdhup = want_client_rdhup;
-            }
-        }
+        try self.syncSlotFdInterests(slot, .client, want_client_in, want_client_out, want_client_rdhup);
+        try self.syncSlotFdInterests(slot, .upstream, want_upstream_in, want_upstream_out, want_upstream_rdhup);
+    }
 
-        if (!isInvalidFd(slot.upstream_fd)) {
-            if (slot.upstream_interest_in != want_upstream_in or
-                slot.upstream_interest_out != want_upstream_out or
-                slot.upstream_interest_rdhup != want_upstream_rdhup)
-            {
-                try self.modSlotFd(
-                    slot,
-                    slot.upstream_fd,
-                    .upstream,
-                    want_upstream_in,
-                    want_upstream_out,
-                    want_upstream_rdhup,
-                );
-                slot.upstream_interest_in = want_upstream_in;
-                slot.upstream_interest_out = want_upstream_out;
-                slot.upstream_interest_rdhup = want_upstream_rdhup;
-            }
+    fn syncSlotFdInterests(self: *EventLoop, slot: *ConnectionSlot, role: SlotFdRole, want_in: bool, want_out: bool, want_rdhup: bool) !void {
+        const client = role == .client;
+        const fd = if (client) slot.client_fd else slot.upstream_fd;
+        if (isInvalidFd(fd)) return;
+        const registered = if (client) slot.client_registered else slot.upstream_registered;
+        const interest_in = if (client) &slot.client_interest_in else &slot.upstream_interest_in;
+        const interest_out = if (client) &slot.client_interest_out else &slot.upstream_interest_out;
+        const interest_rdhup = if (client) &slot.client_interest_rdhup else &slot.upstream_interest_rdhup;
+        const hup = if (client) slot.client_hup else slot.upstream_hup;
+        const fully_closed = if (client)
+            slot.client_read_closed and slot.client_write_shutdown
+        else
+            slot.upstream_read_closed and slot.upstream_write_shutdown;
+        const relay_phase = slot.phase == .relaying or slot.phase == .mask_relaying;
+        if (relay_phase and (hup or fully_closed) and !want_in and !want_out) {
+            // Modifying interests cannot mask HUP. Keep ownership of the fd,
+            // but remove readiness until the opposite queue drains (or close).
+            try self.delSlotFd(slot, role);
+        } else if (!registered) {
+            // A fresh generation prevents events from the parked registration
+            // from being mistaken for the resumed fd's readiness.
+            try self.addSlotFd(slot, fd, role, want_in, want_out, want_rdhup);
+        } else if (interest_in.* != want_in or interest_out.* != want_out or interest_rdhup.* != want_rdhup) {
+            try self.modSlotFd(slot, fd, role, want_in, want_out, want_rdhup);
         }
+        interest_in.* = want_in;
+        interest_out.* = want_out;
+        interest_rdhup.* = want_rdhup;
     }
 
     fn ensureMpC2sScratch(self: *EventLoop, min_capacity: usize) ![]u8 {
@@ -4217,9 +4216,9 @@ const EventLoop = struct {
         }
     }
 
-    /// IN and RDHUP share the ordinary transport handlers and dispatch budget.
+    /// IN, RDHUP and error-free HUP share transport handlers and dispatch budget.
     /// Level-triggered epoll preserves readiness after yielding for fairness or
-    /// backpressure; RDHUP becomes EOF only when the handler actually reads zero.
+    /// backpressure; hangup becomes EOF only when the handler actually reads zero.
     fn drainRelayReads(self: *EventLoop, slot: *ConnectionSlot, fd: posix.fd_t) void {
         if (isInvalidFd(fd)) return;
         const from_client = fd == slot.client_fd;
@@ -6128,6 +6127,138 @@ test "relay drain records EOF once and keeps the reverse half open" {
     try std.testing.expectEqual(@as(u64, 0), state.stats_relay_upstream_eof_first.load(.monotonic));
 }
 
+fn relayHangupTestTcpPair() ![2]posix.fd_t {
+    var listener = try net.listen(net.ip4(.{ 127, 0, 0, 1 }, 0), .{});
+    defer listener.deinit();
+    const addr = try net.localAddress(listener.handle);
+    const peer = try net.socketTcpNonblocking(addr);
+    errdefer closeFd(peer);
+    net.connectFd(peer, addr) catch |err| switch (err) {
+        error.WouldBlock, error.ConnectionPending => {},
+        else => return err,
+    };
+    var ready = [_]posix.pollfd{.{ .fd = listener.handle, .events = linux.POLL.IN, .revents = 0 }};
+    if (try posix.poll(&ready, 5000) == 0) return error.TestUnexpectedResult;
+    const accepted = try net.acceptFd(listener.handle);
+    return .{ accepted.fd, peer };
+}
+
+test "TCP HUP drains oversized responses across budgets and client backpressure" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var cfg = Config{
+        .users = std.StringHashMap([16]u8).init(std.testing.allocator),
+        .direct_users = std.StringHashMap(void).init(std.testing.allocator),
+        .mask_relay_max_secs = 0,
+        .client_silence_close_sec = 0,
+    };
+    defer cfg.deinit(std.testing.allocator);
+    var state = try ProxyState.init(std.testing.allocator, std.testing.io, cfg);
+    defer state.deinit();
+    const listener = try relayDrainTestSocketPair();
+    defer closeFd(listener[0]);
+    defer closeFd(listener[1]);
+    const control = try createWorkerEventFd();
+    defer closeFd(control);
+    const loop = try EventLoop.init(&state, listener[0], control, 0, 1, default_managed_buffer_limit_bytes, null);
+    defer {
+        loop.deinit();
+        std.testing.allocator.destroy(loop);
+    }
+    const response = try std.testing.allocator.alloc(u8, 6 * relay_read_scratch_size + 37);
+    defer std.testing.allocator.free(response);
+    for (response, 0..) |*byte, i| byte.* = @truncate(i * 29 + 7);
+    const received = try std.testing.allocator.alloc(u8, response.len);
+    defer std.testing.allocator.free(received);
+
+    for ([_]ConnectionPhase{ .mask_relaying, .relaying }) |phase| {
+        for ([_]bool{ false, true }) |backpressure| {
+            const client = try relayDrainTestSocketPair();
+            defer closeFd(client[1]);
+            const upstream = try relayHangupTestTcpPair();
+            defer closeFd(upstream[1]);
+            const slot = loop.pool.acquire() orelse return error.TestUnexpectedResult;
+            slot.phase = phase;
+            slot.client_transport = .direct_obfuscated;
+            slot.use_fast_mode = true;
+            slot.client_fd = client[0];
+            slot.upstream_fd = upstream[0];
+            slot.peer_addr = net.ip4(.{ 127, 0, 0, 1 }, 12345);
+            slot.created_at_ms = runtime_time.monotonicMilli();
+            slot.last_activity_ms = slot.created_at_ms;
+            slot.idle_timeout_ms = 60_000;
+            defer if (slot.phase != .idle) loop.closeSlot(slot, "TCP HUP test cleanup");
+            const receive_capacity: c_int = 1024 * 1024;
+            try posix.setsockopt(upstream[0], posix.SOL.SOCKET, posix.SO.RCVBUF, std.mem.asBytes(&receive_capacity));
+            if (backpressure) {
+                const send_capacity: c_int = 4096;
+                try posix.setsockopt(client[0], posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&send_capacity));
+            }
+            try loop.addSlotFd(slot, client[0], .client, true, false, true);
+            try loop.addSlotFd(slot, upstream[0], .upstream, true, false, true);
+            try loop.syncInterests(slot);
+            try shutdownWriteFd(client[1]);
+            loop.processSlotEvent(slot, client[0], linux.EPOLL.IN | linux.EPOLL.RDHUP);
+            try std.testing.expect(slot.client_read_closed and slot.upstream_write_shutdown);
+            try std.testing.expectEqual(response.len, try socket_ops.writeFd(upstream[1], response));
+            try shutdownWriteFd(upstream[1]);
+            // Poll only unmaskable events: wait for FIN without consuming data.
+            var hungup = [_]posix.pollfd{.{ .fd = upstream[0], .events = 0, .revents = 0 }};
+            try std.testing.expect(try posix.poll(&hungup, 5000) > 0);
+            try std.testing.expect((hungup[0].revents & linux.POLL.HUP) != 0);
+            try std.testing.expect((hungup[0].revents & linux.POLL.ERR) == 0);
+
+            var events: [8]linux.epoll_event = undefined;
+            const initial = linux.epoll_wait(loop.epoll_fd, &events, events.len, 0);
+            try std.testing.expect(linux.errno(initial) == .SUCCESS and initial > 0);
+            var saw_hup = false;
+            for (events[0..initial]) |ev| {
+                const token = decodeSlotEventToken(ev.data.u64) orelse continue;
+                if (token.role != .upstream) continue;
+                saw_hup = (ev.events & linux.EPOLL.HUP) != 0;
+                loop.processSlotEvent(slot, upstream[0], ev.events);
+            }
+            try std.testing.expect(saw_hup);
+            try std.testing.expectEqual(phase, slot.phase);
+            try std.testing.expect(!slot.upstream_read_closed);
+            if (backpressure) {
+                try std.testing.expect(slot.hasClientPending());
+                try std.testing.expect(!slot.upstream_registered);
+                const parked = linux.epoll_wait(loop.epoll_fd, &events, events.len, 0);
+                try std.testing.expect(linux.errno(parked) == .SUCCESS);
+                for (events[0..parked]) |ev| {
+                    const token = decodeSlotEventToken(ev.data.u64) orelse continue;
+                    try std.testing.expect(token.role != .upstream);
+                }
+            }
+
+            var received_len: usize = 0;
+            const deadline = runtime_time.monotonicMilli() + 5000;
+            while (slot.phase != .idle or received_len < received.len) {
+                try std.testing.expect(runtime_time.monotonicMilli() < deadline);
+                if (received_len < received.len) {
+                    const n = posix.read(client[1], received[received_len..]) catch |err| switch (err) {
+                        error.WouldBlock => 0,
+                        else => return err,
+                    };
+                    received_len += n;
+                }
+                if (slot.phase == .idle) continue;
+                const ready = linux.epoll_wait(loop.epoll_fd, &events, events.len, 10);
+                try std.testing.expect(linux.errno(ready) == .SUCCESS);
+                for (events[0..ready]) |ev| {
+                    const token = decodeSlotEventToken(ev.data.u64) orelse continue;
+                    const current = loop.pool.getByToken(token) orelse continue;
+                    const fd = if (token.role == .client) current.client_fd else current.upstream_fd;
+                    loop.processSlotEvent(current, fd, ev.events);
+                }
+            }
+            try std.testing.expectEqualSlices(u8, response, received);
+            try std.testing.expectEqual(@as(u32, 1), loop.pool.free_count);
+            loop.drainPendingCloses();
+        }
+    }
+}
+
 test "pipelined handshake capacity stays independent of relay scratch size" {
     try std.testing.expectEqual(
         @as(usize, pipelined_initial_capacity),
@@ -6194,10 +6325,12 @@ test "epoll hangup helper" {
     try std.testing.expect(hasFatalEpollHangup(linux.EPOLL.HUP));
     try std.testing.expect(hasFatalEpollHangup(linux.EPOLL.ERR));
     try std.testing.expect(!hasFatalEpollHangup(linux.EPOLL.IN));
-    try std.testing.expect(hasGracefulEpollRdhup(linux.EPOLL.RDHUP));
-    try std.testing.expect(hasGracefulEpollRdhup(linux.EPOLL.RDHUP | linux.EPOLL.IN));
-    try std.testing.expect(!hasGracefulEpollRdhup(linux.EPOLL.RDHUP | linux.EPOLL.HUP));
-    try std.testing.expect(!hasGracefulEpollRdhup(linux.EPOLL.RDHUP | linux.EPOLL.ERR));
+    try std.testing.expect(hasGracefulEpollReadHangup(linux.EPOLL.RDHUP));
+    try std.testing.expect(hasGracefulEpollReadHangup(linux.EPOLL.RDHUP | linux.EPOLL.IN));
+    try std.testing.expect(hasGracefulEpollReadHangup(linux.EPOLL.RDHUP | linux.EPOLL.HUP));
+    try std.testing.expect(hasGracefulEpollReadHangup(linux.EPOLL.HUP | linux.EPOLL.IN));
+    try std.testing.expect(!hasGracefulEpollReadHangup(linux.EPOLL.RDHUP | linux.EPOLL.ERR));
+    try std.testing.expect(!hasGracefulEpollReadHangup(linux.EPOLL.HUP | linux.EPOLL.ERR));
 }
 
 test "fatal hangup close policy distinguishes client/upstream while connecting" {

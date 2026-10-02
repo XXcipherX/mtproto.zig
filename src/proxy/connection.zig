@@ -287,6 +287,9 @@ pub const ConnectionSlot = struct {
     upstream_interest_in: bool = false,
     upstream_interest_out: bool = false,
     upstream_interest_rdhup: bool = false,
+    // HUP is unmaskable; park its fd when queue backpressure prevents reading.
+    client_hup: bool = false,
+    upstream_hup: bool = false,
     client_registered: bool = false,
     upstream_registered: bool = false,
     event_io_budget: ?*EventIoBudget = null,
