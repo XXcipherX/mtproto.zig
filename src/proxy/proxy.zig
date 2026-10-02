@@ -14,6 +14,7 @@ const linux = std.os.linux;
 const constants = @import("../protocol/constants.zig");
 const crypto = @import("../crypto/crypto.zig");
 const runtime_time = @import("../runtime/time.zig");
+const runtime_io = @import("../runtime/io.zig");
 const linux_events = @import("../runtime/linux_events.zig");
 const createTimerFd = linux_events.createTimerFd;
 const armTimerFd = linux_events.armTimerFd;
@@ -2461,20 +2462,22 @@ const EventLoop = struct {
 
         const offers_pq = v.key_share == .x25519_mlkem768;
         const echoed_cipher = v.first_tls13_cipher;
-        const cipher_label = if (echoed_cipher) |cs| switch (cs) {
-            0x1301 => "0x1301",
-            0x1302 => "0x1302",
-            0x1303 => "0x1303",
-            else => "unknown",
-        } else "none";
-        var client_ip_buf: [64]u8 = undefined;
-        const client_ip = formatClientIp(slot.peer_addr, &client_ip_buf);
-        log.debug("[{d}] valid FakeTLS ClientHello: key_share={s} cipher={s} client={s}", .{
-            slot.conn_id,
-            if (offers_pq) "X25519MLKEM768(0x11ec)" else "x25519(0x001d)",
-            cipher_label,
-            client_ip,
-        });
+        if (runtime_io.logEnabled(.debug, .proxy)) {
+            const cipher_label = if (echoed_cipher) |cs| switch (cs) {
+                0x1301 => "0x1301",
+                0x1302 => "0x1302",
+                0x1303 => "0x1303",
+                else => "unknown",
+            } else "none";
+            var client_ip_buf: [64]u8 = undefined;
+            const client_ip = formatClientIp(slot.peer_addr, &client_ip_buf);
+            log.debug("[{d}] valid FakeTLS ClientHello: key_share={s} cipher={s} client={s}", .{
+                slot.conn_id,
+                if (offers_pq) "X25519MLKEM768(0x11ec)" else "x25519(0x001d)",
+                cipher_label,
+                client_ip,
+            });
+        }
 
         const server_hello = self.prepareServerHello(slot, offers_pq, echoed_cipher) catch {
             self.closeSlot(slot, "build server hello failed");
@@ -2731,7 +2734,7 @@ const EventLoop = struct {
         }
 
         // Log DC routing decisions at debug level (enable with log_level = "debug" in config)
-        if (plan.is_media_path) {
+        if (plan.is_media_path and runtime_io.logEnabled(.debug, .proxy)) {
             var addr_buf: [64]u8 = undefined;
             const addr_str = formatAddress(plan.candidates[0], &addr_buf);
             log.debug("[{d}] route: dc_idx={d} dc_abs={d} media={} middle_proxy={} candidates={d} -> {s}", .{
@@ -2984,7 +2987,8 @@ const EventLoop = struct {
                 return self.tryNextDcEndpoint(slot, next_err, next_addr);
             };
 
-            if (attempt_addr) |addr| {
+            if (attempt_addr != null and runtime_io.logEnabled(.warn, .proxy)) {
+                const addr = attempt_addr.?;
                 var prev_buf: [64]u8 = undefined;
                 const prev_str = formatAddress(addr, &prev_buf);
                 log.warn("[{d}] dc connect failed ({any}), retry candidate {d}/{d} after {s}", .{
@@ -3021,15 +3025,17 @@ const EventLoop = struct {
                 return false;
             };
 
-            var fb_buf: [64]u8 = undefined;
-            const fb_str = formatAddress(fallback, &fb_buf);
-            log.warn("[{d}] middle-proxy dc={d} exhausted after {d} candidate(s) ({any}), fallback to direct {s}", .{
-                slot.conn_id,
-                slot.dc_idx,
-                candidate_count,
-                err,
-                fb_str,
-            });
+            if (runtime_io.logEnabled(.warn, .proxy)) {
+                var fb_buf: [64]u8 = undefined;
+                const fb_str = formatAddress(fallback, &fb_buf);
+                log.warn("[{d}] middle-proxy dc={d} exhausted after {d} candidate(s) ({any}), fallback to direct {s}", .{
+                    slot.conn_id,
+                    slot.dc_idx,
+                    candidate_count,
+                    err,
+                    fb_str,
+                });
+            }
             return true;
         }
 
@@ -3060,7 +3066,8 @@ const EventLoop = struct {
                 continue;
             };
 
-            if (previous_addr) |addr| {
+            if (previous_addr != null and runtime_io.logEnabled(.debug, .proxy)) {
+                const addr = previous_addr.?;
                 var prev_buf: [64]u8 = undefined;
                 log.debug("[{d}] mask connect failed ({any}), retry candidate {d}/{d} after {s}", .{
                     slot.conn_id,
@@ -3821,9 +3828,11 @@ const EventLoop = struct {
             return false;
         };
 
-        var fb_buf: [64]u8 = undefined;
-        const fb_str = formatAddress(fallback, &fb_buf);
-        log.warn("[{d}] middle-proxy handshake failed, reconnecting direct to {s}", .{ slot.conn_id, fb_str });
+        if (runtime_io.logEnabled(.warn, .proxy)) {
+            var fb_buf: [64]u8 = undefined;
+            const fb_str = formatAddress(fallback, &fb_buf);
+            log.warn("[{d}] middle-proxy handshake failed, reconnecting direct to {s}", .{ slot.conn_id, fb_str });
+        }
         return true;
     }
 
@@ -4251,8 +4260,7 @@ const EventLoop = struct {
         }
     }
 
-    fn closeSlot(self: *EventLoop, slot: *ConnectionSlot, reason: []const u8) void {
-        if (slot.phase == .idle) return;
+    fn logSlotClose(slot: *ConnectionSlot, reason: []const u8) void {
         const first_eof = if (slot.first_relay_eof) |side| @tagName(side) else "none";
         const lifetime_ms = connectionLifetimeMs(slot.created_at_ms, runtime_time.monotonicMilli());
         if (slot.phase == .mask_relaying) {
@@ -4304,6 +4312,11 @@ const EventLoop = struct {
                 client_ip,
             });
         }
+    }
+
+    fn closeSlot(self: *EventLoop, slot: *ConnectionSlot, reason: []const u8) void {
+        if (slot.phase == .idle) return;
+        if (runtime_io.logEnabled(.debug, .proxy)) logSlotClose(slot, reason);
         self.deadline_heap.remove(self.pool.slots, slot);
 
         if (!isInvalidFd(slot.client_fd)) {

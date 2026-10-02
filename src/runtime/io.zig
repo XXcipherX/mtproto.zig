@@ -4,6 +4,14 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+// Set once during startup, before either relay starts its workers.
+pub var log_level: std.log.Level = .info;
+
+/// Share the logger's filter with call sites that prepare expensive arguments.
+pub fn logEnabled(comptime level: std.log.Level, comptime scope: @EnumLiteral()) bool {
+    return std.log.logEnabled(level, scope) and @intFromEnum(level) <= @intFromEnum(log_level);
+}
+
 pub fn writeStdout(bytes: []const u8) void {
     if (builtin.os.tag == .linux) {
         writeLinuxFd(std.os.linux.STDOUT_FILENO, bytes);

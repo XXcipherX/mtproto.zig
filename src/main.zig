@@ -26,13 +26,9 @@ const web_probe_material = @import("web/probe_material.zig");
 // don't interleave. This avoids the global stderr_mutex that Zig's
 // default logger uses, which causes catastrophic contention under
 // hundreds of concurrent threads.
-// Runtime log level, set from config.toml at startup.
-// Checked by lockFreeLog to filter messages without recompilation.
-pub var runtime_log_level: std.log.Level = .info;
-
 pub const std_options = std.Options{
     // Set comptime level to .debug so all log calls are compiled in.
-    // Runtime filtering is done in lockFreeLog via runtime_log_level.
+    // Runtime filtering is shared with argument preparation via runtime_io.
     .log_level = .debug,
     .logFn = lockFreeLog,
 };
@@ -66,7 +62,7 @@ fn lockFreeLog(
     args: anytype,
 ) void {
     // Runtime filter: skip messages below configured level
-    if (@intFromEnum(message_level) > @intFromEnum(runtime_log_level)) return;
+    if (!runtime_io.logEnabled(message_level, scope)) return;
 
     var buf: [4096]u8 = undefined;
     const prefix = formatLogPrefix(message_level, scope, &buf);
@@ -604,7 +600,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // Apply runtime log level from config
-    runtime_log_level = cfg.log_level;
+    runtime_io.log_level = cfg.log_level;
 
     cfg.validate() catch |err| {
         writeStderr(

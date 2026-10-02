@@ -46,6 +46,7 @@ Code anchors:
 - `src/proxy/middle_proxy_nat.zig`, `middle_proxy_routing.zig`, `middle_proxy_handshake.zig`, `timeout_policy.zig` (egress discovery, route/cooldown policy, handshake KDF/frame preparation, pure slot-deadline calculations)
 - `src/proxy/socket_ops.zig`, `src/runtime/tcp_options.zig`, `src/runtime/linux_events.zig` (proxy-specific socket errors, shared best-effort TCP tuning, and epoll/timerfd/eventfd primitives)
 - `src/main.zig` (CLI/startup orchestration, capacity policy/banner, lock-free logger, public-IP detection)
+- `src/runtime/io.zig` shares the startup-only runtime log level between the logger and `logEnabled(level, scope)` guards. Set it before starting workers; guard diagnostic-only address formatting, clocks and divisions before computing their arguments. Preserve functional preparation and enabled log contents.
 - `src/runtime/resources.zig`, `src/runtime/signals.zig` (host/cgroup memory detection and the process signal/eventfd bridge; neither owns the application `std.Io` backend)
 - `src/http_fetch.zig` (bounded HTTPS fetch helper for background public-IPv4 and MiddleProxy metadata discovery)
 - `deploy/setup_tunnel.sh` (namespace + AmneziaWG deployment path)

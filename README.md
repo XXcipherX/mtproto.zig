@@ -1275,6 +1275,8 @@ Built-in Split-TLS is opt-in: set `[censorship].desync = true` to split fake `Se
 
 > **Operational note** &nbsp; High-churn mobile networks can produce many normal disconnects (`ConnectionResetByPeer`/`EndOfStream`). In release builds these are logged at debug level to keep production logs signal-focused.
 
+The runtime log filter also skips diagnostic-only client-IP/address formatting and close-lifetime clock reads when their level is disabled. Enabled messages retain the same details; `log_level` takes effect on restart for both ordinary proxy and WEB relay processes.
+
 > **Operational note** &nbsp; `deploy/mtproto-proxy.service` ships with `LimitNOFILE=131582` to allow higher custom caps when needed. Default `max_connections=512` is tuned for small VPS profiles; increase it only after capacity testing.
 
 > **Shutdown note** &nbsp; The bundled systemd and Docker Compose definitions allow 25 seconds for the proxy's default 15-second graceful drain before the supervisor may force termination.
