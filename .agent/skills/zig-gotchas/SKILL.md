@@ -105,6 +105,12 @@ Reserve deferred-close/free list capacity before exposing a new fd to
 epoll; OOM must not force immediate teardown inside an event batch. A connecting
 WEB backend must queue the PROXY header and payload until `SO_ERROR` succeeds, and
 retain those bytes across candidate retries. Never retry an established stream.
+WEB's borrowed dispatch budget also applies to writes on other fds and deferred
+batch/timer visits; exhausted budget is a yield, never EOF or a zero-byte write.
+Zig 0.16 has no `std.posix.write`; socket fixtures must use the existing raw
+write helpers (and separate setup counters), just as production paths do.
+Keep already-read coalesced bytes owned before yielding. Backend HUP must survive
+budget exhaustion and be removed/re-added under flow control to avoid epoll spin.
 
 - Outbound data is queued in intrusive page-sized blocks served by the shared `MessageBlockPool`; append into the current tail before acquiring a new page.
 - Recycled/destroyed queue blocks are securely wiped. If appending an acquired block pointer fails, return it to the shared pool (or destroy it) before propagating OOM.

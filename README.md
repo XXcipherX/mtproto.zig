@@ -614,6 +614,11 @@ WEB relay hardening includes the semantic fixes from upstream PR #429. Backend q
 the protocol's full 4 MiB receive window, and WebSocket messages can carry one maximum
 1 MiB relay payload plus its header. Outbound DATA/WINDOW frames are batched within an
 event-loop pass; input frames are consumed with one buffer compaction per pass.
+Each WEB dispatch shares a 256 KiB/64-operation I/O budget across reads and writes,
+including writes to other sockets and EINTR retries. Unsent bytes remain owned by
+queues; level-triggered readiness resumes work in the next pass. Deferred batch
+flushes and timer visits get a fresh budget per connection. Backend HUP is drained
+to EOF; while flow control blocks it, the fd is parked until WINDOW or carrier drain.
 Every inbound relay message is validated completely before its first stream/window
 mutation; client control frames are restricted to HELLO before adoption and PONG after
 it, and 4096 deduplicated closed-stream tombstones make valid late DATA/WINDOW/CLOSE

@@ -264,6 +264,8 @@ const Conn = struct {
     msg_active: bool = false,
     want_in: bool = false,
     want_out: bool = false,
+    backend_hup: bool = false,
+    hup_parked: bool = false,
     /// Deadline in monotonic ms; 0 disables.
     deadline_ms: i64 = 0,
     /// Close as soon as the out queue drains (a final HTTP response or a CLOSE frame).
@@ -415,6 +417,8 @@ pub const Relay = struct {
     throttled: bool = false,
     stop: bool = false,
     read_buf: [read_buf_size]u8 = undefined,
+    /// Borrowed only during a dispatch, timer visit or deferred batch flush.
+    io_budget: ?*queue_io.IoBudget = null,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, opts: Options, cfg: *const config.Config) !Relay {
         const caps = try buildCapabilities(allocator, cfg, opts.domain, opts.base_path);
@@ -572,8 +576,8 @@ pub const Relay = struct {
     // ── epoll plumbing ────────────────────────────────────────────────────────
 
     /// RDHUP is subscribed to only while we actually want to read. A connection parked
-    /// by flow control still has ERR/HUP armed, but a half-closed peer would otherwise
-    /// re-notify on every wait with nothing to consume — a 100% CPU spin.
+    /// by flow control avoids repeated half-close hints. An established backend with
+    /// unmaskable HUP is removed entirely by sync() until reads can resume.
     fn addFd(self: *Relay, fd: posix.fd_t, want_in: bool, want_out: bool) !void {
         var flags: u32 = linux.EPOLL.ERR | linux.EPOLL.HUP;
         if (want_in) flags |= linux.EPOLL.IN | linux.EPOLL.RDHUP;
@@ -770,7 +774,7 @@ pub const Relay = struct {
             try conn.out.appendCopy(second);
             return false;
         }
-        const written = try queue_io.writeMsgPair(conn.fd, first, second, &self.bytes_out, null);
+        const written = try queue_io.writeMsgPair(conn.fd, first, second, &self.bytes_out, null, self.io_budget);
         if (written == total) {
             releaseEmptyQueue(conn);
             return true;
@@ -817,6 +821,9 @@ pub const Relay = struct {
     fn flushBatches(self: *Relay) void {
         for (self.batch_fds.items) |fd| {
             const conn = self.conns.get(fd) orelse continue;
+            var budget: queue_io.IoBudget = .{};
+            self.io_budget = &budget;
+            defer self.io_budget = null;
             conn.batch_pending = false;
             self.flushBatch(conn) catch self.closeConn(conn, "carrier batch write failed");
         }
@@ -869,6 +876,25 @@ pub const Relay = struct {
 
     /// Recompute epoll interest, writing it out only when it changed.
     fn sync(self: *Relay, conn: *Conn, want_in: bool, want_out: bool) void {
+        // HUP is unmaskable. Park an undrained backend while flow control blocks
+        // reads, then re-add it when WINDOW or a carrier drain permits progress.
+        if (conn.backend_hup and !want_in and !want_out) {
+            if (!conn.hup_parked) self.delFd(conn.fd);
+            conn.hup_parked = true;
+            conn.want_in = false;
+            conn.want_out = false;
+            return;
+        }
+        if (conn.hup_parked) {
+            self.addFd(conn.fd, want_in, want_out) catch {
+                self.closeConn(conn, "backend re-arm failed");
+                return;
+            };
+            conn.hup_parked = false;
+            conn.want_in = want_in;
+            conn.want_out = want_out;
+            return;
+        }
         if (conn.want_in == want_in and conn.want_out == want_out) return;
         conn.want_in = want_in;
         conn.want_out = want_out;
@@ -909,6 +935,14 @@ pub const Relay = struct {
     // ── event dispatch ────────────────────────────────────────────────────────
 
     fn dispatch(self: *Relay, conn: *Conn, events: u32) void {
+        var budget: queue_io.IoBudget = .{};
+        self.dispatchWithBudget(conn, events, &budget);
+    }
+
+    fn dispatchWithBudget(self: *Relay, conn: *Conn, events: u32, budget: *queue_io.IoBudget) void {
+        std.debug.assert(self.io_budget == null);
+        self.io_budget = budget;
+        defer self.io_budget = null;
         const fd = conn.fd;
         const fatal = (events & (linux.EPOLL.ERR | linux.EPOLL.HUP)) != 0;
         // A failed/prematurely closed connect must not enter the read/flush path:
@@ -917,15 +951,16 @@ pub const Relay = struct {
             if (!self.retryBackend(conn)) self.closeConn(conn, "backend connect failed");
             return;
         }
+        if (conn.kind == .backend and (events & linux.EPOLL.ERR) == 0 and (events & linux.EPOLL.HUP) != 0) conn.backend_hup = true;
         if ((events & linux.EPOLL.OUT) != 0) {
             self.onWritable(conn);
             if (!self.alive(fd)) return;
         }
-        if ((events & linux.EPOLL.IN) != 0 or (events & linux.EPOLL.RDHUP) != 0) {
+        if ((events & (linux.EPOLL.IN | linux.EPOLL.RDHUP)) != 0 or conn.backend_hup) {
             self.onReadable(conn);
             if (!self.alive(fd)) return;
         }
-        if (fatal) {
+        if (fatal and ((events & linux.EPOLL.ERR) != 0 or conn.kind != .backend)) {
             self.closeConn(conn, "socket error or hangup");
             return;
         }
@@ -946,7 +981,7 @@ pub const Relay = struct {
         }
         const fd = conn.fd;
         const before = conn.out.total_len;
-        const drained = queue_io.flushQueue(conn.fd, &conn.out, &self.bytes_out, null) catch {
+        const drained = queue_io.flushQueue(conn.fd, &conn.out, &self.bytes_out, null, self.io_budget) catch {
             self.closeConn(conn, "write failed");
             return;
         };
@@ -986,7 +1021,7 @@ pub const Relay = struct {
     // ── HTTP ──────────────────────────────────────────────────────────────────
 
     fn onHttpReadable(self: *Relay, conn: *Conn) void {
-        const n = posix.read(conn.fd, &self.read_buf) catch |err| {
+        const n = queue_io.readFd(conn.fd, &self.read_buf, self.io_budget) catch |err| {
             if (err == error.WouldBlock) return;
             self.closeConn(conn, "http read error");
             return;
@@ -1386,7 +1421,7 @@ pub const Relay = struct {
     // ── WebSocket frames ──────────────────────────────────────────────────────
 
     fn onWsReadable(self: *Relay, conn: *Conn) void {
-        const n = posix.read(conn.fd, &self.read_buf) catch |err| {
+        const n = queue_io.readFd(conn.fd, &self.read_buf, self.io_budget) catch |err| {
             if (err == error.WouldBlock) return;
             self.closeConn(conn, "websocket read error");
             return;
@@ -2057,7 +2092,7 @@ pub const Relay = struct {
             var hit_eof = false;
             var read_failed = false;
             while (filled < budget) {
-                const n = posix.read(conn.fd, self.read_buf[filled..budget]) catch |err| {
+                const n = queue_io.readFd(conn.fd, self.read_buf[filled..budget], self.io_budget) catch |err| {
                     if (err != error.WouldBlock) read_failed = true;
                     break;
                 };
@@ -2125,6 +2160,9 @@ pub const Relay = struct {
 
         for (self.tick_scratch.items) |fd| {
             const conn = self.conns.get(fd) orelse continue;
+            var budget: queue_io.IoBudget = .{};
+            self.io_budget = &budget;
+            defer self.io_budget = null;
             if (conn.deadline_ms != 0 and now >= conn.deadline_ms) {
                 if (conn.connecting and self.retryBackend(conn)) continue;
                 self.closeConn(conn, "timed out");
@@ -2261,6 +2299,162 @@ test "backend diagnostic counters saturate without disrupting backpressure" {
     try std.testing.expectEqual(@as(u32, max), backend.stall_carrier);
     try std.testing.expectEqual(@as(u32, 1), backend.last_window);
     try std.testing.expectEqual(@as(u32, 1), stream.send_window);
+}
+
+test "WEB dispatch yields bulk input while interactive WINDOW and control traffic progress" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var pairs: [3][2]posix.fd_t = undefined;
+    var created: usize = 0;
+    defer for (pairs[0..created]) |pair| {
+        closeFd(pair[0]);
+        closeFd(pair[1]);
+    };
+    for (&pairs) |*pair| {
+        const rc = linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0, pair);
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+        created += 1;
+    }
+    var relay = testRelay(allocator, 1024 * 1024);
+    relay.epoll_fd = try socket_utils.epollCreate();
+    defer closeFd(relay.epoll_fd);
+    defer relay.conns.deinit(allocator);
+    defer relay.batch_fds.deinit(allocator);
+    const peer = net_helpers.ip4(.{ 127, 0, 0, 1 }, 0);
+    var carrier = Conn{ .fd = pairs[2][0], .kind = .websocket, .peer = peer, .out = .{ .allocator = allocator } };
+    defer carrier.out.deinit();
+    defer carrier.in.deinit(allocator);
+    defer carrier.batch.deinit(allocator);
+    var session = Session{ .conn = &carrier, .user = "test", .client_addr = null, .welcomed = true };
+    defer session.streams.deinit(allocator);
+    carrier.session = &session;
+    var bulk = Conn{ .fd = pairs[0][0], .kind = .backend, .peer = peer, .out = .{ .allocator = allocator } };
+    var interactive = Conn{ .fd = pairs[1][0], .kind = .backend, .peer = peer, .out = .{ .allocator = allocator } };
+    defer bulk.out.deinit();
+    defer interactive.out.deinit();
+    var bulk_stream = Stream{ .id = 1, .session = &session, .conn = &bulk };
+    var interactive_stream = Stream{ .id = 3, .session = &session, .conn = &interactive };
+    bulk.stream = &bulk_stream;
+    interactive.stream = &interactive_stream;
+    try session.streams.put(allocator, 1, &bulk_stream);
+    try session.streams.put(allocator, 3, &interactive_stream);
+    for ([_]*Conn{ &bulk, &interactive, &carrier }) |conn| {
+        try relay.conns.put(allocator, conn.fd, conn);
+        try relay.addFd(conn.fd, false, false);
+        relay.syncConn(conn);
+    }
+    const payload = [_]u8{0xa5} ** (16 * 1024);
+    var setup_bytes: std.atomic.Value(u64) = .init(0);
+    try std.testing.expectEqual(@as(usize, payload.len), try queue_io.writeMsgPair(pairs[0][1], &payload, "", &setup_bytes, null, null));
+    try std.testing.expectEqual(@as(usize, 2), try queue_io.writeMsgPair(pairs[1][1], "hi", "", &setup_bytes, null, null));
+    var bulk_budget = queue_io.IoBudget{ .bytes_remaining = 4096, .operations_remaining = 4 };
+    relay.dispatchWithBudget(&bulk, linux.EPOLL.IN, &bulk_budget);
+    try std.testing.expectEqual(@as(u64, 4096), bulk.rx_bytes);
+    try std.testing.expectEqual(@as(usize, 0), bulk_budget.bytes_remaining);
+    relay.dispatch(&interactive, linux.EPOLL.IN);
+    try std.testing.expectEqual(@as(u64, 2), interactive.rx_bytes);
+    try std.testing.expectEqual(@as(u64, 2), session.data_frames);
+    var events: [3]linux.epoll_event = undefined;
+    const ready = linux.epoll_wait(relay.epoll_fd, &events, events.len, 0);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(ready));
+    var bulk_ready = false;
+    for (events[0..ready]) |event| if (event.data.fd == bulk.fd and (event.events & linux.EPOLL.IN) != 0) {
+        bulk_ready = true;
+    };
+    try std.testing.expect(bulk_ready); // unread bytes remain level-triggered
+
+    // One masked binary WINDOW followed by a masked WebSocket PING, both mask=0.
+    var incoming: [25]u8 = undefined;
+    @memcpy(incoming[0..6], &[_]u8{ 0x82, 0x8c, 0, 0, 0, 0 });
+    frame.writeHeader(incoming[6..14], .window, 1, 4);
+    const grant = frame.windowPayload(4096);
+    @memcpy(incoming[14..18], &grant);
+    @memcpy(incoming[18..], &[_]u8{ 0x89, 0x81, 0, 0, 0, 0, 'p' });
+    try std.testing.expectEqual(@as(usize, incoming.len), try queue_io.writeMsgPair(pairs[2][1], &incoming, "", &setup_bytes, null, null));
+    var control_budget = queue_io.IoBudget{ .operations_remaining = 1 };
+    relay.dispatchWithBudget(&carrier, linux.EPOLL.IN, &control_budget);
+    try std.testing.expectEqual(frame.initial_stream_window, bulk_stream.send_window);
+    try std.testing.expectEqual(@as(usize, 0), control_budget.operations_remaining);
+    try std.testing.expectEqual(@as(usize, 0), carrier.in.items.len);
+    try std.testing.expectEqual(@as(usize, 3), carrier.out.total_len); // PONG owned until next OUT
+    try std.testing.expectEqual(@as(u64, 0), relay.bytes_out.load(.monotonic));
+    const batch = try allocator.dupe(u8, carrier.batch.items);
+    defer allocator.free(batch);
+    relay.flushBatches();
+    var flush_budget = queue_io.IoBudget{ .bytes_remaining = 9, .operations_remaining = 1 };
+    relay.dispatchWithBudget(&carrier, linux.EPOLL.OUT, &flush_budget);
+    try std.testing.expectEqual(@as(u64, 9), relay.bytes_out.load(.monotonic));
+    try std.testing.expect(carrier.out.total_len > 0);
+    var received: [8192]u8 = undefined;
+    const prefix = try posix.read(pairs[2][1], &received);
+    try std.testing.expectEqual(@as(usize, 9), prefix);
+    relay.dispatch(&carrier, linux.EPOLL.OUT);
+    const tail = try posix.read(pairs[2][1], received[prefix..]);
+    var header: [ws.max_server_header]u8 = undefined;
+    const framing = try ws.writeHeader(&header, true, .binary, batch.len);
+    try std.testing.expectEqual(@as(usize, 3) + framing.len + batch.len, prefix + tail);
+    try std.testing.expectEqualSlices(u8, &.{ 0x8a, 1, 'p' }, received[0..3]);
+    try std.testing.expectEqualSlices(u8, framing, received[3..][0..framing.len]);
+    try std.testing.expectEqualSlices(u8, batch, received[3 + framing.len .. prefix + tail]);
+    try std.testing.expect(carrier.out.isEmpty());
+    var next_budget = queue_io.IoBudget{ .bytes_remaining = 4096 };
+    relay.dispatchWithBudget(&bulk, linux.EPOLL.IN, &next_budget);
+    try std.testing.expectEqual(@as(u64, 8192), bulk.rx_bytes);
+    try std.testing.expect(relay.io_budget == null);
+}
+
+test "WEB budgeted backend HUP parks under zero window and resumes unread bytes" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var fds: [2]posix.fd_t = undefined;
+    const rc = linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0, &fds);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+    defer closeFd(fds[0]);
+    defer if (fds[1] >= 0) closeFd(fds[1]);
+    var relay = testRelay(allocator, 1024 * 1024);
+    relay.epoll_fd = try socket_utils.epollCreate();
+    defer closeFd(relay.epoll_fd);
+    defer relay.conns.deinit(allocator);
+    defer relay.batch_fds.deinit(allocator);
+    const peer = net_helpers.ip4(.{ 127, 0, 0, 1 }, 0);
+    var carrier = Conn{ .fd = -1, .kind = .websocket, .peer = peer, .out = .{ .allocator = allocator } };
+    defer carrier.batch.deinit(allocator);
+    var session = Session{ .conn = &carrier, .user = "test", .client_addr = null, .welcomed = true };
+    defer session.streams.deinit(allocator);
+    var backend = Conn{ .fd = fds[0], .kind = .backend, .peer = peer, .out = .{ .allocator = allocator } };
+    defer backend.out.deinit();
+    var stream = Stream{ .id = 1, .session = &session, .conn = &backend };
+    backend.stream = &stream;
+    try session.streams.put(allocator, 1, &stream);
+    try relay.conns.put(allocator, backend.fd, &backend);
+    try relay.addFd(backend.fd, false, false);
+    relay.syncConn(&backend);
+    const payload = [_]u8{0xa5} ** (16 * 1024);
+    var setup_bytes: std.atomic.Value(u64) = .init(0);
+    try std.testing.expectEqual(@as(usize, payload.len), try queue_io.writeMsgPair(fds[1], &payload, "", &setup_bytes, null, null));
+    closeFd(fds[1]);
+    fds[1] = -1;
+    var event: [1]linux.epoll_event = undefined;
+    const ready = linux.epoll_wait(relay.epoll_fd, &event, 1, 0);
+    try std.testing.expectEqual(@as(usize, 1), ready);
+    try std.testing.expect(event[0].events & linux.EPOLL.HUP != 0);
+    var budget = queue_io.IoBudget{ .bytes_remaining = 2048 };
+    relay.dispatchWithBudget(&backend, event[0].events, &budget);
+    try std.testing.expectEqual(@as(u64, 2048), backend.rx_bytes);
+    try std.testing.expect(relay.alive(backend.fd));
+    stream.send_window = 0;
+    relay.syncConn(&backend);
+    try std.testing.expect(backend.hup_parked);
+    try std.testing.expectEqual(@as(usize, 0), linux.epoll_wait(relay.epoll_fd, &event, 1, 0));
+    const grant = frame.windowPayload(1024);
+    try relay.handleRelayFrame(&session, .{ .type = .window, .stream_id = 1, .payload = &grant });
+    try std.testing.expect(!backend.hup_parked);
+    try std.testing.expectEqual(@as(usize, 1), linux.epoll_wait(relay.epoll_fd, &event, 1, 0));
+    budget = .{ .bytes_remaining = 1024 };
+    relay.dispatchWithBudget(&backend, event[0].events, &budget);
+    try std.testing.expectEqual(@as(u64, 3072), backend.rx_bytes);
+    try std.testing.expect(backend.hup_parked);
+    try std.testing.expect(relay.alive(backend.fd));
 }
 
 test "WEB byte lists amortize small appends and charge chosen capacity" {

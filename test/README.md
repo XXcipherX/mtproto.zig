@@ -64,6 +64,12 @@ The existing 8-byte aggregate-budget fixtures keep testing tight-budget growth.
 The DATA/WINDOW emitter checks retained batch capacity, including spare space
 after clearing its live bytes, and verifies that idle reclamation releases it.
 
+WEB fairness coverage uses real nonblocking socket pairs and epoll with a bulk
+stream, an interactive stream and masked WINDOW/PING input. Injected small budgets
+check bounded reads, shared read/write operation accounting, owned PONG deferral,
+partial queue flush and exact eventual bytes. A real backend HUP remains alive
+across a budget yield, parks with zero credit and re-arms on WINDOW without spinning.
+
 ServerHello builder fixtures compare every emitted byte with an independent
 legacy layout using the response's fresh public randomness, at minimum/default/
 4096/maximum certificate sizes in both X25519 and PQ paths. They also verify the
