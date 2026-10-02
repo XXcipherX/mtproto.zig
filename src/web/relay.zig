@@ -985,30 +985,40 @@ pub const Relay = struct {
             self.closeConn(conn, "out of memory");
             return;
         };
+        self.processHttpBuffer(conn);
+    }
+
+    fn processHttpBuffer(self: *Relay, conn: *Conn) void {
         const fd = conn.fd;
-        while (http.headEnd(conn.in.items) != null) {
-            const request = http.parse(conn.in.items) catch |err| {
+        var used: usize = 0;
+        defer if (used > 0 and self.alive(fd)) {
+            dropFront(&conn.in, used);
+            self.accountConn(conn);
+        };
+        while (http.headEnd(conn.in.items[used..]) != null) {
+            const request = http.parse(conn.in.items[used..]) catch |err| {
                 self.respondStatus(conn, if (err == error.HeadTooLarge) "431 Request Header Fields Too Large" else "400 Bad Request");
                 return;
             };
-            // `request` borrows slices out of conn.in, so the head can only be dropped
-            // once serve() is done reading it — including the upgrade path, which must
-            // keep any bytes that followed the head as the start of the WebSocket stream.
+            // The request borrows conn.in until serve() finishes. Advance a cursor;
+            // compact once at the end, or before handing the remainder to WebSocket.
             const consumed = request.head_len;
             self.serve(conn, &request);
             if (!self.alive(fd)) return;
-            dropFront(&conn.in, consumed);
-            self.accountConn(conn);
+            used += consumed;
             if (conn.kind != .http) {
                 // Upgraded. Anything pipelined behind the request head is already the
                 // WebSocket stream, and no further readiness event will announce it.
+                dropFront(&conn.in, used);
+                used = 0;
+                self.accountConn(conn);
                 if (conn.in.items.len > 0) self.processWsBuffer(conn);
                 return;
             }
             if (conn.close_after_flush) return;
             conn.deadline_ms = nowMs() + http_idle_timeout_ms;
         }
-        if (conn.in.items.len >= http.max_head_bytes) self.respondStatus(conn, "431 Request Header Fields Too Large");
+        if (conn.in.items.len - used >= http.max_head_bytes) self.respondStatus(conn, "431 Request Header Fields Too Large");
     }
 
     fn serve(self: *Relay, conn: *Conn, request: *const http.Request) void {
@@ -2174,8 +2184,7 @@ fn metricsRequestAllowed(peer: Address, request: *const http.Request) bool {
     return std.mem.eql(u8, host, "127.0.0.1") or std.mem.startsWith(u8, host, "127.0.0.1:") or std.mem.eql(u8, host, "[::1]") or std.mem.startsWith(u8, host, "[::1]:");
 }
 
-/// Test-only witness: `processWsBuffer` must compact once per read pass, never once per
-/// frame. Counting it is the only way a test can see the O(n²) memmove come back.
+/// Test-only witness: HTTP/WebSocket pipelines compact once per protocol pass.
 var compactions_for_test: usize = 0;
 var validation_comparisons_for_test: usize = 0;
 
@@ -2853,6 +2862,77 @@ test "an unknown client becomes a LOCAL header the proxy tolerates" {
         .ok => |res| try std.testing.expectEqual(@as(?Address, null), res.src),
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "HTTP pipeline compacts once and keeps an incomplete head and close suffix" {
+    const allocator = std.testing.allocator;
+    var relay = testRelay(allocator, 1024 * 1024);
+    defer relay.conns.deinit(allocator);
+    // Queue responses without socket I/O; matching interests avoid epoll changes.
+    var conn = Conn{ .fd = 7, .kind = .http, .peer = net_helpers.ip4(.{ 127, 0, 0, 1 }, 0), .out = .{ .allocator = allocator }, .connecting = true, .want_in = true, .want_out = true };
+    defer conn.in.deinit(allocator);
+    defer conn.out.deinit();
+    try relay.conns.put(allocator, conn.fd, &conn);
+    const request = "HEAD /metrics HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
+    const partial = "HEAD /metrics HTTP/1.1\r\nHost: ";
+    for (0..128) |_| try relay.appendInput(&conn, request, false);
+    try relay.appendInput(&conn, partial, false);
+    compactions_for_test = 0;
+    relay.processHttpBuffer(&conn);
+    try std.testing.expectEqualStrings(partial, conn.in.items);
+    try std.testing.expectEqual(@as(usize, 1), compactions_for_test);
+    const response = try allocator.alloc(u8, conn.out.total_len);
+    defer allocator.free(response);
+    var iovecs: [64]posix.iovec_const = undefined;
+    const count = conn.out.prepareIovecs(&iovecs);
+    var written: usize = 0;
+    for (iovecs[0..count]) |iov| {
+        @memcpy(response[written .. written + iov.len], iov.base[0..iov.len]);
+        written += iov.len;
+    }
+    try std.testing.expectEqual(response.len, written);
+    try std.testing.expectEqual(@as(usize, 128), std.mem.count(u8, response, "HTTP/1.1 200 OK"));
+    try relay.appendInput(&conn, "127.0.0.1\r\n\r\n", false);
+    relay.processHttpBuffer(&conn);
+    try std.testing.expectEqual(@as(usize, 0), conn.in.items.len);
+    conn.want_in = false;
+    try relay.appendInput(&conn, "HEAD /metrics HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n" ++ request, false);
+    compactions_for_test = 0;
+    relay.processHttpBuffer(&conn);
+    try std.testing.expect(conn.close_after_flush);
+    try std.testing.expectEqualStrings(request, conn.in.items);
+    try std.testing.expectEqual(@as(usize, 1), compactions_for_test);
+}
+
+test "HTTP upgrade passes pipelined WebSocket bytes on without another read" {
+    const allocator = std.testing.allocator;
+    var relay = testRelay(allocator, 1024 * 1024);
+    relay.opts.domain = "relay.example.com";
+    relay.opts.max_sessions = 2;
+    relay.opts.max_streams = 4;
+    relay.opts.check_origin = true;
+    relay.opts.trust_forwarded_for = false;
+    relay.websocket_path = try allocator.dupe(u8, "/api/v1/socket");
+    defer allocator.free(relay.websocket_path);
+    defer relay.conns.deinit(allocator);
+    defer relay.carrier_tokens.deinit(allocator);
+    const token = try relay.carrier_tokens.issue(allocator, std.testing.io, "test", nowMs(), 4);
+    var conn = Conn{ .fd = 7, .kind = .http, .peer = net_helpers.ip4(.{ 127, 0, 0, 1 }, 0), .out = .{ .allocator = allocator }, .connecting = true, .want_in = true, .want_out = true };
+    defer conn.in.deinit(allocator);
+    defer conn.out.deinit();
+    defer if (conn.session) |session| relay.destroySession(session);
+    try relay.conns.put(allocator, conn.fd, &conn);
+    const request = try std.fmt.allocPrint(allocator, "GET /api/v1/socket HTTP/1.1\r\nHost: relay.example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Protocol: tproxy-v1.{s}\r\n\r\n", .{token});
+    defer allocator.free(request);
+    const pong = [_]u8{ 0x8a, 0x80, 1, 2, 3, 4 };
+    try relay.appendInput(&conn, request, false);
+    try relay.appendInput(&conn, &pong, false);
+    try relay.appendInput(&conn, pong[0..2], false);
+    compactions_for_test = 0;
+    relay.processHttpBuffer(&conn);
+    try std.testing.expectEqual(ConnKind.websocket, conn.kind);
+    try std.testing.expectEqualSlices(u8, pong[0..2], conn.in.items);
+    try std.testing.expectEqual(@as(usize, 2), compactions_for_test); // HTTP once, WebSocket once.
 }
 
 test "a burst of tiny websocket frames compacts the carrier buffer once, not once per frame" {

@@ -52,6 +52,11 @@ reject every candidate, and bound poll calls by candidate count instead of a
 wall-clock threshold. Preset cancellation issues no poll; deterministic deadline
 checks retain the correct remaining wait after an early wakeup.
 
+HTTP pipeline regressions count one compaction for 128 requests, check every
+queued response and incomplete-head continuation, stop at Connection: close,
+and exercise authenticated upgrade with complete and partial WebSocket bytes
+already following its head. Upgrade runs one HTTP and one WebSocket compaction.
+
 `zig build web-bridge` needs Python 3, Node.js and the configured Zig compiler. It
 runs `web-bridge/render.zig` to render the production bridge and HELLO/WELCOME
 vectors, then passes the actual script to the Node harness. Missing tools fail the
