@@ -43,6 +43,11 @@ WEB backend diagnostic regressions start read/stall counters just below their
 maximum and exercise both zero-window and carrier-high-water guards twice. Totals
 saturate while the recorded credit and backpressure behavior remain correct.
 
+Carrier preflight regressions use 4096 IDs sharing the old validation hash buckets.
+A deterministic comparison counter bounds work for a full late-CLOSE batch, one
+late CLOSE and a control-only PONG; the latter performs no stream/history lookup.
+Preflight allocates nothing and retains whole-batch rejection before live mutation.
+
 WEB credential lookup unit regressions live in `src/web/credential_index.zig`,
 `src/web/relay.zig` and `src/web/tokens.zig`, reached by the existing `zig build test`
 target. They cover the decoded 64-bit/base64 boundary, genuine padded/bare root and

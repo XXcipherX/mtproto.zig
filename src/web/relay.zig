@@ -1505,14 +1505,21 @@ pub const Relay = struct {
         exists: bool = false,
         closed: bool = false,
     };
-    const validation_slot_count = frame.max_batch_frames * 4;
+    fn validationLessThan(_: void, a: ValidationState, b: ValidationState) bool {
+        if (builtin.is_test) validation_comparisons_for_test += 1;
+        return a.id < b.id;
+    }
 
-    fn validationSlot(slots: *[validation_slot_count]ValidationState, id: u32) *ValidationState {
-        var index = (@as(usize, id) *% 0x9e37_79b1) & (slots.len - 1);
-        while (slots[index].id != 0 and slots[index].id != id) {
-            index = (index + 1) & (slots.len - 1);
+    fn validationState(states: []ValidationState, id: u32) ?*ValidationState {
+        var low: usize = 0;
+        var high = states.len;
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            if (builtin.is_test) validation_comparisons_for_test += 1;
+            if (states[mid].id == id) return &states[mid];
+            if (states[mid].id < id) low = mid + 1 else high = mid;
         }
-        return &slots[index];
+        return null;
     }
 
     fn validateClientFrameShape(welcomed: bool, f: frame.Frame) ProtocolError!void {
@@ -1533,7 +1540,8 @@ pub const Relay = struct {
     }
 
     /// Validate shape, count and every per-stream transition before a batch mutates
-    /// live state. The fixed table avoids attacker-controlled allocation.
+    /// live state. Only batch IDs are sorted, with bounded O(n log n) work and
+    /// no client-selected hash collisions or message-path allocation.
     fn validateCarrierMessage(self: *Relay, session: *const Session, message: []const u8) ProtocolError!void {
         _ = self;
         if (message.len == 0) return error.Protocol;
@@ -1550,6 +1558,8 @@ pub const Relay = struct {
         }
 
         var count: usize = 0;
+        var states: [frame.max_batch_frames]ValidationState = undefined;
+        var stream_count: usize = 0;
         var shapes = frame.Iterator.init(message);
         while (true) {
             const maybe = shapes.next() catch return error.Protocol;
@@ -1557,27 +1567,40 @@ pub const Relay = struct {
             if (count == frame.max_batch_frames) return error.Protocol;
             count += 1;
             try validateClientFrameShape(true, value);
+            if (value.stream_id != 0) {
+                states[stream_count] = .{ .id = value.stream_id };
+                stream_count += 1;
+            }
         }
         if (count == 0 or shapes.rest().len != 0) return error.Protocol;
 
-        var states = [_]ValidationState{.{}} ** validation_slot_count;
+        // Control-only messages do not touch stream state or closed history.
+        if (stream_count == 0) return;
+        std.sort.heap(ValidationState, states[0..stream_count], {}, validationLessThan);
+        var unique: usize = 0;
+        for (states[0..stream_count]) |state| {
+            if (unique != 0 and states[unique - 1].id == state.id) continue;
+            states[unique] = state;
+            unique += 1;
+        }
+        const active_states = states[0..unique];
+        for (active_states) |*state| {
+            if (session.streams.get(state.id)) |stream| {
+                state.exists = true;
+                state.recv_window = stream.recv_window;
+            }
+        }
+        // Scan bounded history once, searching only the sorted batch IDs.
+        // This costs O(history * log(batch)), rather than one scan per ID.
         for (session.closed_ids) |id| {
             if (id == 0) continue;
-            const state = validationSlot(&states, id);
-            state.* = .{ .id = id, .closed = true };
+            if (validationState(active_states, id)) |state| state.closed = true;
         }
 
         var semantics = frame.Iterator.init(message);
         while ((semantics.next() catch unreachable)) |value| {
             if (value.stream_id == 0) continue;
-            const state = validationSlot(&states, value.stream_id);
-            if (state.id == 0) {
-                state.id = value.stream_id;
-                if (session.streams.get(value.stream_id)) |stream| {
-                    state.exists = true;
-                    state.recv_window = stream.recv_window;
-                }
-            }
+            const state = validationState(active_states, value.stream_id) orelse unreachable;
             switch (value.type) {
                 .open => {
                     if (state.exists or state.closed) return error.Protocol;
@@ -2136,6 +2159,7 @@ fn metricsRequestAllowed(peer: Address, request: *const http.Request) bool {
 /// Test-only witness: `processWsBuffer` must compact once per read pass, never once per
 /// frame. Counting it is the only way a test can see the O(n²) memmove come back.
 var compactions_for_test: usize = 0;
+var validation_comparisons_for_test: usize = 0;
 
 fn testRelay(allocator: std.mem.Allocator, limit: usize) Relay {
     var options: Options = undefined;
@@ -2377,6 +2401,35 @@ test "closed streams ignore only well-formed late frames and reject id reuse" {
     try std.testing.expectError(error.Protocol, relay.handleRelayFrame(&session, .{ .type = .close, .stream_id = 7, .payload = "x" }));
     try std.testing.expectError(error.Protocol, relay.handleRelayFrame(&session, .{ .type = .open, .stream_id = 7, .payload = "" }));
     try std.testing.expectEqual(@as(?*Stream, &neighbor), session.streams.get(8));
+}
+
+test "validation work stays bounded for IDs colliding in the old table" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var relay = testRelay(failing.allocator(), 1024);
+    var ids: [closed_history]u32 = undefined;
+    for (&ids, 0..) |*id, i| id.* = @intCast((i % 1024) * 16384 + i / 1024 + 1);
+    var session = Session{ .conn = undefined, .user = "test", .client_addr = null, .welcomed = true, .closed_ids = &ids };
+    var message: [frame.max_batch_frames * frame.header_size]u8 = undefined;
+    frame.writeHeader(message[0..frame.header_size], .pong, 0, 0);
+    validation_comparisons_for_test = 0;
+    try relay.validateCarrierMessage(&session, message[0..frame.header_size]);
+    try std.testing.expectEqual(@as(usize, 0), validation_comparisons_for_test);
+
+    frame.writeHeader(message[0..frame.header_size], .close, ids[0], 0);
+    validation_comparisons_for_test = 0;
+    try relay.validateCarrierMessage(&session, message[0..frame.header_size]);
+    try std.testing.expect(validation_comparisons_for_test <= closed_history + 2);
+
+    for (ids, 0..) |id, i| frame.writeHeader(message[i * frame.header_size ..][0..frame.header_size], .close, id, 0);
+    validation_comparisons_for_test = 0;
+    try relay.validateCarrierMessage(&session, &message);
+    try std.testing.expect(validation_comparisons_for_test < 8 * frame.max_batch_frames * 13);
+    try std.testing.expect(!failing.has_induced_failure);
+    // No preflight mutation, including when a later frame invalidates a batch.
+    frame.writeHeader(message[frame.header_size..][0..frame.header_size], .open, ids[0], 0);
+    try std.testing.expectError(error.Protocol, relay.validateCarrierMessage(&session, message[0 .. 2 * frame.header_size]));
+    try std.testing.expect(session.recentlyClosed(ids[0]));
+    try std.testing.expectEqual(@as(usize, 0), session.streams.count());
 }
 
 test "client relay frame shapes are strict for every type and scope" {
