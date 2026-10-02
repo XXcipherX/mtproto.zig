@@ -42,6 +42,11 @@ tail packing, partial consumption and bounded recycling. On targets with a
 needs 257 blocks instead of the former 512; these are layout counts, not an RSS
 benchmark. Larger runtime pages can still round allocations further.
 
+Managed-budget pressure coverage keeps active relay data and a stream buffer
+alive while reclaiming only the required cached queue pages. It checks normal
+cache reuse, zeroed recycled payloads, exact accounting and a failed replacement
+growth that leaves the original bytes owned and unchanged.
+
 `zig build web-bridge` needs Python 3, Node.js and the configured Zig compiler. It
 runs `web-bridge/render.zig` to render the production bridge and HELLO/WELCOME
 vectors, then passes the actual script to the Node harness. Missing tools fail the

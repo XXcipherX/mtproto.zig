@@ -1429,6 +1429,10 @@ const EventLoop = struct {
             managed_buffer_limit,
         );
         loop.message_block_pool = .{ .allocator = loop.managed_buffers.allocator() };
+        loop.managed_buffers.pressure_handler = .{
+            .context = &loop.message_block_pool,
+            .reclaim = MessageBlockPool.reclaimForPressure,
+        };
         loop.accept_paused = false;
         loop.accept_resume_ns = 0;
         loop.saturation_paused = false;

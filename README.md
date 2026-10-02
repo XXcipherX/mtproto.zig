@@ -1281,6 +1281,11 @@ Built-in Split-TLS is opt-in: set `[censorship].desync = true` to split fake `Se
 
 The runtime log filter also skips diagnostic-only client-IP/address formatting and close-lifetime clock reads when their level is disabled. Enabled messages retain the same details; `log_level` takes effect on restart for both ordinary proxy and WEB relay processes.
 
+Before rejecting an allocation at a worker's dynamic-buffer limit, the ordinary
+proxy releases enough free cached queue pages for one retry. Active output and
+MiddleProxy buffers stay owned, and replacement growth still counts both old
+and new storage. The cache remains available when allocations fit the budget.
+
 > **Operational note** &nbsp; `deploy/mtproto-proxy.service` ships with `LimitNOFILE=131582` to allow higher custom caps when needed. Default `max_connections=512` is tuned for small VPS profiles; increase it only after capacity testing.
 
 > **Shutdown note** &nbsp; The bundled systemd and Docker Compose definitions allow 25 seconds for the proxy's default 15-second graceful drain before the supervisor may force termination.

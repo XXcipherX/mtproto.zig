@@ -64,6 +64,20 @@ pub const MessageBlockPool = struct {
         self.free_count = 0;
     }
 
+    /// Free enough cached pages for one budget retry. Active queue pages are
+    /// never linked here; the capped free list bounds work to 1024 blocks.
+    pub fn reclaimForPressure(context: *anyopaque, needed: usize) void {
+        const self: *MessageBlockPool = @ptrCast(@alignCast(context));
+        var reclaimed: usize = 0;
+        while (reclaimed < needed) {
+            const blk = self.free_head orelse break;
+            self.free_head = blk.next;
+            self.free_count -= 1;
+            destroyMsgBlock(self.allocator, blk);
+            reclaimed += @sizeOf(MsgBlock);
+        }
+    }
+
     fn acquire(self: *MessageBlockPool) !*MsgBlock {
         const blk = self.free_head orelse return allocateMsgBlock(self.allocator);
         self.free_head = blk.next;
@@ -412,6 +426,41 @@ test "shared message block pool trims and wipes recycled page blocks" {
     for (blockStorageConst(recycled)) |byte| {
         try std.testing.expectEqual(@as(u8, 0), byte);
     }
+}
+
+test "managed pressure reclaims only free pages before retrying allocation" {
+    const page_bytes = @sizeOf(MsgBlock);
+    var budget = ManagedBufferAllocator.init(std.testing.allocator, 5 * page_bytes);
+    const allocator = budget.allocator();
+    var pool = MessageBlockPool{ .allocator = allocator };
+    defer pool.deinit();
+    budget.pressure_handler = .{ .context = &pool, .reclaim = MessageBlockPool.reclaimForPressure };
+    const active = try pool.acquire();
+    defer pool.recycle(active);
+    @memset(blockStorage(active), 0xa5);
+    const cached1 = try pool.acquire();
+    const cached2 = try pool.acquire();
+    pool.recycle(cached1);
+    pool.recycle(cached2);
+    const stream_buffer = try allocator.alloc(u8, 2 * page_bytes);
+    defer allocator.free(stream_buffer);
+    @memset(stream_buffer, 0x5a);
+    try std.testing.expectEqual(5 * page_bytes, budget.used_bytes);
+    const extra = try allocator.alloc(u8, page_bytes);
+    try std.testing.expectEqual(@as(usize, 1), pool.free_count);
+    try std.testing.expectEqual(5 * page_bytes, budget.used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), budget.denied_allocations);
+    allocator.free(extra);
+    const reused = try pool.acquire(); // No pressure: reuse the remaining page.
+    try std.testing.expect(reused == cached1);
+    for (blockStorageConst(reused)) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+    pool.recycle(reused);
+    try std.testing.expectError(error.OutOfMemory, allocator.realloc(stream_buffer, 3 * page_bytes));
+    try std.testing.expectEqual(@as(usize, 0), pool.free_count);
+    try std.testing.expectEqual(3 * page_bytes, budget.used_bytes);
+    try std.testing.expectEqual(@as(u64, 1), budget.denied_allocations);
+    for (blockStorageConst(active)) |byte| try std.testing.expectEqual(@as(u8, 0xa5), byte);
+    for (stream_buffer) |byte| try std.testing.expectEqual(@as(u8, 0x5a), byte);
 }
 
 test "managed buffer budget includes retained message pages" {

@@ -44,6 +44,7 @@ Code anchors:
 - `src/proxy/proxy.zig` (`ProxyState`, worker startup/shutdown, `EventLoop` dispatch, timeout actions, MiddleProxy metadata publication)
 - `src/proxy/connection.zig`, `connection_pool.zig`, `deadline_queue.zig` (slot ownership and wiping, generation-tagged fd roles, indexed deadlines)
 - `src/proxy/limits.zig`, `message_queue.zig`, `managed_buffer_allocator.zig`, `relay_io.zig` (shared fixed queue/ME headroom budgets, worker-local queue pages, managed accounting, budgeted relay reads/writes and frame-aligned half-close checks)
+- On managed-budget pressure, one synchronous callback frees only enough cached queue pages for a single reservation retry, bounded by the 1024-block free list. Its context is the stable heap-owned worker pool; the callback may free but must never allocate or touch active pages. Ordinary allocations retain the cache. Realloc still charges old plus replacement storage, and only unrecovered budget failures increment `denied_allocations`.
 - `src/proxy/security_state.zig`, `wedge_recovery.zig` (process-shared admission tables/gate and per-slot recovery tracker)
 - `src/proxy/middle_proxy_nat.zig`, `middle_proxy_routing.zig`, `middle_proxy_handshake.zig`, `timeout_policy.zig` (egress discovery, route/cooldown policy, handshake KDF/frame preparation, pure slot-deadline calculations)
 - `src/proxy/socket_ops.zig`, `src/runtime/tcp_options.zig`, `src/runtime/linux_events.zig` (proxy-specific socket errors, shared best-effort TCP tuning, and epoll/timerfd/eventfd primitives)

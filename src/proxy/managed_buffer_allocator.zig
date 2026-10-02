@@ -14,6 +14,11 @@ pub const ManagedBufferAllocator = struct {
     used_bytes: usize = 0,
     peak_bytes: usize = 0,
     denied_allocations: u64 = 0,
+    // Called synchronously without allocations; context outlives this allocator.
+    pressure_handler: ?struct {
+        context: *anyopaque,
+        reclaim: *const fn (*anyopaque, usize) void,
+    } = null,
 
     pub fn init(child: std.mem.Allocator, limit_bytes: usize) ManagedBufferAllocator {
         return .{
@@ -35,14 +40,16 @@ pub const ManagedBufferAllocator = struct {
     }
 
     fn reserve(self: *ManagedBufferAllocator, len: usize) bool {
-        const next = std.math.add(usize, self.used_bytes, len) catch {
-            self.denied_allocations +|= 1;
-            return false;
-        };
-        if (next > self.limit_bytes) {
+        if (len > self.limit_bytes -| self.used_bytes) {
+            if (self.pressure_handler) |handler| {
+                handler.reclaim(handler.context, len - (self.limit_bytes -| self.used_bytes));
+            }
+        }
+        if (len > self.limit_bytes -| self.used_bytes) {
             self.denied_allocations +|= 1;
             return false;
         }
+        const next = self.used_bytes + len;
         self.used_bytes = next;
         self.peak_bytes = @max(self.peak_bytes, next);
         return true;
