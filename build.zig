@@ -10,15 +10,15 @@ pub fn build(b: *std.Build) void {
     ) orelse false;
 
     // The proxy uses the requested optimize mode by default. Operators can opt
-    // into ReleaseSafe for ReleaseFast proxy builds with -Ddataplane_safety=true.
+    // into safe mode for fast proxy builds with -Ddataplane_safety=true.
     // Other optimize modes and the benchmark/soak artifacts remain unchanged.
     const dataplane_safety = b.option(
         bool,
         "dataplane_safety",
-        "Use ReleaseSafe for the proxy when optimize=ReleaseFast (default: false)",
+        "Use safe mode for the proxy when optimize=fast (default: false)",
     ) orelse false;
-    const dataplane_optimize: std.builtin.OptimizeMode =
-        if (dataplane_safety and optimize == .ReleaseFast) .ReleaseSafe else optimize;
+    const dataplane_optimize: std.lang.Optimize =
+        if (dataplane_safety and optimize == .fast) .safe else optimize;
 
     const production_options = b.addOptions();
     production_options.addOption(bool, "e2e_test_hooks", false);
@@ -44,9 +44,7 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
 
     const run_step = b.step("run", "Run the proxy");
     run_step.dependOn(&run_cmd.step);
@@ -68,18 +66,14 @@ pub fn build(b: *std.Build) void {
     install_bench_step.dependOn(&install_bench.step);
 
     const run_bench_cmd = b.addRunArtifact(bench_exe);
-    if (b.args) |args| {
-        run_bench_cmd.addArgs(args);
-    }
+    run_bench_cmd.addPassthruArgs();
 
     const bench_step = b.step("bench", "Run encapsulation microbenchmarks");
     bench_step.dependOn(&run_bench_cmd.step);
 
     const run_soak_cmd = b.addRunArtifact(bench_exe);
     run_soak_cmd.addArg("soak");
-    if (b.args) |args| {
-        run_soak_cmd.addArgs(args);
-    }
+    run_soak_cmd.addPassthruArgs();
 
     const soak_step = b.step("soak", "Run multithreaded soak stress test");
     soak_step.dependOn(&run_soak_cmd.step);
@@ -88,8 +82,11 @@ pub fn build(b: *std.Build) void {
     // so Zig unit tests cannot exercise its client-facing contract. CI drives the
     // production renderer and a Node harness. Missing tools must fail this target.
     const web_bridge_cmd = b.addSystemCommand(&.{"python3"});
-    web_bridge_cmd.addFileArg(b.path("test/web-bridge/run.py"));
-    web_bridge_cmd.setEnvironmentVariable("ZIG", b.graph.zig_exe);
+    web_bridge_cmd.addFileArg2(b.path("test/web-bridge/run.py"), .{});
+    // Resolve the compiler at make time: configure caches can move between CI
+    // runners whose Zig installation paths and inherited environments differ.
+    web_bridge_cmd.addArg("--zig");
+    web_bridge_cmd.addFileArg2(std.Build.LazyPath.zig_exe, .{ .make_absolute = true });
     const web_bridge_step = b.step("web-bridge", "Run WEB proxy bridge-page contract tests");
     web_bridge_step.dependOn(&web_bridge_cmd.step);
 
@@ -129,12 +126,12 @@ pub fn build(b: *std.Build) void {
     stress_tools.dependOn(&install_stress_generator.step);
 
     const e2e_cmd = b.addSystemCommand(&.{"python3"});
-    e2e_cmd.addFileArg(b.path("test/process_e2e.py"));
+    e2e_cmd.addFileArg2(b.path("test/process_e2e.py"), .{});
     e2e_cmd.addArg("--proxy-bin");
-    e2e_cmd.addFileArg(e2e_proxy.getEmittedBin());
+    e2e_cmd.addFileArg2(e2e_proxy.getEmittedBin(), .{});
     e2e_cmd.addArg("--obf-gen");
-    e2e_cmd.addFileArg(obf_gen.getEmittedBin());
-    if (b.args) |args| e2e_cmd.addArgs(args);
+    e2e_cmd.addFileArg2(obf_gen.getEmittedBin(), .{});
+    e2e_cmd.addPassthruArgs();
 
     const e2e_step = b.step("e2e", "Run real-process relay E2E tests");
     e2e_step.dependOn(&e2e_cmd.step);
@@ -158,7 +155,7 @@ pub fn build(b: *std.Build) void {
 
     // Keep coverage-guided security fuzzing isolated from the benchmark test
     // binary. Invoke with a bounded iteration count in CI, for example:
-    // `zig build -Doptimize=ReleaseSafe fuzz --fuzz=100K`.
+    // `zig build -Doptimize=safe fuzz --fuzz=100K`.
     const fuzz_step = b.step("fuzz", "Run wire-facing security fuzz harnesses");
     fuzz_step.dependOn(&run_unit_tests.step);
 

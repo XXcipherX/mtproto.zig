@@ -7,7 +7,7 @@ const builtin = @import("builtin");
 pub fn run(allocator: std.mem.Allocator, io: std.Io, requested: std.process.RunOptions) !std.process.RunResult {
     var options = requested;
     if (options.timeout == .none) options.timeout = .{ .duration = .{ .raw = .fromSeconds(12), .clock = .awake } };
-    if (builtin.os.tag != .linux) return std.process.run(allocator, io, options);
+    if (builtin.target.os.tag != .linux) return std.process.run(allocator, io, options);
     const argv = try allocator.alloc([]const u8, options.argv.len + 2);
     defer allocator.free(argv);
     // Ubuntu 26.04's default Rust env resets handlers but leaves signals blocked.
@@ -25,7 +25,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, requested: std.process.RunO
 }
 
 test "child runner clears inherited signalfd signal mask" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     var mask = std.posix.sigemptyset();
     std.posix.sigaddset(&mask, .TERM);
     var old: std.posix.sigset_t = undefined;

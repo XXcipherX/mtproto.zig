@@ -49,7 +49,7 @@ fi
 
 fuzz_command=(
     zig build
-    -Doptimize=ReleaseSafe
+    -Doptimize=safe
     fuzz
     "--fuzz=$iterations"
 )
@@ -83,7 +83,7 @@ if [[ -f "$crash_file" ]]; then
     crash_reported=true
 fi
 
-# Zig 0.16 bounded fuzzing can report a finding without returning a failure.
+# Zig 0.17 bounded fuzzing can report a finding without returning a failure.
 if grep -Fq "crashed; input saved to" "$run_log"; then
     crash_reported=true
 fi

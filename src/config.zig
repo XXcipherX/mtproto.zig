@@ -38,7 +38,7 @@ fn isValidEndpointHost(value: []const u8) bool {
 
 fn isValidHostPort(value: []const u8) bool {
     if (value.len == 0 or hasAsciiSpaceOrControl(value)) return false;
-    const colon = std.mem.lastIndexOfScalar(u8, value, ':') orelse return false;
+    const colon = std.mem.findScalarLast(u8, value, ':') orelse return false;
     if (colon == 0 or colon + 1 >= value.len) return false;
 
     const port = std.fmt.parseInt(u16, value[colon + 1 ..], 10) catch return false;
@@ -475,7 +475,7 @@ pub const Config = struct {
     }
 
     pub fn loadFromFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Config {
-        // A regular config file has a meaningful stat size, so use Zig 0.16's
+        // A regular config file has a meaningful stat size, so use Zig 0.17's
         // native bounded file API. Allow the exact historical 1 MiB limit.
         const max_bytes = 1024 * 1024;
         const content = try std.Io.Dir.cwd().readFileAlloc(
@@ -701,7 +701,7 @@ pub const Config = struct {
             }
 
             // Key = value parsing
-            if (std.mem.indexOfScalar(u8, line, '=')) |eq_pos| {
+            if (std.mem.findScalar(u8, line, '=')) |eq_pos| {
                 const key = std.mem.trim(u8, line[0..eq_pos], &[_]u8{ ' ', '\t' });
                 var value = std.mem.trim(u8, line[eq_pos + 1 ..], &[_]u8{ ' ', '\t' });
                 value = stripInlineComment(value);
@@ -1702,7 +1702,7 @@ test "parse config - mask relay lifetime default, opt-out and explicit value" {
         .{ .setting = "mask_relay_max_secs = 0", .expected = 0 },
         .{ .setting = "mask_relay_max_secs = 60", .expected = 60 },
     }) |fixture| {
-        const content = try std.fmt.allocPrint(std.testing.allocator, "[censorship]\n{s}\n[access.users]\nalice = \"00112233445566778899aabbccddeeff\"\n", .{fixture.setting});
+        const content = try std.testing.allocator.print("[censorship]\n{s}\n[access.users]\nalice = \"00112233445566778899aabbccddeeff\"\n", .{fixture.setting});
         defer std.testing.allocator.free(content);
         var cfg = try Config.parse(std.testing.allocator, content);
         defer cfg.deinit(std.testing.allocator);

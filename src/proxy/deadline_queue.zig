@@ -203,7 +203,7 @@ test "deadline queue matches a reference over deterministic updates and removals
         slot.* = .{ .index = @intCast(index) };
         slots[index] = slot;
     }
-    var expected = [_]?i128{null} ** storage.len;
+    var expected: [storage.len]?i128 = @splat(null);
     var queue: DeadlineQueue = .empty;
     try queue.ensureTotalCapacity(std.testing.allocator, storage.len);
     defer queue.deinit(std.testing.allocator);

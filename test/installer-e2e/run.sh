@@ -325,7 +325,7 @@ docker build --build-arg "BASE_IMAGE=$BASE_IMAGE" -t "$TEST_IMAGE" "$ROOT/test/i
 echo "::endgroup::"
 
 echo "::group::Build proxy image from current checkout"
-docker build --build-arg ZIG_VERSION=0.16.0 -t "$CURRENT_IMAGE" "$ROOT"
+docker build --build-arg ZIG_VERSION=0.17.0 -t "$CURRENT_IMAGE" "$ROOT"
 echo "::endgroup::"
 
 echo "::group::Boot isolated systemd + Docker host"

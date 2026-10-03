@@ -60,7 +60,7 @@ pub const Cache = struct {
     fn resolve(allocator: std.mem.Allocator, io: std.Io, host: []const u8, port: u16) !net.AddressList {
         // Production is Linux. NSS resolution in a deadline-bounded child also
         // bounds shutdown even if the system resolver is wedged (five seconds).
-        return if (builtin.os.tag == .linux) net.lookupViaGetent(allocator, io, host, port) else net.getAddressList(allocator, io, host, port);
+        return if (builtin.target.os.tag == .linux) net.lookupViaGetent(allocator, io, host, port) else net.getAddressList(allocator, io, host, port);
     }
 
     fn refresh(self: *Cache, resolver: Resolver) void {

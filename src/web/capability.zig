@@ -181,7 +181,7 @@ pub fn normalizeHost(input: []const u8, out: []u8) HostError![]const u8 {
     for (trimmed, 0..) |c, i| out[i] = std.ascii.toLower(c);
     const host = out[0..trimmed.len];
 
-    if (std.mem.indexOfScalar(u8, host, '.') == null) return error.NotFullyQualified;
+    if (std.mem.findScalar(u8, host, '.') == null) return error.NotFullyQualified;
 
     var labels = std.mem.splitScalar(u8, host, '.');
     while (labels.next()) |label| {
@@ -201,7 +201,7 @@ pub fn normalizeHost(input: []const u8, out: []u8) HostError![]const u8 {
 /// `0x`-prefixed hex label, means the host is really an IPv4 address in some
 /// shorthand (`127.1`, `0x7f.1`, `0177.0.0.1`).
 fn lastLabelIsNumeric(host: []const u8) bool {
-    const dot = std.mem.lastIndexOfScalar(u8, host, '.');
+    const dot = std.mem.findScalarLast(u8, host, '.');
     const label = if (dot) |d| host[d + 1 ..] else host;
     if (label.len == 0) return false;
     const hex = label.len >= 2 and label[0] == '0' and label[1] == 'x';
@@ -244,8 +244,8 @@ test "base path validation accepts only the canonical shared grammar" {
     for ([_][]const u8{ "/leading", "trailing/", "empty//segment", "-lead", "_lead", "a/-lead", "dot.ted", "..", "with space", "per%20cent", "unicode-é" }) |path| {
         try std.testing.expectError(error.NonCanonical, validateBasePath(path));
     }
-    try validateBasePath("a" ** max_base_path_len);
-    try std.testing.expectError(error.TooLong, validateBasePath("a" ** (max_base_path_len + 1)));
+    try validateBasePath(&@as([max_base_path_len]u8, @splat('a')));
+    try std.testing.expectError(error.TooLong, validateBasePath(&@as([max_base_path_len + 1]u8, @splat('a'))));
 }
 
 test "base path link marker wraps the complete padded MTProxy secret" {
@@ -254,7 +254,7 @@ test "base path link marker wraps the complete padded MTProxy secret" {
 }
 
 test "capability comparison is length-checked" {
-    const secret = [_]u8{0xab} ** 16;
+    const secret: [16]u8 = @splat(0xab);
     const cap = deriveForPaddedSecret("proxy.example.com", "", secret);
     try std.testing.expect(matches(&cap, cap));
     try std.testing.expect(!matches(cap[0 .. capability_len - 1], cap));
@@ -300,14 +300,14 @@ test "host normalization keeps a hex-looking label that is not last" {
 }
 
 test "capability changes with the hostname" {
-    const secret = [_]u8{0x11} ** 16;
+    const secret: [16]u8 = @splat(0x11);
     const a = deriveForPaddedSecret("a.example", "", secret);
     const b = deriveForPaddedSecret("b.example", "", secret);
     try std.testing.expect(!std.mem.eql(u8, &a, &b));
 }
 
 test "capability changes with the base path" {
-    const secret = [_]u8{0x22} ** 16;
+    const secret: [16]u8 = @splat(0x22);
     const root = deriveForPaddedSecret("proxy.example", "", secret);
     const one = deriveForPaddedSecret("proxy.example", "one", secret);
     const two = deriveForPaddedSecret("proxy.example", "two", secret);

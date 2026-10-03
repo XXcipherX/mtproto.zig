@@ -24,7 +24,7 @@ pub const SubnetRateLimit = struct {
     };
 
     hash_seed: u64 = 0,
-    entries: [BUCKETS]Entry = [_]Entry{.{}} ** BUCKETS,
+    entries: [BUCKETS]Entry = @splat(.{}),
 
     fn init() SubnetRateLimit {
         return .{
@@ -141,12 +141,12 @@ pub const ReplayCache = struct {
     const Entry = struct {
         used: bool = false,
         key: u64 = 0,
-        digest: [32]u8 = [_]u8{0} ** 32,
+        digest: [32]u8 = @splat(0),
         last_seen_s: i64 = 0,
     };
 
     hash_seed: u64 = 0,
-    entries: [BUCKETS]Entry = [_]Entry{.{}} ** BUCKETS,
+    entries: [BUCKETS]Entry = @splat(.{}),
 
     fn init() ReplayCache {
         return .{
@@ -226,7 +226,7 @@ pub const SubnetHandshakeLimit = struct {
     };
 
     hash_seed: u64 = 0,
-    entries: [BUCKETS]Entry = [_]Entry{.{}} ** BUCKETS,
+    entries: [BUCKETS]Entry = @splat(.{}),
 
     fn init() SubnetHandshakeLimit {
         return .{ .hash_seed = crypto.randomInt(u64) };
@@ -347,25 +347,25 @@ test "subnet rate limit - subnet key groups /24 IPv4" {
 test "subnet rate limit - IPv4-mapped IPv6 keys match native IPv4 /24" {
     const native_v4 = net.ip4(.{ 203, 0, 113, 42 }, 443);
 
-    const mapped_bytes = [_]u8{0} ** 10 ++ [_]u8{ 0xff, 0xff } ++ [_]u8{ 203, 0, 113, 42 };
+    const mapped_bytes = @as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff } ++ [_]u8{ 203, 0, 113, 42 };
     const mapped = net.ip6(mapped_bytes, 443, 0, 0);
 
     const native_key = SubnetRateLimit.subnetKey(native_v4);
     const mapped_key = SubnetRateLimit.subnetKey(mapped);
     try std.testing.expectEqual(native_key, mapped_key);
 
-    const mapped_other_bytes = [_]u8{0} ** 10 ++ [_]u8{ 0xff, 0xff } ++ [_]u8{ 198, 51, 100, 1 };
+    const mapped_other_bytes = @as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff } ++ [_]u8{ 198, 51, 100, 1 };
     const mapped_other = net.ip6(mapped_other_bytes, 443, 0, 0);
     try std.testing.expect(SubnetRateLimit.subnetKey(mapped_other) != mapped_key);
 
-    const native6_bytes = [_]u8{ 0x20, 0x01, 0x0d, 0xb8 } ++ [_]u8{0} ** 12;
+    const native6_bytes = [_]u8{ 0x20, 0x01, 0x0d, 0xb8 } ++ @as([12]u8, @splat(0));
     const native6 = net.ip6(native6_bytes, 443, 0, 0);
     try std.testing.expect(SubnetRateLimit.subnetKey(native6) != mapped_key);
 }
 
 test "subnet rate limit - preserves every IPv6 /48 prefix bit" {
-    const prefix_a = [_]u8{ 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00 } ++ [_]u8{0} ** 10;
-    const prefix_b = [_]u8{ 0x20, 0x01, 0x0d, 0xb9, 0x00, 0x01 } ++ [_]u8{0} ** 10;
+    const prefix_a = [_]u8{ 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00 } ++ @as([10]u8, @splat(0));
+    const prefix_b = [_]u8{ 0x20, 0x01, 0x0d, 0xb9, 0x00, 0x01 } ++ @as([10]u8, @splat(0));
     const addr_a = net.ip6(prefix_a, 443, 0, 0);
     const addr_b = net.ip6(prefix_b, 443, 0, 0);
 
@@ -456,7 +456,7 @@ test "subnet rate limit - different subnets are independent" {
 
 test "replay cache detects duplicate digest" {
     var cache = ReplayCache.init();
-    const digest = [_]u8{0xAB} ** 32;
+    const digest: [32]u8 = @splat(0xAB);
 
     try std.testing.expect(!cache.checkAndInsert(&digest));
     try std.testing.expect(cache.checkAndInsert(&digest));
@@ -464,8 +464,8 @@ test "replay cache detects duplicate digest" {
 
 test "replay cache accepts distinct digests" {
     var cache = ReplayCache.init();
-    const digest_a = [_]u8{0x11} ** 32;
-    const digest_b = [_]u8{0x22} ** 32;
+    const digest_a: [32]u8 = @splat(0x11);
+    const digest_b: [32]u8 = @splat(0x22);
 
     try std.testing.expect(!cache.checkAndInsert(&digest_a));
     try std.testing.expect(!cache.checkAndInsert(&digest_b));
@@ -473,7 +473,7 @@ test "replay cache accepts distinct digests" {
 
 test "replay cache compares full digest on key collision" {
     var cache = ReplayCache.init();
-    const digest_a = [_]u8{0x11} ** 32;
+    const digest_a: [32]u8 = @splat(0x11);
     var digest_b = digest_a;
     digest_b[31] ^= 0xff;
 
@@ -486,14 +486,14 @@ test "replay cache compares full digest on key collision" {
 
 test "replay cache replaces oldest live entry without reporting false replay" {
     var cache = ReplayCache.init();
-    const digest = [_]u8{0x5a} ** 32;
+    const digest: [32]u8 = @splat(0x5a);
     const start = cache.indexFor(ReplayCache.digestKey(&digest));
     const now_s = @divTrunc(runtime_time.monotonicMilli(), 1000);
 
     var probe: usize = 0;
     while (probe < ReplayCache.MAX_PROBES) : (probe += 1) {
         const idx = (start + probe) & (ReplayCache.BUCKETS - 1);
-        var occupied_digest = [_]u8{0} ** 32;
+        var occupied_digest: [32]u8 = @splat(0);
         @memset(&occupied_digest, @intCast(probe + 1));
         cache.entries[idx] = .{
             .used = true,

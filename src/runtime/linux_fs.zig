@@ -1,5 +1,5 @@
 //! Bounded reads for Linux procfs/cgroup pseudo-files.
-//! Zig 0.16's convenient allocRemaining path can trust a zero stat.size for
+//! Zig 0.17's convenient allocRemaining path can trust a zero stat.size for
 //! these files and return empty data; read the stream until EOF instead.
 
 const std = @import("std");
@@ -11,7 +11,7 @@ pub fn readPseudoFileAlloc(
     path: []const u8,
     max_bytes: usize,
 ) ![]u8 {
-    if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
+    if (builtin.target.os.tag != .linux) return error.UnsupportedOperatingSystem;
     const file = try std.Io.Dir.openFileAbsolute(io, path, .{});
     defer file.close(io);
 
@@ -50,8 +50,8 @@ test "bounded pseudo-file reading handles empty exact and oversized input" {
 }
 
 test "procfs status is not empty despite zero stat size" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const content = try readPseudoFileAlloc(std.testing.allocator, std.testing.io, "/proc/self/status", 64 * 1024);
     defer std.testing.allocator.free(content);
-    try std.testing.expect(std.mem.indexOf(u8, content, "Name:") != null);
+    try std.testing.expect(std.mem.find(u8, content, "Name:") != null);
 }

@@ -1,4 +1,4 @@
-//! Canonical Zig 0.16 IP addresses, hostname resolution, and Linux socket boundary.
+//! Canonical Zig 0.17 IP addresses, hostname resolution, and Linux socket boundary.
 
 const builtin = @import("builtin");
 const std = @import("std");
@@ -50,12 +50,15 @@ const Sockaddr = union(enum) {
 
     fn init(addr: Address) Sockaddr {
         return switch (addr) {
-            .ip4 => |value| .{ .ip4 = .{
-                .family = posix.AF.INET,
-                .port = std.mem.nativeToBig(u16, value.port),
-                .addr = @bitCast(value.bytes),
-                .zero = [_]u8{0} ** 8,
-            } },
+            .ip4 => |value| .{
+                .ip4 = .{
+                    .family = posix.AF.INET,
+                    .port = std.mem.nativeToBig(u16, value.port),
+                    // sockaddr stores these bytes in native integer memory order.
+                    .addr = std.mem.readInt(u32, &value.bytes, std.lang.Endian.native),
+                    .zero = @as([8]u8, @splat(0)),
+                },
+            },
             .ip6 => |value| .{ .ip6 = .{
                 .family = posix.AF.INET6,
                 .port = std.mem.nativeToBig(u16, value.port),
@@ -86,7 +89,7 @@ pub fn addressFromSockaddr(storage: *const posix.sockaddr.storage, len: posix.so
         posix.AF.INET => blk: {
             if (len < @sizeOf(posix.sockaddr.in)) break :blk null;
             const sa: *const posix.sockaddr.in = @ptrCast(storage);
-            break :blk ip4(@bitCast(sa.addr), std.mem.bigToNative(u16, sa.port));
+            break :blk ip4(std.mem.toBytes(sa.addr), std.mem.bigToNative(u16, sa.port));
         },
         posix.AF.INET6 => blk: {
             if (len < @sizeOf(posix.sockaddr.in6)) break :blk null;
@@ -128,7 +131,7 @@ pub fn getAddressList(allocator: std.mem.Allocator, io: std.Io, host: []const u8
 
 /// Resolve a host while cooperatively observing an updater stop flag. The
 /// futures and their borrowed stack state are owned and canceled by this
-/// calling thread. Zig 0.16 marks Future/Group cancellation as non-thread-safe;
+/// calling thread. Zig 0.17 marks Future/Group cancellation as non-thread-safe;
 /// Select cancellation itself is thread-safe, but still must not outlive the
 /// buffers and arguments owned by this scope.
 pub fn getAddressListCancelable(
@@ -285,7 +288,7 @@ fn discardAddressListResult(result: anyerror!AddressList) void {
     } else |_| {}
 }
 
-/// Preflight Zig 0.16's resolver parser before it sees a system configuration
+/// Preflight Zig 0.17's resolver parser before it sees a system configuration
 /// that can otherwise reach an unchecked copy, division by zero, or DNS-name
 /// assertion. The stdlib reopens resolv.conf for the actual lookup, so a
 /// privileged concurrent replacement remains an unavoidable TOCTOU until the
@@ -295,7 +298,7 @@ pub fn validateSystemResolverForHost(
     io: std.Io,
     host: []const u8,
 ) !void {
-    if (builtin.os.tag != .linux) return;
+    if (builtin.target.os.tag != .linux) return;
     if (std.Io.net.IpAddress.parse(host, 0)) |_| return else |_| {}
 
     try std.Io.net.HostName.validate(host);
@@ -398,7 +401,7 @@ pub const Listener = struct {
     handle: posix.fd_t,
 
     pub fn deinit(self: *Listener) void {
-        if (builtin.os.tag == .linux) _ = std.os.linux.close(self.handle);
+        if (builtin.target.os.tag == .linux) _ = std.os.linux.close(self.handle);
         self.* = undefined;
     }
 };
@@ -416,7 +419,7 @@ pub const ListenError = error{
 };
 
 pub fn listen(a: Address, options: ListenOptions) ListenError!Listener {
-    if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
+    if (builtin.target.os.tag != .linux) return error.UnsupportedOperatingSystem;
     const linux = std.os.linux;
     const socket_rc = linux.socket(
         family(a),
@@ -500,7 +503,7 @@ pub fn acceptNeedsRetry(err: std.os.linux.E) !bool {
 }
 
 pub fn acceptFd(fd: posix.fd_t) !Accepted {
-    if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
+    if (builtin.target.os.tag != .linux) return error.UnsupportedOperatingSystem;
     const linux = std.os.linux;
     while (true) {
         var storage: posix.sockaddr.storage = undefined;
@@ -517,7 +520,7 @@ pub fn acceptFd(fd: posix.fd_t) !Accepted {
 }
 
 pub fn socketTcpNonblocking(addr: Address) !posix.fd_t {
-    if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
+    if (builtin.target.os.tag != .linux) return error.UnsupportedOperatingSystem;
     const linux = std.os.linux;
     const rc = linux.socket(
         family(addr),
@@ -536,7 +539,7 @@ pub fn socketTcpNonblocking(addr: Address) !posix.fd_t {
 }
 
 pub fn connectFd(fd: posix.fd_t, addr: Address) !void {
-    if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
+    if (builtin.target.os.tag != .linux) return error.UnsupportedOperatingSystem;
     const linux = std.os.linux;
     const sa = Sockaddr.init(addr);
     const rc = linux.connect(fd, sa.ptr(), sa.len());
@@ -552,7 +555,7 @@ pub fn connectFd(fd: posix.fd_t, addr: Address) !void {
 }
 
 fn namedAddress(fd: posix.fd_t, comptime peer: bool) !Address {
-    if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
+    if (builtin.target.os.tag != .linux) return error.UnsupportedOperatingSystem;
     const linux = std.os.linux;
     var storage: posix.sockaddr.storage = undefined;
     var len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
@@ -627,7 +630,7 @@ test "IpAddress IPv6 sockaddr conversion preserves bytes flow scope and port" {
 
 test "sockaddr conversion rejects truncated addresses and retains mapped IPv6" {
     const mapped = ip6(
-        [_]u8{0} ** 10 ++ [_]u8{ 0xff, 0xff, 192, 0, 2, 9 },
+        @as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff, 192, 0, 2, 9 },
         1234,
         0,
         0,
@@ -660,7 +663,7 @@ test "accept errno mapping separates retry wait resource and firewall failures" 
 }
 
 test "Linux socket boundary preserves accept peer and local and remote names" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const linux = std.os.linux;
 
     var listener = try listen(ip4(.{ 127, 0, 0, 1 }, 0), .{});
@@ -796,13 +799,13 @@ test "resolver guard rejects zero attempts after last override" {
 }
 
 test "resolver guard rejects oversized search and lines" {
-    const oversized_search = "search " ++ ([_]u8{'a'} ** 256) ++ "\n";
+    const oversized_search = "search " ++ (@as([256]u8, @splat('a'))) ++ "\n";
     try std.testing.expectError(
         error.UnsafeResolverConfiguration,
         validateResolverConfigurationForHost(oversized_search, "gateway"),
     );
 
-    const oversized_line = [_]u8{'#'} ** (resolver_line_max_bytes + 1);
+    const oversized_line: [resolver_line_max_bytes + 1]u8 = @splat('#');
     try std.testing.expectError(
         error.UnsafeResolverConfiguration,
         validateResolverConfigurationForHost(&oversized_line, "gateway"),
@@ -810,7 +813,7 @@ test "resolver guard rejects oversized search and lines" {
 }
 
 test "resolver guard does not hide CR from Zig search tokens" {
-    const label = [_]u8{'a'} ** 63;
+    const label: [63]u8 = @splat('a');
     const content = "search " ++ label ++ "\r\n";
     try std.testing.expectError(
         error.UnsafeResolverConfiguration,
@@ -819,7 +822,7 @@ test "resolver guard does not hide CR from Zig search tokens" {
 }
 
 test "resolver guard rejects host names beyond DNS wire limit" {
-    var host = [_]u8{'a'} ** 254;
+    var host: [254]u8 = @splat('a');
     host[63] = '.';
     host[127] = '.';
     host[191] = '.';

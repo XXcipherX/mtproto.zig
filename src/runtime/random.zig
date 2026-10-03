@@ -12,9 +12,9 @@ const SecureDrbg = struct {
     const buffer_size = 1024;
     const reseed_interval = 1024 * 1024;
 
-    key: [ChaCha20.key_length]u8 = [_]u8{0} ** ChaCha20.key_length,
-    nonce: [ChaCha20.nonce_length]u8 = [_]u8{0} ** ChaCha20.nonce_length,
-    buffer: [buffer_size]u8 = [_]u8{0} ** buffer_size,
+    key: [ChaCha20.key_length]u8 = @splat(0),
+    nonce: [ChaCha20.nonce_length]u8 = @splat(0),
+    buffer: [buffer_size]u8 = @splat(0),
     buffer_pos: usize = buffer_size,
     counter: u32 = 0,
     generated: usize = reseed_interval,
@@ -78,7 +78,7 @@ pub fn range(comptime T: type, max: T) T {
 }
 
 fn randomBytesFromOs(buf: []u8) !void {
-    if (builtin.os.tag == .linux) {
+    if (builtin.target.os.tag == .linux) {
         const linux = std.os.linux;
         var offset: usize = 0;
         while (offset < buf.len) {

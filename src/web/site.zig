@@ -111,7 +111,7 @@ test "public site file count is bounded" {
     defer dir.cleanup();
     var name_buf: [32]u8 = undefined;
     for (0..max_files + 1) |index| {
-        const name = try std.fmt.bufPrint(&name_buf, "asset-{d}.txt", .{index});
+        const name = try std.mem.print(&name_buf, "asset-{d}.txt", .{index});
         try dir.dir.writeFile(io, .{ .sub_path = name, .data = "" });
     }
     try std.testing.expectError(error.PublicSiteTooLarge, Site.fromDir(std.testing.allocator, io, dir.dir));
@@ -146,7 +146,7 @@ test "public site total loaded bytes are bounded" {
     @memset(chunk, 'x');
     var name_buf: [32]u8 = undefined;
     for (0..17) |index| {
-        const name = try std.fmt.bufPrint(&name_buf, "chunk-{d}.bin", .{index});
+        const name = try std.mem.print(&name_buf, "chunk-{d}.bin", .{index});
         try dir.dir.writeFile(io, .{ .sub_path = name, .data = chunk });
     }
     try std.testing.expectError(error.PublicSiteTooLarge, Site.fromDir(allocator, io, dir.dir));
@@ -159,7 +159,7 @@ test "no configured public directory creates no deployment fingerprint" {
 }
 
 fn mime(path: []const u8) []const u8 {
-    const ext = std.fs.path.extension(path);
+    const ext = std.Io.Dir.path.extension(path);
     const types = .{
         .{ ".html", "text/html; charset=utf-8" },     .{ ".css", "text/css; charset=utf-8" },
         .{ ".js", "text/javascript; charset=utf-8" }, .{ ".json", "application/json" },

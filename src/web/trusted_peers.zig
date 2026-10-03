@@ -104,11 +104,11 @@ test "loopback detection covers v4, v6 and the ipv4-mapped form" {
     try std.testing.expect(isLoopback(net_helpers.ip4(.{ 127, 4, 5, 6 }, 0)));
     try std.testing.expect(!isLoopback(net_helpers.ip4(.{ 10, 0, 0, 1 }, 0)));
 
-    var v6_loopback: [16]u8 = [_]u8{0} ** 16;
+    var v6_loopback: [16]u8 = @splat(0);
     v6_loopback[15] = 1;
     try std.testing.expect(isLoopback(net_helpers.ip6(v6_loopback, 0, 0, 0)));
 
-    var mapped: [16]u8 = [_]u8{0} ** 16;
+    var mapped: [16]u8 = @splat(0);
     mapped[10] = 0xff;
     mapped[11] = 0xff;
     mapped[12] = 127;
@@ -142,7 +142,7 @@ test "explicit sources are matched on address only, ignoring the ephemeral port"
     try std.testing.expect(peers.contains(net_helpers.ip4(.{ 10, 8, 0, 2 }, 54321)));
     try std.testing.expect(!peers.contains(net_helpers.ip4(.{ 10, 8, 0, 3 }, 54321)));
 
-    var v6: [16]u8 = [_]u8{0} ** 16;
+    var v6: [16]u8 = @splat(0);
     v6[0] = 0x20;
     v6[1] = 0x01;
     v6[2] = 0x0d;
@@ -164,7 +164,7 @@ test "IPv6 relay trust includes the interface scope but ignores the port" {
 }
 
 test "v4 and v6 never match each other" {
-    var v6: [16]u8 = [_]u8{0} ** 16;
+    var v6: [16]u8 = @splat(0);
     v6[15] = 2;
     try std.testing.expect(!sameHost(net_helpers.ip4(.{ 0, 0, 0, 2 }, 0), net_helpers.ip6(v6, 0, 0, 0)));
 }

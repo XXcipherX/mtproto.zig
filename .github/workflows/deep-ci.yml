@@ -25,16 +25,16 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0
 
       - name: Run unit tests under ThreadSanitizer
-        run: zig build -Doptimize=ReleaseSafe -Dtsan=true test
+        run: zig build -Doptimize=safe -Dtsan=true test
 
       - name: Run multithreaded soak under ThreadSanitizer
-        run: zig build -Doptimize=ReleaseSafe -Dtsan=true soak -- --seconds=30 --threads=4
+        run: zig build -Doptimize=safe -Dtsan=true soak -- --seconds=30 --threads=4
 
       - name: Run real multi-worker relay under ThreadSanitizer
-        run: zig build -Doptimize=ReleaseSafe -Dtsan=true e2e -- --workers=2
+        run: zig build -Doptimize=safe -Dtsan=true e2e -- --workers=2
 
   valgrind:
     name: Valgrind Memcheck
@@ -46,15 +46,15 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0
 
       - name: Install Valgrind
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends --yes valgrind
 
-      - name: Build baseline ReleaseSafe daemon
-        run: zig build -Doptimize=ReleaseSafe -Dcpu=baseline
+      - name: Build baseline safe daemon
+        run: zig build -Doptimize=safe -Dcpu=baseline
 
       - name: Run real daemon smoke under Memcheck
         run: |
@@ -93,7 +93,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0
 
       - name: Run extended bounded fuzz campaign
         shell: bash

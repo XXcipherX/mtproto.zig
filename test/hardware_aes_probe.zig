@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 comptime {
-    if (builtin.cpu.arch != .x86_64) {
+    if (builtin.target.cpu.arch != .x86_64) {
         @compileError("hardware AES probe expects the published x86_64 target");
     }
     if (!std.crypto.core.aes.has_hardware_support) {

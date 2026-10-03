@@ -5,7 +5,7 @@ const posix = std.posix;
 const linux = std.os.linux;
 
 pub fn ignoreSigpipe() void {
-    if (builtin.os.tag != .linux) return;
+    if (builtin.target.os.tag != .linux) return;
     const action = posix.Sigaction{
         .handler = .{ .handler = posix.SIG.IGN },
         .mask = posix.sigemptyset(),
@@ -39,7 +39,7 @@ pub const ShutdownSignalBridge = struct {
     previous_mask: posix.sigset_t,
 
     pub fn init() !ShutdownSignalBridge {
-        if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
+        if (builtin.target.os.tag != .linux) return error.UnsupportedOperatingSystem;
 
         const signal_mask = shutdownSignalMask();
         var previous_mask: posix.sigset_t = undefined;

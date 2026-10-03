@@ -129,13 +129,13 @@ pub fn encodeFrame(
 test "encrypted MiddleProxy handshake frame keeps four-byte padding and checksum" {
     var frame: [64]u8 = undefined;
     var seq_no: i32 = -2;
-    const key = [_]u8{0} ** 32;
-    const iv = [_]u8{0} ** 16;
+    const key: [32]u8 = @splat(0);
+    const iv: [16]u8 = @splat(0);
     var encryptor = crypto.AesCbcEncryptor.init(&key, &iv);
     defer encryptor.wipe();
     var decryptor = crypto.AesCbcDecryptor.init(&key, &iv);
     defer decryptor.wipe();
-    const payload = [_]u8{7} ** 32;
+    const payload: [32]u8 = @splat(7);
 
     const encoded = try encodeFrame(&frame, &seq_no, &payload, &encryptor);
     try std.testing.expectEqual(@as(usize, 48), encoded.len);
@@ -166,8 +166,8 @@ test "plain MiddleProxy handshake frame keeps wire length, sequence and checksum
 test "MiddleProxy IPv4 NAT override changes KDF and effective local address" {
     const peer = net.ip4(.{ 149, 154, 167, 40 }, 443);
     const local = net.ip4(.{ 10, 0, 0, 2 }, 34567);
-    const server_nonce = [_]u8{1} ** 16;
-    const client_nonce = [_]u8{2} ** 16;
+    const server_nonce: [16]u8 = @splat(1);
+    const client_nonce: [16]u8 = @splat(2);
     var enc_direct: KeyIv = undefined;
     var dec_direct: KeyIv = undefined;
     var enc_nat: KeyIv = undefined;

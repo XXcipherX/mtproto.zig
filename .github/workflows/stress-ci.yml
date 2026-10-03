@@ -79,13 +79,13 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0
 
       - name: Test stress harness helpers
         run: python3 -m unittest discover -s test -p 'test_stress_helpers.py'
 
-      - name: Build ReleaseFast test-hooked proxy and batch nonce generator
-        run: zig build -Doptimize=ReleaseFast stress-tools
+      - name: Build fast test-hooked proxy and batch nonce generator
+        run: zig build -Doptimize=fast stress-tools
 
       - name: Run offline full-relay stress
         env:

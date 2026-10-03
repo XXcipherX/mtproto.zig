@@ -57,6 +57,12 @@ direction and count one buffer-growth allocation. They verify CBC/sequence/CRC
 continuity, eventual shrink after 16 small passes, optional-shrink OOM ownership
 and retry backoff, and immediate reclamation for a burst above the retained cap.
 
+In-place compaction uses `@memmove` with equal-length source and destination
+ranges: MiddleProxy stream and frame buffers, WEB queue block pointers, and
+HTTP/WebSocket input buffers may overlap when shifted left. IPv4 candidate
+prioritization shifts overlapping address ranges right while retaining stable
+ordering within each family. Keep these bounds and ordering intact.
+
 HTTP pipeline regressions count one compaction for 128 requests, check every
 queued response and incomplete-head continuation, stop at Connection: close,
 and exercise authenticated upgrade with complete and partial WebSocket bytes
@@ -88,7 +94,11 @@ snapshots. Cache lifecycle fixtures check key order, erasure while still owned,
 allocation failure and the existing exhaustive startup allocation-failure path.
 These check correctness and allocation behavior; they are not throughput results.
 
-`zig build web-bridge` needs Python 3, Node.js and the configured Zig compiler. It
+`zig build web-bridge` needs Python 3, Node.js and the configured Zig compiler. The
+build graph passes its compiler through Zig 0.17's `LazyPath.zig_exe` and the
+harness's `--zig` argument, resolved at make time so restored configuration caches
+cannot retain a previous runner's temporary Zig path or environment. Direct
+script invocations still accept `ZIG` or find Zig through `PATH`. The build target
 runs `web-bridge/render.zig` to render the production bridge and HELLO/WELCOME
 vectors, then passes the actual script to the Node harness. Missing tools fail the
 step. The harness checks native WebView startup, strict Android/MessagePort boundaries,
@@ -132,6 +142,11 @@ after each case. `src/proxy/middle_proxy_routing.zig` separately covers
 `direct_users` plus a tag, preserving the media bypass and mandatory MiddleProxy
 for CDN DC203. Existing `src/protocol/middleproxy.zig` wire tests verify both the
 tagged `RPC_PROXY_REQ` extension and its absence when no tag is configured.
+
+The AES-CBC block XOR regression checks every output byte against an independent
+bytewise oracle. Production uses byte vectors directly, avoiding Zig 0.17's
+logical array/integer conversions in the per-block loop. Existing CBC roundtrip,
+split-call chaining and wide-decryption tail checks remain required.
 
 FakeTLS size regressions authenticate X25519, PQ and combined-share fixtures,
 including exactly 4096 bytes; correctly signed larger inputs are classified
@@ -270,12 +285,12 @@ Telegram connectivity or elevated privileges.
 `zig build e2e -- --workers=2` additionally verifies two live listening
 socket inodes on the same address/port (a real `SO_REUSEPORT` group), completes
 the relay, and checks graceful process shutdown. CI executes the default,
-two-worker, and `zig build -Doptimize=ReleaseFast e2e` variants. The ReleaseFast
+two-worker, and `zig build -Doptimize=fast e2e` variants. The fast
 variant matches the default production mode. CI also runs
-`zig build -Doptimize=ReleaseFast -Ddataplane_safety=true e2e` for the optional
-hardened ReleaseSafe mode. These scenarios catch runtime-only release defects that
+`zig build -Doptimize=fast -Ddataplane_safety=true e2e` for the optional
+hardened safe mode. These scenarios catch runtime-only release defects that
 a cross-compile or binary-exists check cannot detect. Deep CI retains the explicit
-ReleaseSafe two-worker variant with ThreadSanitizer instrumentation.
+safe two-worker variant with ThreadSanitizer instrumentation.
 
 ## Offline full-relay Stress CI
 
@@ -292,8 +307,8 @@ gh workflow run stress-ci.yml --repo XXcipherX/mtproto.zig --ref stress-validati
 ```
 
 These commands start remote GitHub jobs; they do not build or test on the local
-machine. `zig build -Doptimize=ReleaseFast
-stress-tools` builds the same compile-time-hooked E2E proxy in genuine ReleaseFast,
+machine. `zig build -Doptimize=fast
+stress-tools` builds the same compile-time-hooked E2E proxy in genuine fast,
 matching the default production optimize mode, plus a batch-mode
 obfuscated-handshake generator. The normal shipping executable has no DC
 override. No Telegram, public endpoint, self-hosted runner, Python package
@@ -396,8 +411,8 @@ The standalone `mtproto-bench` program has two handshake-specific modes in
 addition to the encapsulation benchmark and soak test:
 
 ```bash
-zig build -Doptimize=ReleaseFast bench -- handshake --iterations=500000
-zig build -Doptimize=ReleaseFast bench -- handshake-path --iterations=500000 --candidate-count=4
+zig build -Doptimize=fast bench -- handshake --iterations=500000
+zig build -Doptimize=fast bench -- handshake-path --iterations=500000 --candidate-count=4
 ```
 
 `handshake` validates a complete, authenticated and structurally valid FakeTLS

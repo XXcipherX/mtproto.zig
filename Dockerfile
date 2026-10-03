@@ -2,9 +2,9 @@
 #
 # Build (see README "Docker image" for --platform and build-args):
 #   docker build -t mtproto-zig .
-#   docker build --platform linux/amd64 --build-arg ZIG_VERSION=0.16.0 -t mtproto-zig .
+#   docker build --platform linux/amd64 --build-arg ZIG_VERSION=0.17.0 -t mtproto-zig .
 #   docker build --platform linux/amd64 --build-arg MTPROTO_CPU=x86_64_v3+aes -t mtproto-zig:amd64-v3 .
-# Production defaults to ReleaseFast + PIE; opt into ReleaseSafe + PIE with:
+# Production defaults to fast + PIE; opt into safe + PIE with:
 #   docker build --build-arg DATAPLANE_SAFETY=true -t mtproto-zig:release-safe .
 #
 # Run (default config from image listens on 443; override with a volume for production):
@@ -13,7 +13,7 @@
 # To use 8443, set server.port = 8443 in config.toml and run with -p 8443:8443 or manipulate the port mapping like
 # -p 48443:8443
 
-ARG ZIG_VERSION=0.16.0
+ARG ZIG_VERSION=0.17.0
 ARG ZIG_SHA256=
 ARG MTPROTO_CPU=
 ARG DATAPLANE_SAFETY=false
@@ -70,9 +70,9 @@ RUN set -eu \
        esac \
     && cpu="${MTPROTO_CPU:-$default_cpu}" \
     && if [ -n "$cpu" ]; then \
-         zig build -Doptimize=ReleaseFast -Ddataplane_safety="$DATAPLANE_SAFETY" -Dtarget="$target" -Dcpu="$cpu"; \
+         zig build -Doptimize=fast -Ddataplane_safety="$DATAPLANE_SAFETY" -Dtarget="$target" -Dcpu="$cpu"; \
        else \
-         zig build -Doptimize=ReleaseFast -Ddataplane_safety="$DATAPLANE_SAFETY" -Dtarget="$target"; \
+         zig build -Doptimize=fast -Ddataplane_safety="$DATAPLANE_SAFETY" -Dtarget="$target"; \
        fi
 
 FROM debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a

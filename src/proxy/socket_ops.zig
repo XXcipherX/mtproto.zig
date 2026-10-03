@@ -6,7 +6,7 @@ const posix = std.posix;
 const linux = std.os.linux;
 
 pub fn getsockoptErrorFd(fd: posix.fd_t) !void {
-    if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
+    if (builtin.target.os.tag != .linux) return error.UnsupportedOperatingSystem;
 
     var err_code: i32 = 0;
     var err_len: linux.socklen_t = @sizeOf(i32);
@@ -18,7 +18,7 @@ pub fn getsockoptErrorFd(fd: posix.fd_t) !void {
     }
     if (err_code == 0) return;
 
-    const err: @TypeOf(linux.errno(rc)) = @enumFromInt(err_code);
+    const err: @TypeOf(linux.errno(rc)) = @fromBackingInt(@intCast(err_code));
     switch (err) {
         .CONNREFUSED => return error.ConnectionRefused,
         .HOSTUNREACH, .NETUNREACH => return error.NetworkUnreachable,
@@ -28,7 +28,7 @@ pub fn getsockoptErrorFd(fd: posix.fd_t) !void {
 }
 
 pub fn writeFd(fd: posix.fd_t, data: []const u8) !usize {
-    if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
+    if (builtin.target.os.tag != .linux) return error.UnsupportedOperatingSystem;
     if (data.len == 0) return 0;
 
     while (true) {
@@ -46,7 +46,7 @@ pub fn writeFd(fd: posix.fd_t, data: []const u8) !usize {
 }
 
 pub fn writevFd(fd: posix.fd_t, iovecs: []const posix.iovec_const) !usize {
-    if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
+    if (builtin.target.os.tag != .linux) return error.UnsupportedOperatingSystem;
     if (iovecs.len == 0) return 0;
 
     while (true) {
@@ -64,7 +64,7 @@ pub fn writevFd(fd: posix.fd_t, iovecs: []const posix.iovec_const) !usize {
 }
 
 pub fn seekFdToStart(fd: posix.fd_t) !void {
-    if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
+    if (builtin.target.os.tag != .linux) return error.UnsupportedOperatingSystem;
 
     const rc = linux.lseek(fd, 0, linux.SEEK.SET);
     switch (linux.errno(rc)) {
@@ -96,8 +96,8 @@ pub fn formatAddress(addr: net.Address, buf: *[64]u8) []const u8 {
         .ip6 => |v6| net.Address.fromIp6(v6),
     };
     return switch (normalized) {
-        .ip4 => std.fmt.bufPrint(buf, "[ipv4]:{d}", .{addr.getPort()}) catch "?",
-        .ip6 => std.fmt.bufPrint(buf, "[ipv6]:{d}", .{addr.getPort()}) catch "?",
+        .ip4 => std.mem.print(buf, "[ipv4]:{d}", .{addr.getPort()}) catch "?",
+        .ip6 => std.mem.print(buf, "[ipv6]:{d}", .{addr.getPort()}) catch "?",
     };
 }
 
@@ -111,7 +111,7 @@ pub fn formatClientIp(addr: net.Address, buf: *[64]u8) []const u8 {
     };
     switch (normalized) {
         .ip4 => |v4| {
-            return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{
+            return std.mem.print(buf, "{d}.{d}.{d}.{d}", .{
                 v4.bytes[0], v4.bytes[1], v4.bytes[2], v4.bytes[3],
             }) catch "?";
         },
@@ -120,7 +120,7 @@ pub fn formatClientIp(addr: net.Address, buf: *[64]u8) []const u8 {
             normalized.format(&writer) catch return "?";
             const endpoint = writer.buffered();
             if (endpoint.len < 2 or endpoint[0] != '[') return "?";
-            const closing = std.mem.indexOfScalar(u8, endpoint, ']') orelse return "?";
+            const closing = std.mem.findScalar(u8, endpoint, ']') orelse return "?";
             return endpoint[1..closing];
         },
     }
@@ -139,7 +139,7 @@ test "client IP formatting omits port and normalizes mapped IPv4" {
     const native = net.ip4(.{ 203, 0, 113, 7 }, 54321);
     try std.testing.expectEqualStrings("203.0.113.7", formatClientIp(native, &buf));
 
-    const mapped_bytes = [_]u8{0} ** 10 ++ [_]u8{ 0xff, 0xff } ++ [_]u8{ 203, 0, 113, 7 };
+    const mapped_bytes = @as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff } ++ [_]u8{ 203, 0, 113, 7 };
     const mapped = net.ip6(mapped_bytes, 54321, 0, 0);
     try std.testing.expectEqualStrings("203.0.113.7", formatClientIp(mapped, &buf));
 }

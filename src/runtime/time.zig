@@ -5,7 +5,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 pub fn realtimeNano() i128 {
-    if (builtin.os.tag == .linux) {
+    if (builtin.target.os.tag == .linux) {
         const linux = std.os.linux;
         var ts: linux.timespec = undefined;
         return switch (linux.errno(linux.clock_gettime(.REALTIME, &ts))) {
@@ -24,7 +24,7 @@ pub fn realtimeSeconds() i64 {
 }
 
 pub fn monotonicNano() i128 {
-    if (builtin.os.tag == .linux) {
+    if (builtin.target.os.tag == .linux) {
         const linux = std.os.linux;
         var ts: linux.timespec = undefined;
         if (linux.errno(linux.clock_gettime(.MONOTONIC, &ts)) != .SUCCESS) {
@@ -44,7 +44,7 @@ pub fn monotonicMilli() i64 {
 }
 
 pub fn sleep(ns: u64) void {
-    if (builtin.os.tag == .linux) {
+    if (builtin.target.os.tag == .linux) {
         const linux = std.os.linux;
         var req = linux.timespec{
             .sec = @intCast(ns / std.time.ns_per_s),

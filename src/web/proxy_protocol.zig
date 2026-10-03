@@ -50,7 +50,7 @@ pub fn parse(buf: []const u8) ParseResult {
 fn parseV1(buf: []const u8) ParseResult {
     // "PROXY TCP4 <src> <dst> <sport> <dport>\r\n", max 107 bytes, terminated by CRLF.
     const max_v1 = 107;
-    const crlf = std.mem.indexOf(u8, buf[0..@min(buf.len, max_v1)], "\r\n") orelse {
+    const crlf = std.mem.find(u8, buf[0..@min(buf.len, max_v1)], "\r\n") orelse {
         return if (buf.len < max_v1) .incomplete else .invalid;
     };
     const line = buf[0..crlf];
@@ -157,7 +157,7 @@ pub fn buildV2(buf: *[64]u8, src: ?Address, dst: Address) []const u8 {
                 return buf[0..28];
             },
             .ip6 => |s6| {
-                var d: [16]u8 = [_]u8{0} ** 16;
+                var d: [16]u8 = @splat(0);
                 var d_port: u16 = 0;
                 switch (target) {
                     .ip6 => |d6| {

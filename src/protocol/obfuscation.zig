@@ -200,7 +200,7 @@ fn buildTestClientHandshakeFields(
     dc_idx: i16,
     iv: u128,
 ) [constants.handshake_len]u8 {
-    var handshake = [_]u8{0x42} ** constants.handshake_len;
+    var handshake: [constants.handshake_len]u8 = @splat(0x42);
     handshake[0] = first_byte;
     handshake[4] = 1;
     handshake[5] = 2;
@@ -221,7 +221,7 @@ fn buildTestClientHandshakeFields(
     const decrypt_key = crypto.sha256(&dec_key_input);
     const decrypt_iv = std.mem.readInt(u128, dec_iv_bytes, .big);
 
-    var stream = [_]u8{0} ** constants.handshake_len;
+    var stream: [constants.handshake_len]u8 = @splat(0);
     var decryptor = crypto.AesCtr.init(&decrypt_key, decrypt_iv);
     defer decryptor.wipe();
     decryptor.apply(&stream);
@@ -245,8 +245,8 @@ test "trial block matches full handshake decrypt and preserves traffic counters"
     try std.testing.expectEqual(@as(usize, 3), trial_block_index);
     try std.testing.expectEqual(@as(usize, 8), constants.proto_tag_pos - trial_block_start);
     try std.testing.expectEqual(@as(usize, 12), constants.dc_idx_pos - trial_block_start);
-    const secret = [_]u8{0x11} ** 16;
-    const wrong = UserSecret{ .name = "wrong", .secret = [_]u8{0xa5} ** 16 };
+    const secret: [16]u8 = @splat(0x11);
+    const wrong = UserSecret{ .name = "wrong", .secret = @as([16]u8, @splat(0xa5)) };
     const secrets = [_]UserSecret{ wrong, .{ .name = "matched", .secret = secret }, wrong };
     for ([_]constants.ProtoTag{ .abridged, .intermediate, .secure }) |tag| {
         for ([_]i16{ 0, 1, 5, -1, -5, 203, -203, std.math.minInt(i16), std.math.maxInt(i16) }) |dc_idx| {
@@ -287,7 +287,7 @@ test "trial block matches full handshake decrypt and preserves traffic counters"
                 var actual = parsed.params.createDecryptor();
                 defer actual.wipe();
                 actual.ctr +%= @divExact(constants.handshake_len, trial_block_len); // EventLoop's unchanged traffic initialization.
-                var expected_bytes = [_]u8{0x67} ** 193;
+                var expected_bytes: [193]u8 = @splat(0x67);
                 var actual_bytes = expected_bytes;
                 full.apply(expected_bytes[0..31]);
                 full.apply(expected_bytes[31..]);
@@ -305,7 +305,7 @@ test "trial block matches full handshake decrypt and preserves traffic counters"
 
 test "isValidNonce" {
     // Valid nonce
-    var valid = [_]u8{0x42} ** constants.handshake_len;
+    var valid: [constants.handshake_len]u8 = @splat(0x42);
     valid[4] = 1;
     valid[5] = 2;
     valid[6] = 3;
@@ -313,12 +313,12 @@ test "isValidNonce" {
     try std.testing.expect(isValidNonce(&valid));
 
     // Invalid: starts with 0xef
-    var invalid1 = [_]u8{0x00} ** constants.handshake_len;
+    var invalid1: [constants.handshake_len]u8 = @splat(0x00);
     invalid1[0] = 0xef;
     try std.testing.expect(!isValidNonce(&invalid1));
 
     // Invalid: starts with "HEAD"
-    var invalid2 = [_]u8{0x00} ** constants.handshake_len;
+    var invalid2: [constants.handshake_len]u8 = @splat(0x00);
     invalid2[0] = 'H';
     invalid2[1] = 'E';
     invalid2[2] = 'A';
@@ -326,7 +326,7 @@ test "isValidNonce" {
     try std.testing.expect(!isValidNonce(&invalid2));
 
     // Invalid: bytes 4..8 are all zeros
-    var invalid3 = [_]u8{0x42} ** constants.handshake_len;
+    var invalid3: [constants.handshake_len]u8 = @splat(0x42);
     invalid3[4] = 0;
     invalid3[5] = 0;
     invalid3[6] = 0;
@@ -341,7 +341,7 @@ test "generateNonce produces valid nonces" {
 }
 
 test "fromHandshake rejects reserved nonce even when encrypted tag is valid" {
-    const secret = [_]u8{0x11} ** 16;
+    const secret: [16]u8 = @splat(0x11);
     const secrets = [_]UserSecret{.{ .name = "alice", .secret = secret }};
 
     const valid = buildTestClientHandshake(0x42, secret);
@@ -354,7 +354,7 @@ test "fromHandshake rejects reserved nonce even when encrypted tag is valid" {
 }
 
 test "prepareTgNonce - intermediate tag" {
-    var nonce: [64]u8 = [_]u8{0x00} ** 64;
+    var nonce: [64]u8 = @splat(0x00);
     prepareTgNonce(&nonce, constants.ProtoTag.intermediate, null);
 
     // Check that bytes 56-59 are the intermediate tag (eeeeeeee)
@@ -363,7 +363,7 @@ test "prepareTgNonce - intermediate tag" {
 }
 
 test "prepareTgNonce - fast mode key inversion" {
-    var nonce: [64]u8 = [_]u8{0x00} ** 64;
+    var nonce: [64]u8 = @splat(0x00);
 
     // 32-byte key + 16-byte IV = 48 bytes
     var client_key_iv: [48]u8 = undefined;
@@ -389,8 +389,8 @@ test "fuzz obfuscated handshake parsing" {
             var handshake: [constants.handshake_len]u8 = undefined;
             smith.bytes(&handshake);
             const secrets = [_]UserSecret{
-                .{ .name = "one", .secret = [_]u8{0x11} ** 16 },
-                .{ .name = "two", .secret = [_]u8{0xa5} ** 16 },
+                .{ .name = "one", .secret = @as([16]u8, @splat(0x11)) },
+                .{ .name = "two", .secret = @as([16]u8, @splat(0xa5)) },
             };
 
             if (ObfuscationParams.fromHandshake(&handshake, &secrets)) |parsed| {

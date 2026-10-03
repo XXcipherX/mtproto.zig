@@ -66,7 +66,7 @@ pub const MiddleProxyHealth = struct {
 /// Bounded, by-value endpoint history. The caller holds the existing MP lock;
 /// neither routing nor health updates touch the relay data plane.
 pub const MiddleProxyHealthStore = struct {
-    entries: [middle_proxy_health_slots]MiddleProxyHealth = [_]MiddleProxyHealth{.{}} ** middle_proxy_health_slots,
+    entries: [middle_proxy_health_slots]MiddleProxyHealth = @splat(.{}),
     selections: u64 = 0,
 
     fn find(self: *MiddleProxyHealthStore, addr: net.Address) ?*MiddleProxyHealth {
@@ -239,7 +239,7 @@ pub fn isSameIpEndpoint(a: net.Address, b: net.Address) bool {
 pub fn defaultMiddleProxyCandidateLists(primary: [5]net.Address) [5][16]net.Address {
     var lists: [5][16]net.Address = undefined;
     for (primary, 0..) |addr, i| {
-        lists[i] = [_]net.Address{addr} ** 16;
+        lists[i] = @as([16]net.Address, @splat(addr));
     }
     return lists;
 }
@@ -328,7 +328,7 @@ pub fn prioritizeIpv4Addresses(addrs: []net.Address) void {
         if (addrs[read] != .ip4) continue;
         if (read != write) {
             const ipv4 = addrs[read];
-            std.mem.copyBackwards(net.Address, addrs[write + 1 .. read + 1], addrs[write..read]);
+            @memmove(addrs[write + 1 .. read + 1], addrs[write..read]);
             addrs[write] = ipv4;
         }
         write += 1;
@@ -514,7 +514,7 @@ fn trySelectReachableMiddleProxyBatch(
     timeout_ms: i32,
     stop: ?*const std.atomic.Value(bool),
 ) ?net.Address {
-    if (builtin.os.tag != .linux) return null;
+    if (builtin.target.os.tag != .linux) return null;
 
     var fds: [4]linux.pollfd = undefined;
     var addrs: [4]net.Address = undefined;
@@ -598,7 +598,7 @@ test "MiddleProxy probe waits use elapsed deadline time" {
 }
 
 test "MiddleProxy probes stop polling after all sockets fail" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const fd = try net.socketTcpNonblocking(net.ip4(.{ 127, 0, 0, 1 }, 0));
     defer _ = linux.close(fd);
     // Reserve a loopback TCP port without listening: connects must be refused,
@@ -606,8 +606,8 @@ test "MiddleProxy probes stop polling after all sockets fail" {
     const address = std.posix.sockaddr.in{
         .family = linux.AF.INET,
         .port = 0,
-        .addr = @bitCast([_]u8{ 127, 0, 0, 1 }),
-        .zero = [_]u8{0} ** 8,
+        .addr = std.mem.readInt(u32, &.{ 127, 0, 0, 1 }, std.lang.Endian.native),
+        .zero = @as([8]u8, @splat(0)),
     };
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.bind(fd, @ptrCast(&address), @sizeOf(@TypeOf(address)))));
     const target = try net.localAddress(fd);
@@ -678,18 +678,18 @@ test "direct users bypass middle-proxy routing except CDN DC 203" {
     const mp_dc203 = net.ip4(.{ 12, 12, 12, 12 }, 443);
     const mp_media_dc5_secondary = net.ip4(.{ 13, 13, 13, 13 }, 443);
     const regular_snapshot = MiddleProxySnapshot{
-        .candidates = [_]net.Address{mp_dc4} ** 16,
+        .candidates = @as([16]net.Address, @splat(mp_dc4)),
         .candidate_len = 1,
         .secret_version = 1,
     };
     const media_203_snapshot = MiddleProxySnapshot{
-        .candidates = [_]net.Address{mp_dc203} ** 16,
+        .candidates = @as([16]net.Address, @splat(mp_dc203)),
         .candidate_len = 1,
         .secret_version = 1,
     };
     const media_dc5_snapshot = MiddleProxySnapshot{
         .candidates = [_]net.Address{ constants.tg_media_middle_proxies_v4[4], mp_media_dc5_secondary } ++
-            ([_]net.Address{constants.tg_media_middle_proxies_v4[4]} ** 14),
+            (@as([14]net.Address, @splat(constants.tg_media_middle_proxies_v4[4]))),
         .candidate_len = 2,
         .secret_version = 1,
     };
@@ -765,7 +765,7 @@ test "promotion tag preserves direct-user bypass for regular and media DCs excep
     try std.testing.expect(!cfg.userBypassesMiddleProxy("regular"));
     const mp_dc4 = net.ip4(.{ 11, 11, 11, 11 }, 443);
     const snapshot = MiddleProxySnapshot{
-        .candidates = [_]net.Address{mp_dc4} ** 16,
+        .candidates = @as([16]net.Address, @splat(mp_dc4)),
         .candidate_len = 1,
         .secret_version = 1,
     };
@@ -781,7 +781,7 @@ test "promotion tag preserves direct-user bypass for regular and media DCs excep
     cfg.use_middle_proxy = false;
     cfg.force_media_middle_proxy = false;
     const cdn_snapshot = MiddleProxySnapshot{
-        .candidates = [_]net.Address{constants.tg_cdn_middle_proxy_v4} ** 16,
+        .candidates = @as([16]net.Address, @splat(constants.tg_cdn_middle_proxy_v4)),
         .candidate_len = 1,
         .secret_version = 1,
     };
@@ -808,7 +808,7 @@ test "successful middle-proxy fallback candidate is promoted" {
     const first = net.ip4(.{ 11, 11, 11, 11 }, 443);
     const second = net.ip4(.{ 12, 12, 12, 12 }, 443);
     const third = net.ip4(.{ 13, 13, 13, 13 }, 443);
-    var candidates = [_]net.Address{ first, second, third } ++ ([_]net.Address{first} ** 13);
+    var candidates = [_]net.Address{ first, second, third } ++ (@as([13]net.Address, @splat(first)));
 
     try std.testing.expect(promoteMiddleProxyCandidateInList(&candidates, 3, second));
     try std.testing.expect(net.exactAddressEql(candidates[0], second));
@@ -820,8 +820,8 @@ test "successful middle-proxy fallback candidate is promoted" {
 test "middle-proxy cooldown prioritizes healthy candidates" {
     const first = net.ip4(.{ 11, 11, 11, 11 }, 443);
     const second = net.ip4(.{ 12, 12, 12, 12 }, 443);
-    var candidates = [_]net.Address{ first, second } ++ ([_]net.Address{first} ** 14);
-    var cooldowns = [_]MiddleProxyCooldown{.{}} ** middle_proxy_cooldown_slots;
+    var candidates = [_]net.Address{ first, second } ++ (@as([14]net.Address, @splat(first)));
+    var cooldowns: [middle_proxy_cooldown_slots]MiddleProxyCooldown = @splat(.{});
     cooldowns[0] = .{ .active = true, .addr = first, .until_ms = 200 };
 
     prioritizeMiddleProxyCandidates(&candidates, 2, &cooldowns, 100);
@@ -833,8 +833,8 @@ test "middle-proxy cooldown tries earliest recovery first when all cooled" {
     const first = net.ip4(.{ 11, 11, 11, 11 }, 443);
     const second = net.ip4(.{ 12, 12, 12, 12 }, 443);
     const third = net.ip4(.{ 13, 13, 13, 13 }, 443);
-    var candidates = [_]net.Address{ first, second, third } ++ ([_]net.Address{first} ** 13);
-    var cooldowns = [_]MiddleProxyCooldown{.{}} ** middle_proxy_cooldown_slots;
+    var candidates = [_]net.Address{ first, second, third } ++ (@as([13]net.Address, @splat(first)));
+    var cooldowns: [middle_proxy_cooldown_slots]MiddleProxyCooldown = @splat(.{});
     cooldowns[0] = .{ .active = true, .addr = first, .until_ms = 300 };
     cooldowns[1] = .{ .active = true, .addr = second, .until_ms = 200 };
     cooldowns[2] = .{ .active = true, .addr = third, .until_ms = 250 };
@@ -857,7 +857,7 @@ test "middle-proxy health prefers a stably faster authenticated endpoint" {
         health.noteAuth(fast, 60, now_ms);
     }
     const none = [_]MiddleProxyCooldown{};
-    var candidates = [_]net.Address{ slow, fast } ++ ([_]net.Address{slow} ** 14);
+    var candidates = [_]net.Address{ slow, fast } ++ (@as([14]net.Address, @splat(slow)));
     health.rank(&candidates, 2, &none, 2_000);
     try std.testing.expect(net.exactAddressEql(candidates[0], fast));
 
@@ -881,7 +881,7 @@ test "middle-proxy health keeps cooldown authoritative and ages stale samples" {
         health.noteConnect(second, 200, now_ms);
         health.noteAuth(second, 200, now_ms);
     }
-    var candidates = [_]net.Address{ first, second } ++ ([_]net.Address{first} ** 14);
+    var candidates = [_]net.Address{ first, second } ++ (@as([14]net.Address, @splat(first)));
     const cooled = [_]MiddleProxyCooldown{.{ .active = true, .addr = first, .until_ms = 3_000 }};
     health.rank(&candidates, 2, &cooled, 2_000);
     try std.testing.expect(net.exactAddressEql(candidates[0], second));
@@ -907,11 +907,11 @@ test "middle-proxy health explores unknown endpoints and discards rotated metada
     health.noteAuth(known, 30, 1_001);
     const none = [_]MiddleProxyCooldown{};
     for (0..15) |_| {
-        var candidates = [_]net.Address{ known, unknown } ++ ([_]net.Address{known} ** 14);
+        var candidates = [_]net.Address{ known, unknown } ++ (@as([14]net.Address, @splat(known)));
         health.rank(&candidates, 2, &none, 2_000);
         try std.testing.expect(net.exactAddressEql(candidates[0], known));
     }
-    var candidates = [_]net.Address{ known, unknown } ++ ([_]net.Address{known} ** 14);
+    var candidates = [_]net.Address{ known, unknown } ++ (@as([14]net.Address, @splat(known)));
     health.rank(&candidates, 2, &none, 2_000);
     try std.testing.expect(net.exactAddressEql(candidates[0], unknown));
 
@@ -936,7 +936,7 @@ test "middle-proxy health failure penalty ends after authenticated recovery" {
     }
     const none = [_]MiddleProxyCooldown{};
     health.noteFailure(fast, 2_000);
-    var candidates = [_]net.Address{ fast, slow } ++ ([_]net.Address{fast} ** 14);
+    var candidates = [_]net.Address{ fast, slow } ++ (@as([14]net.Address, @splat(fast)));
     health.rank(&candidates, 2, &none, 2_001);
     try std.testing.expect(net.exactAddressEql(candidates[0], slow));
 

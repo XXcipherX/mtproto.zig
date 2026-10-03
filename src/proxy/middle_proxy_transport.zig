@@ -50,9 +50,9 @@ pub const MiddleProxyTransport = struct {
     step: Step = .none,
     write_seq_no: i32 = -2,
     read_seq_no: i32 = -2,
-    nonce: [16]u8 = [_]u8{0} ** 16,
+    nonce: [16]u8 = @splat(0),
     timestamp: u32 = 0,
-    server_nonce: [16]u8 = [_]u8{0} ** 16,
+    server_nonce: [16]u8 = @splat(0),
     enc: ?crypto.AesCbcEncryptor = null,
     dec: ?crypto.AesCbcDecryptor = null,
     peer_addr: ?net.Address = null,
@@ -245,7 +245,7 @@ pub const MiddleProxyTransport = struct {
                 return error.BadMiddleProxyChecksum;
 
             const payload_len = frame.len - 12;
-            std.mem.copyForwards(u8, frame_buf[0..payload_len], frame[8 .. frame.len - 4]);
+            @memmove(frame_buf[0..payload_len], frame[8 .. frame.len - 4]);
             self.resetFrame(encrypted);
             return frame_buf[0..payload_len];
         }
@@ -296,8 +296,8 @@ test "cold transport keeps nonce and authenticated CBC sequence parity" {
     const peer = net.ip4(.{ 149, 154, 167, 40 }, 443);
     const local = net.ip4(.{ 10, 0, 0, 2 }, 34567);
     const nat_ip4: [4]u8 = .{ 203, 0, 113, 7 };
-    const nonce = [_]u8{0x35} ** 16;
-    const server_nonce = [_]u8{0x79} ** 16;
+    const nonce: [16]u8 = @splat(0x35);
+    const server_nonce: [16]u8 = @splat(0x79);
     const timestamp: u32 = 1_700_000_000;
     var selector: [4]u8 = undefined;
     @memcpy(&selector, middleproxy.proxy_secret[0..4]);
@@ -307,7 +307,7 @@ test "cold transport keeps nonce and authenticated CBC sequence parity" {
 
     var nonce_wire: [handshake.frame_buf_size]u8 = undefined;
     const nonce_frame = try transport.begin(&nonce_wire, &selector, &nonce, timestamp);
-    var nonce_payload = [_]u8{0} ** 32;
+    var nonce_payload: [32]u8 = @splat(0);
     @memcpy(nonce_payload[0..4], &middleproxy.rpc_nonce_req);
     @memcpy(nonce_payload[4..8], &selector);
     @memcpy(nonce_payload[8..12], &middleproxy.rpc_crypto_aes);
@@ -363,7 +363,7 @@ test "cold transport keeps nonce and authenticated CBC sequence parity" {
         nat_ip4,
         &middleproxy.proxy_secret,
     );
-    var auth_payload = [_]u8{0} ** 32;
+    var auth_payload: [32]u8 = @splat(0);
     @memcpy(auth_payload[0..4], &middleproxy.rpc_handshake);
     @memcpy(auth_payload[8..20], "IPIPPRPDTIME");
     @memcpy(auth_payload[20..32], "IPIPPRPDTIME");

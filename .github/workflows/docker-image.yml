@@ -10,15 +10,15 @@ on:
       zig_version:
         description: Zig version used by the Docker build
         required: true
-        default: 0.16.0
+        default: 0.17.0
       production_mode:
         description: Production mode
         required: true
         type: choice
-        default: ReleaseFast
+        default: fast
         options:
-          - ReleaseFast
-          - ReleaseSafe
+          - fast
+          - safe
       push_latest:
         description: Also publish the latest tag
         required: true
@@ -69,8 +69,8 @@ jobs:
         run: |
           set -euo pipefail
           case "$PRODUCTION_MODE" in
-            ReleaseFast) dataplane_safety=false ;;
-            ReleaseSafe) dataplane_safety=true ;;
+            fast) dataplane_safety=false ;;
+            safe) dataplane_safety=true ;;
             *) echo "Unsupported production mode: $PRODUCTION_MODE" >&2; exit 1 ;;
           esac
           echo "dataplane_safety=$dataplane_safety" >> "$GITHUB_OUTPUT"

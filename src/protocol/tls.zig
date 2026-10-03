@@ -230,7 +230,7 @@ pub fn validateTlsHandshakeDetailed(
 }
 
 /// The immutable startup snapshot owns these keyed contexts in secret order.
-/// Zig 0.16 HmacSha256/Sha256 contain only by-value arrays and integer state.
+/// Zig 0.17 HmacSha256/Sha256 contain only by-value arrays and integer state.
 pub fn validateTlsHandshakePrepared(
     allocator: std.mem.Allocator,
     handshake: []const u8,
@@ -276,7 +276,7 @@ fn validateTlsHandshakeImpl(
     defer std.crypto.secureZero(u8, &digest);
 
     const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
-    const zero_digest = [_]u8{0} ** constants.tls_digest_len;
+    const zero_digest: [constants.tls_digest_len]u8 = @splat(0);
 
     const now: i64 = if (!ignore_time_skew)
         runtime_time.realtimeSeconds()
@@ -931,7 +931,7 @@ pub fn extractFirstTls13Cipher(handshake: []const u8) ?u16 {
 // ============= Tests =============
 
 fn buildTestClientHello(comptime session_id_len: usize, session_fill: u8) [94 + session_id_len]u8 {
-    var hello = [_]u8{0} ** (94 + session_id_len);
+    var hello: [94 + session_id_len]u8 = @splat(0);
     hello[0] = constants.tls_record_handshake;
     hello[1] = 0x03;
     hello[2] = 0x01;
@@ -1000,9 +1000,9 @@ fn buildSizedTestClientHello(buffer: []u8, pq: bool, x25519: bool, secret: *cons
 
 test "prepared FakeTLS HMAC snapshots preserve cold validation and remain reusable" {
     const secrets = [_]UserSecret{
-        .{ .name = "alice", .secret = [_]u8{0x11} ** 16 },
-        .{ .name = "bob", .secret = [_]u8{0x22} ** 16 },
-        .{ .name = "carol", .secret = [_]u8{0x33} ** 16 },
+        .{ .name = "alice", .secret = @as([16]u8, @splat(0x11)) },
+        .{ .name = "bob", .secret = @as([16]u8, @splat(0x22)) },
+        .{ .name = "carol", .secret = @as([16]u8, @splat(0x33)) },
     };
     var prepared: [secrets.len]PreparedHmacState = undefined;
     defer std.crypto.secureZero(u8, std.mem.asBytes(&prepared));
@@ -1060,7 +1060,7 @@ test "prepared FakeTLS HMAC snapshots preserve cold validation and remain reusab
     try std.testing.expect(!no_alloc.has_induced_failure);
 
     // A restarted user configuration prepares a new snapshot, independent of the old one.
-    const replacement = [_]UserSecret{.{ .name = "carol", .secret = [_]u8{0x44} ** 16 }};
+    const replacement = [_]UserSecret{.{ .name = "carol", .secret = @as([16]u8, @splat(0x44)) }};
     var replacement_contexts = [_]PreparedHmacState{PreparedHmacState.init(&replacement[0].secret)};
     defer std.crypto.secureZero(u8, std.mem.asBytes(&replacement_contexts));
     const old_hello = buildSizedTestClientHello(&storage, true, true, &secrets[2].secret);
@@ -1076,7 +1076,7 @@ test "prepared FakeTLS HMAC snapshots preserve cold validation and remain reusab
 }
 
 test "FakeTLS authentication bounds input without lowering the TLS parser limit" {
-    const secrets = [_]UserSecret{.{ .name = "alice", .secret = [_]u8{0x1a} ** 16 }};
+    const secrets = [_]UserSecret{.{ .name = "alice", .secret = @as([16]u8, @splat(0x1a)) }};
     var storage: [constants.max_tls_plaintext_size + 5]u8 = undefined;
     for ([_]struct { pq: bool, x25519: bool, len: usize }{
         .{ .pq = false, .x25519 = true, .len = 256 },
@@ -1110,7 +1110,7 @@ test "FakeTLS authentication bounds input without lowering the TLS parser limit"
 }
 
 test "FakeTLS requires a supported share and returns PQ priority and cipher from validation" {
-    const secrets = [_]UserSecret{.{ .name = "alice", .secret = [_]u8{0x1a} ** 16 }};
+    const secrets = [_]UserSecret{.{ .name = "alice", .secret = @as([16]u8, @splat(0x1a)) }};
     var storage: [1600]u8 = undefined;
     for ([_]struct { pq: bool, x25519: bool, selected: ?ClientKeyShare }{
         .{ .pq = true, .x25519 = false, .selected = .x25519_mlkem768 },
@@ -1154,7 +1154,7 @@ test "FakeTLS requires a supported share and returns PQ priority and cipher from
 }
 
 test "FakeTLS retains duplicate key-share extension and group policies" {
-    const secret = [_]u8{0x1a} ** 16;
+    const secret: [16]u8 = @splat(0x1a);
     var storage: [3000]u8 = undefined;
     const share_pos: usize = 84 + 9 + "example.org".len + 6;
     for ([_]bool{ false, true }) |pq| {
@@ -1193,8 +1193,8 @@ test "timing_safe.eql" {
 
 test "buildServerHello produces valid three-record server template structure" {
     const allocator = std.testing.allocator;
-    var digest = [_]u8{0x42} ** 32;
-    const session_id = [_]u8{0x01} ** 32;
+    var digest: [32]u8 = @splat(0x42);
+    const session_id: [32]u8 = @splat(0x01);
 
     const response = try buildServerHello(
         allocator,
@@ -1271,8 +1271,8 @@ test "buildServerHello produces valid three-record server template structure" {
 
 test "buildServerHello AppData: fixed length, per-connection-random body" {
     const allocator = std.testing.allocator;
-    var digest = [_]u8{0xAA} ** 32;
-    const session_id = [_]u8{0xBB} ** 32;
+    var digest: [32]u8 = @splat(0xAA);
+    const session_id: [32]u8 = @splat(0xBB);
 
     // Build two responses: size stays fixed, encrypted-cert bytes vary per connection.
     const r1 = try buildServerHello(allocator, &digest, &digest, &session_id);
@@ -1297,8 +1297,8 @@ test "buildServerHelloTemplate depends on seed" {
 
 test "buildServerHelloTemplateAlloc supports custom fake cert size" {
     const allocator = std.testing.allocator;
-    var digest = [_]u8{0xAA} ** 32;
-    const session_id = [_]u8{0xBB} ** 32;
+    var digest: [32]u8 = @splat(0xAA);
+    const session_id: [32]u8 = @splat(0xBB);
     const cert_size: usize = 4096;
 
     const template = try buildServerHelloTemplateAlloc(allocator, 0x1111_2222_3333_4444, cert_size);
@@ -1317,7 +1317,7 @@ fn expectServerHelloTestHmac(response: []const u8, secret: []const u8, digest: *
     var hmac = std.crypto.auth.hmac.sha2.HmacSha256.init(secret);
     hmac.update(digest);
     hmac.update(response[0..tmpl_random_offset]);
-    hmac.update(&([_]u8{0} ** 32));
+    hmac.update(&(@as([32]u8, @splat(0))));
     hmac.update(response[tmpl_random_offset + 32 ..]);
     var expected: [32]u8 = undefined;
     hmac.final(&expected);
@@ -1326,14 +1326,14 @@ fn expectServerHelloTestHmac(response: []const u8, secret: []const u8, digest: *
 
 test "ServerHello into builders preserve allocated wire invariants at every cert size" {
     const allocator = std.testing.allocator;
-    const secret = [_]u8{0x42} ** 16;
-    const digest = [_]u8{0x71} ** 32;
-    const sid = [_]u8{0x39} ** 32;
+    const secret: [16]u8 = @splat(0x42);
+    const digest: [32]u8 = @splat(0x71);
+    const sid: [32]u8 = @splat(0x39);
     for ([_]usize{ min_fake_cert_size, default_fake_cert_size, 4096, max_fake_cert_size }) |cert_size| {
         const template = try buildServerHelloTemplateAlloc(allocator, 42, cert_size);
         defer allocator.free(template);
         for ([_]bool{ false, true }) |pq| {
-            var scratch = [_]u8{0xa5} ** (max_server_hello_len + 1);
+            var scratch: [max_server_hello_len + 1]u8 = @splat(0xa5);
             const response = if (pq)
                 try buildServerHelloPqInto(&scratch, &secret, &digest, &sid, 0x1303, cert_size)
             else
@@ -1415,8 +1415,8 @@ test "validateTlsHandshake - valid handshake" {
 
     // Create mock secrets
     var secrets = [_]UserSecret{
-        .{ .name = "alice", .secret = [_]u8{0x1A} ** 16 },
-        .{ .name = "bob", .secret = [_]u8{0x2B} ** 16 },
+        .{ .name = "alice", .secret = @as([16]u8, @splat(0x1A)) },
+        .{ .name = "bob", .secret = @as([16]u8, @splat(0x2B)) },
     };
 
     // Client hello mock with 32-byte session_id, matching the ServerHello template contract.
@@ -1455,8 +1455,8 @@ test "validateTlsHandshake - valid handshake" {
 
 test "validateTlsHandshake - invalid user" {
     const allocator = std.testing.allocator;
-    var secrets = [_]UserSecret{.{ .name = "alice", .secret = [_]u8{0x1A} ** 16 }};
-    var handshake = [_]u8{0xAA} ** 64; // random junk
+    var secrets = [_]UserSecret{.{ .name = "alice", .secret = @as([16]u8, @splat(0x1A)) }};
+    var handshake: [64]u8 = @splat(0xAA); // random junk
 
     const result = try validateTlsHandshake(allocator, &handshake, &secrets, true);
     try std.testing.expect(result == null);
@@ -1464,7 +1464,7 @@ test "validateTlsHandshake - invalid user" {
 
 test "validateTlsHandshakeDetailed classifies authentication failures" {
     const allocator = std.testing.allocator;
-    var secrets = [_]UserSecret{.{ .name = "alice", .secret = [_]u8{0x1A} ** 16 }};
+    var secrets = [_]UserSecret{.{ .name = "alice", .secret = @as([16]u8, @splat(0x1A)) }};
     var diagnostic: TlsValidationDiagnostic = undefined;
 
     const bad_secret = buildTestClientHello(32, 0xaa);
@@ -1527,7 +1527,7 @@ test "extractSni - malformed returns null" {
 
 test "ClientHello readers reject malformed record framing" {
     const domain = "example.com";
-    var ch = [_]u8{0} ** 72;
+    var ch: [72]u8 = @splat(0);
     const base = buildTestClientHello(0, 0);
     @memcpy(ch[0..50], base[0..50]);
     std.mem.writeInt(u16, ch[3..5], @intCast(ch.len - 5), .big);
@@ -1553,7 +1553,7 @@ test "ClientHello readers reject malformed record framing" {
 
 test "SNI routing ignores unrelated FakeTLS key-share policy" {
     const domain = "example.com";
-    var ch = [_]u8{0} ** 83;
+    var ch: [83]u8 = @splat(0);
     const base = buildTestClientHello(0, 0);
     @memcpy(ch[0..50], base[0..50]);
     std.mem.writeInt(u16, ch[3..5], @intCast(ch.len - 5), .big);
@@ -1616,8 +1616,8 @@ test "extractFirstTls13Cipher returns first non-GREASE TLS1.3 suite" {
 
 test "buildServerHelloWithTemplateCipher echoes chosen cipher" {
     const allocator = std.testing.allocator;
-    var digest = [_]u8{0xAA} ** 32;
-    const session_id = [_]u8{0xBB} ** 32;
+    var digest: [32]u8 = @splat(0xAA);
+    const session_id: [32]u8 = @splat(0xBB);
 
     const resp = try buildServerHelloWithTemplateCipher(allocator, &server_template, &digest, &digest, &session_id, 0x1303);
     defer allocator.free(resp);
@@ -1682,9 +1682,9 @@ test "clientOffersPqKeyShare detects a complete 0x11ec key_share entry" {
 
 test "buildServerHelloPq emits a 0x11ec key_share with correct framing + HMAC" {
     const allocator = std.testing.allocator;
-    const digest = [_]u8{0} ** constants.tls_digest_len;
-    const sid = [_]u8{0x33} ** 32;
-    const secret = [_]u8{0x42} ** 16;
+    const digest: [constants.tls_digest_len]u8 = @splat(0);
+    const sid: [32]u8 = @splat(0x33);
+    const secret: [16]u8 = @splat(0x42);
 
     const resp = try buildServerHelloPq(allocator, &secret, &digest, &sid, 0x1303, default_fake_cert_size);
     defer allocator.free(resp);
@@ -1715,9 +1715,9 @@ test "buildServerHelloPq emits a 0x11ec key_share with correct framing + HMAC" {
 
 test "buildServerHelloPq supports custom fake cert size" {
     const allocator = std.testing.allocator;
-    const digest = [_]u8{0} ** constants.tls_digest_len;
-    const sid = [_]u8{0x33} ** 32;
-    const secret = [_]u8{0x42} ** 16;
+    const digest: [constants.tls_digest_len]u8 = @splat(0);
+    const sid: [32]u8 = @splat(0x33);
+    const secret: [16]u8 = @splat(0x42);
     const cert_size: usize = 4096;
 
     const resp = try buildServerHelloPq(allocator, &secret, &digest, &sid, 0x1301, cert_size);
@@ -1731,7 +1731,7 @@ test "buildServerHelloPq supports custom fake cert size" {
 test "validateTlsHandshake returns canonical_hmac" {
     const allocator = std.testing.allocator;
 
-    var secrets = [_]UserSecret{.{ .name = "alice", .secret = [_]u8{0x1A} ** 16 }};
+    var secrets = [_]UserSecret{.{ .name = "alice", .secret = @as([16]u8, @splat(0x1A)) }};
     var handshake = buildTestClientHello(32, 0xaa);
 
     const hmac_input = buildTestClientHello(32, 0xaa);
@@ -1755,7 +1755,7 @@ test "validateTlsHandshake returns canonical_hmac" {
 test "validateTlsHandshake rejects non-32 session id" {
     const allocator = std.testing.allocator;
 
-    var secrets = [_]UserSecret{.{ .name = "alice", .secret = [_]u8{0x1A} ** 16 }};
+    var secrets = [_]UserSecret{.{ .name = "alice", .secret = @as([16]u8, @splat(0x1A)) }};
     var handshake = buildTestClientHello(4, 0xaa);
     const hmac_input = buildTestClientHello(4, 0xaa);
 
@@ -1781,7 +1781,7 @@ test "fuzz FakeTLS ClientHello parsing and validation" {
             const input = storage[0..smith.slice(&storage)];
             const secrets = [_]UserSecret{.{
                 .name = "fuzz-user",
-                .secret = [_]u8{0x5a} ** 16,
+                .secret = @as([16]u8, @splat(0x5a)),
             }};
 
             _ = isTlsHandshake(input);

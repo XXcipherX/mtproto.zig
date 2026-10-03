@@ -4,7 +4,7 @@ const builtin = @import("builtin");
 const linux_fs = @import("linux_fs.zig");
 
 fn detectTotalRamBytes(allocator: std.mem.Allocator, io: std.Io) ?u64 {
-    if (builtin.os.tag != .linux) return null;
+    if (builtin.target.os.tag != .linux) return null;
 
     if (detectTotalRamBytesSysinfo()) |total| {
         return total;
@@ -32,7 +32,7 @@ fn detectTotalRamBytes(allocator: std.mem.Allocator, io: std.Io) ?u64 {
 }
 
 fn detectTotalRamBytesSysinfo() ?u64 {
-    if (builtin.os.tag != .linux) return null;
+    if (builtin.target.os.tag != .linux) return null;
 
     var info: std.os.linux.Sysinfo = undefined;
     const rc = std.os.linux.sysinfo(&info);
@@ -167,7 +167,7 @@ fn parentCgroupPath(path: []const u8) ?[]const u8 {
     if (!isSafeAbsoluteCgroupPath(path) or std.mem.eql(u8, path, "/")) return null;
     const trimmed = std.mem.trimEnd(u8, path, "/");
     if (trimmed.len <= 1) return "/";
-    const slash = std.mem.lastIndexOfScalar(u8, trimmed, '/') orelse return null;
+    const slash = std.mem.findScalarLast(u8, trimmed, '/') orelse return null;
     return if (slash == 0) "/" else trimmed[0..slash];
 }
 
@@ -201,12 +201,12 @@ fn mountedCgroupLeafPath(
     }
 
     if (relative.len == 0) {
-        return std.fmt.bufPrint(output, "{s}", .{normalized_mount}) catch null;
+        return std.mem.print(output, "{s}", .{normalized_mount}) catch null;
     }
     if (std.mem.eql(u8, normalized_mount, "/")) {
-        return std.fmt.bufPrint(output, "{s}", .{relative}) catch null;
+        return std.mem.print(output, "{s}", .{relative}) catch null;
     }
-    return std.fmt.bufPrint(output, "{s}{s}", .{ normalized_mount, relative }) catch null;
+    return std.mem.print(output, "{s}{s}", .{ normalized_mount, relative }) catch null;
 }
 
 fn scanCgroupHierarchy(
@@ -227,9 +227,9 @@ fn scanCgroupHierarchy(
     while (true) {
         var limit_path_buf: [4096]u8 = undefined;
         const limit_path: ?[]const u8 = if (std.mem.eql(u8, current, "/"))
-            std.fmt.bufPrint(&limit_path_buf, "/{s}", .{filename}) catch null
+            std.mem.print(&limit_path_buf, "/{s}", .{filename}) catch null
         else
-            std.fmt.bufPrint(&limit_path_buf, "{s}/{s}", .{ current, filename }) catch null;
+            std.mem.print(&limit_path_buf, "{s}/{s}", .{ current, filename }) catch null;
         if (limit_path) |path| {
             best = minMemoryLimit(
                 best,
@@ -311,7 +311,7 @@ fn scanConventionalCgroupMounts(
 }
 
 fn detectCgroupMemoryLimitBytes(allocator: std.mem.Allocator, io: std.Io) ?u64 {
-    if (builtin.os.tag != .linux) return null;
+    if (builtin.target.os.tag != .linux) return null;
 
     const membership = linux_fs.readPseudoFileAlloc(
         allocator,
@@ -325,8 +325,8 @@ fn detectCgroupMemoryLimitBytes(allocator: std.mem.Allocator, io: std.Io) ?u64 {
     var lines = std.mem.splitScalar(u8, membership, '\n');
     while (lines.next()) |line| {
         if (line.len == 0) continue;
-        const first_colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
-        const second_rel = std.mem.indexOfScalar(u8, line[first_colon + 1 ..], ':') orelse continue;
+        const first_colon = std.mem.findScalar(u8, line, ':') orelse continue;
+        const second_rel = std.mem.findScalar(u8, line[first_colon + 1 ..], ':') orelse continue;
         const second_colon = first_colon + 1 + second_rel;
         const hierarchy = line[0..first_colon];
         const controllers = line[first_colon + 1 .. second_colon];

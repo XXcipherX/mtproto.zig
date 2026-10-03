@@ -347,8 +347,8 @@ test "relay half-close completes only after both FIN paths drain" {
 
 test "client TLS framing preserves cipher continuity at every pair of TCP splits" {
     const crypto = @import("../crypto/crypto.zig");
-    const key = [_]u8{0x37} ** 32;
-    const upstream_key = [_]u8{0x91} ** 32;
+    const key: [32]u8 = @splat(0x37);
+    const upstream_key: [32]u8 = @splat(0x91);
     const plaintext = "abcdefghijklmnopq";
     var ciphertext: [plaintext.len]u8 = undefined;
     @memcpy(&ciphertext, plaintext);
@@ -427,7 +427,7 @@ test "client TLS framing rejects invalid records and retains truncated EOF state
 }
 
 fn relayTestSocketPair() ![2]posix.fd_t {
-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    if (@import("builtin").target.os.tag != .linux) return error.SkipZigTest;
     const linux = std.os.linux;
     var fds: [2]posix.fd_t = undefined;
     const rc = linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0, &fds);
@@ -487,7 +487,7 @@ test "one-part upstream EAGAIN owns bytes without charging progress" {
     const fds = try relayTestSocketPair();
     defer _ = std.os.linux.close(fds[0]);
     defer _ = std.os.linux.close(fds[1]);
-    const fill = [_]u8{0} ** 4096;
+    const fill: [4096]u8 = @splat(0);
     var blocked = false;
     for (0..1024) |_| {
         _ = writeFd(fds[0], &fill) catch |err| {
@@ -526,7 +526,7 @@ test "one-part upstream batching preserves atomic queue errors and empty input" 
     try std.testing.expect(try queueUpstreamParts(&slot, &.{""}));
     try std.testing.expectEqual(connection.event_io_operation_budget, budget.operations_remaining);
     try slot.upstream_queue.appendCopy("pre");
-    const source = [_]u8{0x42} ** 4096;
+    const source: [4096]u8 = @splat(0x42);
     try std.testing.expectError(error.OutOfMemory, queueUpstreamParts(&slot, &.{&source}));
     var actual: [3]u8 = undefined;
     try copyTestQueue(&slot.upstream_queue, &actual);
@@ -594,7 +594,7 @@ test "scatter fallback preserves ordering and copies reused TLS headers" {
         try std.testing.expectEqualSlices(u8, &[_]u8{ 0x17, 3, 3, 0, 1 }, actual[offset..][0..5]);
         try std.testing.expectEqual(byte, actual[offset + 5]);
     }
-    const too_many = [_][]const u8{""} ** (max_scatter_parts + 1);
+    const too_many: [max_scatter_parts + 1][]const u8 = @splat("");
     try std.testing.expectError(error.TooManyParts, queueOrWriteParts(&slot, slot.client_fd, &slot.client_queue, &too_many));
 }
 
@@ -602,7 +602,7 @@ test "scatter EAGAIN queues all parts without charging unsent bytes" {
     const fds = try relayTestSocketPair();
     defer _ = std.os.linux.close(fds[0]);
     defer _ = std.os.linux.close(fds[1]);
-    const fill = [_]u8{0} ** 4096;
+    const fill: [4096]u8 = @splat(0);
     var blocked = false;
     for (0..1024) |_| {
         _ = writeFd(fds[0], &fill) catch |err| {

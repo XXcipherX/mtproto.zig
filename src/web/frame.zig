@@ -114,7 +114,7 @@ pub const Parsed = union(enum) {
 /// a short buffer is not.
 pub fn parseOne(buf: []const u8) ParseError!Parsed {
     if (buf.len < header_size) return .incomplete;
-    const raw_type: FrameType = @enumFromInt(buf[0]);
+    const raw_type: FrameType = @fromBackingInt(@intCast(buf[0]));
     if (!raw_type.known()) return error.Malformed;
     const stream_id = (@as(u32, buf[1]) << 16) | (@as(u32, buf[2]) << 8) | @as(u32, buf[3]);
     const length = std.mem.readInt(u32, buf[4..8], .big);
@@ -161,7 +161,7 @@ pub const Iterator = struct {
 pub fn writeHeader(out: *[header_size]u8, kind: FrameType, stream_id: u32, payload_len: u32) void {
     std.debug.assert(stream_id <= max_stream_id);
     std.debug.assert(payload_len <= max_payload);
-    out[0] = @intFromEnum(kind);
+    out[0] = @backingInt(kind);
     out[1] = @intCast((stream_id >> 16) & 0xff);
     out[2] = @intCast((stream_id >> 8) & 0xff);
     out[3] = @intCast(stream_id & 0xff);
@@ -263,7 +263,7 @@ test "unknown type and oversized length are fatal" {
     buf[0] = 0x77; // not in IsKnownType
     try std.testing.expectError(error.Malformed, parseOne(&buf));
 
-    buf[0] = @intFromEnum(FrameType.data);
+    buf[0] = @backingInt(FrameType.data);
     std.mem.writeInt(u32, buf[4..8], @as(u32, max_payload + 1), .big);
     try std.testing.expectError(error.Malformed, parseOne(&buf));
 }
@@ -283,9 +283,9 @@ test "window payload roundtrip rejects zero and wrong sizes" {
 test "frame type classification matches tdesktop" {
     try std.testing.expect(FrameType.open.known());
     try std.testing.expect(FrameType.bye.known());
-    try std.testing.expect(!(@as(FrameType, @enumFromInt(0x00))).known());
-    try std.testing.expect(!(@as(FrameType, @enumFromInt(0x07))).known());
-    try std.testing.expect(!(@as(FrameType, @enumFromInt(0x20))).known());
+    try std.testing.expect(!(@as(FrameType, @fromBackingInt(@intCast(0x00)))).known());
+    try std.testing.expect(!(@as(FrameType, @fromBackingInt(@intCast(0x07)))).known());
+    try std.testing.expect(!(@as(FrameType, @fromBackingInt(@intCast(0x20)))).known());
     try std.testing.expect(FrameType.ping.sessionScoped());
     try std.testing.expect(!FrameType.data.sessionScoped());
 }

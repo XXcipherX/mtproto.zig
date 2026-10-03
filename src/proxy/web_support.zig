@@ -9,7 +9,7 @@ pub const DnsCache = @import("../web/dns_cache.zig").Cache;
 /// WEB terminator addresses refresh independently; failed lookups keep the last snapshot.
 pub fn createMaskDns(allocator: std.mem.Allocator, io: std.Io, spec: []const u8) !*DnsCache {
     const helpers = @import("../web/net_helpers.zig");
-    const colon = std.mem.lastIndexOfScalar(u8, spec, ':') orelse return error.InvalidWebMaskBackend;
+    const colon = std.mem.findScalarLast(u8, spec, ':') orelse return error.InvalidWebMaskBackend;
     const host = std.mem.trim(u8, spec[0..colon], "[] ");
     const port = try std.fmt.parseInt(u16, spec[colon + 1 ..], 10);
     if (host.len == 0 or port == 0) return error.InvalidWebMaskBackend;

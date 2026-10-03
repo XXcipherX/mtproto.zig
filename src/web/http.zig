@@ -129,16 +129,16 @@ pub fn listHasToken(value: []const u8, token: []const u8) bool {
 }
 
 pub fn pathOf(target: []const u8) []const u8 {
-    const q = std.mem.indexOfScalar(u8, target, '?') orelse return target;
+    const q = std.mem.findScalar(u8, target, '?') orelse return target;
     if (q == 0) return "/";
     return target[0..q];
 }
 
 pub fn queryValue(target: []const u8, key: []const u8) ?[]const u8 {
-    const q = std.mem.indexOfScalar(u8, target, '?') orelse return null;
+    const q = std.mem.findScalar(u8, target, '?') orelse return null;
     var it = std.mem.splitScalar(u8, target[q + 1 ..], '&');
     while (it.next()) |pair| {
-        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        const eq = std.mem.findScalar(u8, pair, '=') orelse continue;
         if (std.mem.eql(u8, pair[0..eq], key)) return pair[eq + 1 ..];
     }
     return null;
@@ -146,7 +146,7 @@ pub fn queryValue(target: []const u8, key: []const u8) ?[]const u8 {
 
 /// Offset just past `\r\n\r\n`, or null while the head is still incomplete.
 pub fn headEnd(buf: []const u8) ?usize {
-    const idx = std.mem.indexOf(u8, buf, "\r\n\r\n") orelse return null;
+    const idx = std.mem.find(u8, buf, "\r\n\r\n") orelse return null;
     return idx + 4;
 }
 
@@ -167,7 +167,7 @@ pub fn parse(buf: []const u8) ParseError!Request {
     var target = raw_target;
     if (std.mem.startsWith(u8, target, "http://") or std.mem.startsWith(u8, target, "https://")) {
         const scheme_len: usize = if (target[4] == ':') 7 else 8;
-        const authority_end = std.mem.indexOfAnyPos(u8, target, scheme_len, "/?") orelse target.len;
+        const authority_end = std.mem.findAnyPos(u8, target, scheme_len, "/?") orelse target.len;
         if (authority_end == scheme_len) return error.Malformed;
         target = if (authority_end == target.len) "/" else target[authority_end..];
     }
@@ -201,7 +201,7 @@ pub fn parse(buf: []const u8) ParseError!Request {
         if (line.len == 0) return error.Malformed; // an empty line inside the head
         // Obsolete line folding is a smuggling primitive; refuse it.
         if (line[0] == ' ' or line[0] == '\t') return error.Malformed;
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.Malformed;
+        const colon = std.mem.findScalar(u8, line, ':') orelse return error.Malformed;
         const name = line[0..colon];
         if (name.len == 0) return error.Malformed;
         for (name) |c| {
@@ -481,7 +481,7 @@ fn canonicalToken(value: []const u8) bool {
     // 32 bytes encode to 43 base64url characters. The last symbol contains only four
     // significant bits, so its two unused low bits must be zero.
     const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    const last = std.mem.indexOfScalar(u8, alphabet, value[42]) orelse return false;
+    const last = std.mem.findScalar(u8, alphabet, value[42]) orelse return false;
     return (last & 3) == 0;
 }
 

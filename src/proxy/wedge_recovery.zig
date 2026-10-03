@@ -89,7 +89,7 @@ pub const WedgeRecoveryGate = struct {
     };
 
     hash_seed: u64 = 0,
-    entries: [bucket_count]Entry = [_]Entry{.{}} ** bucket_count,
+    entries: [bucket_count]Entry = @splat(.{}),
     untracked_suppression_reported: bool = false,
 
     fn indexFor(self: *const WedgeRecoveryGate, client_key: u64, dc_abs: u16) usize {
@@ -600,7 +600,7 @@ test "wedge recovery gate bounds parallel candidates in one wave" {
 test "wedge client identity ignores port and normalizes mapped IPv4" {
     const native_a = net.ip4(.{ 203, 0, 113, 7 }, 1000);
     const native_b = net.ip4(.{ 203, 0, 113, 7 }, 2000);
-    const mapped_bytes = [_]u8{0} ** 10 ++ [_]u8{ 0xff, 0xff } ++ [_]u8{ 203, 0, 113, 7 };
+    const mapped_bytes = @as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff } ++ [_]u8{ 203, 0, 113, 7 };
     const mapped = net.ip6(mapped_bytes, 3000, 0, 0);
 
     const key = wedgeClientIdentityKey(native_a, "alice");

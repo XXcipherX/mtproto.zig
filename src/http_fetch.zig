@@ -196,7 +196,7 @@ fn fetchUrlStep(
     uri.scheme = "https";
 
     var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
-    const host = try uri.getHost(&host_buf);
+    const host = try std.Io.net.HostName.fromUri(uri, &host_buf);
     try net.validateSystemResolverForHost(allocator, client.io, host.bytes);
 
     var req = try client.request(.GET, uri, .{
@@ -252,7 +252,7 @@ fn resolveHttpsRedirect(
     };
     if (!std.ascii.eqlIgnoreCase(uri.scheme, "https")) return error.InsecureHttpRedirect;
     uri.scheme = "https";
-    return std.fmt.allocPrint(allocator, "{f}", .{std.Uri.fmt(&uri, .all)});
+    return allocator.print("{f}", .{std.Uri.fmt(&uri, .all)});
 }
 
 fn runCurlFetch(
@@ -264,8 +264,8 @@ fn runCurlFetch(
     var timeout_buf: [16]u8 = undefined;
     var max_redirects_buf: [4]u8 = undefined;
     const timeout = if (options.timeout_sec == 0) default_timeout_sec else options.timeout_sec;
-    const timeout_arg = try std.fmt.bufPrint(&timeout_buf, "{d}", .{timeout});
-    const max_redirects_arg = try std.fmt.bufPrint(&max_redirects_buf, "{d}", .{options.max_redirects});
+    const timeout_arg = try std.mem.print(&timeout_buf, "{d}", .{timeout});
+    const max_redirects_arg = try std.mem.print(&max_redirects_buf, "{d}", .{options.max_redirects});
 
     const argv = [_][]const u8{
         "curl",

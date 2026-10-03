@@ -18,11 +18,11 @@
 //! ## Why its own process, and its own event loop
 //!
 //! Own *process* (`mtproto-proxy web-relay`, unit `mtproto-web-relay.service`): a fault
-//! here must not take the data plane down with it. In optional ReleaseSafe builds,
+//! here must not take the data plane down with it. In optional safe builds,
 //! a runtime safety trap aborts only this process. It remains the same binary, so
 //! Docker and source updates still replace a single proxy artifact.
 //!
-//! Own *event loop*: `std.http.Server` exists in Zig 0.16 and even has `respondWebSocket`,
+//! Own *event loop*: `std.http.Server` exists in Zig 0.17 and even has `respondWebSocket`,
 //! but it is a blocking `Io.Reader`/`Io.Writer` API (thread-per-connection) and its
 //! `readSmallMessage` rejects every fragmented frame. A session here has to multiplex one
 //! WebSocket against N backend sockets, so it needs readiness notification anyway. This
@@ -184,7 +184,7 @@ pub fn resolveBackend(allocator: std.mem.Allocator, io: std.Io, cfg: *const conf
     const spec = cfg.web.backend orelse {
         return net_helpers.ip4(.{ 127, 0, 0, 1 }, cfg.port);
     };
-    const colon = std.mem.lastIndexOfScalar(u8, spec, ':') orelse return error.InvalidBackend;
+    const colon = std.mem.findScalarLast(u8, spec, ':') orelse return error.InvalidBackend;
     const host = std.mem.trim(u8, spec[0..colon], "[] ");
     const port = std.fmt.parseInt(u16, spec[colon + 1 ..], 10) catch return error.InvalidBackend;
     if (host.len == 0) return error.InvalidBackend;
@@ -200,7 +200,7 @@ pub fn resolveBackend(allocator: std.mem.Allocator, io: std.Io, cfg: *const conf
 fn prefixedPath(allocator: std.mem.Allocator, base_path: []const u8, suffix: []const u8) ![]u8 {
     std.debug.assert(suffix.len > 0 and suffix[0] == '/');
     if (base_path.len == 0) return allocator.dupe(u8, suffix);
-    return std.fmt.allocPrint(allocator, "/{s}{s}", .{ base_path, suffix });
+    return allocator.print("/{s}{s}", .{ base_path, suffix });
 }
 
 // ── capabilities ──────────────────────────────────────────────────────────────
@@ -319,7 +319,7 @@ const Session = struct {
     closed_pos: usize = 0,
     last_rx_ms: i64 = 0,
     last_ping_ms: i64 = 0,
-    ping_payload: [8]u8 = [_]u8{0} ** 8,
+    ping_payload: [8]u8 = @splat(0),
     needs_window_flush: bool = false,
     /// DATA frames and payload bytes pushed at the client. Their ratio is the average
     /// frame size, which is what decides how much work the client's JS thread does per
@@ -348,7 +348,7 @@ const Session = struct {
 };
 
 test "closed stream retention keeps the full protocol history" {
-    var ids: [4096]u32 = [_]u32{0} ** 4096;
+    var ids: [4096]u32 = @splat(0);
     var session = Session{ .conn = undefined, .user = "test", .client_addr = null, .closed_ids = &ids };
     for (1..4097) |id| session.rememberClosed(@intCast(id));
     try std.testing.expect(session.recentlyClosed(1));
@@ -357,7 +357,7 @@ test "closed stream retention keeps the full protocol history" {
 }
 
 test "duplicate closed ids do not evict other tombstones" {
-    var ids: [4]u32 = [_]u32{0} ** 4;
+    var ids: [4]u32 = @splat(0);
     var session = Session{ .conn = undefined, .user = "test", .client_addr = null, .closed_ids = &ids };
     for (1..5) |id| session.rememberClosed(@intCast(id));
     for (0..8) |_| session.rememberClosed(4);
@@ -453,7 +453,7 @@ pub const Relay = struct {
         const cache = try dns_cache.Cache.create(allocator, io);
         errdefer cache.destroy();
         const spec = cfg.web.backend;
-        const colon = if (spec) |value| std.mem.lastIndexOfScalar(u8, value, ':') orelse return error.InvalidBackend else 0;
+        const colon = if (spec) |value| std.mem.findScalarLast(u8, value, ':') orelse return error.InvalidBackend else 0;
         const host = if (spec) |value| std.mem.trim(u8, value[0..colon], "[] ") else "127.0.0.1";
         const port = if (spec) |value| try std.fmt.parseInt(u16, value[colon + 1 ..], 10) else cfg.port;
         const addresses = try net_helpers.getAddressList(allocator, io, host, port);
@@ -548,7 +548,7 @@ pub const Relay = struct {
                     var info: linux.signalfd_siginfo = undefined;
                     const size = posix.read(fd, std.mem.asBytes(&info)) catch continue;
                     if (size == @sizeOf(linux.signalfd_siginfo)) {
-                        if (info.signo == @intFromEnum(posix.SIG.HUP)) {
+                        if (info.signo == @backingInt(posix.SIG.HUP)) {
                             log.info("SIGHUP received; relay configuration changes require a restart", .{});
                         } else self.stop = true;
                     }
@@ -1126,7 +1126,7 @@ pub const Relay = struct {
         defer self.allocator.free(body);
 
         var header_buf: [1536]u8 = undefined;
-        const headers = std.fmt.bufPrint(&header_buf, "Content-Type: text/html; charset=utf-8\r\n" ++
+        const headers = std.mem.print(&header_buf, "Content-Type: text/html; charset=utf-8\r\n" ++
             "Cache-Control: no-store\r\nReferrer-Policy: no-referrer\r\n" ++
             "X-Content-Type-Options: nosniff\r\nX-DNS-Prefetch-Control: off\r\n" ++
             "Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=(), usb=(), clipboard-read=(), clipboard-write=()\r\n" ++
@@ -1157,7 +1157,7 @@ pub const Relay = struct {
         tag[0] = '"';
         @memcpy(tag[1..65], &entry.etag);
         tag[65] = '"';
-        const headers = std.fmt.bufPrint(&headers_buf, "Content-Type: {s}\r\nETag: {s}\r\n" ++
+        const headers = std.mem.print(&headers_buf, "Content-Type: {s}\r\nETag: {s}\r\n" ++
             "Cache-Control: public, max-age=300\r\nX-Content-Type-Options: nosniff\r\n", .{ entry.mime, tag }) catch {
             self.respondStatus(conn, "500 Internal Server Error");
             return;
@@ -1171,11 +1171,11 @@ pub const Relay = struct {
     }
 
     fn hasPresentedCapabilityCounted(self: *Relay, request: *const http.Request, comparisons: ?*usize) bool {
-        const q = std.mem.indexOfScalar(u8, request.target, '?') orelse return false;
+        const q = std.mem.findScalar(u8, request.target, '?') orelse return false;
         var pairs = std.mem.splitScalar(u8, request.target[q + 1 ..], '&');
         var found = false;
         while (pairs.next()) |pair| {
-            const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+            const eq = std.mem.findScalar(u8, pair, '=') orelse continue;
             const key = pair[0..eq];
             if (!std.mem.eql(u8, key, "bridge") and !std.mem.eql(u8, key, "b")) continue;
             if (self.matchCapabilityCounted(pair[eq + 1 ..], comparisons) != null) found = true;
@@ -1189,7 +1189,7 @@ pub const Relay = struct {
         while (it.next()) |conn| {
             if (conn.*.session) |session| streams += session.streams.count();
         }
-        return std.fmt.bufPrint(buffer, "# TYPE mtproto_web_sessions gauge\nmtproto_web_sessions {d}\n" ++
+        return std.mem.print(buffer, "# TYPE mtproto_web_sessions gauge\nmtproto_web_sessions {d}\n" ++
             "# TYPE mtproto_web_streams gauge\nmtproto_web_streams {d}\n" ++
             "# TYPE mtproto_web_streams_refused_total counter\nmtproto_web_streams_refused_total {d}\n" ++
             "# TYPE mtproto_web_accept_refused_total counter\nmtproto_web_accept_refused_total {d}\n" ++
@@ -1293,7 +1293,7 @@ pub const Relay = struct {
 
         const accept = ws.acceptKey(key);
         var head_buf: [256]u8 = undefined;
-        const head = std.fmt.bufPrint(&head_buf, "HTTP/1.1 101 Switching Protocols\r\n" ++
+        const head = std.mem.print(&head_buf, "HTTP/1.1 101 Switching Protocols\r\n" ++
             "Upgrade: websocket\r\n" ++
             "Connection: Upgrade\r\n" ++
             "Sec-WebSocket-Accept: {s}\r\n" ++
@@ -1347,7 +1347,7 @@ pub const Relay = struct {
         if (request.headerCount("origin") > 1) return false;
         const origin = request.header("origin") orelse return true;
         var expected: [capability.max_host_len + 16]u8 = undefined;
-        const want = std.fmt.bufPrint(&expected, "https://{s}", .{self.opts.domain}) catch return false;
+        const want = std.mem.print(&expected, "https://{s}", .{self.opts.domain}) catch return false;
         return std.mem.eql(u8, origin, want);
     }
 
@@ -2219,7 +2219,7 @@ fn httpDate(buffer: []u8, seconds: u64) ![]const u8 {
     const time = epoch.getDaySeconds();
     const weekdays = [_][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
     const months = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
-    return std.fmt.bufPrint(buffer, "{s}, {d:0>2} {s} {d} {d:0>2}:{d:0>2}:{d:0>2} GMT", .{ weekdays[(day.day + 4) % 7], @as(u8, month.day_index) + 1, months[month.month.numeric() - 1], year.year, time.getHoursIntoDay(), time.getMinutesIntoHour(), time.getSecondsIntoMinute() });
+    return std.mem.print(buffer, "{s}, {d:0>2} {s} {d} {d:0>2}:{d:0>2}:{d:0>2} GMT", .{ weekdays[(day.day + 4) % 7], @as(u8, month.day_index) + 1, months[month.month.numeric() - 1], year.year, time.getHoursIntoDay(), time.getMinutesIntoHour(), time.getSecondsIntoMinute() });
 }
 
 test "HTTP Date uses IMF-fixdate in UTC" {
@@ -2263,9 +2263,9 @@ fn expectQueuedBodylessStatus(conn: *const Conn, status: []const u8) !void {
     try std.testing.expectEqual(@as(usize, 1), count);
     const response = iovecs[0].base[0..iovecs[0].len];
     var prefix_buf: [96]u8 = undefined;
-    const prefix = try std.fmt.bufPrint(&prefix_buf, "HTTP/1.1 {s}\r\n", .{status});
+    const prefix = try std.mem.print(&prefix_buf, "HTTP/1.1 {s}\r\n", .{status});
     try std.testing.expect(std.mem.startsWith(u8, response, prefix));
-    try std.testing.expect(std.mem.indexOf(u8, response, "Content-Length: 0\r\n") != null);
+    try std.testing.expect(std.mem.find(u8, response, "Content-Length: 0\r\n") != null);
     try std.testing.expect(std.mem.endsWith(u8, response, "\r\n\r\n"));
 }
 
@@ -2302,7 +2302,7 @@ test "backend diagnostic counters saturate without disrupting backpressure" {
 }
 
 test "WEB dispatch yields bulk input while interactive WINDOW and control traffic progress" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var pairs: [3][2]posix.fd_t = undefined;
     var created: usize = 0;
@@ -2343,7 +2343,7 @@ test "WEB dispatch yields bulk input while interactive WINDOW and control traffi
         try relay.addFd(conn.fd, false, false);
         relay.syncConn(conn);
     }
-    const payload = [_]u8{0xa5} ** (16 * 1024);
+    const payload: [16 * 1024]u8 = @splat(0xa5);
     var setup_bytes: std.atomic.Value(u64) = .init(0);
     try std.testing.expectEqual(@as(usize, payload.len), try queue_io.writeMsgPair(pairs[0][1], &payload, "", &setup_bytes, null, null));
     try std.testing.expectEqual(@as(usize, 2), try queue_io.writeMsgPair(pairs[1][1], "hi", "", &setup_bytes, null, null));
@@ -2404,7 +2404,7 @@ test "WEB dispatch yields bulk input while interactive WINDOW and control traffi
 }
 
 test "WEB budgeted backend HUP parks under zero window and resumes unread bytes" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var fds: [2]posix.fd_t = undefined;
     const rc = linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0, &fds);
@@ -2429,7 +2429,7 @@ test "WEB budgeted backend HUP parks under zero window and resumes unread bytes"
     try relay.conns.put(allocator, backend.fd, &backend);
     try relay.addFd(backend.fd, false, false);
     relay.syncConn(&backend);
-    const payload = [_]u8{0xa5} ** (16 * 1024);
+    const payload: [16 * 1024]u8 = @splat(0xa5);
     var setup_bytes: std.atomic.Value(u64) = .init(0);
     try std.testing.expectEqual(@as(usize, payload.len), try queue_io.writeMsgPair(fds[1], &payload, "", &setup_bytes, null, null));
     closeFd(fds[1]);
@@ -2480,9 +2480,9 @@ test "WEB optional byte-list slack falls back to exact growth on allocator press
     var relay = testRelay(allocator, 16 * 1024);
     var conn = Conn{ .fd = -1, .kind = .websocket, .peer = net_helpers.ip4(.{ 127, 0, 0, 1 }, 0), .out = .{ .allocator = allocator } };
     defer conn.msg.deinit(allocator);
-    const first = [_]u8{0xa5} ** 3000;
+    const first: [3000]u8 = @splat(0xa5);
     try relay.appendInput(&conn, &first, true);
-    try relay.appendInput(&conn, &([_]u8{0x5a} ** 100), true);
+    try relay.appendInput(&conn, &(@as([100]u8, @splat(0x5a))), true);
     try std.testing.expectEqual(@as(usize, 3100), conn.msg.capacity);
     try std.testing.expectEqual(conn.msg.capacity, relay.buffered_bytes);
     try std.testing.expectEqualSlices(u8, &first, conn.msg.items[0..3000]);
@@ -2527,7 +2527,7 @@ test "aggregate budget charges retained byte-list capacity and rejects growth be
 }
 
 test "WEB full writes allocate no queue metadata and reject budget before writing" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     var fds: [2]posix.fd_t = undefined;
     const rc = linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0, &fds);
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
@@ -2552,7 +2552,7 @@ test "WEB full writes allocate no queue metadata and reject budget before writin
 }
 
 test "WEB partial pair writes retain only an owned ordered suffix" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     for ([_]usize{ 32, 32 * 1024 }) |prefix_len| {
         var fds: [2]posix.fd_t = undefined;
@@ -2768,7 +2768,7 @@ test "client relay frame shapes are strict for every type and scope" {
     try Relay.validateClientFrameShape(true, .{ .type = .window, .stream_id = 1, .payload = &good_window });
     try Relay.validateClientFrameShape(true, .{ .type = .close, .stream_id = 1, .payload = "" });
 
-    const too_long_pong = [_]u8{0} ** (frame.max_ping_payload + 1);
+    const too_long_pong: [frame.max_ping_payload + 1]u8 = @splat(0);
     const bad = [_]frame.Frame{
         .{ .type = .ping, .stream_id = 0, .payload = "" },
         .{ .type = .bye, .stream_id = 0, .payload = "" },
@@ -2861,8 +2861,8 @@ test "metrics accepts direct loopback requests and rejects public or forwarded r
     relay.streams_refused = 7;
     var buffer: [2048]u8 = undefined;
     const metrics = try relay.renderMetrics(&buffer);
-    try std.testing.expect(std.mem.indexOf(u8, metrics, "mtproto_web_sessions 3\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, metrics, "mtproto_web_streams_refused_total 7\n") != null);
+    try std.testing.expect(std.mem.find(u8, metrics, "mtproto_web_sessions 3\n") != null);
+    try std.testing.expect(std.mem.find(u8, metrics, "mtproto_web_streams_refused_total 7\n") != null);
 }
 
 test "no public directory keeps unsupported methods on the bodyless 404 default" {
@@ -2944,7 +2944,7 @@ fn dropFront(list: *std.ArrayList(u8), n: usize) void {
     if (builtin.is_test) compactions_for_test += 1;
     std.debug.assert(n <= list.items.len);
     const rest = list.items.len - n;
-    if (rest > 0) std.mem.copyForwards(u8, list.items[0..rest], list.items[n..]);
+    if (rest > 0) @memmove(list.items[0..rest], list.items[n..]);
     list.shrinkRetainingCapacity(rest);
 }
 
@@ -2969,8 +2969,8 @@ fn addressToSockaddr(addr: Address, storage: *posix.sockaddr.storage) posix.sock
             sa.* = .{
                 .family = posix.AF.INET,
                 .port = std.mem.nativeToBig(u16, v4.port),
-                .addr = @bitCast(v4.bytes),
-                .zero = [_]u8{0} ** 8,
+                .addr = std.mem.readInt(u32, &v4.bytes, std.lang.Endian.native),
+                .zero = @as([8]u8, @splat(0)),
             };
             return @sizeOf(posix.sockaddr.in);
         },
@@ -2991,7 +2991,7 @@ fn addressToSockaddr(addr: Address, storage: *posix.sockaddr.storage) posix.sock
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 test "backend retry freezes candidates and preserves queued bytes while retiring stale fd" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const listener = try net_helpers.listen(net_helpers.ip4(.{ 127, 0, 0, 1 }, 0), 8, false);
     defer closeFd(listener.socket.handle);
@@ -3071,7 +3071,7 @@ test "proxy v2 header round-trips through the proxy's own parser" {
 
 test "an ipv4-mapped client is reported as ipv4" {
     var buf: [64]u8 = undefined;
-    var mapped: [16]u8 = [_]u8{0} ** 16;
+    var mapped: [16]u8 = @splat(0);
     mapped[10] = 0xff;
     mapped[11] = 0xff;
     mapped[12] = 198;
@@ -3089,7 +3089,7 @@ test "an ipv4-mapped client is reported as ipv4" {
 
 test "an ipv6 client survives an ipv4 backend" {
     var buf: [64]u8 = undefined;
-    var v6: [16]u8 = [_]u8{0} ** 16;
+    var v6: [16]u8 = @splat(0);
     v6[0] = 0x20;
     v6[1] = 0x01;
     v6[15] = 0x01;
@@ -3170,7 +3170,7 @@ test "HTTP upgrade passes pipelined WebSocket bytes on without another read" {
     defer conn.out.deinit();
     defer if (conn.session) |session| relay.destroySession(session);
     try relay.conns.put(allocator, conn.fd, &conn);
-    const request = try std.fmt.allocPrint(allocator, "GET /api/v1/socket HTTP/1.1\r\nHost: relay.example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Protocol: tproxy-v1.{s}\r\n\r\n", .{token});
+    const request = try allocator.print("GET /api/v1/socket HTTP/1.1\r\nHost: relay.example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Protocol: tproxy-v1.{s}\r\n\r\n", .{token});
     defer allocator.free(request);
     const pong = [_]u8{ 0x8a, 0x80, 1, 2, 3, 4 };
     try relay.appendInput(&conn, request, false);
@@ -3272,7 +3272,7 @@ test "options require an enabled section, a domain and at least one user" {
     try std.testing.expectError(error.WebProxyDisabled, Options.fromConfig(&cfg, &buf));
     cfg.web.enabled = true;
     try std.testing.expectError(error.NoUsersConfigured, Options.fromConfig(&cfg, &buf));
-    try cfg.users.put(try std.testing.allocator.dupe(u8, "alice"), [_]u8{7} ** 16);
+    try cfg.users.put(try std.testing.allocator.dupe(u8, "alice"), @as([16]u8, @splat(7)));
     try std.testing.expectError(error.MissingDomain, Options.fromConfig(&cfg, &buf));
     cfg.web.domain = try std.testing.allocator.dupe(u8, "127.0.0.1");
     try std.testing.expectError(error.InvalidDomain, Options.fromConfig(&cfg, &buf));
@@ -3397,7 +3397,7 @@ test "capability prefix collisions require full comparison of the remainder" {
 
 test "negative capability prefixes perform zero full comparisons for large snapshots and query batches" {
     const allocator = std.testing.allocator;
-    const missing = [_]u8{'A'} ** capability.capability_len; // decoded prefix zero
+    const missing: [capability.capability_len]u8 = @splat('A'); // decoded prefix zero
     for ([_]usize{ 1, 100, 1000 }) |users| {
         const caps = try allocator.alloc(UserCapability, users * 2);
         defer allocator.free(caps);
@@ -3494,7 +3494,7 @@ test "authenticated websocket key failures return 400 and release the token" {
     };
     for (key_headers, 0..) |key_header, index| {
         const token = try relay.carrier_tokens.issue(allocator, std.testing.io, "alice", nowMs(), 8);
-        const raw = try std.fmt.allocPrint(allocator, "GET /api/v1/socket HTTP/1.1\r\n" ++
+        const raw = try allocator.print("GET /api/v1/socket HTTP/1.1\r\n" ++
             "Host: relay.example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n" ++
             "Sec-WebSocket-Version: 13\r\n{s}" ++
             "Sec-WebSocket-Protocol: tproxy-v1.{s}\r\n\r\n", .{ key_header, token });

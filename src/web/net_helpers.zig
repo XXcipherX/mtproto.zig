@@ -67,7 +67,7 @@ pub fn listen(addr: Address, backlog: u31, reuse_port: bool) !std.Io.net.Server 
     if (isIpv6(addr)) try posix.setsockopt(fd, posix.IPPROTO.IPV6, std.os.linux.IPV6.V6ONLY, std.mem.asBytes(&off));
     const bind_rc = switch (addr) {
         .ip4 => |a| blk: {
-            var sa = posix.sockaddr.in{ .family = posix.AF.INET, .port = std.mem.nativeToBig(u16, a.port), .addr = @bitCast(a.bytes), .zero = [_]u8{0} ** 8 };
+            var sa = posix.sockaddr.in{ .family = posix.AF.INET, .port = std.mem.nativeToBig(u16, a.port), .addr = std.mem.readInt(u32, &a.bytes, std.lang.Endian.native), .zero = @as([8]u8, @splat(0)) };
             break :blk posix.system.bind(fd, @ptrCast(&sa), @sizeOf(@TypeOf(sa)));
         },
         .ip6 => |a| blk: {
@@ -101,8 +101,8 @@ pub fn getAddressList(allocator: std.mem.Allocator, io: std.Io, host: []const u8
     } else |_| {}
 
     // On Linux use the deadline-bounded NSS resolver. This avoids feeding VPS
-    // resolv.conf quirks into Zig 0.16's resolver and is also used by refresh.
-    const resolved = if (@import("builtin").os.tag == .linux)
+    // resolv.conf quirks into Zig 0.17's resolver and is also used by refresh.
+    const resolved = if (@import("builtin").target.os.tag == .linux)
         try lookupViaGetent(allocator, io, host, port)
     else
         try lookupViaStd(allocator, io, host, port);
@@ -286,7 +286,7 @@ test "DNS ordering is IPv4 first and stable within each family" {
 }
 
 test "startup address snapshots bound retained answers to sixteen" {
-    const addresses = [_]Address{ip4(.{ 192, 0, 2, 1 }, 443)} ** 97;
+    const addresses: [97]Address = @splat(ip4(.{ 192, 0, 2, 1 }, 443));
     const candidates = AddressCandidates.init(&addresses);
     try std.testing.expectEqual(@as(usize, 16), candidates.slice().len);
 }

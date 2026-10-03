@@ -25,7 +25,7 @@ pub const AesCtr = struct {
     buffer_pos: u8 = 16, // start exhausted so first call generates
 
     /// Expanded AES-256 encryption context type (backend-independent)
-    const EncCtx = @TypeOf(Aes256.initEnc([_]u8{0} ** 32));
+    const EncCtx = @TypeOf(Aes256.initEnc(@as([32]u8, @splat(0))));
 
     /// Main AES-CTR batch width. Eight independent counter blocks expose enough
     /// instruction-level parallelism for the x86_64 AES-NI production target.
@@ -136,9 +136,11 @@ pub const AesCtr = struct {
 // ============= AES-256-CBC =============
 
 fn xorBlockInPlace(block: *[16]u8, mask: *const [16]u8) void {
-    const block_int: u128 = @bitCast(block.*);
-    const mask_int: u128 = @bitCast(mask.*);
-    block.* = @bitCast(block_int ^ mask_int);
+    // Keep XOR in byte vectors: Zig 0.17 array/integer logical bitcasts
+    // regress code generation on this per-block CBC path.
+    const block_bytes: @Vector(16, u8) = block.*;
+    const mask_bytes: @Vector(16, u8) = mask.*;
+    block.* = block_bytes ^ mask_bytes;
 }
 
 /// Direction-specific AES-256-CBC encryptor with proper chaining.
@@ -147,7 +149,7 @@ pub const AesCbcEncryptor = struct {
     iv: [16]u8,
 
     const block_size = 16;
-    const EncCtx = @TypeOf(Aes256.initEnc([_]u8{0} ** 32));
+    const EncCtx = @TypeOf(Aes256.initEnc(@as([32]u8, @splat(0))));
 
     pub fn init(key: *const [32]u8, iv: *const [16]u8) AesCbcEncryptor {
         return .{
@@ -191,7 +193,7 @@ pub const AesCbcDecryptor = struct {
 
     const block_size = 16;
     const wide_blocks = 8;
-    const DecCtx = @TypeOf(Aes256.initDec([_]u8{0} ** 32));
+    const DecCtx = @TypeOf(Aes256.initDec(@as([32]u8, @splat(0))));
 
     pub fn init(key: *const [32]u8, iv: *const [16]u8) AesCbcDecryptor {
         return .{
@@ -339,8 +341,21 @@ pub fn randomRange(comptime T: type, max: T) T {
 
 // ============= Tests =============
 
+test "block XOR preserves each byte" {
+    var block: [16]u8 = undefined;
+    var mask: [16]u8 = undefined;
+    var expected: [16]u8 = undefined;
+    for (&block, &mask, &expected, 0..) |*byte, *mask_byte, *want, i| {
+        byte.* = @truncate(i * 73 + 19);
+        mask_byte.* = @truncate(i * 29 + 0xa1);
+        want.* = byte.* ^ mask_byte.*;
+    }
+    xorBlockInPlace(&block, &mask);
+    try std.testing.expectEqualSlices(u8, &expected, &block);
+}
+
 test "AesCtr roundtrip" {
-    const key = [_]u8{0} ** 32;
+    const key: [32]u8 = @splat(0);
     const iv: u128 = 12345;
     const original = "Hello, MTProto!";
 
@@ -360,7 +375,7 @@ test "AesCtr roundtrip" {
 
 test "AesCtr wide path matches byte-at-a-time across boundaries and counter wrap" {
     const allocator = std.testing.allocator;
-    const key = [_]u8{0x42} ** 32;
+    const key: [32]u8 = @splat(0x42);
     const iv: u128 = std.math.maxInt(u128) - 5;
     const lengths = [_]usize{
         0,   1,    15,  16,  17,  31,  63,  64,
@@ -404,7 +419,7 @@ test "AesCtr wide path matches byte-at-a-time across boundaries and counter wrap
 }
 
 test "AesCtr in-place symmetry" {
-    const key = [_]u8{0x42} ** 32;
+    const key: [32]u8 = @splat(0x42);
     const iv: u128 = 999;
     const original = "Test data for in-place encryption";
 
@@ -421,8 +436,8 @@ test "AesCtr in-place symmetry" {
 }
 
 test "AesCbc roundtrip" {
-    const key = [_]u8{0x12} ** 32;
-    const iv = [_]u8{0x34} ** 16;
+    const key: [32]u8 = @splat(0x12);
+    const iv: [16]u8 = @splat(0x34);
 
     var plaintext: [48]u8 = undefined;
     for (0..48) |i| {
@@ -440,8 +455,8 @@ test "AesCbc roundtrip" {
 }
 
 test "AesCbc eight-block decryption preserves tails and split-call chaining" {
-    const key = [_]u8{0x5a} ** 32;
-    const iv = [_]u8{0xa5} ** 16;
+    const key: [32]u8 = @splat(0x5a);
+    const iv: [16]u8 = @splat(0xa5);
 
     var plaintext: [480]u8 = undefined;
     for (&plaintext, 0..) |*byte, index| byte.* = @truncate(index *% 37 +% 11);
@@ -466,9 +481,9 @@ test "AesCbc eight-block decryption preserves tails and split-call chaining" {
 }
 
 test "AesCbc chaining works" {
-    const key = [_]u8{0x42} ** 32;
-    const iv = [_]u8{0x00} ** 16;
-    var plaintext = [_]u8{0xAA} ** 32;
+    const key: [32]u8 = @splat(0x42);
+    const iv: [16]u8 = @splat(0x00);
+    var plaintext: [32]u8 = @splat(0xAA);
 
     var encryptor = AesCbcEncryptor.init(&key, &iv);
     try encryptor.encryptInPlace(&plaintext);

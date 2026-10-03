@@ -20,7 +20,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0
 
       - name: Check Zig formatting
         run: zig fmt --check build.zig src test/hardware_aes_probe.zig
@@ -46,11 +46,14 @@ jobs:
       - name: Run WEB proxy bridge-page contract tests
         run: zig build web-bridge
 
-      - name: Run ReleaseSafe tests
-        run: zig build -Doptimize=ReleaseSafe test
+      - name: Run safe tests
+        run: zig build -Doptimize=safe test
 
-      - name: Run ReleaseFast tests
-        run: zig build -Doptimize=ReleaseFast test
+      - name: Run baseline safe tests
+        run: zig build -Doptimize=safe -Dcpu=baseline test
+
+      - name: Run fast tests
+        run: zig build -Doptimize=fast test
 
       - name: Debug build
         run: zig build
@@ -65,30 +68,30 @@ jobs:
         run: zig build e2e -- --workers=2
 
       - name: Shipping-build real-process relay E2E
-        run: zig build -Doptimize=ReleaseFast e2e
+        run: zig build -Doptimize=fast e2e
 
       - name: Hardened-build real-process relay E2E
-        run: zig build -Doptimize=ReleaseFast -Ddataplane_safety=true e2e
+        run: zig build -Doptimize=fast -Ddataplane_safety=true e2e
 
       - name: Hardened release build (native)
         run: |
-          zig build -Doptimize=ReleaseFast -Ddataplane_safety=true
+          zig build -Doptimize=fast -Ddataplane_safety=true
           readelf -h zig-out/bin/mtproto-proxy | grep -Eq 'Type:[[:space:]]+DYN'
 
       - name: Release build (native)
-        run: zig build -Doptimize=ReleaseFast
+        run: zig build -Doptimize=fast
 
       - name: Cross-compile for Linux x86_64
-        run: zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux
+        run: zig build -Doptimize=fast -Dtarget=x86_64-linux
 
       - name: Cross-compile deploy target
-        run: zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux -Dcpu=x86_64_v3+aes
+        run: zig build -Doptimize=fast -Dtarget=x86_64-linux -Dcpu=x86_64_v3+aes
 
       - name: Verify optimized Docker target enables hardware AES
         run: bash test/check_hardware_aes.sh
 
       - name: Cross-compile for Linux aarch64
-        run: zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux
+        run: zig build -Doptimize=fast -Dtarget=aarch64-linux
 
       - name: Verify binary exists
         run: |
@@ -97,7 +100,7 @@ jobs:
           readelf -h zig-out/bin/mtproto-proxy | grep -Eq 'Type:[[:space:]]+DYN'
 
       - name: Docker build smoke
-        run: docker build --build-arg ZIG_VERSION=0.16.0 -t mtproto-zig-smoke .
+        run: docker build --build-arg ZIG_VERSION=0.17.0 -t mtproto-zig-smoke .
 
       - name: Docker safe-default smoke
         shell: bash
@@ -138,7 +141,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0
 
       - name: Run bounded coverage-guided fuzzing
         shell: bash
@@ -173,22 +176,22 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0
 
       - name: Run microbenchmark
-        run: zig build -Doptimize=ReleaseFast bench 2>&1 | tee bench-output.txt
+        run: zig build -Doptimize=fast bench 2>&1 | tee bench-output.txt
 
       - name: Run FakeTLS handshake benchmark
-        run: zig build -Doptimize=ReleaseFast bench -- handshake --iterations=500000 2>&1 | tee handshake-output.txt
+        run: zig build -Doptimize=fast bench -- handshake --iterations=500000 2>&1 | tee handshake-output.txt
 
       - name: Run single-candidate handshake-path benchmark
-        run: zig build -Doptimize=ReleaseFast bench -- handshake-path --iterations=500000 --candidate-count=1 2>&1 | tee handshake-path-single-output.txt
+        run: zig build -Doptimize=fast bench -- handshake-path --iterations=500000 --candidate-count=1 2>&1 | tee handshake-path-single-output.txt
 
       - name: Run inline-candidate handshake-path benchmark
-        run: zig build -Doptimize=ReleaseFast bench -- handshake-path --iterations=500000 --candidate-count=4 2>&1 | tee handshake-path-inline-output.txt
+        run: zig build -Doptimize=fast bench -- handshake-path --iterations=500000 --candidate-count=4 2>&1 | tee handshake-path-inline-output.txt
 
       - name: Run heap-fallback handshake-path benchmark
-        run: zig build -Doptimize=ReleaseFast bench -- handshake-path --iterations=200000 --candidate-count=8 2>&1 | tee handshake-path-heap-output.txt
+        run: zig build -Doptimize=fast bench -- handshake-path --iterations=200000 --candidate-count=8 2>&1 | tee handshake-path-heap-output.txt
 
       - name: Run soak test
         run: |
@@ -198,7 +201,7 @@ jobs:
             SOAK_SECONDS=60
           fi
           echo "Running soak for ${SOAK_SECONDS}s"
-          zig build -Doptimize=ReleaseFast soak -- --seconds=${SOAK_SECONDS} 2>&1 | tee soak-output.txt
+          zig build -Doptimize=fast soak -- --seconds=${SOAK_SECONDS} 2>&1 | tee soak-output.txt
 
       - name: Upload bench results
         if: always()
@@ -224,7 +227,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0
 
       - name: Run native ARM64 tests
         run: zig build test
@@ -236,4 +239,4 @@ jobs:
         run: python3 test/daemon_smoke.py --binary zig-out/bin/mtproto-proxy
 
       - name: Run native ARM64 soak
-        run: zig build -Doptimize=ReleaseFast soak -- --seconds=10 --threads=4
+        run: zig build -Doptimize=fast soak -- --seconds=10 --threads=4

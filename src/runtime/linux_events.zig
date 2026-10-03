@@ -4,7 +4,7 @@ const posix = std.posix;
 const linux = std.os.linux;
 
 pub fn createTimerFd() !posix.fd_t {
-    if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
+    if (builtin.target.os.tag != .linux) return error.UnsupportedOperatingSystem;
     const rc = linux.timerfd_create(.MONOTONIC, .{ .NONBLOCK = true, .CLOEXEC = true });
     switch (linux.errno(rc)) {
         .SUCCESS => return @intCast(rc),
@@ -13,7 +13,7 @@ pub fn createTimerFd() !posix.fd_t {
 }
 
 pub fn armTimerFd(fd: posix.fd_t, deadline_ns: ?i128) !void {
-    if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
+    if (builtin.target.os.tag != .linux) return error.UnsupportedOperatingSystem;
 
     const value = deadline_ns orelse 0;
     const spec = linux.itimerspec{

@@ -107,7 +107,7 @@ fn checkSocketErrorCode(so_error: i32) !void {
     // Map SO_ERROR to a specific error so failover logs distinguish DPI blackholing/
     // throttling (ETIMEDOUT/EHOSTUNREACH/ENETUNREACH) from a genuine refusal — the old code
     // collapsed every cause into ConnectionRefused, hiding exactly what an operator needs.
-    const err: posix.E = @enumFromInt(so_error);
+    const err: posix.E = @fromBackingInt(@intCast(so_error));
     switch (err) {
         .TIMEDOUT => return error.Timeout,
         .CONNREFUSED => return error.ConnectionRefused,
@@ -124,7 +124,7 @@ pub fn addressFromSockaddrStorage(storage: *const posix.sockaddr.storage) ?Addre
             const sa4: *const posix.sockaddr.in = @ptrCast(storage);
             break :blk .{
                 .ip4 = .{
-                    .bytes = @bitCast(sa4.addr),
+                    .bytes = std.mem.toBytes(sa4.addr),
                     .port = std.mem.bigToNative(u16, sa4.port),
                 },
             };
@@ -220,24 +220,24 @@ pub fn configureRelaySocket(fd: posix.fd_t) void {
 
 pub fn formatAddress(addr: Address, buf: *[64]u8) []const u8 {
     return switch (addr) {
-        .ip4 => |ip4_addr| std.fmt.bufPrint(buf, "[ipv4]:{d}", .{ip4_addr.port}) catch "?",
+        .ip4 => |ip4_addr| std.mem.print(buf, "[ipv4]:{d}", .{ip4_addr.port}) catch "?",
         .ip6 => |ip6_addr| blk: {
             const bytes = &ip6_addr.bytes;
-            const is_ipv4_mapped = std.mem.eql(u8, bytes[0..10], &[_]u8{0} ** 10) and
+            const is_ipv4_mapped = std.mem.eql(u8, bytes[0..10], &@as([10]u8, @splat(0))) and
                 std.mem.eql(u8, bytes[10..12], &[_]u8{ 0xff, 0xff });
             if (is_ipv4_mapped) {
-                break :blk std.fmt.bufPrint(buf, "[ipv4]:{d}", .{ip6_addr.port}) catch "?";
+                break :blk std.mem.print(buf, "[ipv4]:{d}", .{ip6_addr.port}) catch "?";
             }
-            break :blk std.fmt.bufPrint(buf, "[ipv6]:{d}", .{ip6_addr.port}) catch "?";
+            break :blk std.mem.print(buf, "[ipv6]:{d}", .{ip6_addr.port}) catch "?";
         },
     };
 }
 
 test "SO_ERROR code preserves known connect failures" {
     try checkSocketErrorCode(0);
-    try std.testing.expectError(error.Timeout, checkSocketErrorCode(@intFromEnum(posix.E.TIMEDOUT)));
-    try std.testing.expectError(error.ConnectionRefused, checkSocketErrorCode(@intFromEnum(posix.E.CONNREFUSED)));
-    try std.testing.expectError(error.HostUnreachable, checkSocketErrorCode(@intFromEnum(posix.E.HOSTUNREACH)));
-    try std.testing.expectError(error.NetworkUnreachable, checkSocketErrorCode(@intFromEnum(posix.E.NETUNREACH)));
-    try std.testing.expectError(error.ConnectionResetByPeer, checkSocketErrorCode(@intFromEnum(posix.E.CONNRESET)));
+    try std.testing.expectError(error.Timeout, checkSocketErrorCode(@backingInt(posix.E.TIMEDOUT)));
+    try std.testing.expectError(error.ConnectionRefused, checkSocketErrorCode(@backingInt(posix.E.CONNREFUSED)));
+    try std.testing.expectError(error.HostUnreachable, checkSocketErrorCode(@backingInt(posix.E.HOSTUNREACH)));
+    try std.testing.expectError(error.NetworkUnreachable, checkSocketErrorCode(@backingInt(posix.E.NETUNREACH)));
+    try std.testing.expectError(error.ConnectionResetByPeer, checkSocketErrorCode(@backingInt(posix.E.CONNRESET)));
 }

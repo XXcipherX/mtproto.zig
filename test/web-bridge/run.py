@@ -13,6 +13,7 @@ hands it to harness.js, which impersonates the client.
 Missing node or zig is an error; contract tests cannot silently pass without running.
 """
 
+import argparse
 import os
 import shutil
 import subprocess
@@ -25,8 +26,8 @@ PAGE = REPO / "src" / "web" / "page.zig"
 HARNESS = Path(__file__).resolve().parent / "harness.js"
 
 
-def extract_script() -> tuple[str, str, str]:
-    zig = os.environ.get("ZIG") or shutil.which("zig")
+def extract_script(zig: str | None = None) -> tuple[str, str, str]:
+    zig = zig or os.environ.get("ZIG") or shutil.which("zig")
     if not zig:
         raise SystemExit("web-bridge: zig is required")
     rendered = subprocess.run([
@@ -47,12 +48,15 @@ def extract_script() -> tuple[str, str, str]:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--zig", help="Zig executable supplied by the build graph")
+    args = parser.parse_args()
     node = shutil.which("node")
     if node is None:
         print("web-bridge: node is required", file=sys.stderr)
         return 1
 
-    js, hello, welcome = extract_script()
+    js, hello, welcome = extract_script(args.zig)
     print(f"web-bridge: checking {len(js)} bytes of bridge script")
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "bridge.js"

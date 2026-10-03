@@ -29,7 +29,7 @@ pub fn encodeSlotEventToken(slot: *const ConnectionSlot, role: SlotFdRole) u64 {
     };
     return @as(u64, slot.index) |
         (@as(u64, generation) << 32) |
-        (@as(u64, @intFromEnum(role)) << 63);
+        (@as(u64, @backingInt(role)) << 63);
 }
 
 pub fn decodeSlotEventToken(token: u64) ?SlotEventToken {
@@ -38,7 +38,7 @@ pub fn decodeSlotEventToken(token: u64) ?SlotEventToken {
     return .{
         .index = @truncate(token),
         .generation = generation,
-        .role = @enumFromInt(@as(u1, @truncate(token >> 63))),
+        .role = @fromBackingInt(@intCast(@as(u1, @truncate(token >> 63)))),
     };
 }
 

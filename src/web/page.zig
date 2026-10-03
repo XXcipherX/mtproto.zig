@@ -213,7 +213,7 @@ pub fn renderSessionBridge(allocator: std.mem.Allocator, ws_path: []const u8, to
 }
 
 fn validateWsPath(ws_path: []const u8) !void {
-    if (ws_path.len == 0 or ws_path[0] != '/' or std.mem.startsWith(u8, ws_path, "//") or std.mem.indexOfAny(u8, ws_path, "?#\\") != null) return error.InvalidWsPath;
+    if (ws_path.len == 0 or ws_path[0] != '/' or std.mem.startsWith(u8, ws_path, "//") or std.mem.findAny(u8, ws_path, "?#\\") != null) return error.InvalidWsPath;
     for (ws_path) |c| if (c < 0x20 or c == 0x7f) return error.InvalidWebSocketPath;
 }
 

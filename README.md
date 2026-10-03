@@ -11,7 +11,7 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 </p>
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Zig](https://img.shields.io/badge/zig-0.16.0-f7a41d.svg?logo=zig&logoColor=white)](https://ziglang.org)
+[![Zig](https://img.shields.io/badge/zig-0.17.0-f7a41d.svg?logo=zig&logoColor=white)](https://ziglang.org)
 [![Platform](https://img.shields.io/badge/platform-linux-blueviolet.svg?logo=linux&logoColor=white)](#-quick-start)
 [![Dependencies](https://img.shields.io/badge/dependencies-0-success)](build.zig)
 
@@ -62,7 +62,7 @@ Connection-capacity methodology and command profiles: `test/README.md`.
 - Client relay uses one Linux `epoll` event loop by default. `[server].workers=0` auto-selects a bounded count or an explicit `2..16` runs independent loops and `SO_REUSEPORT` listeners. Each accepted connection stays on its worker. `epoll_event.data.u64` retains the slot index, generation, and fd role, so stale events cannot attach to a reused slot. Each loop has one 32 KiB relay-read scratch buffer; queued output copies data before another event reuses it.
 - `SIGINT` and `SIGTERM` use a non-blocking `eventfd`; the async signal handler only writes a notification. In multi-worker mode one control thread reads it and broadcasts to separate worker eventfds, so every sleeping `epoll_wait` wakes. The first signal disables new accepts and drains each worker's active slots for `graceful_shutdown_timeout_sec`; a second signal or each deadline closes remaining slots before all workers are joined and the discovery updater stops.
 - External discovery never delays the listening socket: MiddleProxy metadata/NAT detection and hostname-based masking resolution run in a joinable background worker. Metadata and masking candidates refresh hourly, reachability probes run in cancellable batches of at most four sockets, in-flight DNS/HTTPS/curl work is canceled cooperatively during shutdown, and stalled MiddleProxy handshakes can request an early refresh.
-- Zig 0.16's `main(init).io` owns high-level startup and background file/DNS/HTTPS I/O. The discovery updater and WEB DNS workers borrow it only while their owning process is alive and are joined before shutdown. The proxy relay path deliberately stays on Linux epoll/timerfd/eventfd and its own low-level clock, logging, and thread-local CSPRNG.
+- Zig 0.17's `main(init).io` owns high-level startup and background file/DNS/HTTPS I/O. The discovery updater and WEB DNS workers borrow it only while their owning process is alive and are joined before shutdown. The proxy relay path deliberately stays on Linux epoll/timerfd/eventfd and its own low-level clock, logging, and thread-local CSPRNG.
 - Native hostname resolution runs its producer with `std.Io.concurrent` while draining the bounded result queue. Allocation failure still drains without more allocations; cancellation joins the producer before releasing borrowed state. Resolver preflight and literal-address handling are retained. WEB's bounded Linux getent path remains separate and requires GNU `env` to unblock inherited signals in the child. Ubuntu 26.04 provides it as `/usr/bin/gnuenv`; Debian and Ubuntu 24.04 use `/usr/bin/env`.
 - Startup keeps capacity policy in `main.zig`; host/cgroup memory detection and the signal/eventfd bridge live in focused runtime modules. This separation does not change `init.io` ownership or shutdown order.
 - FakeTLS validation expects Telegram-style 32-byte ClientHello Session IDs and copies the Session ID into the synthetic ServerHello.
@@ -107,8 +107,8 @@ dependency boundaries are documented in
 
 ### Prerequisites
 
-- **Linux** (x86_64 or aarch64) — the proxy uses `epoll` and does not support macOS, FreeBSD, or OpenBSD at runtime
-- [Zig](https://ziglang.org/download/) **0.16.0** (the version pinned by CI, Docker, and installers; macOS is fine for cross-compilation)
+- **Linux 5.10+** (x86_64 or aarch64) — the proxy uses `epoll` and does not support macOS, FreeBSD, or OpenBSD at runtime
+- [Zig](https://ziglang.org/download/) **0.17.0** (the version pinned by CI, Docker, and installers; macOS is fine for cross-compilation)
 
 ### Build & Run locally
 
@@ -134,12 +134,12 @@ The binary defaults to `config.toml`; the repository intentionally ships `config
 
 The example listens on privileged port `443`. Run locally with sufficient bind permissions (for example, as root) or change `[server].port` to a port above `1024`. The systemd unit uses `CAP_NET_BIND_SERVICE`, but `make run` does not grant that capability.
 
-Production defaults to genuine `ReleaseFast`: `zig build -Doptimize=ReleaseFast`
+Production defaults to genuine `fast`: `zig build -Doptimize=fast`
 and `make release` compile `mtproto-proxy` in that mode. `dataplane_safety` defaults
 to `false`; explicitly passing `-Ddataplane_safety=false` has the same result.
-For the optional hardened `ReleaseSafe` mode with bounds, overflow and null checks,
-use `zig build -Doptimize=ReleaseFast -Ddataplane_safety=true`, or
-`make release DATAPLANE_SAFETY=true`. Direct `-Doptimize=ReleaseSafe` also works;
+For the optional hardened `safe` mode with bounds, overflow and null checks,
+use `zig build -Doptimize=fast -Ddataplane_safety=true`, or
+`make release DATAPLANE_SAFETY=true`. Direct `-Doptimize=safe` also works;
 other optimize modes are unchanged. `bench` and `soak` retain the requested mode
 regardless of `dataplane_safety`. PIE remains enabled in both production modes so
 Linux ASLR can randomize the proxy's load address.
@@ -158,11 +158,12 @@ python3 -m py_compile deploy/web_probe.py test/*.py test/web-bridge/*.py
 python3 -m unittest discover -s test -p 'test_probe_helpers.py'
 python3 -m unittest discover -s test -p 'test_web_setup_probe.py'
 shellcheck --severity=error deploy/*.sh deploy/monitor/*.sh
-zig build -Doptimize=ReleaseSafe test
-zig build -Doptimize=ReleaseFast test
+zig build -Doptimize=safe test
+zig build -Doptimize=safe -Dcpu=baseline test
+zig build -Doptimize=fast test
 ```
 
-On a 64-bit Linux development host, Zig 0.16 can drive the security parser
+On a 64-bit Linux development host, Zig 0.17 can drive the security parser
 harnesses with coverage-guided input generation. Use a finite per-target budget
 for a bounded local/CI campaign:
 
@@ -175,7 +176,7 @@ Omit the limit only for an intentional interactive campaign, then stop it with
 `Ctrl+C`:
 
 ```bash
-zig build -Doptimize=ReleaseSafe fuzz --fuzz
+zig build -Doptimize=safe fuzz --fuzz
 ```
 
 The dedicated `fuzz` build step covers FakeTLS and obfuscated handshakes,
@@ -183,7 +184,7 @@ MiddleProxy stream framing, and the public WEB HTTP, WebSocket, PROXY-protocol
 and multiplexed-frame parsers without pulling the benchmark test binary into the
 campaign. CI runs 25K iterations per target for pull requests and 100K per target
 for pushes to `main`, in a separate parallel job with a 15-minute hard timeout.
-The shared `test/run_fuzz.sh` wrapper also detects Zig 0.16's bounded-fuzz crash
+The shared `test/run_fuzz.sh` wrapper also detects Zig 0.17's bounded-fuzz crash
 file even when `zig build` returns success. `make fuzz` stores its evidence under
 `fuzz-artifacts/`; failed CI campaigns preserve the run log and crash input as a
 90-day artifact.
@@ -193,7 +194,7 @@ job instruments the unit-test, real multi-worker E2E proxy, and benchmark/soak a
 builds are unchanged. A separate Valgrind Memcheck job drives the real daemon
 smoke through a controlled startup and graceful shutdown. Invalid memory accesses
 and definite/indirect leaks fail the job; all leak categories remain available in
-the uploaded report. Its ReleaseSafe build uses a baseline CPU so Ubuntu's
+the uploaded report. Its safe build uses a baseline CPU so Ubuntu's
 Valgrind never has to emulate unsupported host-specific crypto instructions; an
 8 MiB stack-frame threshold covers the proxy's legitimate initialization frame
 without suppressing memory errors. A third job runs a bounded
@@ -202,10 +203,10 @@ failure evidence can be uploaded before the workflow's hard timeout. The checks
 can be reproduced on supported Linux hosts:
 
 ```bash
-zig build -Doptimize=ReleaseSafe -Dtsan=true test
-zig build -Doptimize=ReleaseSafe -Dtsan=true soak -- --seconds=30 --threads=4
+zig build -Doptimize=safe -Dtsan=true test
+zig build -Doptimize=safe -Dtsan=true soak -- --seconds=30 --threads=4
 
-zig build -Doptimize=ReleaseSafe -Dcpu=baseline
+zig build -Doptimize=safe -Dcpu=baseline
 python3 test/daemon_smoke.py --binary zig-out/bin/mtproto-proxy \
   --startup-timeout-sec 20 --shutdown-timeout-sec 20 \
   --launcher valgrind --tool=memcheck \
@@ -224,13 +225,13 @@ bash test/run_fuzz.sh 1M deep-fuzz-artifacts 40m
 make bench
 
 # Structurally valid FakeTLS authentication benchmark
-zig build -Doptimize=ReleaseFast bench -- handshake --iterations=500000
+zig build -Doptimize=fast bench -- handshake --iterations=500000
 
 # Full obfuscated-handshake path; 1/4 use inline candidate storage,
 # while 8 deliberately measures the heap fallback
-zig build -Doptimize=ReleaseFast bench -- handshake-path --iterations=500000 --candidate-count=1
-zig build -Doptimize=ReleaseFast bench -- handshake-path --iterations=500000 --candidate-count=4
-zig build -Doptimize=ReleaseFast bench -- handshake-path --iterations=200000 --candidate-count=8
+zig build -Doptimize=fast bench -- handshake-path --iterations=500000 --candidate-count=1
+zig build -Doptimize=fast bench -- handshake-path --iterations=500000 --candidate-count=4
+zig build -Doptimize=fast bench -- handshake-path --iterations=200000 --candidate-count=8
 
 # 30-second multithreaded soak (crash/stability guard)
 make soak
@@ -247,10 +248,10 @@ zig build e2e
 zig build e2e -- --workers=2
 
 # The same process path under the shipping optimization/safety policy
-zig build -Doptimize=ReleaseFast e2e
+zig build -Doptimize=fast e2e
 
 # Custom soak shape
-zig build -Doptimize=ReleaseFast soak -- --seconds=120 --threads=8 --max-payload=131072
+zig build -Doptimize=fast soak -- --seconds=120 --threads=8 --max-payload=131072
 ```
 
 The process E2E compiles a non-shipping daemon variant with a loopback-only DC
@@ -267,10 +268,10 @@ terminates an idle-load attempt, require per-connection payload factories during
 churn, and verify reuse of the expensive realistic ClientHello template. This
 keeps a broken probe from reporting a misleading proxy result.
 
-The GitHub workflow additionally covers default `ReleaseFast` and optional hardened
-`ReleaseSafe` builds and real-process relay E2E, PIE output,
+The GitHub workflow additionally covers default `fast` and optional hardened
+`safe` builds and real-process relay E2E, PIE output,
 Linux `x86_64`, deploy-target `x86_64_v3+aes`, Linux `aarch64`, Docker build smoke,
-and genuine `ReleaseFast` tests and benchmark/soak paths. The benchmark job records
+and genuine `fast` tests and benchmark/soak paths. The benchmark job records
 FakeTLS validation plus single, inline-four and heap-eight handshake candidate paths
 as downloadable artifacts; these are regression signals, not noisy shared-runner
 pass/fail thresholds. The ARM64 job runs the unit tests, real daemon smoke and a short soak natively on GitHub's official
@@ -280,9 +281,11 @@ All Ubuntu CI jobs use explicit `ubuntu-26.04` or `ubuntu-26.04-arm` runner
 labels. The installer E2E still covers its Debian 12/13 and Ubuntu 24.04/26.04
 container matrix on the Ubuntu 26.04 runner.
 
-The separate Stress CI builds its proxy with `-Doptimize=ReleaseFast stress-tools`,
-matching the default production optimize mode. Debug and ReleaseSafe unit tests,
-ReleaseSafe security fuzzing, ThreadSanitizer and Valgrind checks retain their modes.
+The separate Stress CI builds its proxy with `-Doptimize=fast stress-tools`,
+matching the default production optimize mode. Debug and safe unit tests,
+safe security fuzzing, ThreadSanitizer and Valgrind checks retain their modes.
+CI also runs safe unit tests on the baseline CPU target to cover protected
+software AES and its connection-memory accounting.
 
 The separate Debian/Ubuntu installer matrix builds the proxy image from the
 checked-out commit, publishes it only to a registry inside the isolated test host,
@@ -306,19 +309,19 @@ operations per second and a checksum that keeps the measured work observable.
 | Target | Description |
 |--------|-------------|
 | `make build` | Debug build |
-| `make release [DATAPLANE_SAFETY=true]` | Production build (`ReleaseFast` + PIE by default; optional `ReleaseSafe` + PIE) |
+| `make release [DATAPLANE_SAFETY=true]` | Production build (`fast` + PIE by default; optional `safe` + PIE) |
 | `make run CONFIG=<path>` | Run proxy (default: `config.toml`) |
 | `make test` | Run unit tests |
-| `make fuzz [FUZZ_ITERATIONS=100K]` | Run bounded ReleaseSafe security fuzzing (64-bit Linux) |
-| `make bench` | Run the default ReleaseFast encapsulation microbenchmark; handshake modes are available through `zig build ... bench -- ...` |
-| `make soak` | Run ReleaseFast multithreaded soak stress test (30s default) |
+| `make fuzz [FUZZ_ITERATIONS=100K]` | Run bounded safe security fuzzing (64-bit Linux) |
+| `make bench` | Run the default fast encapsulation microbenchmark; handshake modes are available through `zig build ... bench -- ...` |
+| `make soak` | Run fast multithreaded soak stress test (30s default) |
 | `make capacity-probe-idle` | Run the idle-socket capacity profile; requires the external `/root/benchmarks` workspace described in `test/README.md` |
 | `make capacity-probe-active` | Run the TLS-auth capacity profile; requires the same external benchmark workspace |
 | `make stability-check PID=<pid> [HOST=127.0.0.1 PORT=443]` | Run churn + idle-pool stability harness against an existing proxy process |
 | `make stability-check-load [HOST=127.0.0.1 PORT=443]` | Run load-only stability smoke without `/proc` assertions |
 | `make clean` | Remove build artifacts |
 | `make fmt` | Format Zig files under `src/` |
-| `make deploy SERVER=<ip> [DATAPLANE_SAFETY=true]` | Build `x86_64-linux` with the `x86_64_v3` CPU baseline (`ReleaseFast` + PIE by default), upload binary/scripts/config to VPS, restart service |
+| `make deploy SERVER=<ip> [DATAPLANE_SAFETY=true]` | Build `x86_64-linux` with the `x86_64_v3` CPU baseline (`fast` + PIE by default), upload binary/scripts/config to VPS, restart service |
 | `make migrate SERVER=<ip> [PASSWORD=<pass>]` | Bootstrap server, push local `config.toml`, then run `make deploy` |
 | `make update-dns SERVER=<ip>` | Run the Cloudflare DNS update helper on demand (`DNS_NAME`, `CF_TOKEN`, `CF_ZONE` come from `.env`) |
 | `make deploy-tunnel SERVER=<ip> AWG_CONF=<path> [PASSWORD=<pass>] [TUNNEL_MODE=direct\|preserve\|middleproxy]` | Full migration + AmneziaWG tunnel for blocked regions |
@@ -348,7 +351,7 @@ For a fresh self-domain install, pass `MASK_DOMAIN` as shown below or enter the 
 
 ## Docker image
 
-The repository includes a **multi-stage Dockerfile**: Zig is bootstrapped from the official tarball inside the build stage; the runtime image is Debian **trixie-slim** with `curl` and CA certs. Both stages use the same pinned multiarch image-index digest for amd64 and arm64. The proxy binary performs background HTTPS public-IPv4 detection for MiddleProxy NAT derivation and refreshes Telegram metadata itself, so CA certs are required; `curl` is kept for container-side diagnostics and as a fallback when a bounded preflight rejects `/etc/resolv.conf` before Zig 0.16 can reach its unsafe `attempts:0`, oversized search, or overlong DNS-name paths. Both the built-in client and that fallback follow only a bounded number of HTTPS-to-HTTPS redirects; a redirect to plain HTTP is rejected before the next request. The process runs as **root** inside the container (simple bind to port 443). `config.toml.example` is shipped as documentation only. On a first start without a mounted config, the entrypoint creates `/etc/mtproto-proxy/config.toml` with mode `0600` and a random user secret without printing that secret into Docker logs. Mount your own file for production settings; the Compose installer always does so.
+The repository includes a **multi-stage Dockerfile**: Zig is bootstrapped from the official tarball inside the build stage; the runtime image is Debian **trixie-slim** with `curl` and CA certs. Both stages use the same pinned multiarch image-index digest for amd64 and arm64. The proxy binary performs background HTTPS public-IPv4 detection for MiddleProxy NAT derivation and refreshes Telegram metadata itself, so CA certs are required; `curl` is kept for container-side diagnostics and as a fallback when a bounded preflight rejects `/etc/resolv.conf` before Zig 0.17 can reach its unsafe `attempts:0`, oversized search, or overlong DNS-name paths. Both the built-in client and that fallback follow only a bounded number of HTTPS-to-HTTPS redirects; a redirect to plain HTTP is rejected before the next request. The process runs as **root** inside the container (simple bind to port 443). `config.toml.example` is shipped as documentation only. On a first start without a mounted config, the entrypoint creates `/etc/mtproto-proxy/config.toml` with mode `0600` and a random user secret without printing that secret into Docker logs. Mount your own file for production settings; the Compose installer always does so.
 
 [Dependabot](.github/dependabot.yml) checks the Debian base and the installer E2E's pinned `docker:dind` tooling image every Monday at 06:00 Europe/Moscow and opens update pull requests. The E2E host distributions remain selected by the explicit CI matrix.
 
@@ -358,23 +361,23 @@ The repository includes a **multi-stage Dockerfile**: Zig is bootstrapped from t
 docker build -t mtproto-zig .
 ```
 
-The default image uses `ReleaseFast` + PIE on both `amd64` and `arm64`, including
+The default image uses `fast` + PIE on both `amd64` and `arm64`, including
 the optional `amd64-v3` CPU profile. Set `--build-arg DATAPLANE_SAFETY=true` for
-`ReleaseSafe` + PIE without changing the CPU profile.
+`safe` + PIE without changing the CPU profile.
 
 ### Build arguments
 
 | Argument       | Default   | Description |
 |----------------|-----------|-------------|
-| `ZIG_VERSION`  | `0.16.0`  | Version string passed to `ziglang.org/download/…/zig-<arch>-linux-<version>.tar.xz`. Must match a published Zig release. |
+| `ZIG_VERSION`  | `0.17.0`  | Version string passed to `ziglang.org/download/…/zig-<arch>-linux-<version>.tar.xz`. Must match a published Zig release. |
 | `ZIG_SHA256`   | _(empty)_ | Optional pinned SHA256 for the downloaded Zig tarball. If set, Docker build verifies integrity before extraction. |
 | `MTPROTO_CPU`  | `x86_64` on `amd64`, Zig default on `arm64` | Optional Zig CPU baseline. Use `x86_64_v3+aes` on modern `amd64` hosts to enable hardware AES and avoid software-only AES builds. |
-| `DATAPLANE_SAFETY` | `false` | Production mode: `false` builds genuine `ReleaseFast`; `true` selects `ReleaseSafe`. PIE is enabled in both modes. |
+| `DATAPLANE_SAFETY` | `false` | Production mode: `false` builds genuine `fast`; `true` selects `safe`. PIE is enabled in both modes. |
 
 Example:
 
 ```bash
-docker build --build-arg ZIG_VERSION=0.16.0 -t mtproto-zig .
+docker build --build-arg ZIG_VERSION=0.17.0 -t mtproto-zig .
 docker build --platform linux/amd64 --build-arg MTPROTO_CPU=x86_64_v3+aes -t mtproto-zig:amd64-v3 .
 docker build --build-arg DATAPLANE_SAFETY=true -t mtproto-zig:release-safe .
 ```
@@ -410,7 +413,7 @@ docker buildx build \
 ### Publish from GitHub Actions
 
 The repository includes a manual workflow: **Actions -> Publish Docker image -> Run workflow**.
-Its **Production mode** selector defaults to **ReleaseFast**; choose **ReleaseSafe**
+Its **Production mode** selector defaults to **fast**; choose **safe**
 for the hardened mode. The selection applies equally to the generic multi-platform
 image and optional `amd64-v3` image, and appears in the workflow summary.
 The generic image always includes both `linux/amd64` and `linux/arm64`.
@@ -447,6 +450,13 @@ compile time unless Zig selects its hardware AES implementation, preventing an
 image-label or build-argument change from silently turning the optimized image
 into a software-AES build. Generic multi-architecture images deliberately remain
 baseline-compatible and are not covered by this hardware-only assertion.
+
+Zig 0.17's protected software AES backend retains additional expanded keys.
+The startup RAM estimate includes this target-dependent storage: the normal
+MiddleProxy connection allowance is 40 KiB with hardware AES and 70 KiB with
+software AES on 64-bit Linux. Generic images therefore have a lower automatic
+connection ceiling for the same memory limit. The configured connection cap
+and buffer limits are unchanged.
 
 ### Run
 
@@ -719,8 +729,8 @@ curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/in
 ```
 
 This will:
-1. Install **Zig 0.16.0** (if not present)
-2. Clone and build the proxy as `ReleaseFast` + PIE for the native CPU by default
+1. Install **Zig 0.17.0** (if not present)
+2. Clone and build the proxy as `fast` + PIE for the native CPU by default
 3. Generate a random 16-byte secret on first install
 4. Create a `systemd` service (`mtproto-proxy`)
 5. Open the configured proxy port in `ufw` (if active)
@@ -732,7 +742,7 @@ This will:
 11. Refresh optional monitor files if `proxy-monitor` already exists
 12. Print a ready-to-use `tg://` connection link when `[access.users]` contains a valid 32-hex secret
 
-To install or update in the optional hardened `ReleaseSafe` + PIE mode, pass the
+To install or update in the optional hardened `safe` + PIE mode, pass the
 build setting to the installer:
 
 ```bash
@@ -820,12 +830,12 @@ curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/in
 
 ```bash
 # x86_64
-curl -sSfL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz | \
+curl -sSfL https://ziglang.org/download/0.17.0/zig-x86_64-linux-0.17.0.tar.xz | \
   sudo tar xJ -C /usr/local
-sudo ln -sf /usr/local/zig-x86_64-linux-0.16.0/zig /usr/local/bin/zig
+sudo ln -sf /usr/local/zig-x86_64-linux-0.17.0/zig /usr/local/bin/zig
 
 # Verify
-zig version   # → 0.16.0
+zig version   # → 0.17.0
 ```
 
 **2. Build the proxy**
@@ -833,17 +843,17 @@ zig version   # → 0.16.0
 ```bash
 git clone https://github.com/XXcipherX/mtproto.zig.git
 cd mtproto.zig
-zig build -Doptimize=ReleaseFast
+zig build -Doptimize=fast
 ```
 
-This builds genuine `ReleaseFast` + PIE. Add `-Ddataplane_safety=true` to select
-the optional hardened `ReleaseSafe` + PIE mode. The source installer and Docker
-image also default to `ReleaseFast`, with `DATAPLANE_SAFETY=true` as their opt-in.
+This builds genuine `fast` + PIE. Add `-Ddataplane_safety=true` to select
+the optional hardened `safe` + PIE mode. The source installer and Docker
+image also default to `fast`, with `DATAPLANE_SAFETY=true` as their opt-in.
 
 Or cross-compile on your Mac for a baseline-compatible x86_64 target:
 
 ```bash
-zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux
+zig build -Doptimize=fast -Dtarget=x86_64-linux
 scp zig-out/bin/mtproto-proxy root@<SERVER_IP>:/opt/mtproto-proxy/
 ```
 

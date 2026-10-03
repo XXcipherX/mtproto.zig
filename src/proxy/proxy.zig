@@ -165,16 +165,16 @@ fn isInvalidFd(fd: posix.fd_t) bool {
 }
 
 fn fakeFd(value: usize) posix.fd_t {
-    return switch (builtin.os.tag) {
+    return switch (builtin.target.os.tag) {
         .windows => @ptrFromInt(value),
         else => @intCast(value),
     };
 }
 
 fn closeFd(fd: posix.fd_t) void {
-    if (builtin.os.tag == .linux) {
+    if (builtin.target.os.tag == .linux) {
         _ = linux.close(fd);
-    } else if (builtin.os.tag == .windows) {
+    } else if (builtin.target.os.tag == .windows) {
         std.os.windows.CloseHandle(fd);
     }
 }
@@ -225,7 +225,7 @@ fn prepareUserHmacs(allocator: std.mem.Allocator, secrets: []const obfuscation.U
 }
 
 fn wipeUserHmacs(contexts: []tls.PreparedHmacState) void {
-    // HmacSha256 and its Sha256 state contain no pointers or enums in Zig 0.16.
+    // HmacSha256 and its Sha256 state contain no pointers or enums in Zig 0.17.
     std.crypto.secureZero(u8, std.mem.sliceAsBytes(contexts));
 }
 
@@ -434,7 +434,7 @@ pub const ProxyState = struct {
             log.info("WEB-only mode active: direct MTProto is masked for every peer except the trusted relay", .{});
         }
 
-        var default_middle_proxy_secret = [_]u8{0} ** 256;
+        var default_middle_proxy_secret: [256]u8 = @splat(0);
         @memcpy(default_middle_proxy_secret[0..middleproxy.proxy_secret.len], middleproxy.proxy_secret[0..]);
 
         var detected_nat_ip4: ?[4]u8 = null;
@@ -480,17 +480,17 @@ pub const ProxyState = struct {
             .middle_proxy_addrs_media_primary = constants.tg_media_middle_proxies_v4,
             .middle_proxy_addr_203 = constants.tg_cdn_middle_proxy_v4,
             .middle_proxy_candidates = defaultMiddleProxyCandidateLists(constants.tg_middle_proxies_v4),
-            .middle_proxy_candidate_lens = [_]usize{1} ** 5,
+            .middle_proxy_candidate_lens = @as([5]usize, @splat(1)),
             .middle_proxy_media_candidates = defaultMiddleProxyCandidateLists(constants.tg_media_middle_proxies_v4),
-            .middle_proxy_media_candidate_lens = [_]usize{1} ** 5,
-            .middle_proxy_candidates_203 = [_]net.Address{constants.tg_cdn_middle_proxy_v4} ** 16,
+            .middle_proxy_media_candidate_lens = @as([5]usize, @splat(1)),
+            .middle_proxy_candidates_203 = @as([16]net.Address, @splat(constants.tg_cdn_middle_proxy_v4)),
             .middle_proxy_candidates_203_len = 1,
-            .middle_proxy_cooldowns = [_]MiddleProxyCooldown{.{}} ** middle_proxy_cooldown_slots,
+            .middle_proxy_cooldowns = @as([middle_proxy_cooldown_slots]MiddleProxyCooldown, @splat(.{})),
             .middle_proxy_health = .{},
             .middle_proxy_secret = default_middle_proxy_secret,
             .middle_proxy_secret_len = middleproxy.proxy_secret.len,
             .middle_proxy_secret_version = 1,
-            .middle_proxy_previous_secret = [_]u8{0} ** 256,
+            .middle_proxy_previous_secret = @as([256]u8, @splat(0)),
             .middle_proxy_previous_secret_len = 0,
             .middle_proxy_previous_secret_version = 0,
             .middle_proxy_nat_ip4 = detected_nat_ip4,
@@ -569,7 +569,7 @@ pub const ProxyState = struct {
     }
 
     pub fn run(self: *ProxyState, shutdown_fd: posix.fd_t) !void {
-        if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
+        if (builtin.target.os.tag != .linux) return error.UnsupportedOperatingSystem;
         if (self.web_mask_dns) |cache| try cache.start();
 
         var middle_proxy_updater_started = false;
@@ -669,7 +669,7 @@ pub const ProxyState = struct {
 
     fn listenClient(self: *ProxyState, ipv6: bool, reuse_port: bool) !net.Listener {
         const address = if (ipv6)
-            net.ip6([_]u8{0} ** 16, self.config.port, 0, 0)
+            net.ip6(@as([16]u8, @splat(0)), self.config.port, 0, 0)
         else
             net.ip4(.{ 0, 0, 0, 0 }, self.config.port);
         return net.listen(address, .{
@@ -1154,12 +1154,12 @@ pub const ProxyState = struct {
         const cfg_bytes = try self.fetchMiddleProxyMetadata("getProxyConfig", middle_proxy_config_url);
         defer secureFree(self.allocator, cfg_bytes);
 
-        var next_primary: [5]?net.Address = [_]?net.Address{null} ** 5;
-        var next_media_primary: [5]?net.Address = [_]?net.Address{null} ** 5;
+        var next_primary: [5]?net.Address = @splat(null);
+        var next_media_primary: [5]?net.Address = @splat(null);
         var next_candidates: [5][16]net.Address = undefined;
-        var next_candidate_lens: [5]usize = [_]usize{0} ** 5;
+        var next_candidate_lens: [5]usize = @splat(0);
         var next_media_candidates: [5][16]net.Address = undefined;
-        var next_media_candidate_lens: [5]usize = [_]usize{0} ** 5;
+        var next_media_candidate_lens: [5]usize = @splat(0);
         for (0..next_primary.len) |i| {
             if (self.middle_proxy_updater_stop.load(.acquire)) return error.UpdateCancelled;
             const dc_num: i16 = @intCast(i + 1);
@@ -4651,7 +4651,7 @@ fn maxConnectionsForNofile(soft_nofile: usize) u32 {
 }
 
 fn getNofileSoftLimit() ?usize {
-    if (builtin.os.tag != .linux) return null;
+    if (builtin.target.os.tag != .linux) return null;
 
     var lim: linux.rlimit = undefined;
     const rc = linux.getrlimit(.NOFILE, &lim);
@@ -4684,7 +4684,7 @@ fn writePlainMiddleProxyTestFrame(fd: posix.fd_t, seq_no: i32, payload: []const 
 }
 
 test "middle proxy nonce response failure retries another candidate before direct fallback" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
 
     var cfg = Config{
         .users = std.StringHashMap([16]u8).init(std.testing.allocator),
@@ -4804,16 +4804,16 @@ test "middle proxy nonce response failure retries another candidate before direc
     try slot.setUpstreamCandidates(state.allocator, &mp_candidates);
     slot.upstream_candidate_next = 1;
     slot.obf_params = .{
-        .decrypt_key = [_]u8{0} ** constants.key_len,
+        .decrypt_key = @as([constants.key_len]u8, @splat(0)),
         .decrypt_iv = 0,
-        .encrypt_key = [_]u8{0} ** constants.key_len,
+        .encrypt_key = @as([constants.key_len]u8, @splat(0)),
         .encrypt_iv = 0,
         .proto_tag = .intermediate,
         .dc_idx = 4,
     };
     slot.mp_transport.resetFrame(false);
 
-    var bad_nonce_payload = [_]u8{0} ** 32;
+    var bad_nonce_payload: [32]u8 = @splat(0);
     @memcpy(bad_nonce_payload[0..4], &middleproxy.rpc_proxy_ans);
     try writePlainMiddleProxyTestFrame(upstream_file.handle, -2, &bad_nonce_payload);
     try seekFdToStart(upstream_file.handle);
@@ -4960,9 +4960,9 @@ test "ServerHello preparation freezes process certificate size and preserves scr
                     state.allocator = if (desync) std.testing.allocator else failing.allocator();
                     defer state.allocator = std.testing.allocator;
                     var slot = ConnectionSlot{
-                        .validation_secret = [_]u8{0x42} ** 16,
-                        .validation_digest = [_]u8{0x71} ** 32,
-                        .validation_session_id = [_]u8{0x39} ** 32,
+                        .validation_secret = @as([16]u8, @splat(0x42)),
+                        .validation_digest = @as([32]u8, @splat(0x71)),
+                        .validation_session_id = @as([32]u8, @splat(0x39)),
                         .validation_session_id_len = 32,
                     };
                     defer if (slot.server_hello) |response| secureFree(state.allocator, response);
@@ -5002,7 +5002,7 @@ test "unsplit ServerHello pending bytes survive worker scratch reuse" {
             const client = try relayDrainTestSocketPair();
             defer closeFd(client[0]);
             defer closeFd(client[1]);
-            const fill = [_]u8{0} ** 4096;
+            const fill: [4096]u8 = @splat(0);
             var filled: usize = 0;
             if (fixture.blocked) {
                 var blocked = false;
@@ -5022,9 +5022,9 @@ test "unsplit ServerHello pending bytes survive worker scratch reuse" {
             var slot = ConnectionSlot{
                 .phase = .writing_server_hello_rest,
                 .client_fd = client[0],
-                .validation_secret = [_]u8{0x42} ** 16,
-                .validation_digest = [_]u8{0x71} ** 32,
-                .validation_session_id = [_]u8{0x39} ** 32,
+                .validation_secret = @as([16]u8, @splat(0x42)),
+                .validation_digest = @as([32]u8, @splat(0x71)),
+                .validation_session_id = @as([32]u8, @splat(0x39)),
                 .validation_session_id_len = 32,
                 .client_queue = .{ .allocator = if (fixture.prefix == null) failing.allocator() else std.testing.allocator },
                 .event_io_budget = &budget,
@@ -5062,7 +5062,7 @@ test "unsplit ServerHello pending bytes survive worker scratch reuse" {
 }
 
 test "FakeTLS size and key-share refusals mask the complete original record" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const hostname = "example.org";
     var cfg = Config{
         .users = std.StringHashMap([16]u8).init(std.testing.allocator),
@@ -5074,7 +5074,7 @@ test "FakeTLS size and key-share refusals mask the complete original record" {
         .datacenter_override = net.ip4(.{ 127, 0, 0, 1 }, 443),
     };
     defer cfg.deinit(std.testing.allocator);
-    const secret = [_]u8{0x1a} ** 16;
+    const secret: [16]u8 = @splat(0x1a);
     const username = try std.testing.allocator.dupe(u8, "alice");
     cfg.users.put(username, secret) catch |err| {
         std.testing.allocator.free(username);
@@ -5167,7 +5167,7 @@ test "FakeTLS size and key-share refusals mask the complete original record" {
 }
 
 test "relay idle deadlines wake early, recompute live activity and preserve timer ordering" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     var cfg = Config{
         .users = std.StringHashMap([16]u8).init(std.testing.allocator),
         .direct_users = std.StringHashMap(void).init(std.testing.allocator),
@@ -5288,7 +5288,7 @@ test "relay idle deadlines wake early, recompute live activity and preserve time
 }
 
 test "active ordinary masking expires by default while opt-out, WEB and authenticated relays survive" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     var cfg = Config{
         .users = std.StringHashMap([16]u8).init(std.testing.allocator),
         .direct_users = std.StringHashMap(void).init(std.testing.allocator),
@@ -5365,7 +5365,7 @@ test "active ordinary masking expires by default while opt-out, WEB and authenti
 }
 
 test "absolute slot timers remain immediate across handshake, connect, MP, mask and desync" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     var cfg = Config{
         .users = std.StringHashMap([16]u8).init(std.testing.allocator),
         .direct_users = std.StringHashMap(void).init(std.testing.allocator),
@@ -5490,7 +5490,7 @@ test "readable activity changes only with actual relay or handshake progress" {
             .upstream_fd = upstream[0],
             .client_transport = if (fixture.direct) .direct_obfuscated else .fake_tls,
             .use_fast_mode = true,
-            .tg_encryptor = crypto.AesCtr.init(&([_]u8{0x42} ** 32), 0),
+            .tg_encryptor = crypto.AesCtr.init(&(@as([32]u8, @splat(0x42))), 0),
             .last_activity_ms = 123,
             .client_queue = .{ .allocator = std.testing.allocator },
             .upstream_queue = .{ .allocator = std.testing.allocator },
@@ -5565,7 +5565,7 @@ test "writable activity records sent bytes and ignores a blocked flush" {
 }
 
 test "ClientHello allocation failure preserves cleanup ownership at the inline boundary" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     var cfg = Config{
         .users = std.StringHashMap([16]u8).init(std.testing.allocator),
         .direct_users = std.StringHashMap(void).init(std.testing.allocator),
@@ -5633,7 +5633,7 @@ test "handshake read yields when the event I/O budget is exhausted" {
 }
 
 test "direct nonce ignores promotion and preserves pipelined cipher continuity" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     var cfg = Config{
         .users = std.StringHashMap([16]u8).init(std.testing.allocator),
         .direct_users = std.StringHashMap(void).init(std.testing.allocator),
@@ -5651,7 +5651,7 @@ test "direct nonce ignores promotion and preserves pipelined cipher continuity" 
     // emitted stream as a DC would, without relying on the slot's cipher state.
     const client_payload = "client payload immediately after nonce";
     for ([_]bool{ false, true }) |with_tag| {
-        state.config.tag = if (with_tag) [_]u8{0x42} ** 16 else null;
+        state.config.tag = if (with_tag) @as([16]u8, @splat(0x42)) else null;
         for ([_]constants.ProtoTag{ .abridged, .intermediate, .secure }) |proto_tag| {
             for ([_]bool{ false, true }) |fast_mode| {
                 for ([_]i16{ 4, -4 }) |dc_idx| {
@@ -5665,9 +5665,9 @@ test "direct nonce ignores promotion and preserves pipelined cipher continuity" 
                             .use_fast_mode = fast_mode,
                             .is_media_path = dc_idx < 0,
                             .obf_params = .{
-                                .decrypt_key = [_]u8{0} ** constants.key_len,
+                                .decrypt_key = @as([constants.key_len]u8, @splat(0)),
                                 .decrypt_iv = 0,
-                                .encrypt_key = [_]u8{0x37} ** constants.key_len,
+                                .encrypt_key = @as([constants.key_len]u8, @splat(0x37)),
                                 .encrypt_iv = 0x1234,
                                 .proto_tag = proto_tag,
                                 .dc_idx = dc_idx,
@@ -5705,7 +5705,7 @@ test "direct nonce ignores promotion and preserves pipelined cipher continuity" 
 }
 
 test "multiple client TLS records consume one read operation before queue backpressure" {
-    if (builtin.os.tag != .linux) return;
+    if (builtin.target.os.tag != .linux) return;
     var fds: [2]i32 = undefined;
     const rc = linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0, &fds);
     if (linux.errno(rc) != .SUCCESS) return posix.unexpectedErrno(linux.errno(rc));
@@ -5718,7 +5718,7 @@ test "multiple client TLS records consume one read operation before queue backpr
     // the heap, without starting listeners, updater threads, or a full daemon.
     const loop = try std.testing.allocator.create(EventLoop);
     defer std.testing.allocator.destroy(loop);
-    const key = [_]u8{0x37} ** 32;
+    const key: [32]u8 = @splat(0x37);
     var budget = EventIoBudget{ .operations_remaining = 1 };
     var slot = ConnectionSlot{
         .phase = .relaying,
@@ -5740,7 +5740,7 @@ test "multiple client TLS records consume one read operation before queue backpr
 }
 
 fn relayDrainTestSocketPair() ![2]posix.fd_t {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     var fds: [2]posix.fd_t = undefined;
     const rc = linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0, &fds);
     if (linux.errno(rc) != .SUCCESS) return posix.unexpectedErrno(linux.errno(rc));
@@ -5760,8 +5760,8 @@ fn expectRelayTestQueue(queue: *const message_queue.MessageQueue, expected: []co
 }
 
 test "direct C2S batches records with CCS and owns backpressured suffixes" {
-    const client_key = [_]u8{0x37} ** 32;
-    const upstream_key = [_]u8{0x92} ** 32;
+    const client_key: [32]u8 = @splat(0x37);
+    const upstream_key: [32]u8 = @splat(0x92);
     var plaintext: [47]u8 = undefined;
     for (&plaintext, 0..) |*byte, i| byte.* = @truncate(i * 29 + 9);
     var ciphertext = plaintext;
@@ -5804,7 +5804,7 @@ test "direct C2S batches records with CCS and owns backpressured suffixes" {
         defer closeFd(upstream[0]);
         defer closeFd(upstream[1]);
         var blocked_bytes: usize = 0;
-        const fill = [_]u8{0} ** 4096;
+        const fill: [4096]u8 = @splat(0);
         if (fixture.blocked) {
             var blocked = false;
             for (0..1024) |_| {
@@ -5871,8 +5871,8 @@ test "direct C2S flushes each read without waiting for a complete TLS record" {
     const upstream = try relayDrainTestSocketPair();
     defer closeFd(upstream[0]);
     defer closeFd(upstream[1]);
-    const client_key = [_]u8{0x73} ** 32;
-    const upstream_key = [_]u8{0x29} ** 32;
+    const client_key: [32]u8 = @splat(0x73);
+    const upstream_key: [32]u8 = @splat(0x29);
     const plaintext = "one record forwarded across two body reads";
     var ciphertext = plaintext.*;
     var client_cipher = crypto.AesCtr.init(&client_key, 3);
@@ -5926,8 +5926,8 @@ test "direct C2S flushes each read without waiting for a complete TLS record" {
 }
 
 test "direct C2S bounds scatter batches and queues the rest of a consumed chunk" {
-    const client_key = [_]u8{0x18} ** 32;
-    const upstream_key = [_]u8{0xc9} ** 32;
+    const client_key: [32]u8 = @splat(0x18);
+    const upstream_key: [32]u8 = @splat(0xc9);
     var plaintext: [2 * relay_io.max_scatter_parts + 3]u8 = undefined;
     for (&plaintext, 0..) |*byte, i| byte.* = @truncate(i * 31 + 5);
     var ciphertext = plaintext;
@@ -5994,8 +5994,8 @@ test "direct C2S forwards a valid batch before rejecting a later malformed recor
     const upstream = try relayDrainTestSocketPair();
     defer closeFd(upstream[0]);
     defer closeFd(upstream[1]);
-    const client_key = [_]u8{0x24} ** 32;
-    const upstream_key = [_]u8{0x81} ** 32;
+    const client_key: [32]u8 = @splat(0x24);
+    const upstream_key: [32]u8 = @splat(0x81);
     var ciphertext = "abcdefg".*;
     var client_cipher = crypto.AesCtr.init(&client_key, 17);
     client_cipher.apply(&ciphertext);
@@ -6031,7 +6031,7 @@ test "direct C2S forwards a valid batch before rejecting a later malformed recor
 }
 
 test "relay drain forwards multiple chunks and respects the shared byte and operation budgets" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const payload = try std.testing.allocator.alloc(u8, 3 * relay_read_scratch_size);
     defer std.testing.allocator.free(payload);
     for (payload, 0..) |*byte, i| byte.* = @truncate(i * 29 + 7);
@@ -6187,7 +6187,7 @@ fn relayHangupTestTcpPair() ![2]posix.fd_t {
 }
 
 test "TCP HUP drains oversized responses across budgets and client backpressure" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     var cfg = Config{
         .users = std.StringHashMap([16]u8).init(std.testing.allocator),
         .direct_users = std.StringHashMap(void).init(std.testing.allocator),
@@ -6324,8 +6324,8 @@ fn initProxyStateAndDeinit(allocator: std.mem.Allocator, cfg: Config) !void {
 
 test "prepared user HMACs preserve key order, wipe storage and propagate allocation failure" {
     const secrets = [_]obfuscation.UserSecret{
-        .{ .name = "alice", .secret = [_]u8{0x11} ** 16 },
-        .{ .name = "bob", .secret = [_]u8{0x22} ** 16 },
+        .{ .name = "alice", .secret = @as([16]u8, @splat(0x11)) },
+        .{ .name = "bob", .secret = @as([16]u8, @splat(0x22)) },
     };
     const cache_bytes = secrets.len * @sizeOf(tls.PreparedHmacState);
     var backing: [cache_bytes + @alignOf(tls.PreparedHmacState)]u8 = @splat(0xa5);
@@ -6628,7 +6628,7 @@ test "concurrent workers share connection, handshake, replay, rate and wedge lim
         .rate_winners = &rate_winners,
         .ready = &ready,
         .go = &go,
-        .digest = [_]u8{0x42} ** 32,
+        .digest = @as([32]u8, @splat(0x42)),
         .wedge_ticket = wedge_ticket,
     };
     var threads: [8]std.Thread = undefined;
@@ -6726,7 +6726,7 @@ test "MiddleProxy route snapshots remain synchronized across workers" {
 }
 
 test "nonblocking accept reports EAGAIN when libc is linked" {
-    if (builtin.os.tag != .linux) return;
+    if (builtin.target.os.tag != .linux) return;
 
     const address = net.ip4(.{ 127, 0, 0, 1 }, 0);
     var listener = try net.listen(address, .{});
@@ -6736,7 +6736,7 @@ test "nonblocking accept reports EAGAIN when libc is linked" {
 }
 
 test "control broadcast wakes every worker eventfd" {
-    if (builtin.os.tag != .linux) return;
+    if (builtin.target.os.tag != .linux) return;
     const first = try createWorkerEventFd();
     defer closeFd(first);
     const second = try createWorkerEventFd();
@@ -6755,7 +6755,7 @@ test "control broadcast wakes every worker eventfd" {
 }
 
 test "abandoned worker startup releases its reuseport listener" {
-    if (builtin.os.tag != .linux) return;
+    if (builtin.target.os.tag != .linux) return;
     var cfg = Config{
         .users = std.StringHashMap([16]u8).init(std.testing.allocator),
         .direct_users = std.StringHashMap(void).init(std.testing.allocator),

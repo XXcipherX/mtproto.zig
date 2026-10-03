@@ -73,16 +73,16 @@ pub const ProtoTag = enum(u32) {
     pub fn fromBytes(bytes: [4]u8) ?ProtoTag {
         const val = std.mem.readInt(u32, &bytes, .little);
         return switch (val) {
-            @intFromEnum(ProtoTag.abridged) => .abridged,
-            @intFromEnum(ProtoTag.intermediate) => .intermediate,
-            @intFromEnum(ProtoTag.secure) => .secure,
+            @backingInt(ProtoTag.abridged) => .abridged,
+            @backingInt(ProtoTag.intermediate) => .intermediate,
+            @backingInt(ProtoTag.secure) => .secure,
             else => null,
         };
     }
 
     pub fn toBytes(self: ProtoTag) [4]u8 {
         var buf: [4]u8 = undefined;
-        std.mem.writeInt(u32, &buf, @intFromEnum(self), .little);
+        std.mem.writeInt(u32, &buf, @backingInt(self), .little);
         return buf;
     }
 };

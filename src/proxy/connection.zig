@@ -16,7 +16,7 @@ pub const event_io_operation_budget: usize = 64;
 const client_hello_inline_size: usize = 512;
 const upstream_candidates_inline_cap: usize = 4;
 pub const no_timer_heap_index = std.math.maxInt(u32);
-pub const invalid_fd: posix.fd_t = switch (builtin.os.tag) {
+pub const invalid_fd: posix.fd_t = switch (builtin.target.os.tag) {
     .windows => std.os.windows.INVALID_HANDLE_VALUE,
     else => -1,
 };
@@ -200,11 +200,11 @@ pub const ConnectionSlot = struct {
     client_hello_heap: ?[]u8 = null,
     client_hello_len: usize = 0,
 
-    validation_secret: [16]u8 = [_]u8{0} ** 16,
-    validation_digest: [32]u8 = [_]u8{0} ** 32,
-    validation_session_id: [32]u8 = [_]u8{0} ** 32,
+    validation_secret: [16]u8 = @splat(0),
+    validation_digest: [32]u8 = @splat(0),
+    validation_session_id: [32]u8 = @splat(0),
     validation_session_id_len: u8 = 0,
-    validation_user: [32]u8 = [_]u8{0} ** 32,
+    validation_user: [32]u8 = @splat(0),
     validation_user_len: u8 = 0,
     validation_force_direct: bool = false,
 
@@ -559,10 +559,24 @@ pub fn secureFree(allocator: std.mem.Allocator, buf: []u8) void {
     allocator.free(buf);
 }
 
+// A compact AES-256 context holds fifteen 16-byte round keys. Zig 0.17's
+// protected software backend also caches bitsliced keys. Account only for that
+// stdlib-owned expansion: four CTR states, two CBC encryptors (MiddleProxy
+// context/transport), and two CBC decryptors remain embedded in each slot.
+const compact_aes_context_bytes = 15 * 16;
+const aes_backend_extra_bytes =
+    6 * (@sizeOf(std.crypto.core.aes.AesEncryptCtx(std.crypto.core.aes.Aes256)) - compact_aes_context_bytes) +
+    2 * (@sizeOf(std.crypto.core.aes.AesDecryptCtx(std.crypto.core.aes.Aes256)) - compact_aes_context_bytes);
+
+/// Conservative slot allowance used by both the layout guard and RAM admission.
+/// The original 6 KiB project allowance is unchanged on hardware-AES targets.
+pub const slot_working_memory_bytes: usize = 6 * 1024 + aes_backend_extra_bytes;
+
 comptime {
-    // Every worker can retain one slot per accepted connection. Leave ABI
-    // headroom, but reject a large accidental inline-buffer expansion.
-    if (@sizeOf(ConnectionSlot) > 6144) @compileError("ConnectionSlot exceeded its per-connection size budget");
+    // Reject project-owned buffer/state growth beyond the original allowance;
+    // a larger native stdlib AES backend must also be charged to RAM admission.
+    if (@sizeOf(ConnectionSlot) > slot_working_memory_bytes)
+        @compileError("ConnectionSlot exceeded its per-connection size budget");
 }
 
 test "MiddleProxyHandshakeStep.awaitingMiddleProxy gates reactive refresh" {

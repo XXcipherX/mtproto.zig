@@ -8,14 +8,14 @@ HOST ?= 127.0.0.1
 PORT ?= 443
 PID ?=
 FUZZ_ITERATIONS ?= 100K
-# Production: ReleaseFast + PIE by default; set true for ReleaseSafe + PIE.
+# Production: fast + PIE by default; set true for safe + PIE.
 DATAPLANE_SAFETY ?= false
 
 build:
 	zig build
 
 release:
-	zig build -Doptimize=ReleaseFast -Ddataplane_safety="$(DATAPLANE_SAFETY)"
+	zig build -Doptimize=fast -Ddataplane_safety="$(DATAPLANE_SAFETY)"
 
 run:
 	zig build run -- $(CONFIG)
@@ -27,10 +27,10 @@ fuzz:
 	bash test/run_fuzz.sh "$(FUZZ_ITERATIONS)" fuzz-artifacts
 
 bench:
-	zig build -Doptimize=ReleaseFast bench
+	zig build -Doptimize=fast bench
 
 soak:
-	zig build -Doptimize=ReleaseFast soak -- --seconds=30
+	zig build -Doptimize=fast soak -- --seconds=30
 
 fmt:
 	zig fmt src/
@@ -39,7 +39,7 @@ clean:
 	rm -rf .zig-cache zig-out
 
 deploy:
-	zig build -Doptimize=ReleaseFast -Ddataplane_safety="$(DATAPLANE_SAFETY)" -Dtarget=x86_64-linux -Dcpu=x86_64_v3
+	zig build -Doptimize=fast -Ddataplane_safety="$(DATAPLANE_SAFETY)" -Dtarget=x86_64-linux -Dcpu=x86_64_v3
 	ssh root@$(SERVER) 'systemctl stop mtproto-proxy || true'
 	scp zig-out/bin/mtproto-proxy root@$(SERVER):/opt/mtproto-proxy/
 	scp deploy/*.sh root@$(SERVER):/opt/mtproto-proxy/

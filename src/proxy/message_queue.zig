@@ -373,7 +373,7 @@ test "message queue uses page-sized blocks and fills the tail first" {
 
     q.clear();
 
-    var payload: [msg_block_payload_size + 1]u8 = [_]u8{0xA5} ** (msg_block_payload_size + 1);
+    var payload: [msg_block_payload_size + 1]u8 = @splat(0xA5);
     try q.appendCopy(&payload);
     const page_first = q.head.?;
     const page_second = page_first.next.?;
@@ -387,7 +387,7 @@ test "message queue consumed prefix permits one conservative extra block" {
     var q = MessageQueue{ .allocator = std.testing.allocator };
     defer q.deinit();
 
-    var payload: [msg_block_payload_size]u8 = [_]u8{0x5A} ** msg_block_payload_size;
+    var payload: [msg_block_payload_size]u8 = @splat(0x5A);
     try q.appendCopy(&payload);
     const first = q.head.?;
     try q.consume(1);
@@ -501,7 +501,7 @@ test "queue memory budget covers two queues and the shared pool" {
 }
 
 test "multipart append leaves the existing queue intact on every reservation failure" {
-    const payload = [_]u8{0xa5} ** (msg_block_payload_size * 2);
+    const payload: [msg_block_payload_size * 2]u8 = @splat(0xa5);
     for ([_]usize{ 1, 2 }) |fail_index| {
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
         var queue = MessageQueue{ .allocator = failing.allocator() };
@@ -523,7 +523,7 @@ test "multipart reservation retains managed accounting and rejects overflow befo
     var queue = MessageQueue{ .allocator = budget.allocator(), .pool = &pool };
     defer queue.deinit();
     try queue.appendCopy("prefix");
-    const payload = [_]u8{0x91} ** (msg_block_payload_size * 2);
+    const payload: [msg_block_payload_size * 2]u8 = @splat(0x91);
     try std.testing.expectError(error.OutOfMemory, queue.appendParts(&.{&payload}));
     try std.testing.expectEqual(@as(usize, 6), queue.total_len);
     try std.testing.expectEqual(@as(usize, 1), pool.free_count);

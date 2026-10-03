@@ -8,7 +8,7 @@ This workflow documents current build and deploy paths as implemented in `Makefi
 
 ## Prerequisites
 
-- Zig 0.16.0 for local builds
+- Zig 0.17.0 for local builds
 - SSH access to VPS
 - systemd on target host
 - GNU coreutils `env` for Linux WEB DNS children; use the existing `/usr/bin/gnuenv` on Ubuntu 26.04 or `/usr/bin/env` on Debian/Ubuntu 24.04. The Rust implementation does not unblock the relay's inherited signal mask.
@@ -19,10 +19,10 @@ This workflow documents current build and deploy paths as implemented in `Makefi
 ## Key Commands
 
 - `make build` : debug build
-- `make release [DATAPLANE_SAFETY=true]` : production proxy (`ReleaseFast` + PIE by default; optional `ReleaseSafe` + PIE); benchmark targets retain the requested mode
+- `make release [DATAPLANE_SAFETY=true]` : production proxy (`fast` + PIE by default; optional `safe` + PIE); benchmark targets retain the requested mode
 - `make run CONFIG=<path>` : run proxy with selected config
 - `make test` : run unit tests
-- `make fuzz [FUZZ_ITERATIONS=100K]` : bounded ReleaseSafe security fuzz campaign (64-bit Linux)
+- `make fuzz [FUZZ_ITERATIONS=100K]` : bounded safe security fuzz campaign (64-bit Linux)
 - `make bench` : encapsulation microbench
 - `make soak` : 30s multithreaded soak
 - `mtproto-proxy --check-config <path>` : parse and semantically validate a config without opening a listener
@@ -55,42 +55,45 @@ python3 -m unittest discover -s test -p 'test_probe_helpers.py'
 python3 -m unittest discover -s test -p 'test_web_setup_probe.py'
 shellcheck --severity=error docker-entrypoint.sh deploy/*.sh deploy/monitor/*.sh test/check_hardware_aes.sh test/run_fuzz.sh test/installer-e2e/run.sh test/installer-e2e/fake-*
 zig build test
-zig build -Doptimize=ReleaseSafe test
-zig build -Doptimize=ReleaseFast test
+zig build -Doptimize=safe test
+zig build -Doptimize=safe -Dcpu=baseline test
+zig build -Doptimize=fast test
 bash test/run_fuzz.sh 100K fuzz-artifacts 12m
 zig build
 python3 test/daemon_smoke.py --binary zig-out/bin/mtproto-proxy
 zig build e2e
-zig build -Doptimize=ReleaseFast e2e
-zig build -Doptimize=ReleaseFast -Ddataplane_safety=true e2e
-zig build -Doptimize=ReleaseFast -Ddataplane_safety=true
-zig build -Doptimize=ReleaseFast
-zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux
-zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux -Dcpu=x86_64_v3+aes
+zig build -Doptimize=fast e2e
+zig build -Doptimize=fast -Ddataplane_safety=true e2e
+zig build -Doptimize=fast -Ddataplane_safety=true
+zig build -Doptimize=fast
+zig build -Doptimize=fast -Dtarget=x86_64-linux
+zig build -Doptimize=fast -Dtarget=x86_64-linux -Dcpu=x86_64_v3+aes
 bash test/check_hardware_aes.sh
-zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux
-docker build --build-arg ZIG_VERSION=0.16.0 -t mtproto-zig-smoke .
-zig build -Doptimize=ReleaseFast bench
-zig build -Doptimize=ReleaseFast soak -- --seconds=10
+zig build -Doptimize=fast -Dtarget=aarch64-linux
+docker build --build-arg ZIG_VERSION=0.17.0 -t mtproto-zig-smoke .
+zig build -Doptimize=fast bench
+zig build -Doptimize=fast soak -- --seconds=10
 ```
 
-Production defaults to genuine `ReleaseFast`: `dataplane_safety` defaults to
-`false`, so `zig build -Doptimize=ReleaseFast` and the explicit
-`-Ddataplane_safety=false` form both use that mode. Opt into hardened `ReleaseSafe`
-with `zig build -Doptimize=ReleaseFast -Ddataplane_safety=true`, or request
-`-Doptimize=ReleaseSafe` directly. Other optimize modes are unchanged. Bench/soak
+Production defaults to genuine `fast`: `dataplane_safety` defaults to
+`false`, so `zig build -Doptimize=fast` and the explicit
+`-Ddataplane_safety=false` form both use that mode. Opt into hardened `safe`
+with `zig build -Doptimize=fast -Ddataplane_safety=true`, or request
+`-Doptimize=safe` directly. Other optimize modes are unchanged. Bench/soak
 retain the requested mode regardless of this flag. The proxy ELF remains PIE in
 both production modes.
 
 Make release/deploy targets and the source installer expose `DATAPLANE_SAFETY`
-with default `false`; set it to `true` for `ReleaseSafe`. Docker uses the same
+with default `false`; set it to `true` for `safe`. Docker uses the same
 build argument on generic x86_64, aarch64 and `x86_64_v3+aes` profiles. The publish
-workflow's **Production mode** choice defaults to **ReleaseFast** and maps the
+workflow's **Production mode** choice defaults to **fast** and maps the
 same selection to both the generic and optional `amd64-v3` image builds.
 
-Stress CI keeps `zig build -Doptimize=ReleaseFast stress-tools`, so its proxy
-matches the default production optimize mode. Debug/ReleaseSafe unit tests,
-ReleaseSafe fuzzing, ThreadSanitizer and Valgrind retain their explicit modes.
+Stress CI keeps `zig build -Doptimize=fast stress-tools`, so its proxy
+matches the default production optimize mode. Debug/safe unit tests,
+safe fuzzing, ThreadSanitizer and Valgrind retain their explicit modes.
+CI additionally runs safe unit tests with `-Dcpu=baseline` to exercise protected
+software AES and the matching connection-memory admission allowance.
 
 The default install graph contains only `mtproto-proxy`. Use `zig build install-bench` only when the standalone `mtproto-bench` binary is required; `bench` and `soak` build it explicitly without coupling `run` to the global install step.
 
@@ -100,13 +103,13 @@ stop immediately on process/system FD exhaustion, resolve callable churn payload
 inside each connection attempt, and retain the bounded hostname cache for the
 realistic TLS template.
 
-The daemon smoke launches a real localhost proxy, verifies a valid FakeTLS handshake, checks that the same SNI with a bad secret does not receive a valid FakeTLS response, and holds an authenticated connection across `SIGTERM` until the configured graceful-shutdown deadline forces a clean exit. `zig build e2e` goes further: a compile-time test-only loopback DC override drives the real daemon through FakeTLS, the obfuscated MTProto nonce, upstream setup, and C2S/S2C relay without exposing that override in the installed binary. CI repeats that process scenario with `-Doptimize=ReleaseFast` for the default shipping mode and adds `-Ddataplane_safety=true` for the optional hardened `ReleaseSafe` mode. It also builds the hardened production executable and checks its PIE output. CI uses a shorter soak for pull requests and a longer soak on pushes. In addition to the aarch64 cross-build, the official `ubuntu-26.04-arm` runner executes unit tests, this daemon smoke and a short four-worker soak natively so architecture-specific runtime defects cannot hide behind successful cross-compilation.
+The daemon smoke launches a real localhost proxy, verifies a valid FakeTLS handshake, checks that the same SNI with a bad secret does not receive a valid FakeTLS response, and holds an authenticated connection across `SIGTERM` until the configured graceful-shutdown deadline forces a clean exit. `zig build e2e` goes further: a compile-time test-only loopback DC override drives the real daemon through FakeTLS, the obfuscated MTProto nonce, upstream setup, and C2S/S2C relay without exposing that override in the installed binary. CI repeats that process scenario with `-Doptimize=fast` for the default shipping mode and adds `-Ddataplane_safety=true` for the optional hardened `safe` mode. It also builds the hardened production executable and checks its PIE output. CI uses a shorter soak for pull requests and a longer soak on pushes. In addition to the aarch64 cross-build, the official `ubuntu-26.04-arm` runner executes unit tests, this daemon smoke and a short four-worker soak natively so architecture-specific runtime defects cannot hide behind successful cross-compilation.
 
 The separate `.github/workflows/deep-ci.yml` workflow runs weekly and through `workflow_dispatch`. Its `-Dtsan=true` option applies ThreadSanitizer only to the `src/main.zig` and `src/bench.zig` test artifacts plus the benchmark executable used by soak; it never instruments the normal production proxy build. Keep `TSAN_OPTIONS=halt_on_error=1:exitcode=66` so a reported race fails the job instead of becoming advisory output.
 
-Deep CI also runs the real ReleaseSafe daemon smoke under Valgrind Memcheck. It deliberately builds with `-Dcpu=baseline` so the probe does not depend on Valgrind support for host-specific instructions such as SHA-NI (`SHA256RNDS2`). Keep this profile when updating runner images. `--max-stackframe=8388608` classifies the proxy's roughly 3.6 MiB initialization frame as a normal Linux stack frame instead of producing false invalid-access reports. The harness's `--launcher` option consumes the remainder of the command line and must therefore be last; it prepends those arguments without a shell. Memcheck reports every leak category to an artifact and uses `--errors-for-leak-kinds=definite,indirect --error-exitcode=97`, so invalid accesses and actionable leaks fail without treating `possible` or `reachable` runtime allocations as proven project defects. Do not add suppressions without a reproduced and documented toolchain false positive.
+Deep CI also runs the real safe daemon smoke under Valgrind Memcheck. It deliberately builds with `-Dcpu=baseline` so the probe does not depend on Valgrind support for host-specific instructions such as SHA-NI (`SHA256RNDS2`). Keep this profile when updating runner images. `--max-stackframe=8388608` classifies the proxy's roughly 3.6 MiB initialization frame as a normal Linux stack frame instead of producing false invalid-access reports. The harness's `--launcher` option consumes the remainder of the command line and must therefore be last; it prepends those arguments without a shell. Memcheck reports every leak category to an artifact and uses `--errors-for-leak-kinds=definite,indirect --error-exitcode=97`, so invalid accesses and actionable leaks fail without treating `possible` or `reachable` runtime allocations as proven project defects. Do not add suppressions without a reproduced and documented toolchain false positive.
 
-The third Deep CI job runs `bash test/run_fuzz.sh 1M deep-fuzz-artifacts 40m`. The wrapper exists because Zig 0.16 bounded fuzzing can leave `.zig-cache/f/crash` while returning a successful build status. It treats that file or the corresponding crash message as a failure, copies the crash input plus available fuzzer logs into a non-hidden artifact directory, and rejects a pre-existing crash instead of deleting evidence or misattributing it to a later campaign. Keep the inner 40-minute limit below the 50-minute job timeout so the artifact upload step can still run.
+The third Deep CI job runs `bash test/run_fuzz.sh 1M deep-fuzz-artifacts 40m`. The wrapper exists because Zig 0.17 bounded fuzzing can leave `.zig-cache/f/crash` while returning a successful build status. It treats that file or the corresponding crash message as a failure, copies the crash input plus available fuzzer logs into a non-hidden artifact directory, and rejects a pre-existing crash instead of deleting evidence or misattributing it to a later campaign. Keep the inner 40-minute limit below the 50-minute job timeout so the artifact upload step can still run.
 
 Installer changes also require the separate `.github/workflows/installer-e2e.yml` matrix. It boots privileged systemd containers for Debian 12/13 and Ubuntu 24.04/26.04, runs the real Docker Compose installer twice, and checks the private config, Caddy-only topology, WEB relay, service health, HTTPS masking, external-only SYNFIX/NFQUEUE rules, their saved IPv4 boot snapshot plus enabled `netfilter-persistent`, disabled-by-default TCPMSS, and idempotent reinstall. Before installation, the harness builds the proxy image from the current checkout and publishes it to a registry inside the isolated host. The real installer pulls that local tag, and verification requires both proxy services to run its exact image ID; never replace this with the public `latest` tag. Docker, Compose, Caddy, the proxy image, systemd, and iptables remain real; only public ACME and the external `nfqws` implementation use deterministic test substitutes. Source/build/image changes trigger this matrix as well as installer changes. Run one case locally with:
 
@@ -200,7 +203,7 @@ sudo env MTPROTO_DOCKER_INSTALL=1 bash /opt/mtproto-proxy/setup_web.sh --remove
 
 ## `make deploy` (current behavior)
 
-1. Builds Linux target: `zig build -Doptimize=ReleaseFast -Ddataplane_safety=false -Dtarget=x86_64-linux -Dcpu=x86_64_v3` by default; `make deploy DATAPLANE_SAFETY=true SERVER=<ip>` selects `ReleaseSafe`. PIE remains enabled in both modes.
+1. Builds Linux target: `zig build -Doptimize=fast -Ddataplane_safety=false -Dtarget=x86_64-linux -Dcpu=x86_64_v3` by default; `make deploy DATAPLANE_SAFETY=true SERVER=<ip>` selects `safe`. PIE remains enabled in both modes.
 2. Stops remote service (`systemctl stop mtproto-proxy`).
 3. Uploads binary and `deploy/*.sh` via `scp`.
 4. Uploads config when local config file exists.
@@ -286,8 +289,8 @@ the directory and binary: config remains `mtproto:mtproto`/`0640`, and `env.sh`
 remains `root:root`/`0600`. Do not use recursive permission widening or relax umask
 globally to repair executable access.
 
-It builds genuine `ReleaseFast` + native CPU + PIE by default. For hardened
-`ReleaseSafe` + native CPU + PIE, pass the setting through `sudo`:
+It builds genuine `fast` + native CPU + PIE by default. For hardened
+`safe` + native CPU + PIE, pass the setting through `sudo`:
 
 ```bash
 curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/install.sh | sudo env DATAPLANE_SAFETY=true bash

@@ -21,10 +21,10 @@ pub fn parseIpv4Literal(text: []const u8) ?[4]u8 {
 }
 
 pub fn isRunningInNonInitNetns(io: std.Io) bool {
-    if (builtin.os.tag != .linux) return false;
+    if (builtin.target.os.tag != .linux) return false;
 
-    var self_buf: [std.fs.max_path_bytes]u8 = undefined;
-    var init_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var self_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var init_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
 
     const self_len = std.Io.Dir.readLinkAbsolute(io, "/proc/self/ns/net", &self_buf) catch return false;
     const init_len = std.Io.Dir.readLinkAbsolute(io, "/proc/1/ns/net", &init_buf) catch return false;
@@ -39,13 +39,13 @@ fn parseEndpointHost(endpoint: []const u8) ?[]const u8 {
     if (trimmed.len == 0) return null;
 
     if (trimmed[0] == '[') {
-        const close_idx = std.mem.indexOfScalar(u8, trimmed, ']') orelse return null;
+        const close_idx = std.mem.findScalar(u8, trimmed, ']') orelse return null;
         const host = trimmed[1..close_idx];
         if (host.len == 0) return null;
         return host;
     }
 
-    if (std.mem.lastIndexOfScalar(u8, trimmed, ':')) |sep| {
+    if (std.mem.findScalarLast(u8, trimmed, ':')) |sep| {
         if (sep == 0) return null;
         return std.mem.trim(u8, trimmed[0..sep], &[_]u8{ ' ', '\t', '\r', '\n' });
     }
@@ -103,13 +103,13 @@ fn parseAwgEndpointIpv4FromConfig(
         }
         if (!in_peer) continue;
 
-        const eq_pos = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const eq_pos = std.mem.findScalar(u8, line, '=') orelse continue;
         const key = std.mem.trim(u8, line[0..eq_pos], &[_]u8{ ' ', '\t' });
         if (!std.ascii.eqlIgnoreCase(key, "Endpoint")) continue;
 
         var value = std.mem.trim(u8, line[eq_pos + 1 ..], &[_]u8{ ' ', '\t' });
-        if (std.mem.indexOfScalar(u8, value, '#')) |idx| value = value[0..idx];
-        if (std.mem.indexOfScalar(u8, value, ';')) |idx| value = value[0..idx];
+        if (std.mem.findScalar(u8, value, '#')) |idx| value = value[0..idx];
+        if (std.mem.findScalar(u8, value, ';')) |idx| value = value[0..idx];
         value = std.mem.trim(u8, value, &[_]u8{ ' ', '\t' });
         const host = parseEndpointHost(value) orelse continue;
 
@@ -125,7 +125,7 @@ pub fn detectAwgEndpointIpv4(
     io: std.Io,
     stop: ?*const std.atomic.Value(bool),
 ) !?[4]u8 {
-    if (builtin.os.tag != .linux) return null;
+    if (builtin.target.os.tag != .linux) return null;
 
     const paths = [_][]const u8{
         "/etc/amnezia/amneziawg/awg0.conf",
@@ -217,7 +217,7 @@ test "middle-proxy NAT selection uses AWG endpoint only in tunnel mode" {
 }
 
 pub fn formatIpv4Bytes(ip: [4]u8, buf: *[16]u8) []const u8 {
-    return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ ip[0], ip[1], ip[2], ip[3] }) catch "?.?.?.?";
+    return std.mem.print(buf, "{d}.{d}.{d}.{d}", .{ ip[0], ip[1], ip[2], ip[3] }) catch "?.?.?.?";
 }
 
 pub fn ipv4BytesForMiddleProxyKdf(network_order_ip: [4]u8) [4]u8 {

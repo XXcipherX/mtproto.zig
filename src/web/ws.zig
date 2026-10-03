@@ -36,7 +36,7 @@ pub const Opcode = enum(u4) {
     _,
 
     pub fn isControl(self: Opcode) bool {
-        return (@intFromEnum(self) & 0x8) != 0;
+        return (@backingInt(self) & 0x8) != 0;
     }
 
     pub fn known(self: Opcode) bool {
@@ -119,7 +119,7 @@ pub fn parseHeader(buf: []const u8) FrameError!Incoming {
     // RSV1..3 must be zero: we negotiate no extensions.
     if ((b0 & 0x70) != 0) return error.Protocol;
 
-    const opcode: Opcode = @enumFromInt(@as(u4, @truncate(b0 & 0x0f)));
+    const opcode: Opcode = @fromBackingInt(@intCast(@as(u4, @truncate(b0 & 0x0f))));
     if (!opcode.known()) return error.Protocol;
 
     const fin = (b0 & 0x80) != 0;
@@ -168,7 +168,9 @@ pub fn parseHeader(buf: []const u8) FrameError!Incoming {
 /// so a payload can be unmasked in several chunks.
 pub fn unmask(payload: []u8, mask: [4]u8, offset: usize) void {
     const rotated = [4]u8{ mask[offset & 3], mask[(offset +% 1) & 3], mask[(offset +% 2) & 3], mask[(offset +% 3) & 3] };
-    const key: @Vector(16, u8) = (rotated ** 4);
+    const key = @shuffle(u8, @as(@Vector(4, u8), rotated), undefined, @as(@Vector(16, i32), .{
+        0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3,
+    }));
     var used: usize = 0;
     while (payload.len - used >= 16) : (used += 16) {
         const block: @Vector(16, u8) = payload[used..][0..16].*;
@@ -185,7 +187,7 @@ pub const max_server_header: usize = 10;
 /// Write a server frame header (never masked) into `out`, returning the written slice.
 pub fn writeHeader(out: []u8, fin: bool, opcode: Opcode, payload_len: usize) error{NoSpace}![]u8 {
     if (out.len < 2) return error.NoSpace;
-    out[0] = (if (fin) @as(u8, 0x80) else 0) | @as(u8, @intFromEnum(opcode));
+    out[0] = (if (fin) @as(u8, 0x80) else 0) | @as(u8, @backingInt(opcode));
     if (payload_len < 126) {
         out[1] = @intCast(payload_len);
         return out[0..2];
@@ -250,6 +252,22 @@ test "unmasking in chunks matches unmasking in one pass" {
     unmask(payload[3..7], mask, 3);
     unmask(payload[7..], mask, 7);
     try std.testing.expectEqualSlices(u8, &reference, &payload);
+}
+
+test "SIMD unmasking preserves mask byte order at every offset and block boundary" {
+    const mask = [4]u8{ 0x91, 0x27, 0xe3, 0x5a };
+    for ([_]usize{ 0, 1, 15, 16, 17, 31, 32, 33, 65 }) |len| {
+        for (0..4) |offset| {
+            var payload: [65]u8 = undefined;
+            var expected: [65]u8 = undefined;
+            for (payload[0..len], expected[0..len], 0..) |*byte, *want, i| {
+                byte.* = @truncate(i * 73 + 19);
+                want.* = byte.* ^ mask[(offset + i) % mask.len];
+            }
+            unmask(payload[0..len], mask, offset);
+            try std.testing.expectEqualSlices(u8, expected[0..len], payload[0..len]);
+        }
+    }
 }
 
 test "unmasked client frames are rejected" {

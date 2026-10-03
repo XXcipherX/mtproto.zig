@@ -47,7 +47,7 @@ const Context = struct {
 pub const PrefixIndex = struct {
     const Map = std.HashMapUnmanaged(u64, usize, Context, 80);
     counts: Map = .empty,
-    hash_key: [16]u8 = [_]u8{0} ** 16,
+    hash_key: [16]u8 = @splat(0),
     seeded: bool = false,
     removals_since_rehash: usize = 0,
 
@@ -127,7 +127,7 @@ test "credential prefix index retains colliding members until the last removal" 
     const allocator = std.testing.allocator;
     var index = try PrefixIndex.init(std.testing.io);
     defer index.deinit(allocator);
-    const a = [_]u8{'A'} ** encoded_len;
+    const a: [encoded_len]u8 = @splat('A');
     var b = a;
     b[20] = 'B';
     var missing = a;
@@ -145,7 +145,7 @@ test "credential prefix index retains colliding members until the last removal" 
 }
 
 fn testCredential(value: u64) [encoded_len]u8 {
-    var bytes = [_]u8{0} ** 32;
+    var bytes: [32]u8 = @splat(0);
     std.mem.writeInt(u64, bytes[0..8], value, .big);
     var text: [encoded_len]u8 = undefined;
     _ = std.base64.url_safe_no_pad.Encoder.encode(&text, &bytes);

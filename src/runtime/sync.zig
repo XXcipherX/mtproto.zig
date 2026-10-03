@@ -1,6 +1,6 @@
 //! Kernel-thread synchronization for shared proxy state.
 //!
-//! Zig 0.16 std.Io.Mutex requires an Io context for lock/unlock and permits
+//! Zig 0.17 std.Io.Mutex requires an Io context for lock/unlock and permits
 //! cancellation. Epoll workers, metadata refresh and DNS cache call these
 //! locks synchronously from ordinary threads, including cleanup paths with
 //! no owning Io context. Keep this uncancelable futex mutex instead of adding
@@ -31,7 +31,7 @@ pub const BlockingMutex = struct {
 };
 
 fn futexWait(ptr: *const std.atomic.Value(u32), expect: u32) void {
-    if (builtin.os.tag != .linux) {
+    if (builtin.target.os.tag != .linux) {
         while (ptr.load(.monotonic) == expect) std.atomic.spinLoopHint();
         return;
     }
@@ -45,7 +45,7 @@ fn futexWait(ptr: *const std.atomic.Value(u32), expect: u32) void {
 }
 
 fn futexWake(ptr: *const std.atomic.Value(u32), max_waiters: u32) void {
-    if (builtin.os.tag != .linux) return;
+    if (builtin.target.os.tag != .linux) return;
     const linux = std.os.linux;
     const rc = linux.futex_3arg(
         &ptr.raw,

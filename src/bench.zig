@@ -115,7 +115,7 @@ fn runBench(allocator: std.mem.Allocator) !void {
 }
 
 fn runHandshakeBench(allocator: std.mem.Allocator, iterations: usize) !void {
-    const bench_secret = [_]u8{0x42} ** 16;
+    const bench_secret: [16]u8 = @splat(0x42);
     const user_secrets = [_]tls.UserSecret{.{ .name = "bench", .secret = bench_secret }};
     const handshake = buildTlsBenchmarkHandshake(&bench_secret, 0x11223344);
 
@@ -162,7 +162,7 @@ fn runHandshakeBench(allocator: std.mem.Allocator, iterations: usize) !void {
 fn runHandshakePathBench(allocator: std.mem.Allocator, opts: Options) !void {
     if (opts.candidate_count == 0 or opts.candidate_count > 16) return error.InvalidArgument;
 
-    const bench_secret = [_]u8{0x33} ** 16;
+    const bench_secret: [16]u8 = @splat(0x33);
     const user_secrets = [_]obfuscation.UserSecret{.{ .name = "bench", .secret = bench_secret }};
 
     var handshakes: [8][constants.handshake_len]u8 = undefined;
@@ -350,8 +350,8 @@ fn soakWorker(args: WorkerArgs) void {
 }
 
 fn initContext(allocator: std.mem.Allocator, proto_tag: constants.ProtoTag) !middleproxy.MiddleProxyContext {
-    const key = [_]u8{0} ** 32;
-    const iv = [_]u8{0} ** 16;
+    const key: [32]u8 = @splat(0);
+    const iv: [16]u8 = @splat(0);
 
     return middleproxy.MiddleProxyContext.init(
         allocator,
@@ -376,7 +376,7 @@ fn buildTlsBenchmarkHandshake(
     secret: *const [16]u8,
     timestamp: u32,
 ) [126]u8 {
-    var handshake = [_]u8{0} ** 126;
+    var handshake: [126]u8 = @splat(0);
     handshake[0] = constants.tls_record_handshake;
     handshake[1] = 0x03;
     handshake[2] = 0x01;
@@ -412,7 +412,7 @@ fn buildObfuscationHandshake(
     dc_idx: i16,
     nonce_seed: u8,
 ) [constants.handshake_len]u8 {
-    var nonce = [_]u8{0} ** constants.handshake_len;
+    var nonce: [constants.handshake_len]u8 = @splat(0);
     for (&nonce, 0..) |*byte, idx| {
         byte.* = @truncate((idx * 29 + nonce_seed) % 251);
     }
@@ -623,7 +623,7 @@ test "soak payload lengths stay aligned and in range" {
 }
 
 test "FakeTLS benchmark handshake remains structurally valid" {
-    const secret = [_]u8{0x42} ** 16;
+    const secret: [16]u8 = @splat(0x42);
     const users = [_]tls.UserSecret{.{ .name = "bench", .secret = secret }};
     const handshake = buildTlsBenchmarkHandshake(&secret, 0x11223344);
 
@@ -639,7 +639,7 @@ test "FakeTLS benchmark handshake remains structurally valid" {
 }
 
 test "obfuscated benchmark handshake roundtrips" {
-    const secret = [_]u8{0x33} ** 16;
+    const secret: [16]u8 = @splat(0x33);
     const users = [_]obfuscation.UserSecret{.{ .name = "bench", .secret = secret }};
     const handshake = buildObfuscationHandshake(&secret, .intermediate, -4, 23);
 

@@ -27,7 +27,7 @@ fn keepaliveIdleForFd(fd_number: u64) u32 {
 }
 
 fn setOption(fd: posix.fd_t, level: i32, option: u32, bytes: []const u8, policy: TuningPolicy) bool {
-    if (builtin.os.tag != .linux) return false;
+    if (builtin.target.os.tag != .linux) return false;
     return switch (policy) {
         .proxy_raw => linux.errno(linux.setsockopt(fd, level, option, bytes.ptr, @intCast(bytes.len))) == .SUCCESS,
         .web_posix => blk: {
@@ -47,7 +47,7 @@ pub fn setTcpNoDelay(fd: posix.fd_t, policy: TuningPolicy) void {
 
 pub fn setTcpKeepalive(fd: posix.fd_t, policy: TuningPolicy) void {
     if (!setIntOption(fd, linux.SOL.SOCKET, linux.SO.KEEPALIVE, 1, policy) and policy == .web_posix) return;
-    const idle_sec = if (builtin.os.tag == .linux) keepaliveIdleForFd(@intCast(fd)) else relay_keepalive_max_idle_sec;
+    const idle_sec = if (builtin.target.os.tag == .linux) keepaliveIdleForFd(@intCast(fd)) else relay_keepalive_max_idle_sec;
     if (!setIntOption(fd, linux.IPPROTO.TCP, linux.TCP.KEEPIDLE, @intCast(idle_sec), policy) and policy == .web_posix) return;
     if (!setIntOption(fd, linux.IPPROTO.TCP, linux.TCP.KEEPINTVL, @intCast(relay_keepalive_interval_sec), policy) and policy == .web_posix) return;
     _ = setIntOption(fd, linux.IPPROTO.TCP, linux.TCP.KEEPCNT, @intCast(relay_keepalive_probe_count), policy);
@@ -55,7 +55,7 @@ pub fn setTcpKeepalive(fd: posix.fd_t, policy: TuningPolicy) void {
 
 /// TCP_USER_TIMEOUT applies to non-blocking sockets, unlike SO_SNDTIMEO.
 pub fn setTcpUserTimeout(fd: posix.fd_t, timeout_ms: u32, policy: TuningPolicy) void {
-    if (builtin.os.tag != .linux) return;
+    if (builtin.target.os.tag != .linux) return;
     if (policy == .proxy_raw) {
         const value: c_int = @intCast(timeout_ms);
         _ = setOption(fd, linux.IPPROTO.TCP, linux.TCP.USER_TIMEOUT, std.mem.asBytes(&value), policy);
@@ -74,7 +74,7 @@ pub fn configureRelaySocket(fd: posix.fd_t, policy: TuningPolicy) void {
 test "relay user timeout does not preempt keepalive probe budget" {
     try std.testing.expectEqual(@as(u32, 90_000), relay_user_timeout_ms);
     const idle_span: usize = relay_keepalive_max_idle_sec - relay_keepalive_min_idle_sec + 1;
-    var seen = [_]bool{false} ** idle_span;
+    var seen: [idle_span]bool = @splat(false);
     for (0..128) |fd| {
         const idle_sec = keepaliveIdleForFd(@intCast(fd));
         try std.testing.expect(idle_sec >= relay_keepalive_min_idle_sec);

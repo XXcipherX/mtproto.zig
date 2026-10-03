@@ -19,7 +19,7 @@ fn activeSecret(cfg: *const config.Config) ?[16]u8 {
 }
 
 fn makeProbe(secret: [16]u8, initial: [64]u8, nonce: [16]u8, seconds: u64) Probe {
-    var clear: [108]u8 = [_]u8{0} ** 108;
+    var clear: [108]u8 = @splat(0);
     defer std.crypto.secureZero(u8, &clear);
     @memcpy(clear[0..64], &initial);
     @memset(clear[56..60], 0xdd);
@@ -50,7 +50,7 @@ fn makeProbe(secret: [16]u8, initial: [64]u8, nonce: [16]u8, seconds: u64) Probe
     std.crypto.core.modes.ctr(@TypeOf(encrypt), encrypt, &result.request, &clear, clear[40..56].*, .big);
     @memcpy(result.request[0..56], clear[0..56]);
     const decrypt = std.crypto.core.aes.Aes256.initEnc(decrypt_key);
-    const zeros = [_]u8{0} ** 512;
+    const zeros: [512]u8 = @splat(0);
     std.crypto.core.modes.ctr(@TypeOf(decrypt), decrypt, &result.response_key, &zeros, reversed[32..48].*, .big);
     return result;
 }
@@ -58,9 +58,9 @@ fn makeProbe(secret: [16]u8, initial: [64]u8, nonce: [16]u8, seconds: u64) Probe
 fn effectivePath(allocator: std.mem.Allocator, base_path: []const u8, suffix: []const u8, trailing_slash: bool) ![]u8 {
     if (base_path.len == 0) return allocator.dupe(u8, suffix);
     return if (trailing_slash)
-        std.fmt.allocPrint(allocator, "/{s}/", .{base_path})
+        allocator.print("/{s}/", .{base_path})
     else
-        std.fmt.allocPrint(allocator, "/{s}{s}", .{ base_path, suffix });
+        allocator.print("/{s}{s}", .{ base_path, suffix });
 }
 
 /// Return sensitive, caller-owned JSON. The caller must write it only to the probe's
@@ -121,7 +121,7 @@ test "req_pq wire bytes and response key match the upstream independent vector" 
     for (&initial, 1..) |*byte, index| byte.* = @intCast(index);
     var nonce: [16]u8 = undefined;
     for (&nonce, 0..) |*byte, index| byte.* = @intCast(index);
-    const probe = makeProbe([_]u8{0x11} ** 16, initial, nonce, 1700000000);
+    const probe = makeProbe(@as([16]u8, @splat(0x11)), initial, nonce, 1700000000);
     var expected: [108]u8 = undefined;
     _ = try std.fmt.hexToBytes(&expected, "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738fa994dc688e58644f6df46d7a17f438b1168566826f172a3bc770868794270d81b763e816ec6381ef8f6dd717296ca1b91149ee9");
     try std.testing.expectEqualSlices(u8, &expected, &probe.request);

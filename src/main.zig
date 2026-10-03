@@ -16,6 +16,7 @@ const tls = @import("protocol/tls.zig");
 const config = @import("config.zig");
 const net = @import("net_helpers.zig");
 const proxy = @import("proxy/proxy.zig");
+const connection = @import("proxy/connection.zig");
 const web_capability = @import("web/capability.zig");
 const web_relay = @import("web/relay.zig");
 const web_probe_material = @import("web/probe_material.zig");
@@ -66,7 +67,7 @@ fn lockFreeLog(
 
     var buf: [4096]u8 = undefined;
     const prefix = formatLogPrefix(message_level, scope, &buf);
-    const body = std.fmt.bufPrint(buf[prefix.len..], format ++ "\n", args) catch return;
+    const body = std.mem.print(buf[prefix.len..], format ++ "\n", args) catch return;
     runtime_io.writeStderr(buf[0 .. prefix.len + body.len]);
 }
 
@@ -87,14 +88,14 @@ fn writeStdoutBytes(bytes: []const u8) void {
 /// Write a formatted string to stdout via posix write.
 fn writeStdout(comptime fmt: []const u8, args: anytype) void {
     var buf: [4096]u8 = undefined;
-    const slice = std.fmt.bufPrint(&buf, fmt, args) catch return;
+    const slice = std.mem.print(&buf, fmt, args) catch return;
     writeStdoutBytes(slice);
 }
 
 /// Write a formatted string to stderr.
 fn writeStderr(comptime fmt: []const u8, args: anytype) void {
     var buf: [4096]u8 = undefined;
-    const slice = std.fmt.bufPrint(&buf, fmt, args) catch return;
+    const slice = std.mem.print(&buf, fmt, args) catch return;
     runtime_io.writeStderr(slice);
 }
 
@@ -160,7 +161,9 @@ fn estimateCapacity(cfg: *const config.Config, total_ram_bytes: u64) CapacityEst
     // multiplying their rare maxima by every slot.
     // Deliberately keep the admission estimate conservative even though relay
     // reads now use one scratch buffer per event loop rather than 4 KiB/slot.
-    const tls_working_bytes: u64 = @intCast(6 * 1024);
+    // Include the native AES backend's expanded keys without reducing the
+    // original conservative 6 KiB allowance on hardware-AES targets.
+    const tls_working_bytes: u64 = connection.slot_working_memory_bytes;
     const requires_middle_proxy_runtime = cfg.requiresMiddleProxyRuntime();
     const managed_initial_per_conn_bytes: u64 = if (requires_middle_proxy_runtime)
         @intCast(config.Config.middle_proxy_initial_stream_buffer_bytes * 2)
@@ -225,7 +228,7 @@ fn managedBufferLimitForConnections(
 
 fn enforceCapacitySafety(cfg: *config.Config, capacity_estimate: ?CapacityEstimate) !void {
     const est = capacity_estimate orelse {
-        if (builtin.os.tag == .linux and !cfg.unsafe_override_limits) {
+        if (builtin.target.os.tag == .linux and !cfg.unsafe_override_limits) {
             const log_main = std.log.scoped(.config);
             log_main.warn(
                 "could not detect total RAM; skipping max_connections RAM admission clamp. " ++
@@ -639,7 +642,7 @@ pub fn main(init: std.process.Init) !void {
     var shutdown_signals = try signals.ShutdownSignalBridge.init();
     defer shutdown_signals.deinit();
 
-    if (!std.crypto.core.aes.has_hardware_support and (builtin.cpu.arch == .x86_64 or builtin.cpu.arch == .aarch64)) {
+    if (!std.crypto.core.aes.has_hardware_support and (builtin.target.cpu.arch == .x86_64 or builtin.target.cpu.arch == .aarch64)) {
         const log_main = std.log.scoped(.config);
         log_main.warn(
             "AES backend is software-only for this build/target. MiddleProxy video traffic will be CPU-heavy. " ++
@@ -796,8 +799,21 @@ test "capacity estimate reserves one shared managed buffer pool" {
         @as(u64, 2 * config.Config.middle_proxy_initial_stream_buffer_bytes),
         est.managed_initial_per_conn_bytes,
     );
-    try std.testing.expectEqual(@as(u64, 40 * 1024), est.per_conn_bytes);
-    try std.testing.expectEqual(@as(u32, 5_324), est.safe_connections);
+    // The protected software backend caches fifteen [32]usize bitsliced round
+    // keys per AES context on our Linux targets. Each slot embeds eight contexts.
+    const extra_keys_per_context: u64 = if (std.crypto.core.aes.has_hardware_support or
+        std.options.side_channels_mitigations == .none)
+        0
+    else
+        15 * 32 * @sizeOf(usize);
+    const expected_per_conn_bytes = 40 * 1024 + 8 * extra_keys_per_context;
+    try std.testing.expectEqual(expected_per_conn_bytes, est.per_conn_bytes);
+    try std.testing.expectEqual(
+        @as(u32, @intCast(208 * 1024 * 1024 / expected_per_conn_bytes)),
+        est.safe_connections,
+    );
+    try std.testing.expect(est.per_conn_bytes >=
+        @sizeOf(connection.ConnectionSlot) + 2 * 1024 + est.managed_initial_per_conn_bytes);
     try std.testing.expectEqual(
         @as(u64, 216 * 1024 * 1024),
         managedBufferLimitForConnections(est, 256),

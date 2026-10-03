@@ -21,7 +21,7 @@ fn addressKdfInput(addr: net.Address) [20]u8 {
 
 test "middle proxy KDF address serialization is endian explicit" {
     const v4 = addressKdfInput(net.ip4(.{ 10, 20, 30, 40 }, 0x1234));
-    const expected_v4 = [_]u8{0} ** 10 ++ [_]u8{ 0xff, 0xff, 10, 20, 30, 40, 0x34, 0x12, 0, 0 };
+    const expected_v4 = @as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff, 10, 20, 30, 40, 0x34, 0x12, 0, 0 };
     try std.testing.expectEqualSlices(u8, &expected_v4, &v4);
 
     const v6_bytes = [_]u8{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
@@ -86,7 +86,7 @@ pub fn getAesKeyAndIv(
         return error.KdfInputTooLong;
     }
 
-    const empty_ip4 = [_]u8{0} ** 4;
+    const empty_ip4: [4]u8 = @splat(0);
     const srv_ip_bytes = if (srv_ip) |ip| ip else &empty_ip4;
     const clt_ip_bytes = if (clt_ip) |ip| ip else &empty_ip4;
 
@@ -490,7 +490,7 @@ pub const MiddleProxyContext = struct {
         if (pos > 0) {
             const remaining = self.c2s_len - pos;
             if (remaining > 0) {
-                std.mem.copyForwards(u8, self.c2s_buf[0..remaining], self.c2s_buf[pos..self.c2s_len]);
+                @memmove(self.c2s_buf[0..remaining], self.c2s_buf[pos..self.c2s_len]);
             }
             self.c2s_len = remaining;
             self.shrinkC2sIfIdle(total_input_len <= initial_stream_buffer_size);
@@ -758,7 +758,7 @@ pub const MiddleProxyContext = struct {
         if (parse_pos > 0 and parse_pos <= self.s2c_len) {
             const remaining = self.s2c_len - parse_pos;
             if (remaining > 0) {
-                std.mem.copyForwards(u8, self.s2c_buf[0..remaining], self.s2c_buf[parse_pos..self.s2c_len]);
+                @memmove(self.s2c_buf[0..remaining], self.s2c_buf[parse_pos..self.s2c_len]);
             }
             self.s2c_len = remaining;
             self.s2c_decrypted_len -= parse_pos;
@@ -814,14 +814,14 @@ fn expectKdfHex(
 }
 
 test "middle proxy KDF matches fixed IPv4 client and server vectors" {
-    const nonce_srv = [_]u8{0x11} ** 16;
-    const nonce_clt = [_]u8{0x22} ** 16;
+    const nonce_srv: [16]u8 = @splat(0x11);
+    const nonce_clt: [16]u8 = @splat(0x22);
     const timestamp = [_]u8{ 0xaa, 0xbb, 0xcc, 0xdd };
     const server_ip = [_]u8{ 91, 105, 192, 110 };
     const client_ip = [_]u8{ 203, 0, 113, 9 };
     const client_port = [_]u8{ 0x5a, 0x0f };
     const server_port = [_]u8{ 0xbb, 0x01 };
-    const secret = [_]u8{0x07} ** 16;
+    const secret: [16]u8 = @splat(0x07);
 
     try expectKdfHex(
         try getAesKeyAndIv(
@@ -861,15 +861,15 @@ test "middle proxy KDF matches fixed IPv4 client and server vectors" {
 
 test "middle proxy KDF matches fixed NAT and IPv6 vectors" {
     const nat_result = try getAesKeyAndIv(
-        &([_]u8{0x33} ** 16),
-        &([_]u8{0x44} ** 16),
+        &(@as([16]u8, @splat(0x33))),
+        &(@as([16]u8, @splat(0x44))),
         &[_]u8{ 0x01, 0x02, 0x03, 0x04 },
         &[_]u8{ 149, 154, 167, 51 },
         &[_]u8{ 0x03, 0x10 },
         "CLIENT",
         &[_]u8{ 192, 0, 2, 7 },
         &[_]u8{ 0xbb, 0x01 },
-        &([_]u8{0x5a} ** 16),
+        &(@as([16]u8, @splat(0x5a))),
         null,
         null,
     );
@@ -880,17 +880,17 @@ test "middle proxy KDF matches fixed NAT and IPv6 vectors" {
     );
 
     const ipv6_result = try getAesKeyAndIv(
-        &([_]u8{0x55} ** 16),
-        &([_]u8{0x66} ** 16),
+        &(@as([16]u8, @splat(0x55))),
+        &(@as([16]u8, @splat(0x66))),
         &[_]u8{ 0xde, 0xad, 0xbe, 0xef },
         null,
         &[_]u8{ 0x5a, 0x0f },
         "SERVER",
         null,
         &[_]u8{ 0xbb, 0x01 },
-        &([_]u8{0x99} ** 16),
-        &([_]u8{0xab} ** 16),
-        &([_]u8{0xcd} ** 16),
+        &(@as([16]u8, @splat(0x99))),
+        &(@as([16]u8, @splat(0xab))),
+        &(@as([16]u8, @splat(0xcd))),
     );
     try expectKdfHex(
         ipv6_result,
@@ -904,8 +904,8 @@ test "fuzz middle proxy stream framing" {
         fn testOne(_: void, smith: *std.testing.Smith) anyerror!void {
             var input_storage: [1024]u8 = undefined;
             const input = input_storage[0..smith.slice(&input_storage)];
-            const key = [_]u8{0} ** 32;
-            const iv = [_]u8{0} ** 16;
+            const key: [32]u8 = @splat(0);
+            const iv: [16]u8 = @splat(0);
 
             var allocator_storage: [40 * 1024]u8 = undefined;
             var fba = std.heap.FixedBufferAllocator.init(&allocator_storage);
@@ -951,8 +951,8 @@ test "proxy answer flags remain forward-compatible except for dropped responses"
 test "encapsulated c2s keeps rpc_proxy_req header" {
     const allocator = std.testing.allocator;
 
-    const key = [_]u8{0} ** 32;
-    const iv = [_]u8{0} ** 16;
+    const key: [32]u8 = @splat(0);
+    const iv: [16]u8 = @splat(0);
 
     var ctx = try MiddleProxyContext.init(
         allocator,
@@ -987,8 +987,8 @@ test "encapsulated c2s keeps rpc_proxy_req header" {
 test "encapsulated c2s omits ad_tag block when absent" {
     const allocator = std.testing.allocator;
 
-    const key = [_]u8{0} ** 32;
-    const iv = [_]u8{0} ** 16;
+    const key: [32]u8 = @splat(0);
+    const iv: [16]u8 = @splat(0);
 
     var ctx = try MiddleProxyContext.init(
         allocator,
@@ -1023,8 +1023,8 @@ test "encapsulated c2s omits ad_tag block when absent" {
 test "encapsulate c2s rejects unaligned non-secure payload length" {
     const allocator = std.testing.allocator;
 
-    const key = [_]u8{0} ** 32;
-    const iv = [_]u8{0} ** 16;
+    const key: [32]u8 = @splat(0);
+    const iv: [16]u8 = @splat(0);
 
     var ctx = try MiddleProxyContext.init(
         allocator,
@@ -1051,8 +1051,8 @@ test "encapsulate c2s rejects unaligned non-secure payload length" {
 test "encapsulated c2s includes ad_tag block when present" {
     const allocator = std.testing.allocator;
 
-    const key = [_]u8{0} ** 32;
-    const iv = [_]u8{0} ** 16;
+    const key: [32]u8 = @splat(0);
+    const iv: [16]u8 = @splat(0);
     const ad_tag = [_]u8{ 0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef };
 
     var ctx = try MiddleProxyContext.init(
@@ -1094,8 +1094,8 @@ test "encapsulated c2s includes ad_tag block when present" {
 test "required c2s scratch capacity accounts for buffered partial frame" {
     const allocator = std.testing.allocator;
 
-    const key = [_]u8{0} ** 32;
-    const iv = [_]u8{0} ** 16;
+    const key: [32]u8 = @splat(0);
+    const iv: [16]u8 = @splat(0);
 
     var ctx = try MiddleProxyContext.init(
         allocator,
@@ -1115,7 +1115,7 @@ test "required c2s scratch capacity accounts for buffered partial frame" {
     ctx.c2s_len = 2;
     try std.testing.expect(!ctx.c2sAtFrameBoundary());
 
-    var tail = [_]u8{0} ** (2 + MiddleProxyContext.min_client_payload_size);
+    var tail: [2 + MiddleProxyContext.min_client_payload_size]u8 = @splat(0);
     @memset(tail[2..], 0xef);
     const required = try ctx.requiredC2sScratchCapacity(tail[0..]);
     const out_buf = try allocator.alloc(u8, required);
@@ -1130,8 +1130,8 @@ test "required c2s scratch capacity accounts for buffered partial frame" {
 test "secure c2s strips encrypted padded-intermediate padding" {
     const allocator = std.testing.allocator;
 
-    const key = [_]u8{0} ** 32;
-    const iv = [_]u8{0} ** 16;
+    const key: [32]u8 = @splat(0);
+    const iv: [16]u8 = @splat(0);
 
     var ctx = try MiddleProxyContext.init(
         allocator,
@@ -1177,8 +1177,8 @@ test "secure c2s strips encrypted padded-intermediate padding" {
 test "secure c2s strips plain padded-intermediate padding" {
     const allocator = std.testing.allocator;
 
-    const key = [_]u8{0} ** 32;
-    const iv = [_]u8{0} ** 16;
+    const key: [32]u8 = @splat(0);
+    const iv: [16]u8 = @splat(0);
 
     var ctx = try MiddleProxyContext.init(
         allocator,
@@ -1226,8 +1226,8 @@ test "secure c2s strips plain padded-intermediate padding" {
 test "secure c2s rejects unaligned plain mtproto payload data" {
     const allocator = std.testing.allocator;
 
-    const key = [_]u8{0} ** 32;
-    const iv = [_]u8{0} ** 16;
+    const key: [32]u8 = @splat(0);
+    const iv: [16]u8 = @splat(0);
 
     var ctx = try MiddleProxyContext.init(
         allocator,
@@ -1263,8 +1263,8 @@ test "secure c2s rejects unaligned plain mtproto payload data" {
 test "secure c2s treats invalid plain-looking payload as encrypted" {
     const allocator = std.testing.allocator;
 
-    const key = [_]u8{0} ** 32;
-    const iv = [_]u8{0} ** 16;
+    const key: [32]u8 = @splat(0);
+    const iv: [16]u8 = @splat(0);
 
     var ctx = try MiddleProxyContext.init(
         allocator,
@@ -1311,8 +1311,8 @@ test "secure c2s treats invalid plain-looking payload as encrypted" {
 test "decapsulate s2c skips noop padding words" {
     const allocator = std.testing.allocator;
 
-    const key = [_]u8{0} ** 32;
-    const iv = [_]u8{0} ** 16;
+    const key: [32]u8 = @splat(0);
+    const iv: [16]u8 = @splat(0);
 
     var ctx = try MiddleProxyContext.init(
         allocator,
@@ -1373,8 +1373,8 @@ test "secure s2c padding survives padded-intermediate truncate-to-4" {
     // declared-length prefix that is divisible by four, so every generated padding
     // length must leave the original aligned MTProto body intact.
     const allocator = std.testing.allocator;
-    const key = [_]u8{0} ** 32;
-    const iv = [_]u8{0} ** 16;
+    const key: [32]u8 = @splat(0);
+    const iv: [16]u8 = @splat(0);
     const conn_data = [_]u8{ 0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04 };
 
     var round: usize = 0;
@@ -1430,8 +1430,8 @@ test "secure s2c padding survives padded-intermediate truncate-to-4" {
 test "decapsulate s2c validates seq" {
     const allocator = std.testing.allocator;
 
-    const key = [_]u8{0} ** 32;
-    const iv = [_]u8{0} ** 16;
+    const key: [32]u8 = @splat(0);
+    const iv: [16]u8 = @splat(0);
 
     var ctx = try MiddleProxyContext.init(
         allocator,
@@ -1486,8 +1486,8 @@ test "decapsulate s2c validates seq" {
 test "decapsulate s2c rejects checksum mismatch without resyncing" {
     const allocator = std.testing.allocator;
 
-    const key = [_]u8{0} ** 32;
-    const iv = [_]u8{0} ** 16;
+    const key: [32]u8 = @splat(0);
+    const iv: [16]u8 = @splat(0);
 
     var ctx = try MiddleProxyContext.init(
         allocator,
@@ -1524,8 +1524,8 @@ test "decapsulate s2c rejects checksum mismatch without resyncing" {
 test "decapsulate s2c rejects unaligned abridged proxy payload" {
     const allocator = std.testing.allocator;
 
-    const key = [_]u8{0} ** 32;
-    const iv = [_]u8{0} ** 16;
+    const key: [32]u8 = @splat(0);
+    const iv: [16]u8 = @splat(0);
 
     var ctx = try MiddleProxyContext.init(
         allocator,
@@ -1540,7 +1540,7 @@ test "decapsulate s2c rejects unaligned abridged proxy payload" {
     );
     defer ctx.deinit();
 
-    var plain: [48]u8 = [_]u8{0} ** 48;
+    var plain: [48]u8 = @splat(0);
     const conn_data_len: usize = 5;
     const total_len: usize = 8 + 16 + conn_data_len + 4;
     std.mem.writeInt(u32, plain[0..4], @intCast(total_len), .little);
@@ -1565,8 +1565,8 @@ test "decapsulate s2c rejects unaligned abridged proxy payload" {
 test "middle proxy sequence counters wrap without panicking" {
     const allocator = std.testing.allocator;
 
-    const key = [_]u8{0} ** 32;
-    const iv = [_]u8{0} ** 16;
+    const key: [32]u8 = @splat(0);
+    const iv: [16]u8 = @splat(0);
 
     var ctx = try MiddleProxyContext.init(
         allocator,
@@ -1616,8 +1616,8 @@ test "middle proxy sequence counters wrap without panicking" {
 test "decapsulate s2c rejects invalid frame length instead of resyncing" {
     const allocator = std.testing.allocator;
 
-    const key = [_]u8{0} ** 32;
-    const iv = [_]u8{0} ** 16;
+    const key: [32]u8 = @splat(0);
+    const iv: [16]u8 = @splat(0);
 
     var ctx = try MiddleProxyContext.init(
         allocator,
@@ -1647,8 +1647,8 @@ test "decapsulate s2c rejects invalid frame length instead of resyncing" {
 test "decapsulate s2c rejects a frame above the configured stream cap" {
     const allocator = std.testing.allocator;
 
-    const key = [_]u8{0} ** 32;
-    const iv = [_]u8{0} ** 16;
+    const key: [32]u8 = @splat(0);
+    const iv: [16]u8 = @splat(0);
     const buffer_limit: usize = 64 * 1024;
 
     var ctx = try MiddleProxyContext.initWithBuffer(
@@ -1665,7 +1665,7 @@ test "decapsulate s2c rejects a frame above the configured stream cap" {
     );
     defer ctx.deinit();
 
-    var plain = [_]u8{0} ** 16;
+    var plain: [16]u8 = @splat(0);
     std.mem.writeInt(u32, plain[0..4], @intCast(buffer_limit + 16), .little);
 
     var enc = crypto.AesCbc.init(&key, &iv);
@@ -1682,8 +1682,8 @@ test "decapsulate s2c rejects a frame above the configured stream cap" {
 test "encapsulate c2s supports payloads larger than 64KiB" {
     const allocator = std.testing.allocator;
 
-    const key = [_]u8{0} ** 32;
-    const iv = [_]u8{0} ** 16;
+    const key: [32]u8 = @splat(0);
+    const iv: [16]u8 = @splat(0);
 
     var ctx = try MiddleProxyContext.init(
         allocator,
@@ -1722,8 +1722,8 @@ test "encapsulate c2s supports payloads larger than 64KiB" {
 test "middle proxy context grows c2s buffer on demand within configured cap" {
     const allocator = std.testing.allocator;
     var counting = std.testing.FailingAllocator.init(allocator, .{});
-    const key = [_]u8{0} ** 32;
-    const iv = [_]u8{0} ** 16;
+    const key: [32]u8 = @splat(0);
+    const iv: [16]u8 = @splat(0);
 
     var ctx = try MiddleProxyContext.initWithBuffer(
         counting.allocator(),
@@ -1764,7 +1764,7 @@ test "middle proxy context grows c2s buffer on demand within configured cap" {
         try std.testing.expectEqual(crc32(out_buf[0 .. frame_len - 4]), std.mem.readInt(u32, out_buf[frame_len - 4 ..][0..4], .little));
         try std.testing.expectEqualSlices(u8, packet[4..], out_buf[64..][0..payload_len]);
     }
-    var small: [24]u8 = [_]u8{0x42} ** 24;
+    var small: [24]u8 = @splat(0x42);
     std.mem.writeInt(u32, small[0..4], 20, .little);
     for (0..MiddleProxyContext.small_drains_before_shrink - 1) |_| {
         _ = try ctx.encapsulateC2S(&small, out_buf);
@@ -1794,8 +1794,8 @@ test "middle proxy context grows c2s buffer on demand within configured cap" {
 
 test "middle proxy context still enforces configured c2s cap" {
     const allocator = std.testing.allocator;
-    const key = [_]u8{0} ** 32;
-    const iv = [_]u8{0} ** 16;
+    const key: [32]u8 = @splat(0);
+    const iv: [16]u8 = @splat(0);
 
     var ctx = try MiddleProxyContext.initWithBuffer(
         allocator,
@@ -1823,8 +1823,8 @@ test "middle proxy context still enforces configured c2s cap" {
 test "middle proxy context grows s2c buffer on demand within configured cap" {
     const allocator = std.testing.allocator;
     var counting = std.testing.FailingAllocator.init(allocator, .{});
-    const key = [_]u8{0} ** 32;
-    const iv = [_]u8{0} ** 16;
+    const key: [32]u8 = @splat(0);
+    const iv: [16]u8 = @splat(0);
 
     var ctx = try MiddleProxyContext.initWithBuffer(
         counting.allocator(),
@@ -1904,10 +1904,10 @@ test "middle proxy context grows s2c buffer on demand within configured cap" {
 }
 
 test "middle proxy KDF rejects inputs beyond its fixed buffer" {
-    const nonce = [_]u8{0} ** 16;
-    const timestamp = [_]u8{0} ** 4;
-    const port = [_]u8{0} ** 2;
-    const oversized_secret = [_]u8{0} ** 512;
+    const nonce: [16]u8 = @splat(0);
+    const timestamp: [4]u8 = @splat(0);
+    const port: [2]u8 = @splat(0);
+    const oversized_secret: [512]u8 = @splat(0);
 
     try std.testing.expectError(error.KdfInputTooLong, getAesKeyAndIv(
         &nonce,

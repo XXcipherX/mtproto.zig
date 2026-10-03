@@ -28,8 +28,8 @@ pub const AppendReservation = struct {
 
 pub const MessageQueue = struct {
     allocator: std.mem.Allocator,
-    free: std.ArrayListUnmanaged(*MsgBlock) = .empty,
-    blocks: std.ArrayListUnmanaged(*MsgBlock) = .empty,
+    free: std.ArrayList(*MsgBlock) = .empty,
+    blocks: std.ArrayList(*MsgBlock) = .empty,
     head_idx: usize = 0,
     offset: usize = 0,
     total_len: usize = 0,
@@ -174,7 +174,7 @@ pub const MessageQueue = struct {
         if (self.head_idx > 0 and (self.head_idx >= self.blocks.items.len or self.head_idx >= 64)) {
             const rem = self.blocks.items.len - self.head_idx;
             if (rem > 0) {
-                std.mem.copyForwards(*MsgBlock, self.blocks.items[0..rem], self.blocks.items[self.head_idx..]);
+                @memmove(self.blocks.items[0..rem], self.blocks.items[self.head_idx..]);
             }
             self.blocks.shrinkRetainingCapacity(rem);
             self.head_idx = 0;
