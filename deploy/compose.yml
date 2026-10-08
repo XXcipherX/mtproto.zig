@@ -5,6 +5,10 @@ services:
     restart: unless-stopped
     stop_grace_period: 25s
     network_mode: host
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
     volumes:
       - ./config.toml:/etc/mtproto-proxy/config.toml:ro
     logging:

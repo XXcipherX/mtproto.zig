@@ -170,6 +170,32 @@ pub const Config = struct {
         pub fn onlyActive(self: *const Web) bool {
             return self.enabled and self.only;
         }
+
+        /// The relay's HTTP count includes upgraded WebSocket carriers.
+        pub fn httpConnectionLimit(max_sessions: u32) u32 {
+            return @intCast(@min(@as(u64, max_sessions) * 4 + 32, 4096));
+        }
+
+        pub const ConnectionBudget = struct {
+            sessions: u32,
+            stream_slots: u64,
+            http_slots: u32,
+            total_slots: u64,
+        };
+
+        /// Potential proxy occupancy when all HTTP traffic crosses its masking
+        /// listener. Carriers are already in http_slots; do not count them twice.
+        pub fn connectionBudget(self: *const Web) ConnectionBudget {
+            const http_slots = httpConnectionLimit(self.max_sessions);
+            const sessions = @min(self.max_sessions, http_slots);
+            const stream_slots = @as(u64, sessions) * self.max_streams;
+            return .{
+                .sessions = sessions,
+                .stream_slots = stream_slots,
+                .http_slots = http_slots,
+                .total_slots = stream_slots + http_slots,
+            };
+        }
     };
 
     /// Route regular DC traffic via Telegram MiddleProxy transport.
@@ -390,11 +416,13 @@ pub const Config = struct {
     pub fn emitWarnings(self: *const Config) void {
         if (self.web.enabled) {
             const log = std.log.scoped(.config);
-            const worst = @as(u64, self.web.max_sessions) * (@as(u64, self.web.max_streams) + 1);
-            if (worst > self.max_connections) {
+            const budget = self.web.connectionBudget();
+            const pause_at = proxy_limits.admissionPauseThreshold(self.max_connections);
+            if (budget.total_slots >= pause_at) {
                 log.warn(
-                    "[web] may occupy up to {d} proxy connections ({d} sessions x ({d} streams + carrier)); max_connections is {d}",
-                    .{ worst, self.web.max_sessions, self.web.max_streams, self.max_connections },
+                    "[web] may occupy up to {d} proxy slots ({d} sessions x {d} streams + {d} HTTP/carriers), " ++
+                        "reaching the admission pause threshold {d}/{d} (90%); leave room for ordinary clients and reconnects",
+                    .{ budget.total_slots, budget.sessions, self.web.max_streams, budget.http_slots, pause_at, self.max_connections },
                 );
             }
             if (self.web.domain == null) {
@@ -1906,6 +1934,30 @@ test "parse config - WEB relay settings" {
     try std.testing.expectEqual(@as(usize, 2), cfg.web.trusted_http_sources.len);
     try std.testing.expectEqualStrings("127.0.0.1", cfg.web.trusted_http_sources[0]);
     try std.testing.expectEqualStrings("10.200.200.2", cfg.web.trusted_http_sources[1]);
+}
+
+test "WEB occupancy includes HTTP traffic and counts carriers only once" {
+    var web = Config.Web{};
+    const defaults = web.connectionBudget();
+    try std.testing.expectEqual(@as(u32, 8), defaults.sessions);
+    try std.testing.expectEqual(@as(u64, 256), defaults.stream_slots);
+    try std.testing.expectEqual(@as(u32, 64), defaults.http_slots);
+    try std.testing.expectEqual(@as(u64, 320), defaults.total_slots);
+
+    // Twelve sessions fit the hard 512-slot cap but reach its soft pause.
+    web.max_sessions = 12;
+    const crowded = web.connectionBudget();
+    try std.testing.expectEqual(@as(u64, 464), crowded.total_slots);
+    try std.testing.expect(crowded.total_slots >= proxy_limits.admissionPauseThreshold(512));
+    try std.testing.expect(crowded.total_slots < 512);
+
+    // Upgraded carriers remain subject to the same bounded HTTP count.
+    web.max_sessions = std.math.maxInt(u32);
+    web.max_streams = std.math.maxInt(u32);
+    const largest = web.connectionBudget();
+    try std.testing.expectEqual(@as(u32, 4096), largest.sessions);
+    try std.testing.expectEqual(@as(u32, 4096), largest.http_slots);
+    try std.testing.expectEqual(@as(u64, 1) << 44, largest.total_slots);
 }
 
 test "parse config - WEB-only is inert while WEB relay is disabled" {

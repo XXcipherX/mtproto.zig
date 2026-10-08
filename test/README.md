@@ -36,6 +36,13 @@ bytes are written, and verify ordered owned suffixes across partial header and
 payload writes after source storage is overwritten. Connecting-backend retry
 and retained-capacity regressions remain in place.
 
+Capacity regressions distinguish finite zero cgroup limits in v1/v2 from unlimited
+values, exercise an idempotent FD clamp even with the RAM override enabled, and
+check rounded admission thresholds through the largest `u32` cap. WEB occupancy
+checks cover 320 default slots with carriers counted once, a 12-session setup
+that reaches the soft pause before the hard connection cap, and the 4096 HTTP
+limit's restriction on carrier count with large settings.
+
 WEB queue coverage checks minimum-page block layout, block counts for 1 MiB,
 tail packing, partial consumption and bounded recycling. On targets with a
 4 KiB minimum page and 64-bit `usize`, each block carries 4088 bytes, so 1 MiB

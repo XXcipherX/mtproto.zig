@@ -41,8 +41,8 @@ port = 443
 
 # Maximum concurrent client connections. Worker pools preallocate slot-pointer
 # tables and free-index stacks for their share of this cap. ConnectionSlot
-# objects are created on demand. Startup auto-clamps this to a RAM-safe
-# estimate unless unsafe_override_limits=true.
+# objects are created on demand. Startup applies the RAM clamp unless
+# unsafe_override_limits=true, then the FD clamp before pool sizing and banner.
 # max_connections = 512
 
 # MTProto data-plane workers. 1 preserves the original single-loop behavior;
@@ -116,7 +116,7 @@ port = 443
 
 # By default, max_connections is auto-clamped to a RAM-safe estimate on startup.
 # Set to true to disable this safety mechanism (only if you're sure your host
-# has enough memory for the configured limits).
+# has enough memory for the configured limits). The FD clamp remains enforced.
 # unsafe_override_limits = false
 
 [monitor]
@@ -201,13 +201,16 @@ port = 443
 # If Origin is supplied, require exactly https://<domain>. Native WebViews may omit it.
 # check_origin = true
 
-# Resource limits. Every session occupies one front/masking connection plus up
-# to max_streams data-plane connections. setup_web.sh uses 8 x 32 by default,
-# at most 264 of the default 512 connection slots.
+# Resource limits. HTTP limit = min(4 * max_sessions + 32, 4096), carriers included.
+# Budget min(max_sessions, HTTP limit) * max_streams + HTTP limit proxy slots
+# when HTTP crosses the masking listener. Default 8 x 32 budgets 320 slots;
+# admission pauses at 460 of the default 512. Leave room for other clients
+# and reconnects; these slots are not reserved and teardown can overlap.
 # max_sessions = 8
 # max_streams = 32
 # Hard aggregate retained-buffer limit (input/list capacities, queue blocks,
-# freelists and pointer capacities). It is not whole-process RSS or kernel memory.
+# freelists and pointer capacities). Separate from the main proxy's managed pool;
+# budget additional memory for other relay/Caddy allocations and kernel memory.
 # max_buffer_mb = 128
 
 # Additional relay source IP literals trusted to send the direct-obfuscated

@@ -60,9 +60,9 @@ fn parseCgroupMemoryLimit(version: CgroupVersion, content: []const u8) ?u64 {
     if (trimmed.len == 0 or std.mem.eql(u8, trimmed, "max")) return null;
     const limit = std.fmt.parseInt(u64, trimmed, 10) catch return null;
     return switch (version) {
-        // cgroup v1 represents an unlimited controller with zero or a huge
-        // architecture-dependent sentinel.
-        .v1 => if (limit == 0 or limit >= (@as(u64, 1) << 60)) null else limit,
+        // cgroup v1 reports an unlimited controller with a huge
+        // architecture-dependent sentinel. Numeric zero is a real hard limit.
+        .v1 => if (limit >= (@as(u64, 1) << 60)) null else limit,
         // In cgroup v2 only the literal "max" is unlimited. Numeric zero is a
         // real hard limit and must fail the startup capacity check.
         .v2 => limit,
@@ -389,7 +389,7 @@ test "cgroup memory limit parser distinguishes v1 and v2 unlimited values" {
         @as(?u64, 536_870_912),
         parseCgroupMemoryLimit(.v1, "536870912\n"),
     );
-    try std.testing.expectEqual(@as(?u64, null), parseCgroupMemoryLimit(.v1, "0\n"));
+    try std.testing.expectEqual(@as(?u64, 0), parseCgroupMemoryLimit(.v1, "0\n"));
     try std.testing.expectEqual(
         @as(?u64, null),
         parseCgroupMemoryLimit(.v1, "9223372036854771712\n"),

@@ -645,8 +645,8 @@ pub const Relay = struct {
                 },
             } orelse return;
 
-            // One HTTP connection per session plus slack for cover-site traffic.
-            const http_cap = @min(@as(u64, self.opts.max_sessions) * 4 + 32, 4096);
+            // Includes upgraded carriers and slack for cover-site traffic.
+            const http_cap = config.Config.Web.httpConnectionLimit(self.opts.max_sessions);
             if (self.http_count >= http_cap) {
                 var oldest: ?*Conn = null;
                 var peers = self.conns.valueIterator();

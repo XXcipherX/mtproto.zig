@@ -73,6 +73,7 @@ const obfuscation = @import("../protocol/obfuscation.zig");
 const middleproxy = @import("../protocol/middleproxy.zig");
 const tls = @import("../protocol/tls.zig");
 const Config = @import("../config.zig").Config;
+const limits = @import("limits.zig");
 const web_support = @import("web_support.zig");
 const ManagedBufferAllocator = @import("managed_buffer_allocator.zig").ManagedBufferAllocator;
 const message_queue = @import("message_queue.zig");
@@ -582,28 +583,9 @@ pub const ProxyState = struct {
             middle_proxy_updater_started = self.middle_proxy_updater_thread != null;
         }
 
-        if (getNofileSoftLimit()) |soft| {
-            const configured_max = self.config.max_connections;
-            const needed_fds = requiredFdsForConnections(configured_max);
-            if (soft < needed_fds) {
-                const clamped = maxConnectionsForNofile(soft);
-                if (clamped == 0) {
-                    log.err("RLIMIT_NOFILE soft={d} cannot support the minimum 32 connections (need at least {d})", .{
-                        soft,
-                        requiredFdsForConnections(32),
-                    });
-                    return error.InsufficientFileDescriptorLimit;
-                }
-                if (clamped < configured_max) {
-                    self.config.max_connections = clamped;
-                    log.warn("max_connections clamped from {d} to {d} due to RLIMIT_NOFILE soft={d}", .{
-                        configured_max,
-                        clamped,
-                        soft,
-                    });
-                }
-            }
-        }
+        // Startup normally applies this before its banner and buffer sizing.
+        // Keep the guard for callers that construct and run ProxyState directly.
+        try enforceNofileCapacity(&self.config);
 
         const effective_needed_fds = requiredFdsForConnections(self.config.max_connections);
         checkNofileLimit(@max(effective_needed_fds, min_nofile_soft), self.config.max_connections);
@@ -1599,10 +1581,10 @@ const EventLoop = struct {
             if (!self.shutting_down and self.accept_paused and now_ns >= self.accept_resume_ns) {
                 self.resumeAccepting();
             }
-            // Saturation hysteresis: resume accepting when active drops below 80%
+            // Saturation hysteresis: resume at or below the rounded 80% point.
             if (!self.shutting_down and self.saturation_paused) {
                 const active = self.state.active_connections.load(.monotonic);
-                const resume_threshold = (self.state.config.max_connections * 8) / 10;
+                const resume_threshold = limits.admissionResumeThreshold(self.state.config.max_connections);
                 if (active <= resume_threshold) {
                     self.resumeSaturation();
                 }
@@ -1707,11 +1689,11 @@ const EventLoop = struct {
     fn acceptNewConnections(self: *EventLoop) !void {
         if (self.shutting_down) return;
 
-        // Saturation hysteresis: if active > 90% of max, stop accepting entirely.
-        // Resume only when active drops below 80% (checked in run() loop).
+        // Check the rounded 90% pause point before each accept batch; the hard
+        // cap is reserved per slot. Resume at or below 80% in run().
         const active_now = self.state.active_connections.load(.monotonic);
         const max = self.state.config.max_connections;
-        if (active_now >= (max * 9) / 10) {
+        if (active_now >= limits.admissionPauseThreshold(max)) {
             if (!self.saturation_paused) {
                 self.pauseSaturation();
             }
@@ -4634,6 +4616,32 @@ fn relayUpstreamToClientStep(self: *EventLoop, slot: *ConnectionSlot) !RelayProg
     return .forwarded;
 }
 
+/// Apply the same FD policy before startup diagnostics and for direct runners.
+pub fn enforceNofileCapacity(cfg: *Config) !void {
+    const soft = getNofileSoftLimit() orelse return;
+    try enforceNofileCapacityWithLimit(cfg, soft);
+}
+
+fn enforceNofileCapacityWithLimit(cfg: *Config, soft: usize) !void {
+    const configured_max = cfg.max_connections;
+    if (soft >= requiredFdsForConnections(configured_max)) return;
+
+    const clamped = maxConnectionsForNofile(soft);
+    if (clamped == 0) {
+        log.err("RLIMIT_NOFILE soft={d} cannot support the minimum 32 connections (need at least {d})", .{
+            soft,
+            requiredFdsForConnections(32),
+        });
+        return error.InsufficientFileDescriptorLimit;
+    }
+    cfg.max_connections = clamped;
+    log.warn("max_connections clamped from {d} to {d} due to RLIMIT_NOFILE soft={d}", .{
+        configured_max,
+        clamped,
+        soft,
+    });
+}
+
 fn requiredFdsForConnections(max_connections: u32) usize {
     return @as(usize, max_connections) * 2 + nofile_fd_overhead;
 }
@@ -6431,6 +6439,23 @@ test "fd requirement helpers" {
     try std.testing.expectEqual(@as(u32, 32511), maxConnectionsForNofile(65535));
     try std.testing.expectEqual(@as(u32, 32), maxConnectionsForNofile(requiredFdsForConnections(32)));
     try std.testing.expectEqual(@as(u32, 0), maxConnectionsForNofile(requiredFdsForConnections(32) - 1));
+}
+
+test "FD capacity clamp is idempotent and independent of the RAM override" {
+    var cfg = Config{
+        .users = std.StringHashMap([16]u8).init(std.testing.allocator),
+        .direct_users = std.StringHashMap(void).init(std.testing.allocator),
+        .max_connections = 512,
+        .unsafe_override_limits = true,
+    };
+    defer cfg.deinit(std.testing.allocator);
+
+    try enforceNofileCapacityWithLimit(&cfg, 65535);
+    try std.testing.expectEqual(@as(u32, 512), cfg.max_connections);
+    try enforceNofileCapacityWithLimit(&cfg, 1024);
+    try std.testing.expectEqual(@as(u32, 256), cfg.max_connections);
+    try enforceNofileCapacityWithLimit(&cfg, 1024);
+    try std.testing.expectEqual(@as(u32, 256), cfg.max_connections);
 }
 
 test "accept listen interest stays disabled while any pause reason is active" {

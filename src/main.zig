@@ -16,6 +16,7 @@ const tls = @import("protocol/tls.zig");
 const config = @import("config.zig");
 const net = @import("net_helpers.zig");
 const proxy = @import("proxy/proxy.zig");
+const proxy_limits = @import("proxy/limits.zig");
 const connection = @import("proxy/connection.zig");
 const web_capability = @import("web/capability.zig");
 const web_relay = @import("web/relay.zig");
@@ -480,14 +481,20 @@ fn printBanner(
         writeStdout("      RAM ceiling  " ++ B ++ "~{d}" ++ R ++ " baseline connections\n", .{est.safe_connections});
         writeStdout("      Configured   " ++ B ++ "{d}" ++ R ++ " connections\n", .{cfg.max_connections});
         if (cfg.web.enabled) {
-            const web_slots = @as(u64, cfg.web.max_sessions) * (@as(u64, cfg.web.max_streams) + 1);
-            writeStdout("      WEB budget   up to {d} slots ({d} sessions × ({d} streams + carrier))\n", .{
-                web_slots,
-                cfg.web.max_sessions,
+            const budget = cfg.web.connectionBudget();
+            writeStdout("      WEB budget   up to {d} slots ({d} sessions × {d} streams + {d} HTTP/carriers)\n", .{
+                budget.total_slots,
+                budget.sessions,
                 cfg.web.max_streams,
+                budget.http_slots,
             });
         }
-        writeRaw("      Admission    pauses at 90%, resumes at 80%\n");
+        writeStdout("      Admission    pauses at {d}/{d} (90%), resumes at {d}/{d} (80%)\n", .{
+            proxy_limits.admissionPauseThreshold(cfg.max_connections),
+            cfg.max_connections,
+            proxy_limits.admissionResumeThreshold(cfg.max_connections),
+            cfg.max_connections,
+        });
         if (cfg.max_connections > est.safe_connections) {
             writeStdout("      " ++ yellow ++ "configured limit exceeds baseline RAM ceiling" ++ R ++ "\n", .{});
         }
@@ -657,6 +664,7 @@ pub fn main(init: std.process.Init) !void {
         null;
 
     try enforceCapacitySafety(&cfg, capacity_estimate);
+    try proxy.enforceNofileCapacity(&cfg);
     const managed_buffer_limit_bytes =
         managedBufferLimitForConnections(capacity_estimate, cfg.max_connections);
 
