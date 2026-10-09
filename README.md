@@ -39,7 +39,7 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 | **Multi-user** | Access Control | Independent secret-based authentication per user |
 | **Anti-replay** | Timestamp + Digest Cache | Rejects replayed handshakes outside ±2 min window AND detects ТСПУ Revisor active probes |
 | **Masking** | Connection Cloaking | Forwards unauthenticated clients either to `tls_domain:443` or, for self-domain installs, to a local Caddy 404 backend |
-| **WEB Proxy** | Browser HTTPS Carrier | Runs Telegram Desktop 7.1+ WEB links in parallel with ordinary MTProto, using the existing Caddy instance for real TLS/WebSocket termination |
+| **WEB Proxy** | Browser HTTPS Carrier | Runs Telegram Desktop, Android and iOS WEB links in parallel with ordinary MTProto, using the existing Caddy instance for real TLS/WebSocket termination |
 | **PQ FakeTLS** | DPI Evasion | Echoes `X25519MLKEM768` (`0x11ec`) ServerHello key_share for modern Desktop/Android ClientHellos |
 | **Fast Mode** | Direct-Path S2C Offload | Reduces CPU usage by delegating S2C AES work to Telegram DCs on direct paths (non-MiddleProxy) |
 | **MiddleProxy** | Telemt-Compatible ME | Optional ME transport for DC1..5 (`use_middle_proxy`); retries candidates after TCP or endpoint-specific protocol failures within the global handshake deadline, applies a 5-second per-stage deadline, cools failed endpoints for 60 seconds, learns from successful TCP/auth latency, and falls back directly only when a real DC endpoint exists (never for CDN DC203) |
@@ -497,7 +497,7 @@ Useful environment variables:
 | `SECRET` | random | 32-hex user secret; generated once when config is absent |
 | `USE_MIDDLE_PROXY` | `true` | Initial `use_middle_proxy` value |
 | `ENABLE_MASKING` | `true` | Install Caddy/certbot masking and set `mask = true`; Docker installs run Caddy in Compose |
-| `ENABLE_WEB` | `false` | Enable the Telegram Desktop WEB relay alongside ordinary MTProto; an existing enabled WEB setup is preserved when this variable is omitted |
+| `ENABLE_WEB` | `false` | Enable the WEB relay alongside ordinary MTProto; an existing enabled WEB setup is preserved when this variable is omitted |
 | `WEB_DOMAIN` | _(required with `ENABLE_WEB=true`)_ | Separate public DNS hostname used by `tg://webproxy` links; it must differ from `TLS_DOMAIN` |
 | `WEB_BASE_PATH` | generated on first enable | Optional canonical carrier prefix without surrounding slashes. Omit it to generate a 16-character lowercase base32 path on a new WEB setup and preserve the current path on updates; use `none` for the historical host root |
 | `WEB_ONLY` | `false` | With `ENABLE_WEB=true`, mask all direct MTProto clients and serve only the trusted WEB relay; an existing value is preserved when omitted |
@@ -540,21 +540,48 @@ sudo /opt/mtproto-proxy/add_user.sh --add-user iphone
 
 The host-side command generates a separate 16-byte secret, updates `config.toml`, validates it, reloads the proxy and (when enabled) the WEB relay, then prints only the new user's link(s). Docker services are recreated rather than restarted because `config.toml` is a file bind mount. Names may contain letters, digits, `_`, `-` and `.`, up to 64 characters; existing names are rejected. Keep the printed links private. There is no need to rebuild or pull an image to add a user.
 
-## WEB proxy (Telegram Desktop 7.1+ and Telegram iOS 13.0)
+## WEB proxy (Telegram Desktop, Android and iOS)
 
-By default, WEB mode is an additional transport rather than a replacement for the ordinary proxy. Existing `tg://proxy` FakeTLS clients continue to use public TCP `443`; Telegram Desktop and iOS 13.0 can additionally use a `tg://webproxy` link whose traffic is carried by a real browser HTTPS/WebSocket session. Optional WEB-only mode disables that direct door.
+By default, WEB mode is an additional transport rather than a replacement for the ordinary proxy. Existing `tg://proxy` FakeTLS clients continue to use public TCP `443`; Telegram Desktop 7.1+, Android and iOS 13.0 can additionally use a `tg://webproxy` link whose traffic is carried by a real browser HTTPS/WebSocket session. Optional WEB-only mode disables that direct door.
+
+The client sources checked here are
+[Desktop 7.3.0](https://github.com/telegramdesktop/tdesktop/blob/42f8a36d43b8c805bc821905bea4cfeb3af1d41d/Telegram/SourceFiles/core/version.h#L25),
+[Android 12.10.6 (7112)](https://github.com/DrKLO/Telegram/blob/f2908b14133bbffbf7ab04f641ecb5bfaf533242/gradle.properties#L16)
+and iOS 13.0.0. These are source snapshots, not minimum-version claims for Android.
 
 Source-backed iOS 13.0 behavior: MtProtoKit and the optional Rust engine use the same
 WEB carrier and relay framing. Rust passes obfuscated MTProto bytes through
 [raw carrier streams](https://github.com/TelegramMessenger/Telegram-iOS/blob/f1dd7a2dbd02cbbf513e75d5695d8d36d1cf5838/submodules/MTProtoRustEngine/Sources/MTProtoRustEngine/RustCarrierStreams.swift#L15),
 so the server needs no separate Rust transport. The carrier is
-[shared across accounts in one application process](https://github.com/TelegramMessenger/Telegram-iOS/blob/f1dd7a2dbd02cbbf513e75d5695d8d36d1cf5838/submodules/WebProxyTransport/Sources/WebProxyDemandSet.swift#L3);
-`max_sessions` counts carriers, while `max_streams` limits their logical connections.
+[shared across accounts in one application process](https://github.com/TelegramMessenger/Telegram-iOS/blob/f1dd7a2dbd02cbbf513e75d5695d8d36d1cf5838/submodules/WebProxyTransport/Sources/WebProxyDemandSet.swift#L3).
+
+The checked iOS app controls carrier lifetime through its
+[MTProto connection demand and background grace windows](https://github.com/TelegramMessenger/Telegram-iOS/blob/f1dd7a2dbd02cbbf513e75d5695d8d36d1cf5838/submodules/TelegramCore/Sources/Network/Network.swift#L1050).
+App extensions do not start the carrier. Server keepalive cannot keep it running
+after all holders release that demand.
+
+Call audio/video uses a separate VoIP transport. The checked iOS
+[call-media integration accepts only SOCKS5 proxy settings](https://github.com/TelegramMessenger/Telegram-iOS/blob/f1dd7a2dbd02cbbf513e75d5695d8d36d1cf5838/submodules/TelegramVoip/Sources/OngoingCallContext.swift#L972);
+WEB and MTProxy settings do not route call media through this proxy.
+
+`max_sessions` counts simultaneous carrier sessions across all users, while
+`max_streams` limits logical MTProto connections inside each carrier. Android's main
+carrier is also shared across the application's accounts, but its
+[availability checker creates a separate temporary carrier](https://github.com/DrKLO/Telegram/blob/f2908b14133bbffbf7ab04f641ecb5bfaf533242/TMessagesProj/src/main/java/org/telegram/utils/proxy/WebProxyTransport.java#L100).
+A check against the active proxy can therefore consume an extra session: eight
+sessions do not necessarily mean eight devices. Leave headroom for checks and
+reconnect/teardown overlap.
+
+The default `max_streams=32` is server policy, not a WEB protocol limit. The checked
+[Android client allows up to 64 logical streams](https://github.com/DrKLO/Telegram/blob/f2908b14133bbffbf7ab04f641ecb5bfaf533242/TMessagesProj/src/main/java/org/telegram/utils/proxy/WebProxyTransport.java#L64).
+When an OPEN exceeds the server cap, the relay refuses only that stream with CLOSE;
+the carrier and existing streams stay active. Inspect stream-refusal logs/counters
+before increasing the cap, because a larger value also raises the WEB slot budget.
 
 ```text
 ordinary client ───────────────────────────────▶ mtproto-proxy :443 ─▶ Telegram
 
-Telegram Desktop WEB ─▶ mtproto-proxy :443 ─▶ Caddy :8444
+Telegram WEB client ─▶ mtproto-proxy :443 ─▶ Caddy :8444
                                                └─ WebSocket ─▶ web-relay :8081
                                                                   └─ MTProto streams ─▶ mtproto-proxy :443 ─▶ Telegram
 ```
@@ -732,7 +759,7 @@ sudo /opt/mtproto-proxy/setup_web.sh --only web.example.com
 
 For first activation, setup keeps direct MTProto available until Caddy and `mtproto-web-relay` pass the full `req_pq`/`resPQ` probe, then activates the gate in a final proxy-only restart. A failed probe leaves direct MTProto available. Reinstall preserves an already active gate. `--print-links` and installer summaries emit only `tg://webproxy` links while the gate is active. To restore ordinary MTProto without removing WEB support, run `setup_web.sh --no-only web.example.com` (or rerun the Docker installer with `ENABLE_WEB=true WEB_ONLY=false`).
 
-WEB-only requires Caddy masking and an enabled WEB relay. It is ignored if `[web].enabled=false`, so removing WEB support cannot leave an unreachable all-masked proxy. Existing ordinary `tg://proxy` links do not work until WEB-only is disabled, and `[web].max_sessions` becomes the effective desktop-session ceiling.
+WEB-only requires Caddy masking and an enabled WEB relay. It is ignored if `[web].enabled=false`, so removing WEB support cannot leave an unreachable all-masked proxy. Existing ordinary `tg://proxy` links do not work until WEB-only is disabled, and `[web].max_sessions` becomes the effective carrier-session ceiling, including temporary availability checks.
 
 Capacity is separate from the relay's queue-memory limit. The relay permits up to `min(4 * max_sessions + 32, 4096)` HTTP connections, including upgraded WebSocket carriers. Its potential proxy occupancy is `min(max_sessions, HTTP limit) * max_streams + HTTP limit` when HTTP traffic crosses the proxy's masking listener. Carriers are already included in the HTTP limit and are counted once. The default `8 × 32` configuration therefore budgets up to **320 slots**: 256 backend streams plus 64 HTTP/carrier connections. Startup warns when this budget reaches the effective connection cap's 90% admission-pause threshold; leave additional room for ordinary clients and reconnects. The budget is a planning estimate, not a reservation or a bound on transient connections awaiting teardown.
 
@@ -1203,7 +1230,7 @@ rate_limit_per_subnet = 30                # Max new connections/sec per /24 subn
 # port = 61208                             # TCP port for the dashboard
 
 [web]
-# Optional Telegram Desktop 7.1+ WEB transport. setup_web.sh writes these
+# Optional Telegram WEB transport (Desktop/Android/iOS). setup_web.sh writes these
 # values and extends the existing Caddy instance; ordinary MTProto remains on
 # unless only=true is selected.
 # enabled = true
@@ -1274,7 +1301,7 @@ alice = true   # direct where possible; CDN DC203 still requires MiddleProxy
 | `[server]` | `unsafe_override_limits` | `false` | Disable auto-clamping of `max_connections` to the baseline RAM admission ceiling. The shared dynamic-buffer hard limit remains enforced. Use only when the container/service limit as well as host RAM are sufficient |
 | `[monitor]` | `host` | `"127.0.0.1"` | Bind address for the optional monitoring dashboard HTTP server. This section is read by `proxy-monitor`, not by the proxy binary. Set to `"0.0.0.0"` to expose on all interfaces (warning: no built-in auth) |
 | `[monitor]` | `port` | `61208` | TCP port for the optional monitoring dashboard HTTP server |
-| `[web]` | `enabled` | `false` | Enable the separate Telegram Desktop WEB relay process and the trusted relay path in the data plane |
+| `[web]` | `enabled` | `false` | Enable the separate WEB relay process and the trusted relay path in the data plane |
 | `[web]` | `only` / `web_only` | `false` | When WEB is enabled, mask direct MTProto for every non-relay peer. Existing `tg://proxy` links stop working; relay trust comes only from the address returned by `accept()` |
 | `[web]` | `domain` | _(none)_ | Public ASCII DNS hostname placed in `tg://webproxy` links. It must differ from `censorship.tls_domain`; changing it invalidates existing WEB capabilities/links |
 | `[web]` | `public_dir` | _(none)_ | Optional operator-owned static directory loaded once at relay startup. The path is inside the relay/container filesystem and must be readable. Exact routes support MIME/ETag; hidden files, symlinks, traversal and oversized trees are excluded. Unset preserves bodyless ordinary 404s |
@@ -1288,8 +1315,8 @@ alice = true   # direct where possible; CDN DC203 still requires MiddleProxy
 | `[web]` | `client_ip_header` | `"x-forwarded-for"` | Header Caddy uses to pass the real browser address to the relay |
 | `[web]` | `trusted_http_sources` | `[]` | Extra IP literals trusted only as HTTP terminators for forwarded client identity. This does not grant data-plane relay trust; loopback is implicit |
 | `[web]` | `check_origin` | `true` | Permit a missing `Origin` for native WebViews; if supplied, require one exact `https://<web.domain>` value |
-| `[web]` | `max_sessions` | `8` | Concurrent WEB sessions; carriers also count toward the relay's HTTP limit. The default budgets 320 proxy slots including HTTP headroom within the 512-slot small-VPS profile |
-| `[web]` | `max_streams` | `32` | Logical MTProto streams per WEB session; each consumes one data-plane connection |
+| `[web]` | `max_sessions` | `8` | Concurrent carrier sessions across all users, not devices/accounts; an Android availability check may consume another session. Carriers also count toward the relay's HTTP limit. The default budgets 320 proxy slots including HTTP headroom within the 512-slot small-VPS profile |
+| `[web]` | `max_streams` | `32` | Server cap on logical MTProto streams per carrier, independent of the client's cap. Each stream consumes one data-plane connection; excess OPENs receive CLOSE without terminating existing streams |
 | `[web]` | `max_buffer_mb` | `128` | Aggregate hard ceiling for retained WEB-relay list capacities, queue blocks/freelists and queue pointer capacity; separate from the main proxy pool and excludes other RSS/kernel allocations |
 | `[web]` | `relay_sources` | `[]` | Extra IP literals trusted to send PROXY-prefixed direct-obfuscated WEB streams; loopback is implicit while WEB is enabled |
 | `[censorship]` | `tls_domain` | `"google.com"` | FakeTLS SNI domain. With `mask_port=443`, unauthenticated clients are forwarded to this domain directly. For self-domain masking, set it to your own domain and point its DNS A record to the VPS. Since June 2026, the real masking endpoint should negotiate X25519MLKEM768 (`0x11ec`) in one round; classical-x25519-only domains can be a passive marker |

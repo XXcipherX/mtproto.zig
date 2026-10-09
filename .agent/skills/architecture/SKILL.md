@@ -182,15 +182,21 @@ logging overhead.
 Historical idle/TLS-auth capacity probes and the one-connection process E2E
 prove different, narrower properties; neither substitutes for this suite.
 
-## WEB Proxy Flow (Telegram Desktop 7.1+ and Telegram iOS 13.0)
+## WEB Proxy Flow (Telegram Desktop, Android and iOS)
 
-1. Telegram Desktop or iOS opens a browser HTTPS carrier to `[web].domain` on public `:443`; with the default `[web].only=false`, ordinary FakeTLS clients continue to use the same listener with `censorship.tls_domain`.
+1. Telegram Desktop, Android or iOS opens a browser HTTPS carrier to `[web].domain` on public `:443`; with the default `[web].only=false`, ordinary FakeTLS clients continue to use the same listener with `censorship.tls_domain`.
 2. The proxy recognizes the WEB SNI with a bounds-checked routing parser that is independent of FakeTLS key-share/cipher policy, then relays the untouched TLS connection to `[web].mask_backend`, prefixing PROXY v2 with the kernel-reported browser address.
 3. The existing Caddy service terminates TLS and sends the entire WEB hostname through one loopback relay handler; it does not route on unauthenticated carrier-looking paths and removes the reverse-proxy `Via` header.
 4. The permanent secret-derived capability authenticates only the exact canonical bridge bootstrap. That response mints a bounded, short-lived token carried solely as `Sec-WebSocket-Protocol: tproxy-v1.<token>` on the exact WebSocket path, never in its URL. Empty `[web].base_path` keeps root v1 routes; a non-empty path moves both routes below `/<base_path>/` and uses the v2 HMAC context bound to hostname + exact case-sensitive path. Ordinary requests use the optional startup-loaded `[web].public_dir` or the fork's bodyless 404; a genuine capability in a malformed request always fails closed.
 5. Every logical stream connects back to `[web].backend`, prefixes PROXY v2 with the browser address, and carries the client's `dd` direct-obfuscated MTProto stream into the normal DC/MiddleProxy routing path.
 
 Source-backed iOS 13.0: MtProtoKit and Rust share the Swift WEB carrier; Rust uses raw streams with explicit consumption/backpressure callbacks. One carrier serves the accounts of one application process. Keep engine-specific watchdogs separate; see the pinned sources and profiles in `client-behavior/SKILL.md`.
+
+The pinned Rust engine's HTTP/TelegramWeb DC fallback (`/apiw1`, `/apiws` and test
+variants) is excluded for MTProxy and WEB selections by
+[`proxy_blocks_http`](https://github.com/macosswift/mtproto-engine/blob/0de759a36cbb50c1e98560c1ffa38590d317b0fc/crates/mtproto-engine/src/types.rs#L267).
+Rust support needs no implementation of those DC endpoints in this relay.
+`[web].ws_path` independently selects the existing carrier WebSocket endpoint.
 
 Trust is fixed from the kernel-reported peer at `accept()`: only loopback plus explicit `[web].relay_sources` may enter the direct-obfuscated path. A PROXY header may replace the diagnostic/client address but must never grant trust. When both `[web].enabled` and `[web].only` are true, every untrusted peer reaching the ordinary FakeTLS SNI is sent to the normal Caddy masking backend before secret validation, including clients holding a formerly valid direct link; the trusted relay remains admitted. `only` is inert when WEB is disabled. WEB-domain masking carriers and authenticated MTProto relays are exempt from `mask_relay_max_secs`. Ordinary masking/probe relays default to a 300-second absolute cap from admission, independent of activity and sliding idle timeout; explicit zero disables the cap and explicit nonzero values are preserved. Source/Compose installers and the Docker entrypoint omit this key, inheriting the runtime default while retaining existing operator settings.
 
@@ -201,6 +207,16 @@ Trust is fixed from the kernel-reported peer at `accept()`: only loopback plus e
   including all relay headers; each relay payload stays capped at 1 MiB and each
   message at 4096 frames. Input and fragment capacity are charged independently
   against the existing aggregate budget. Keep these limits distinct.
+  Preserve stream credit even for the pinned MtProtoKit adapter's exact-read edge
+  case described in `client-behavior/SKILL.md`; fix client consumption rather than
+  bypassing flow control or treating a larger message cap as a larger window.
+- `max_sessions` counts carriers across users, not devices/accounts. Android's main
+  carrier is shared by accounts, but its separate availability checker can overlap
+  it and consume another same-server session; reconnect/teardown also needs headroom.
+- The default `max_streams = 32` is server admission policy, not a protocol cap;
+  the pinned Android client supports 64 logical streams. Refuse only an excess OPEN
+  with CLOSE and retain its tombstone, preserving the carrier and existing streams.
+  Raising the cap also raises the total connection budget; preserve capacity warnings.
 - The relay accounts retained input, fragment, batch and queue allocations, including
   queue blocks, freelists and pointer capacities. Growth is reserved before allocation
   and drained idle capacity is reclaimed. `web.max_buffer_mb` is not a whole-process RSS

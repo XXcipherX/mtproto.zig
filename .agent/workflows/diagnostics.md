@@ -87,6 +87,39 @@ refused admissions, forwarded byte counters, and retained userspace buffer capac
 Its buffer gauge is not whole-process RSS and is independent of the main process's
 `managed_buf`: unrelated metadata and kernel socket buffers are excluded. Repeated refusals indicate pressure
 against the configured WEB limits, not necessarily a main-proxy capacity problem.
+
+`mtproto_web_sessions` counts carriers across users, not devices or accounts. The
+main Android carrier serves its application accounts, while a same-server availability
+check can temporarily add a second carrier. Reconnect/teardown overlap also needs
+headroom; do not diagnose a session-count increase as another user by itself.
+`mtproto_web_streams_refused_total` counts OPENs rejected at `[web].max_streams`.
+The relay sends CLOSE for that stream and keeps the carrier and other streams alive.
+Use the first `refused a stream over the [web].max_streams cap` warning and the
+session-close `peak N/cap streams, M refused` summary to assess sustained pressure.
+The default 32 is server policy; Android's client cap of 64 does not require raising
+it. Review the WEB slot budget and admission headroom before increasing either cap.
+
+For the pinned Desktop profile, 3-second JavaScript probes and a 10-second native
+health timeout check the local WebView. Native handshake/write acknowledgement,
+browser-fallback and MTProto response timers are separate; see
+`../skills/client-behavior/SKILL.md`. Do not use those local health values to tune
+server PING/PONG or infer a client engine. The relay itself probes after 20 seconds
+without received carrier bytes and closes after 90 seconds without received bytes;
+one late PONG alone is not a close condition. Keep MtProtoKit and optional Rust
+watchdogs separate even though their Swift WEB carrier is shared.
+
+In the pinned iOS profile, carrier demand aggregates per-account `shouldKeepConnection`
+and the client's background grace windows; app extensions do not start the carrier.
+Check client connection demand when correlating background stops or reconnects.
+Server keepalive cannot override a client-requested carrier stop.
+
+MtProtoKit's legacy WEB adapter can also stall if an exact-length packet-remainder
+read exceeds the 4 MiB stream window: it returns credit only after the read completes.
+This is a source-derived edge case, with no confirmed occurrence in captures; see
+`../skills/client-behavior/SKILL.md`. Collect client read/credit evidence before
+attributing a stall to it. Keep the granted credit; raising the 2 MiB message cap or
+changing native batching does not repair client consumption.
+
 Hostname WEB backend/mask targets refresh every minute, retain the last successful
 DNS snapshot on failure, and freeze candidate lists for each connect attempt.
 

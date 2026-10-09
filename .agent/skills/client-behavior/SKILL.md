@@ -40,6 +40,12 @@ Source-backed MtProtoKit behavior:
 - Incoming message confirmations may be queued for a later transaction rather than producing an immediate client write, so a short server→client silence alone is not proof of a wedge
 - Transport-level watchdog: `20s`
 - Reconnect backoff: first retry is immediate, followed by `1s`, `4s`, then `8s` tiers
+- Static WEB edge case inferred from the pinned sources: the intermediate/padded
+  packet parser accepts payloads up to 16 MiB, but the legacy WEB adapter's
+  `drainReads` returns receive credit only after completing an exact-length read.
+  After the 128-byte packet head, a requested remainder above the 4 MiB stream
+  window can stall before the read completes. No occurrence is confirmed in captures;
+  do not attribute this exact-read behavior to Rust's paced raw-stream adapter.
 
 References:
 
@@ -50,6 +56,10 @@ References:
 - https://github.com/TelegramMessenger/Telegram-iOS/blob/f1dd7a2dbd02cbbf513e75d5695d8d36d1cf5838/submodules/MtProtoKit/Sources/MTProto.m#L1037
 - https://github.com/TelegramMessenger/Telegram-iOS/blob/f1dd7a2dbd02cbbf513e75d5695d8d36d1cf5838/submodules/MtProtoKit/Sources/MTTcpTransport.m#L312
 - https://github.com/TelegramMessenger/Telegram-iOS/blob/f1dd7a2dbd02cbbf513e75d5695d8d36d1cf5838/submodules/MtProtoKit/Sources/MTTcpConnectionBehaviour.m#L66
+- https://github.com/TelegramMessenger/Telegram-iOS/blob/f1dd7a2dbd02cbbf513e75d5695d8d36d1cf5838/submodules/MtProtoKit/Sources/MTTransport.m#L3
+- https://github.com/TelegramMessenger/Telegram-iOS/blob/f1dd7a2dbd02cbbf513e75d5695d8d36d1cf5838/submodules/MtProtoKit/Sources/MTTcpConnection.m#L1973
+- https://github.com/TelegramMessenger/Telegram-iOS/blob/f1dd7a2dbd02cbbf513e75d5695d8d36d1cf5838/submodules/MtProtoKit/Sources/MTTcpConnection.m#L2009
+- https://github.com/TelegramMessenger/Telegram-iOS/blob/f1dd7a2dbd02cbbf513e75d5695d8d36d1cf5838/submodules/WebProxyTransport/Sources/WebProxyTransport.swift#L742
 
 Source-backed WEB behavior shared by MtProtoKit and Rust:
 
@@ -57,6 +67,13 @@ Source-backed WEB behavior shared by MtProtoKit and Rust:
 - Relay headers are 8 bytes, individual payloads are capped at 1 MiB, DATA is emitted in 64 KiB chunks, and native batches may reach 2 MiB including headers and 4096 frames. Both sides start with 4 MiB of credit per logical stream. Keep the message cap separate from the per-frame cap.
 - One carrier serves all accounts in an application process. Carrier reconnect uses exponential delay from 1 to 30 seconds plus jitter, independently of the legacy TCP backoff above.
 - Root/path capability HMAC contexts and marked base-path secrets match Desktop. The native bridge still uses the historical `android` fragment name; do not rename it for iOS.
+- Each account contributes carrier demand through `webProxyActive && shouldKeepConnection`,
+  including the existing background grace windows. The aggregate keeps the carrier
+  active until all holders release demand. App extensions (`.appex`) apply no WEB
+  configuration and never request carrier demand; server keepalive cannot override
+  a demand-driven stop.
+- Call audio/video uses a separate VoIP transport. The pinned integration accepts
+  only SOCKS5 proxy settings and skips `.mtp` and `.web` for call media.
 
 Source-backed optional Rust behavior:
 
@@ -64,6 +81,9 @@ Source-backed optional Rust behavior:
 - `RustCarrierStreams` still uses a 12-second raw-stream open timeout. Distinguish opening the WEB stream from an established MTProto response watchdog.
 - FakeTLS nonce generation permits arbitrary random prefixes. Direct-obfuscated generation excludes `0xef`, seven reserved first words and zero bytes 4..8; `PUT ` is not excluded.
 - On iOS, the Debug Settings engine choice applies at the next launch; live engine switching is macOS-only. Preserve MtProtoKit as a separate profile rather than assigning Rust's timers to it.
+- HTTP/TelegramWeb DC fallback (`/apiw1`, `/apiws` and test variants) is a separate
+  transport. `proxy_blocks_http` excludes it for MTProxy and WEB proxy selections;
+  supporting Rust does not require implementing those DC endpoints in this relay.
 
 References:
 
@@ -75,8 +95,12 @@ References:
 - https://github.com/TelegramMessenger/Telegram-iOS/blob/f1dd7a2dbd02cbbf513e75d5695d8d36d1cf5838/submodules/MTProtoRustEngine/Sources/MTProtoRustEngine/RustCarrierStreams.swift#L15
 - https://github.com/TelegramMessenger/Telegram-iOS/blob/f1dd7a2dbd02cbbf513e75d5695d8d36d1cf5838/submodules/MTProtoRustEngine/Sources/MTProtoRustEngine/RustEngineRuntime.swift#L161
 - https://github.com/TelegramMessenger/Telegram-iOS/blob/f1dd7a2dbd02cbbf513e75d5695d8d36d1cf5838/submodules/TelegramCore/Sources/Network/Network.swift#L658
+- https://github.com/TelegramMessenger/Telegram-iOS/blob/f1dd7a2dbd02cbbf513e75d5695d8d36d1cf5838/submodules/TelegramCore/Sources/Network/Network.swift#L1050
+- https://github.com/TelegramMessenger/Telegram-iOS/blob/f1dd7a2dbd02cbbf513e75d5695d8d36d1cf5838/submodules/TelegramVoip/Sources/OngoingCallContext.swift#L972
 - https://github.com/macosswift/mtproto-engine/blob/0de759a36cbb50c1e98560c1ffa38590d317b0fc/crates/mtproto-core/src/session/mod.rs#L1267
 - https://github.com/macosswift/mtproto-engine/blob/0de759a36cbb50c1e98560c1ffa38590d317b0fc/crates/mtproto-core/src/transport/obfuscation.rs#L23
+- https://github.com/macosswift/mtproto-engine/blob/0de759a36cbb50c1e98560c1ffa38590d317b0fc/crates/mtproto-engine/src/types.rs#L267
+- https://github.com/macosswift/mtproto-engine/blob/0de759a36cbb50c1e98560c1ffa38590d317b0fc/crates/mtproto-engine/src/session_http.rs#L350
 
 Field-capture behavior (historical MtProtoKit sessions, not Rust captures):
 
@@ -92,6 +116,9 @@ Proxy implications:
 - Continue assembling MTProto handshake until full 64 bytes are collected.
 - Preserve pipelined appdata after the 64-byte MTProto nonce; some clients can send early payload without waiting for a separate relay read.
 - Do not treat short idle prewarmed sockets as protocol failure.
+- Keep the granted 4 MiB stream credit for the MtProtoKit WEB exact-read edge case.
+  A remedy belongs in client read/credit handling; native batching does not change
+  consumption, and the server must not transmit beyond the client's granted credit.
 - The existing 12-second recovery eligibility window derives from MtProtoKit and remains an engine-agnostic proxy heuristic. Do not describe it as Rust's watchdog or infer the client engine from timing; the relay carries opaque encrypted bytes.
 - Keep proxy-side wedge recovery limited to generic DC relays and treat it as an encrypted-stream heuristic. The relay cannot identify the client platform, so the enabled rule applies to the same timing pattern from any client. A request must reach upstream, a response must begin inside the source-backed 12-second window, and the response must drain to the client before silence timing starts. Any client progress cancels the candidate. Every recovery shares the internal per-real-IP/access-user/DC `T`/`2T`/`4T` budget; after those three waves, use normal idle timeout for 30 minutes from the most recent actual breaker close, without extending the cooldown for healthy matching traffic. Exclude media/DC203, masking, half-close, backpressure, and graceful shutdown. A continuation after an earlier delivered reply and at least 30 seconds in relay upgrades the candidate to `proven` for diagnostics, but never bypasses the group budget.
 
@@ -99,66 +126,96 @@ Proxy implications:
 
 Version snapshot:
 
-- Repo/ref: `DrKLO/Telegram` `master` (snapshot: `12.6.4 (6666)`)
-- Commit: `009e97356f966bb81eceba113d210230bf383122`
+- Repo/ref: `DrKLO/Telegram` `master` (snapshot: `12.10.6 (7112)`)
+- Commit: `f2908b14133bbffbf7ab04f641ecb5bfaf533242`
 
 Source-backed behavior:
 
 - Enables `TCP_NODELAY`, switches socket to `O_NONBLOCK`, uses `connect(..., EINPROGRESS)` with edge-triggered epoll.
-- Connect path chooses address family/static flags and sets per-type logical timeouts (`Proxy=5s`, `Generic=8/12s`, `Upload=25/40s`, `Push=20/30s`).
-- Timeout model is logical/internal (`setTimeout` / `checkTimeout`).
-- Explicit connection-type split (`Generic`, `Download`, `Upload`, `Push`, `Temp`, `Proxy`) and multiple parallel slots.
+- Connect path chooses address family/static flags and sets initial per-type logical timeouts (`Proxy=5s`, `Generic=8/12s`, `Upload=25/40s`, `Push=20/30s`).
+- These are not fixed established-session deadlines: after data arrives, Push uses 15 minutes, Download uses 25 seconds, and generic timeouts adapt to traffic. `checkTimeout` closes an unconnected socket or one with pending requests; an established socket without pending requests refreshes its event timestamp instead.
+- Explicit connection-type split (`Generic`, `Download`, `Upload`, `Push`, `Temp`, `Proxy`, `GenericMedia`) and multiple parallel slots.
+
+Source-backed WEB behavior:
+
+- One main `WebProxyTransport` instance is shared by the application's accounts for the selected address and secret. Native tgnet uses its loopback TCP listener; unavailable WEB setup selects a failing loopback port rather than falling back to direct MTProto.
+- `MAX_STREAMS = 64` is this client's logical-stream cap. The fork's default `[web].max_streams = 32` is independent server policy, not a protocol limit or a requirement to raise the setting to 64.
+- `WebProxyConnectionTester` serializes checks and creates a separate `connectionTestInstance`. A check against the active proxy can temporarily consume a second carrier session. It waits up to 10 seconds for carrier readiness, then waits 500 ms before the native check, whose separate outer timeout is 20 seconds. Cleanup stops the checker carrier.
+- Carrier failure closes its logical streams and schedules WebView recreation after 1 second; creation can be deferred while the app is in the background. This is separate from tgnet's logical-connection timers.
 
 References:
 
-- https://github.com/DrKLO/Telegram/blob/009e97356f966bb81eceba113d210230bf383122/TMessagesProj/jni/tgnet/ConnectionSocket.cpp#L618
-- https://github.com/DrKLO/Telegram/blob/009e97356f966bb81eceba113d210230bf383122/TMessagesProj/jni/tgnet/Connection.cpp#L276
-- https://github.com/DrKLO/Telegram/blob/009e97356f966bb81eceba113d210230bf383122/TMessagesProj/jni/tgnet/Connection.cpp#L368
-- https://github.com/DrKLO/Telegram/blob/009e97356f966bb81eceba113d210230bf383122/TMessagesProj/jni/tgnet/ConnectionSocket.cpp#L1105
-- https://github.com/DrKLO/Telegram/blob/009e97356f966bb81eceba113d210230bf383122/TMessagesProj/jni/tgnet/ConnectionSocket.cpp#L1115
-- https://github.com/DrKLO/Telegram/blob/009e97356f966bb81eceba113d210230bf383122/TMessagesProj/jni/tgnet/Defines.h#L68
-- https://github.com/DrKLO/Telegram/blob/009e97356f966bb81eceba113d210230bf383122/TMessagesProj/jni/tgnet/Defines.h#L26
+- https://github.com/DrKLO/Telegram/blob/f2908b14133bbffbf7ab04f641ecb5bfaf533242/gradle.properties#L16
+- https://github.com/DrKLO/Telegram/blob/f2908b14133bbffbf7ab04f641ecb5bfaf533242/TMessagesProj/jni/tgnet/ConnectionSocket.cpp#L208
+- https://github.com/DrKLO/Telegram/blob/f2908b14133bbffbf7ab04f641ecb5bfaf533242/TMessagesProj/jni/tgnet/Connection.cpp#L309
+- https://github.com/DrKLO/Telegram/blob/f2908b14133bbffbf7ab04f641ecb5bfaf533242/TMessagesProj/jni/tgnet/Connection.cpp#L368
+- https://github.com/DrKLO/Telegram/blob/f2908b14133bbffbf7ab04f641ecb5bfaf533242/TMessagesProj/jni/tgnet/Connection.cpp#L131
+- https://github.com/DrKLO/Telegram/blob/f2908b14133bbffbf7ab04f641ecb5bfaf533242/TMessagesProj/jni/tgnet/ConnectionSocket.cpp#L708
+- https://github.com/DrKLO/Telegram/blob/f2908b14133bbffbf7ab04f641ecb5bfaf533242/TMessagesProj/jni/tgnet/Defines.h#L68
+- https://github.com/DrKLO/Telegram/blob/f2908b14133bbffbf7ab04f641ecb5bfaf533242/TMessagesProj/src/main/java/org/telegram/tgnet/ConnectionsManager.java#L945
+- https://github.com/DrKLO/Telegram/blob/f2908b14133bbffbf7ab04f641ecb5bfaf533242/TMessagesProj/src/main/java/org/telegram/utils/proxy/WebProxyTransport.java#L64
+- https://github.com/DrKLO/Telegram/blob/f2908b14133bbffbf7ab04f641ecb5bfaf533242/TMessagesProj/src/main/java/org/telegram/utils/proxy/WebProxyTransport.java#L100
+- https://github.com/DrKLO/Telegram/blob/f2908b14133bbffbf7ab04f641ecb5bfaf533242/TMessagesProj/src/main/java/org/telegram/utils/proxy/WebProxyTransport.java#L408
+- https://github.com/DrKLO/Telegram/blob/f2908b14133bbffbf7ab04f641ecb5bfaf533242/TMessagesProj/src/main/java/org/telegram/utils/proxy/WebProxyTransport.java#L752
+- https://github.com/DrKLO/Telegram/blob/f2908b14133bbffbf7ab04f641ecb5bfaf533242/TMessagesProj/src/main/java/org/telegram/utils/proxy/WebProxyConnectionTester.java#L8
 
 Proxy implications:
 
 - Expect parallel connection attempts and frequent connect churn.
 - Keep accept/close path cheap and non-blocking.
+- Count carriers rather than devices or accounts when interpreting WEB session occupancy. Leave admission headroom for same-server availability checks and reconnect overlap.
+- If `[web].max_streams` refuses an OPEN, preserve CLOSE for that stream and its tombstone without dropping the carrier. Inspect refusal counters/peak streams and the total WEB slot budget before changing the limit.
 - Subnet rate limiting groups IPv4-mapped IPv6 with native IPv4 `/24`; native IPv6 retains the complete `/48` prefix without a lossy 32-bit fold. Account for that when testing Android address-family races.
 
 ## Desktop (Telegram Desktop)
 
 Version snapshot:
 
-- Repo/tag: `telegramdesktop/tdesktop` `v6.7.2`
-- Commit: `085c4ba65d1f8aa13abf0fd7fc8489f094552542`
+- Repo/tag: `telegramdesktop/tdesktop` `v7.3.0`
+- Commit: `42f8a36d43b8c805bc821905bea4cfeb3af1d41d`
 
 Source-backed behavior:
 
-- Builds multiple test connections and picks by priority.
-- Wait-for-connected starts at `1000ms` and can grow after failures.
+- Ordinary direct sessions build endpoint candidates and pick by priority; MTProto/WEB proxy mode selects one TCP transport candidate per session.
+- Wait-for-connected starts at `1000ms` and doubles after failures toward the maximum of `8s` and the selected transport's full-connect timeout.
 - TCP/HTTP transport full-connect timeout around `8s`.
-- Resolver uses per-IP timeout `4000ms` and scales by resolved count.
-- May wait `2000ms` for a better candidate after first success.
+- Ordinary resolver uses per-IP timeout `4000ms` and scales by resolved count; WEB hostname resolution belongs to the browser carrier.
+- May wait `2000ms` for a better candidate after first success in an endpoint race.
+
+Source-backed WEB behavior:
+
+- Logical MTProto TCP sockets use a process-wide WEB carrier. The client prefers a hidden native WebView and can use a system-browser loopback iframe fallback; WEB proxy mode does not select the ordinary Telegram HTTP transport.
+- Native WebView JavaScript health probes run every 3 seconds, and incoming native messages refresh a 10-second health timeout. These check local WebView responsiveness, not server PING/PONG or MTProto response timing.
+- The native handshake timeout starts at 10 seconds and can be extended by progress within a 45-second total bound. Native write acknowledgements have a 10-second timeout. Browser-fallback WELCOME and carrier write progress use separate 30-second timers.
+- Native carrier recreation backs off from 2 to 30 seconds independently of MTProto connection timers. Carrier loss closes its logical streams; it does not resume/replay established streams.
+- `kMaxLocalClients = 32` limits loopback browser HTTP/WebSocket clients, not logical MTProto streams. Desktop's native base64-message limit is described below. Its ordinary proxy checker skips WEB entries; do not assume it creates Android-style availability carriers.
 
 References:
 
-- https://github.com/telegramdesktop/tdesktop/blob/085c4ba65d1f8aa13abf0fd7fc8489f094552542/Telegram/SourceFiles/mtproto/session_private.cpp#L1010
-- https://github.com/telegramdesktop/tdesktop/blob/085c4ba65d1f8aa13abf0fd7fc8489f094552542/Telegram/SourceFiles/mtproto/session_private.cpp#L34
-- https://github.com/telegramdesktop/tdesktop/blob/085c4ba65d1f8aa13abf0fd7fc8489f094552542/Telegram/SourceFiles/mtproto/session_private.cpp#L1236
-- https://github.com/telegramdesktop/tdesktop/blob/085c4ba65d1f8aa13abf0fd7fc8489f094552542/Telegram/SourceFiles/mtproto/connection_tcp.cpp#L21
-- https://github.com/telegramdesktop/tdesktop/blob/085c4ba65d1f8aa13abf0fd7fc8489f094552542/Telegram/SourceFiles/mtproto/connection_http.cpp#L18
-- https://github.com/telegramdesktop/tdesktop/blob/085c4ba65d1f8aa13abf0fd7fc8489f094552542/Telegram/SourceFiles/mtproto/connection_resolving.cpp#L16
-- https://github.com/telegramdesktop/tdesktop/blob/085c4ba65d1f8aa13abf0fd7fc8489f094552542/Telegram/SourceFiles/mtproto/session_private.cpp#L33
+- https://github.com/telegramdesktop/tdesktop/blob/42f8a36d43b8c805bc821905bea4cfeb3af1d41d/Telegram/SourceFiles/core/version.h#L25
+- https://github.com/telegramdesktop/tdesktop/blob/42f8a36d43b8c805bc821905bea4cfeb3af1d41d/Telegram/SourceFiles/mtproto/session_private.cpp#L1038
+- https://github.com/telegramdesktop/tdesktop/blob/42f8a36d43b8c805bc821905bea4cfeb3af1d41d/Telegram/SourceFiles/mtproto/session_private.cpp#L34
+- https://github.com/telegramdesktop/tdesktop/blob/42f8a36d43b8c805bc821905bea4cfeb3af1d41d/Telegram/SourceFiles/mtproto/session_private.cpp#L1242
+- https://github.com/telegramdesktop/tdesktop/blob/42f8a36d43b8c805bc821905bea4cfeb3af1d41d/Telegram/SourceFiles/mtproto/session_private.cpp#L2399
+- https://github.com/telegramdesktop/tdesktop/blob/42f8a36d43b8c805bc821905bea4cfeb3af1d41d/Telegram/SourceFiles/mtproto/connection_tcp.cpp#L24
+- https://github.com/telegramdesktop/tdesktop/blob/42f8a36d43b8c805bc821905bea4cfeb3af1d41d/Telegram/SourceFiles/mtproto/connection_http.cpp#L18
+- https://github.com/telegramdesktop/tdesktop/blob/42f8a36d43b8c805bc821905bea4cfeb3af1d41d/Telegram/SourceFiles/mtproto/connection_resolving.cpp#L16
+- https://github.com/telegramdesktop/tdesktop/blob/42f8a36d43b8c805bc821905bea4cfeb3af1d41d/Telegram/SourceFiles/mtproto/web_proxy/web_proxy_webview.cpp#L28
+- https://github.com/telegramdesktop/tdesktop/blob/42f8a36d43b8c805bc821905bea4cfeb3af1d41d/Telegram/SourceFiles/mtproto/web_proxy/web_proxy_webview.cpp#L169
+- https://github.com/telegramdesktop/tdesktop/blob/42f8a36d43b8c805bc821905bea4cfeb3af1d41d/Telegram/SourceFiles/mtproto/web_proxy/web_proxy_transport.cpp#L52
+- https://github.com/telegramdesktop/tdesktop/blob/42f8a36d43b8c805bc821905bea4cfeb3af1d41d/Telegram/SourceFiles/mtproto/web_proxy/web_proxy_transport.cpp#L1765
+- https://github.com/telegramdesktop/tdesktop/blob/42f8a36d43b8c805bc821905bea4cfeb3af1d41d/Telegram/SourceFiles/mtproto/proxy_check.cpp#L50
 
 Proxy implications:
 
 - Candidate racing and early cancellation are expected patterns.
 - Keep reconnect path cheap and avoid blocking work in event loop callbacks.
+- Distinguish MTProto logical-connection timers, local native WebView health/write timers, browser-fallback deadlines and the server's carrier keepalive. Do not infer a platform/engine or tune server PING/PONG from the 3-second/10-second local WebView checks.
 - Non-32-byte TLS Session IDs are not supported by the current FakeTLS template; investigate client-side TLS shape first if Desktop auth suddenly masks instead of authenticating.
 
 ## Native WEB Bridge Batching
 
-Source-backed bridge snapshots, separate from the historical TCP profiles above:
+Further source-backed bridge delivery details for the profiles above:
 
 - Android `12.10.6 (7112)`, commit `f2908b14133bbffbf7ab04f641ecb5bfaf533242`:
   the WebView posts a binary ArrayBuffer to one carrier executor, and `processFrames`
