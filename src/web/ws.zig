@@ -10,9 +10,8 @@
 //!
 //!  * server side only: we never mask what we send, and we reject an unmasked client
 //!    frame as RFC 6455 requires;
-//!  * one frame must be fully buffered before it is processed, which is safe because
-//!    tdesktop emits exactly one relay frame per carrier message and caps its own DATA
-//!    frames at 64 KiB (`kDataFrameSize`);
+//!  * one frame must be fully buffered before it is processed; a bounded carrier
+//!    message may contain several complete relay frames, including native iOS batches;
 //!  * no permessage-deflate, no extensions.
 
 const std = @import("std");
@@ -23,8 +22,9 @@ pub const guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 /// base64 of a 20-byte SHA-1 digest.
 pub const accept_len: usize = 28;
 
-/// Largest client frame/message includes one maximum-size relay frame.
-pub const max_message: usize = @import("frame.zig").max_payload + @import("frame.zig").header_size;
+/// Maximum carrier message, including all relay frame headers in a native batch.
+/// The individual relay payload limit remains `frame.max_payload` (1 MiB).
+pub const max_message: usize = 2 * 1024 * 1024;
 
 pub const Opcode = enum(u4) {
     continuation = 0x0,
@@ -290,6 +290,18 @@ test "non-minimal length encodings are rejected" {
     // 64-bit length carrying a value that fits in 16 bits.
     var buf = [_]u8{ 0x82, 0xff, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0 };
     try std.testing.expectError(error.Protocol, parseHeader(&buf));
+}
+
+test "native relay batches fit through the two MiB carrier boundary" {
+    for ([_]usize{ 20 * (64 * 1024 + 8), 2 * 1024 * 1024 }) |len| {
+        var buf: [14]u8 = @splat(0);
+        buf[0] = 0x82;
+        buf[1] = 0xff;
+        std.mem.writeInt(u64, buf[2..10], len, .big);
+        const header = (try parseHeader(&buf)).header;
+        try std.testing.expectEqual(len, header.payload_len);
+        try std.testing.expectEqual(buf.len, header.header_len);
+    }
 }
 
 test "oversized payloads are refused before allocation" {

@@ -2506,6 +2506,77 @@ test "aggregate budget includes retained input and fragment capacity" {
     try std.testing.expectEqual(@as(usize, 8), relay.buffered_bytes);
 }
 
+test "native DATA batches survive whole and fragmented WebSocket messages" {
+    const allocator = std.testing.allocator;
+    const data_len = 64 * 1024;
+    const data_frames = 20;
+    const data_bytes = data_frames * (frame.header_size + data_len);
+    const batch = try allocator.alloc(u8, data_bytes + frame.header_size + 4);
+    defer allocator.free(batch);
+    @memset(batch, 0x5a);
+    for (0..data_frames) |i| {
+        frame.writeHeader(batch[i * (frame.header_size + data_len) ..][0..frame.header_size], .data, 7, data_len);
+    }
+    _ = try frame.serialize(batch[data_bytes..], .window, 8, &frame.windowPayload(1));
+
+    for ([_]bool{ false, true }) |fragmented| {
+        var relay = testRelay(allocator, 8 * 1024 * 1024);
+        defer relay.conns.deinit(allocator);
+        var conn = Conn{ .fd = -1, .kind = .websocket, .peer = net_helpers.ip4(.{ 127, 0, 0, 1 }, 0), .out = .{ .allocator = allocator }, .want_out = true };
+        defer conn.in.deinit(allocator);
+        defer conn.msg.deinit(allocator);
+        defer conn.out.deinit();
+        var closed_ids = [_]u32{7};
+        var session = Session{ .conn = &conn, .user = "test", .client_addr = null, .welcomed = true, .closed_ids = &closed_ids };
+        defer session.streams.deinit(allocator);
+        var neighbor = Stream{ .id = 8, .session = &session };
+        try session.streams.put(allocator, neighbor.id, &neighbor);
+        conn.session = &session;
+        try relay.conns.put(allocator, conn.fd, &conn);
+        try conn.out.appendCopy("x"); // Keep a regression failure off the fake fd.
+        relay.accountConn(&conn);
+
+        // Late DATA is legal; the final WINDOW witnesses complete batch delivery.
+        // Fragment in the middle of a relay frame to exercise actual reassembly.
+        const parts = if (fragmented)
+            [_][]const u8{ batch[0..frame.max_payload], batch[frame.max_payload..] }
+        else
+            [_][]const u8{ batch, "" };
+        for (parts, 0..) |part, i| {
+            if (part.len == 0) continue;
+            var head: [ws.max_server_header + 4]u8 = @splat(0);
+            const encoded = try ws.writeHeader(&head, !fragmented or i == 1, if (i == 0) .binary else .continuation, part.len);
+            head[1] |= 0x80; // Four zero mask bytes leave the payload unchanged.
+            try relay.appendInput(&conn, head[0 .. encoded.len + 4], false);
+            try relay.appendInput(&conn, part, false);
+        }
+        relay.processWsBuffer(&conn);
+        try std.testing.expect(!conn.close_after_flush);
+        try std.testing.expect(!conn.msg_active);
+        try std.testing.expectEqual(@as(usize, 0), conn.in.items.len);
+        try std.testing.expectEqual(@as(usize, 0), conn.msg.items.len);
+        try std.testing.expectEqual(frame.initial_stream_window + 1, neighbor.send_window);
+        try std.testing.expectEqual(conn.in.capacity + conn.msg.capacity + conn.out.retainedBytes(), relay.buffered_bytes);
+    }
+}
+
+test "fragment storage retains the two MiB cap and charges its full capacity" {
+    const allocator = std.testing.allocator;
+    var relay = testRelay(allocator, 4 * 1024 * 1024);
+    var conn = Conn{ .fd = -1, .kind = .websocket, .peer = net_helpers.ip4(.{ 127, 0, 0, 1 }, 0), .out = .{ .allocator = allocator } };
+    defer conn.msg.deinit(allocator);
+    const payload = try allocator.alloc(u8, 2 * 1024 * 1024);
+    defer allocator.free(payload);
+    @memset(payload, 0);
+    try relay.appendInput(&conn, payload, true);
+    try std.testing.expectEqual(payload.len, conn.msg.capacity);
+    try std.testing.expectEqual(conn.msg.capacity, relay.buffered_bytes);
+    try std.testing.expectError(error.BufferBudgetExceeded, relay.appendInput(&conn, "x", true));
+    try std.testing.expectEqual(payload.len, conn.msg.items.len);
+    try std.testing.expectEqual(payload.len, conn.msg.capacity);
+    try std.testing.expectEqual(conn.msg.capacity, relay.buffered_bytes);
+}
+
 fn publicNotModified(request: *const http.Request, etag: []const u8) bool {
     const condition = request.header("if-none-match") orelse return false;
     return std.mem.eql(u8, condition, etag) or std.mem.eql(u8, condition, "*");
