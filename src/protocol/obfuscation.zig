@@ -35,14 +35,29 @@ pub const ObfuscationParams = struct {
     /// Datacenter index (signed: negative = test DC)
     dc_idx: i16,
 
-    /// Try to parse obfuscation params from a 64-byte handshake.
+    /// Try to parse a direct-obfuscated 64-byte handshake, filtering reserved prefixes.
     /// Tries each secret; returns params + matched username on success.
     pub fn fromHandshake(
         handshake: *const [constants.handshake_len]u8,
         secrets: []const UserSecret,
-    ) ?struct { params: ObfuscationParams, user: []const u8 } {
+    ) ?HandshakeResult {
         if (!isValidNonce(handshake)) return null;
+        return parseHandshake(handshake, secrets);
+    }
 
+    /// Parse only after FakeTLS has authenticated this user. TLS-wrapped nonces
+    /// have arbitrary random prefixes; key derivation and tag validation still apply.
+    pub fn fromAuthenticatedFakeTls(
+        handshake: *const [constants.handshake_len]u8,
+        authenticated_user: *const UserSecret,
+    ) ?HandshakeResult {
+        return parseHandshake(handshake, authenticated_user[0..1]);
+    }
+
+    fn parseHandshake(
+        handshake: *const [constants.handshake_len]u8,
+        secrets: []const UserSecret,
+    ) ?HandshakeResult {
         // Extract decrypt prekey (bytes 8..40) and IV (bytes 40..56)
         const dec_prekey_iv = handshake[constants.skip_len .. constants.skip_len + constants.prekey_len + constants.iv_len];
         const dec_prekey = dec_prekey_iv[0..constants.prekey_len];
@@ -132,6 +147,11 @@ pub const ObfuscationParams = struct {
 pub const UserSecret = struct {
     name: []const u8,
     secret: [16]u8,
+};
+
+pub const HandshakeResult = struct {
+    params: ObfuscationParams,
+    user: []const u8,
 };
 
 /// Check if a 64-byte nonce is valid (doesn't match reserved patterns).
@@ -353,6 +373,53 @@ test "fromHandshake rejects reserved nonce even when encrypted tag is valid" {
     try std.testing.expect(ObfuscationParams.fromHandshake(&reserved, &secrets) == null);
 }
 
+test "authenticated FakeTLS accepts reserved prefixes without bypassing key and tag checks" {
+    const secret: [16]u8 = @splat(0x11);
+    const users = [_]UserSecret{.{ .name = "alice", .secret = secret }};
+    const wrong = UserSecret{ .name = "wrong", .secret = @as([16]u8, @splat(0xa5)) };
+    const baseline = buildTestClientHandshakeFields(0x42, secret, .secure, -203, 0x1234);
+    var expected = ObfuscationParams.fromHandshake(&baseline, &users) orelse return error.TestExpectedEqual;
+    defer expected.params.wipe();
+    const prefix_count = constants.reserved_nonce_beginnings.len;
+    for (0..prefix_count + 2) |i| {
+        var handshake = baseline;
+        defer std.crypto.secureZero(u8, &handshake);
+        if (i == 0) {
+            handshake[0] = 0xef;
+        } else if (i <= prefix_count) {
+            @memcpy(handshake[0..4], &constants.reserved_nonce_beginnings[i - 1]);
+        } else {
+            @memset(handshake[4..8], 0);
+        }
+        try std.testing.expect(ObfuscationParams.fromHandshake(&handshake, &users) == null);
+        var parsed = ObfuscationParams.fromAuthenticatedFakeTls(&handshake, &users[0]) orelse return error.TestExpectedEqual;
+        defer parsed.params.wipe();
+        try std.testing.expectEqualStrings("alice", parsed.user);
+        try std.testing.expectEqual(constants.ProtoTag.secure, parsed.params.proto_tag);
+        try std.testing.expectEqual(@as(i16, -203), parsed.params.dc_idx);
+        try std.testing.expectEqualSlices(u8, &expected.params.decrypt_key, &parsed.params.decrypt_key);
+        try std.testing.expectEqualSlices(u8, &expected.params.encrypt_key, &parsed.params.encrypt_key);
+        try std.testing.expectEqual(expected.params.decrypt_iv, parsed.params.decrypt_iv);
+        try std.testing.expectEqual(expected.params.encrypt_iv, parsed.params.encrypt_iv);
+        try std.testing.expect(ObfuscationParams.fromAuthenticatedFakeTls(&handshake, &wrong) == null);
+        handshake[constants.proto_tag_pos] ^= 0x80; // Decrypts to an unknown tag.
+        try std.testing.expect(ObfuscationParams.fromAuthenticatedFakeTls(&handshake, &users[0]) == null);
+    }
+}
+
+test "direct obfuscation accepts the PUT prefix allowed by client nonce generation" {
+    const secret: [16]u8 = @splat(0x11);
+    const users = [_]UserSecret{.{ .name = "alice", .secret = secret }};
+    var handshake = buildTestClientHandshake(0x42, secret);
+    defer std.crypto.secureZero(u8, &handshake);
+    @memcpy(handshake[0..4], &[_]u8{ 'P', 'U', 'T', ' ' });
+    try std.testing.expect(isValidNonce(&handshake));
+    var parsed = ObfuscationParams.fromHandshake(&handshake, &users) orelse return error.TestExpectedEqual;
+    defer parsed.params.wipe();
+    try std.testing.expectEqual(constants.ProtoTag.intermediate, parsed.params.proto_tag);
+    try std.testing.expectEqual(@as(i16, 2), parsed.params.dc_idx);
+}
+
 test "prepareTgNonce - intermediate tag" {
     var nonce: [64]u8 = @splat(0x00);
     prepareTgNonce(&nonce, constants.ProtoTag.intermediate, null);
@@ -394,6 +461,10 @@ test "fuzz obfuscated handshake parsing" {
             };
 
             if (ObfuscationParams.fromHandshake(&handshake, &secrets)) |parsed| {
+                var params = parsed.params;
+                params.wipe();
+            }
+            if (ObfuscationParams.fromAuthenticatedFakeTls(&handshake, &secrets[0])) |parsed| {
                 var params = parsed.params;
                 params.wipe();
             }

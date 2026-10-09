@@ -2667,12 +2667,12 @@ const EventLoop = struct {
     }
 
     fn finishClientHandshake(self: *EventLoop, slot: *ConnectionSlot) void {
-        var known_secret = [_]obfuscation.UserSecret{.{
+        var known_secret = obfuscation.UserSecret{
             .name = slot.validation_user[0..slot.validation_user_len],
             .secret = slot.validation_secret,
-        }};
-        defer std.crypto.secureZero(u8, &known_secret[0].secret);
-        var result = obfuscation.ObfuscationParams.fromHandshake(&slot.handshake_buf, &known_secret) orelse {
+        };
+        defer std.crypto.secureZero(u8, &known_secret.secret);
+        var result = obfuscation.ObfuscationParams.fromAuthenticatedFakeTls(&slot.handshake_buf, &known_secret) orelse {
             self.closeSlot(slot, "bad mtproto obfuscation handshake");
             return;
         };
