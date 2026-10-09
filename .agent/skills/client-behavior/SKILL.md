@@ -5,7 +5,7 @@ description: Version-pinned Telegram client connection behavior notes for proxy 
 
 # MTProto Client Behavior Matrix
 
-Use this skill when behavior differs by platform (iOS/Android/Desktop) or when tuning handshake/relay expectations.
+Use this skill when behavior differs by platform (iOS/Android/Desktop/macOS) or when tuning handshake/relay expectations.
 
 ## Evidence Policy
 
@@ -155,6 +155,46 @@ Proxy implications:
 - Candidate racing and early cancellation are expected patterns.
 - Keep reconnect path cheap and avoid blocking work in event loop callbacks.
 - Non-32-byte TLS Session IDs are not supported by the current FakeTLS template; investigate client-side TLS shape first if Desktop auth suddenly masks instead of authenticating.
+
+## Native WEB Bridge Batching
+
+Source-backed bridge snapshots, separate from the historical TCP profiles above:
+
+- Android `12.10.6 (7112)`, commit `f2908b14133bbffbf7ab04f641ecb5bfaf533242`:
+  the WebView posts a binary ArrayBuffer to one carrier executor, and `processFrames`
+  loops over every complete frame in it. Individual payloads are limited to 1 MiB.
+- Desktop `v7.3.0`, commit `42f8a36d43b8c805bc821905bea4cfeb3af1d41d`:
+  the shared native script encodes binary messages as base64 with a one-byte prefix.
+  `kMaxMessageBytes = 2 MiB` limits that encoded string on Windows and macOS, not
+  decoded bytes. After a lone WELCOME, the transport parses all frames in each message.
+  Its pinned macOS `lib_webview` backend forwards the same script strings through
+  `WKScriptMessageHandler`.
+- The iOS `release-13.0.0` Swift carrier pinned above also has a macOS WebKit path.
+  It accepts up to 2 MiB of decoded binary data; its frame decoder loops over the
+  complete frames, with at most 4096 decoded frames per append. This is evidence for
+  that shared implementation, not a version claim for every separate macOS app.
+
+Proxy implications:
+
+- Keep native downlink groups at complete frame boundaries with a 64 KiB target.
+  A single larger frame may retain its original 1 MiB payload plus 8-byte header;
+  its base64 form and Desktop prefix still fit the encoded 2 MiB limit. Never pass
+  arbitrary 2 MiB raw batches to Desktop's native bridge.
+- Validate the whole WebSocket message before any native delivery, keep WELCOME
+  alone, preserve DATA/WINDOW/CLOSE ordering, and do not wait for another message.
+  The loopback-iframe path still transfers the whole original buffer.
+- This reduces native calls for batches of small frames. It is not evidence of a
+  measured throughput, latency or battery improvement on any client platform.
+
+References:
+
+- https://github.com/DrKLO/Telegram/blob/f2908b14133bbffbf7ab04f641ecb5bfaf533242/TMessagesProj/src/main/java/org/telegram/utils/proxy/WebProxyTransport.java#L531
+- https://github.com/DrKLO/Telegram/blob/f2908b14133bbffbf7ab04f641ecb5bfaf533242/TMessagesProj/src/main/java/org/telegram/utils/proxy/WebProxyTransport.java#L580
+- https://github.com/telegramdesktop/tdesktop/blob/42f8a36d43b8c805bc821905bea4cfeb3af1d41d/Telegram/SourceFiles/mtproto/web_proxy/web_proxy_webview.cpp#L28
+- https://github.com/telegramdesktop/tdesktop/blob/42f8a36d43b8c805bc821905bea4cfeb3af1d41d/Telegram/SourceFiles/mtproto/web_proxy/web_proxy_transport.cpp#L973
+- https://github.com/desktop-app/lib_webview/blob/d6e2e0b8b171a104cd7b63bd351f056563e964b0/webview/platform/mac/webview_mac.mm#L307
+- https://github.com/TelegramMessenger/Telegram-iOS/blob/f1dd7a2dbd02cbbf513e75d5695d8d36d1cf5838/submodules/WebProxyTransport/Sources/WebProxyWebViewCarrier.swift#L222
+- https://github.com/TelegramMessenger/Telegram-iOS/blob/f1dd7a2dbd02cbbf513e75d5695d8d36d1cf5838/submodules/WebProxyTransport/Sources/WebProxyFrame.swift#L100
 
 ## Practical Checklist
 

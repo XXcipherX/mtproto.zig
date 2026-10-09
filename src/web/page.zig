@@ -41,7 +41,7 @@ const bridge_token_var =
 
 const bridge_script_body =
     \\;
-    \\var QUEUE_BYTES=33554432,QUEUE_ITEMS=16384,MAX_FRAME=1048576,MAX_FRAMES=4096;
+    \\var QUEUE_BYTES=33554432,QUEUE_ITEMS=16384,MAX_FRAME=1048576,MAX_FRAMES=4096,NATIVE_BATCH_BYTES=65536;
     \\var client=null,nativeBridge=null,ws=null,wsReady=false,adopted=false,dead=false;
     \\// Keep bounded pre-WELCOME payload references for retry. Browser send() only
     \\// queues bytes locally; it does not prove the relay parsed HELLO. If it did parse
@@ -90,21 +90,34 @@ const bridge_script_body =
     \\}
     \\function fail(){finish(true)}
     \\function knownType(value){return value===1||value===2||value===3||value===4||value===5||value===6||value===16||value===17||value===18||value===19||value===31}
-    \\function splitFrames(value){
+    \\function inspectFrames(value){
     \\ var view=new DataView(value),result=[],offset=0;
     \\ while(offset<value.byteLength){
     \\  if(value.byteLength-offset<8||result.length>=MAX_FRAMES)throw new Error("invalid frame batch");
     \\  var type=view.getUint8(offset),size=view.getUint32(offset+4),end=offset+8+size;
     \\  if(!knownType(type)||size>MAX_FRAME||end>value.byteLength)throw new Error("invalid frame");
-    \\  result.push({type:type,id:(view.getUint8(offset+1)<<16)|(view.getUint8(offset+2)<<8)|view.getUint8(offset+3),size:size,data:value.slice(offset,end)});
+    \\  result.push({type:type,id:(view.getUint8(offset+1)<<16)|(view.getUint8(offset+2)<<8)|view.getUint8(offset+3),size:size,end:end});
     \\  offset=end;
     \\ }
     \\ if(!result.length)throw new Error("empty frame batch");
     \\ return result;
     \\}
+    \\function deliverNative(value,frames){
+    \\ // Forward an existing small batch without copying or waiting for more bytes.
+    \\ if(value.byteLength<=NATIVE_BATCH_BYTES||frames.length===1){client.binary(value);return}
+    \\ // Group larger batches up to 64 KiB at frame boundaries. A single
+    \\ // frame may still carry 1 MiB; even its base64 form fits Desktop's 2 MiB cap.
+    \\ var start=0,end=0;
+    \\ for(var i=0;i<frames.length;i++){
+    \\  var next=frames[i].end;
+    \\  if(end>start&&next-start>NATIVE_BATCH_BYTES){client.binary(value.slice(start,end));start=end}
+    \\  end=next;
+    \\ }
+    \\ client.binary(value.slice(start,end));
+    \\}
     \\function deliver(value){
     \\ var frames;
-    \\ try{frames=splitFrames(value)}catch(e){fail();return}
+    \\ try{frames=inspectFrames(value)}catch(e){fail();return}
     \\ reconcileSocketQueue();
     \\ if(!adopted){
     \\  if(frames.length!==1||frames[0].type!==17||frames[0].id!==0||frames[0].size!==0){fail();return}
@@ -112,7 +125,7 @@ const bridge_script_body =
     \\ }
     \\ down+=value.byteLength;
     \\ try{
-    \\  if(client.native)for(var i=0;i<frames.length;i++)client.binary(frames[i].data);
+    \\  if(client.native)deliverNative(value,frames);
     \\  else client.binary(value);
     \\ }catch(e){fail()}
     \\}

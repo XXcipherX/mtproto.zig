@@ -645,9 +645,17 @@ Every inbound relay message is validated completely before its first stream/wind
 mutation; client control frames are restricted to HELLO before adoption and PONG after
 it, and 4096 deduplicated closed-stream tombstones make valid late DATA/WINDOW/CLOSE
 races harmless without permitting stream-id reuse. Pre-adoption browser reconnects
-replay the initial handshake only once. The nonce-CSP bridge validates/splits downlink
-batches, bounds both bytes and outstanding items, closes on `pagehide`, and strictly
-validates native and loopback-iframe initialization. A missing WebSocket `Origin` is
+replay the initial handshake only once. The nonce-CSP bridge validates the entire
+downlink message before delivery. Native bridges receive existing batches in groups
+of at most 64 KiB at complete frame boundaries, without a batching timer; a larger
+single frame retains its 1 MiB payload limit. Small batches and standalone frames
+reuse the original buffer, reducing native calls and buffer copies. Each group's
+base64 representation also fits Telegram Desktop's 2 MiB native-message limit on
+Windows and macOS; the shared Swift iOS/macOS carrier and Android accept multiple
+frames per message. Loopback-iframe delivery retains the whole message and transfers
+its buffer. WELCOME remains the sole frame of the first message. The bridge bounds
+outbound bytes and outstanding items, closes on `pagehide`, and strictly validates
+native and loopback-iframe initialization. A missing WebSocket `Origin` is
 accepted for native WebViews; if supplied it must be the exact same origin and may not
 be duplicated.
 

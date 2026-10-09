@@ -227,6 +227,14 @@ Trust is fixed from the kernel-reported peer at `accept()`: only loopback plus e
   WebView isolation limits access to off-origin response data but is not a promise that
   every browser engine emits no off-origin packet. Keep the fork's empty Caddy 404 when
   no operator public directory is configured, not an upstream generated cover page.
+- Native downlink delivery groups already-received complete frames up to 64 KiB,
+  without waiting or joining separate WebSocket messages. Validate every frame and
+  the 4096-frame limit before the first native call; a malformed tail must deliver no
+  prefix. Reuse the original buffer for a small batch or a standalone frame. A single
+  frame may still carry 1 MiB and must remain separate when it exceeds the group target;
+  this preserves the old frame limit and fits Desktop's 2 MiB base64-string cap.
+  Preserve byte/frame order, lone initial WELCOME, and whole-buffer transfer on the
+  loopback-iframe path. Incoming 2 MiB C2S batches do not define a native S2C limit.
 - Caddy must proxy the whole WEB hostname to the relay rather than selecting
   carrier-looking paths before authentication. Strip its outer `Via` header, map relay
   failures to the common empty 404, and accept only the exact root or base-prefixed

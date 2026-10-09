@@ -46,6 +46,7 @@ function boot(opts) {
   const toClient = [];
   const parentWindow = {};
   let initReceiverReady = false;
+  let binaryCalls = 0;
 
   class FakeWebSocket {
     constructor(url, protocol) {
@@ -78,12 +79,14 @@ function boot(opts) {
       this.bufferedAmount = 0;
       const data = this.binaryType === 'arraybuffer' ? new Uint8Array(buf).buffer : { blob: Buffer.from(buf) };
       if (this.onmessage) this.onmessage({ data });
+      return data;
     }
   }
 
   const bridge = {
     _receiver: null,
     postMessage(v) {
+      if (v instanceof ArrayBuffer && ++binaryCalls === opts.throwBinaryAt) throw new Error('native delivery failed');
       toClient.push(v);
       if (typeof v === 'string' && JSON.parse(v).t === 'tproxy-android-init') {
         initReceiverReady = typeof this._receiver === 'function';
@@ -224,6 +227,13 @@ cases['iframe fallback'] = (t) => {
   const bins = port.posted.filter(m => m instanceof ArrayBuffer).map(m => Buffer.from(m));
   t.ok(bins.length === 1 && bins[0].equals(WELCOME), 'WELCOME returned through the port');
 
+  const batch = Buffer.concat([frame(0x02, 7, Buffer.alloc(1024 * 1024)), frame(0x02, 8, Buffer.alloc(1024 * 1024 - 16))]);
+  const transferred = p.sockets[0].deliver(batch);
+  const after = port.posted.filter(m => m instanceof ArrayBuffer).map(m => Buffer.from(m));
+  t.eq(after.length, 2, 'iframe fallback keeps the whole batch in one port message');
+  t.ok(after[1].equals(batch), 'iframe batch is unchanged');
+  t.eq(transferred.byteLength, 0, 'iframe delivery still transfers the original buffer');
+
   // On this path control messages are objects, not JSON strings.
   const ctrl = port.posted.filter(m => m && m.t);
   t.ok(ctrl.every(m => typeof m === 'object'), 'control messages are objects here');
@@ -242,21 +252,26 @@ cases['garbage never throws'] = (t) => {
   t.ok(true, 'handler survived garbage');
 };
 
-cases['native downlink batches become validated single frames'] = (t) => {
+cases['native downlink forwards a validated batch without copying or waiting'] = (t) => {
   const p = boot({ native: true });
   p.sockets[0].open();
   p.sockets[0].deliver(WELCOME);
   const ping = frame(0x05, 0, Buffer.from('x'));
   const bye = frame(0x1f, 0);
-  p.sockets[0].deliver(Buffer.concat([ping, bye]));
+  const batch = Buffer.concat([ping, bye]);
+  const received = p.sockets[0].deliver(batch);
   const bins = p.binaries();
-  t.eq(bins.length, 3, 'native bridge receives one complete frame per message');
+  t.eq(bins.length, 2, 'native bridge receives one message for the complete batch');
   t.ok(bins[0].equals(WELCOME), 'WELCOME remains its own first message');
-  t.ok(bins[1].equals(ping) && bins[2].equals(bye), 'batch is split at frame boundaries');
+  t.ok(bins[1].equals(batch), 'batch preserves every frame and its order');
+  t.eq(p.toClient.filter(m => m instanceof ArrayBuffer).at(-1), received, 'small native batch reuses the original buffer');
+  t.eq(p.timers.length, 0, 'native delivery does not add a batching timer');
 
-  p.sockets[0].deliver(frame(0x05, 0, Buffer.from('bad')).subarray(0, 9));
-  t.eq(p.binaries().length, 3, 'partial frame is not delivered');
-  t.ok(p.controls().some(c => c.state === 'failed'), 'partial frame fails closed');
+  const prefix = frame(0x02, 7, Buffer.alloc(64 * 1024));
+  const partial = frame(0x05, 0, Buffer.from('bad')).subarray(0, 9);
+  p.sockets[0].deliver(Buffer.concat([prefix, partial]));
+  t.eq(p.binaries().length, 2, 'malformed tail prevents delivery of even a large valid prefix');
+  t.ok(p.controls().some(c => c.state === 'failed'), 'partial batch fails closed');
 
   const bad = boot({ native: true });
   bad.sockets[0].open();
@@ -265,12 +280,69 @@ cases['native downlink batches become validated single frames'] = (t) => {
   t.ok(bad.controls().some(c => c.state === 'failed'), 'invalid first downlink fails closed');
 };
 
+cases['native batches split at complete frame boundaries above 64 KiB'] = (t) => {
+  const p = boot({ native: true });
+  p.sockets[0].open();
+  p.sockets[0].deliver(WELCOME);
+  const data = frame(0x02, 7, Buffer.alloc(32760, 0x31));
+  const window = frame(0x04, 7, Buffer.from([0, 1, 0, 0]));
+  const other = frame(0x02, 8, Buffer.alloc(32748, 0x32));
+  const close = frame(0x03, 7);
+  const head = Buffer.concat([data, window, other]);
+  const batch = Buffer.concat([head, close]);
+  p.sockets[0].deliver(batch);
+  const bins = p.binaries().slice(1);
+  t.eq(bins.length, 2, 'large batch needs only two native messages');
+  t.eq(bins[0].length, 64 * 1024, 'batch exactly at the target includes its frame headers');
+  t.ok(bins[0].equals(head) && bins[1].equals(close), 'split preserves DATA, WINDOW and CLOSE order');
+  t.ok(Buffer.concat(bins).equals(batch), 'no byte is dropped or duplicated at the split');
+};
+
+cases['native batching preserves standalone full-size DATA frames'] = (t) => {
+  const p = boot({ native: true });
+  p.sockets[0].open();
+  p.sockets[0].deliver(WELCOME);
+  const ordinary = frame(0x02, 7, Buffer.alloc(64 * 1024, 0x33));
+  const received = p.sockets[0].deliver(ordinary);
+  t.ok(p.binaries().at(-1).equals(ordinary), '64 KiB payload plus its header is delivered intact');
+  t.eq(p.toClient.filter(m => m instanceof ArrayBuffer).at(-1), received, 'single DATA frame needs no buffer copy');
+
+  const ping = frame(0x05, 0, Buffer.from('x'));
+  const full = frame(0x02, 8, Buffer.alloc(1024 * 1024, 0x34));
+  const tail = Buffer.concat([frame(0x04, 8, Buffer.from([0, 1, 0, 0])), frame(0x03, 8)]);
+  const batch = Buffer.concat([ping, full, tail]);
+  p.sockets[0].deliver(batch);
+  const bins = p.binaries().slice(2);
+  t.eq(bins.length, 3, 'oversized standalone frame is kept separate from both neighboring groups');
+  t.ok(bins[0].equals(ping) && bins[1].equals(full) && bins[2].equals(tail), '1 MiB frame retains its payload and neighboring frame order');
+  for (const bin of bins) {
+    t.ok(bin.length <= 2 * 1024 * 1024, 'decoded message fits the shared Swift iOS/macOS bridge');
+    t.ok(1 + bin.toString('base64').length <= 2 * 1024 * 1024, 'base64 message and prefix fit Desktop on Windows/macOS');
+  }
+  t.ok(Buffer.concat(bins).equals(batch), 'large frame splitting preserves every byte');
+};
+
+cases['native delivery failure stops the remaining batch'] = (t) => {
+  const p = boot({ native: true, throwBinaryAt: 3 });
+  p.sockets[0].open();
+  p.sockets[0].deliver(WELCOME);
+  const prefix = frame(0x02, 7, Buffer.alloc(64 * 1024));
+  const next = frame(0x02, 8, Buffer.alloc(64 * 1024));
+  p.sockets[0].deliver(Buffer.concat([prefix, next, frame(0x03, 7)]));
+  t.eq(p.binaries().length, 2, 'native failure prevents delivery of the remaining groups');
+  t.ok(p.binaries()[1].equals(prefix), 'successfully delivered group is unchanged');
+  t.eq(p.sockets[0].readyState, 3, 'native failure closes the carrier');
+  t.ok(p.controls().some(c => c.state === 'failed'), 'native failure is reported');
+  t.eq(p.bridge.onmessage, null, 'native failure detaches the client handler');
+};
+
 cases['downlink rejects unknown oversized and excessive frames'] = (t) => {
   const unknown = boot({ native: true });
   unknown.sockets[0].open();
   unknown.sockets[0].deliver(WELCOME);
-  unknown.sockets[0].deliver(frame(0x7f, 0));
+  unknown.sockets[0].deliver(Buffer.concat([frame(0x05, 0), frame(0x7f, 0)]));
   t.eq(unknown.sockets[0].readyState, 3, 'unknown relay type closes the carrier');
+  t.eq(unknown.binaries().length, 1, 'unknown tail is rejected before the valid prefix is delivered');
 
   const oversized = boot({ native: true });
   oversized.sockets[0].open();
@@ -286,6 +358,15 @@ cases['downlink rejects unknown oversized and excessive frames'] = (t) => {
   excessive.sockets[0].deliver(WELCOME);
   excessive.sockets[0].deliver(Buffer.concat(Array.from({ length: 4097 }, () => frame(0x05, 0))));
   t.eq(excessive.sockets[0].readyState, 3, 'batch above 4096 frames closes the carrier');
+  t.eq(excessive.binaries().length, 1, 'excessive batch is rejected before any native delivery');
+
+  const maximum = boot({ native: true });
+  maximum.sockets[0].open();
+  maximum.sockets[0].deliver(WELCOME);
+  const batch = Buffer.concat(Array.from({ length: 4096 }, () => frame(0x05, 0)));
+  maximum.sockets[0].deliver(batch);
+  t.eq(maximum.binaries().length, 2, 'exactly 4096 complete frames fit one native batch');
+  t.ok(maximum.binaries()[1].equals(batch), 'maximum-count batch preserves every frame');
 };
 
 cases['native fragment nonce is exact canonical shape'] = (t) => {
