@@ -32,7 +32,7 @@ pub const ObfuscationParams = struct {
     encrypt_iv: u128,
     /// Protocol tag (abridged/intermediate/secure)
     proto_tag: constants.ProtoTag,
-    /// Datacenter index (signed: negative = test DC)
+    /// Datacenter index (negative = media; test DCs add 10000 before the sign).
     dc_idx: i16,
 
     /// Try to parse a direct-obfuscated 64-byte handshake, filtering reserved prefixes.

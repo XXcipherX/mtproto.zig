@@ -129,7 +129,7 @@ from a low-level module into `EventLoop`.
 3. On valid auth:
 - Builds fake `ServerHello` from template.
 - `desync=false` by default sends the complete fake ServerHello without an intentional pause. Explicit `desync=true` splits it into `1 byte + delay/jitter + rest` (3–5 ms with default timing). `TCP_NODELAY` is configured immediately after admission for either mode.
-4. Proxy assembles 64-byte MTProto obfuscation handshake from TLS appdata records. Extra client appdata bytes pipelined after the nonce are buffered up to one max TLS ciphertext and forwarded after upstream setup.
+4. Proxy assembles 64-byte MTProto obfuscation handshake from TLS appdata records. After FakeTLS HMAC/replay validation, `fromAuthenticatedFakeTls` permits arbitrary nonce prefixes and parses only with the authenticated user's secret. Extra client appdata bytes pipelined after the nonce are buffered up to one max TLS ciphertext and forwarded after upstream setup.
 5. Proxy derives MTProto crypto params and chooses upstream strategy:
 - Direct DC path.
 - MiddleProxy path (`use_middle_proxy=true` and endpoint available).
@@ -182,20 +182,25 @@ logging overhead.
 Historical idle/TLS-auth capacity probes and the one-connection process E2E
 prove different, narrower properties; neither substitutes for this suite.
 
-## WEB Proxy Flow (Telegram Desktop 7.1+)
+## WEB Proxy Flow (Telegram Desktop 7.1+ and Telegram iOS 13.0)
 
-1. Telegram Desktop opens a browser HTTPS carrier to `[web].domain` on public `:443`; with the default `[web].only=false`, ordinary FakeTLS clients continue to use the same listener with `censorship.tls_domain`.
+1. Telegram Desktop or iOS opens a browser HTTPS carrier to `[web].domain` on public `:443`; with the default `[web].only=false`, ordinary FakeTLS clients continue to use the same listener with `censorship.tls_domain`.
 2. The proxy recognizes the WEB SNI with a bounds-checked routing parser that is independent of FakeTLS key-share/cipher policy, then relays the untouched TLS connection to `[web].mask_backend`, prefixing PROXY v2 with the kernel-reported browser address.
 3. The existing Caddy service terminates TLS and sends the entire WEB hostname through one loopback relay handler; it does not route on unauthenticated carrier-looking paths and removes the reverse-proxy `Via` header.
 4. The permanent secret-derived capability authenticates only the exact canonical bridge bootstrap. That response mints a bounded, short-lived token carried solely as `Sec-WebSocket-Protocol: tproxy-v1.<token>` on the exact WebSocket path, never in its URL. Empty `[web].base_path` keeps root v1 routes; a non-empty path moves both routes below `/<base_path>/` and uses the v2 HMAC context bound to hostname + exact case-sensitive path. Ordinary requests use the optional startup-loaded `[web].public_dir` or the fork's bodyless 404; a genuine capability in a malformed request always fails closed.
 5. Every logical stream connects back to `[web].backend`, prefixes PROXY v2 with the browser address, and carries the client's `dd` direct-obfuscated MTProto stream into the normal DC/MiddleProxy routing path.
+
+Source-backed iOS 13.0: MtProtoKit and Rust share the Swift WEB carrier; Rust uses raw streams with explicit consumption/backpressure callbacks. One carrier serves the accounts of one application process. Keep engine-specific watchdogs separate; see the pinned sources and profiles in `client-behavior/SKILL.md`.
 
 Trust is fixed from the kernel-reported peer at `accept()`: only loopback plus explicit `[web].relay_sources` may enter the direct-obfuscated path. A PROXY header may replace the diagnostic/client address but must never grant trust. When both `[web].enabled` and `[web].only` are true, every untrusted peer reaching the ordinary FakeTLS SNI is sent to the normal Caddy masking backend before secret validation, including clients holding a formerly valid direct link; the trusted relay remains admitted. `only` is inert when WEB is disabled. WEB-domain masking carriers and authenticated MTProto relays are exempt from `mask_relay_max_secs`. Ordinary masking/probe relays default to a 300-second absolute cap from admission, independent of activity and sliding idle timeout; explicit zero disables the cap and explicit nonzero values are preserved. Source/Compose installers and the Docker entrypoint omit this key, inheriting the runtime default while retaining existing operator settings.
 
 ## WEB Relay Invariants (upstream PR #429 adaptation)
 
 - WEB backend queues fit the full 4 MiB granted stream window plus PROXY-v2 metadata.
-  Incoming WebSocket messages fit a maximum 1 MiB relay payload plus its frame header.
+  Incoming WebSocket messages and fragment reassembly are capped at 2 MiB total,
+  including all relay headers; each relay payload stays capped at 1 MiB and each
+  message at 4096 frames. Input and fragment capacity are charged independently
+  against the existing aggregate budget. Keep these limits distinct.
 - The relay accounts retained input, fragment, batch and queue allocations, including
   queue blocks, freelists and pointer capacities. Growth is reserved before allocation
   and drained idle capacity is reclaimed. `web.max_buffer_mb` is not a whole-process RSS
@@ -367,7 +372,15 @@ allocation, vector or process failures still fail the job.
 - Ordinary `desync=false` ServerHello uses the heap-owned worker's fixed scratch, sized from `max(X25519 prefix, PQ prefix) + max_fake_cert_size` (17610 bytes). Allocating and into builders share the existing framing, canonical X25519 generation, cipher/session echo and HMAC implementation. The synchronous client queue owns any unsent suffix before scratch wiping/reuse; only explicit desync retains `slot.server_hello` across callbacks, using the existing timer and cleanup phases.
 - `fake_cert_size=0` resolves once in `ProxyState.init` to a random size in 2400..3600, then the shared template fixes it for every classical/PQ connection and worker. Explicit nonzero sizes take priority and retain the 256..16384 clamp. This range is a fallback heuristic, not evidence of a masking-origin match or anti-DPI effectiveness; per-response AppData randomization remains intact. The legacy 2878-byte static helper/fixture is not the runtime zero-setting policy, and no backend profiling/probing is added.
 - Anti-replay cache compares the full canonical HMAC digest, retains entries for the maximum FakeTLS timestamp-validity horizon, and replaces the oldest entry in a saturated bounded probe window so cache pressure cannot masquerade as a proven replay.
-- MTProto obfuscation rejects reserved nonces before decrypting protocol tags. Secret trials decrypt only the AES block containing tag/DC (`48..64`, tag at block offset 8, DC at 12), deriving its start/index from protocol constants and checking their common-block layout at comptime. `AesCtr` counters are big-endian u128 with wrapping addition, so the trial starts at `IV +% 3`; returned traffic params keep the original IV. `finishParsedClientHandshake` still advances the client decryptor by four blocks; no trial state escapes into traffic.
+- Direct-obfuscated MTProto, including trusted WEB streams, rejects protocol-reserved
+  nonce prefixes before decrypting tags. `PUT ` is not a reserved client prefix.
+  Authenticated FakeTLS instead calls `fromAuthenticatedFakeTls` with its already
+  authenticated user; arbitrary nonce prefixes do not bypass key/tag or subsequent
+  DC checks. Peer trust and PROXY metadata alone must never select this parser.
+  Both paths share secret trials over the AES block containing tag/DC (`48..64`,
+  tag at block offset 8, DC at 12), with comptime layout checks. Big-endian CTR
+  counters use wrapping `IV +% 3`; traffic params retain the original IV.
+  `finishParsedClientHandshake` still skips four blocks; no trial state escapes.
 - Unknown MTProto DC indices are rejected before endpoint planning; modulo fallback is not part of the connection path.
 - Masking target selection for unauthenticated clients: `mask_port=443` resolves every address for `tls_domain:443` in the background, prefers IPv4, and fails over across candidates; non-443 `mask_port` connects to a local address on that port (`127.0.0.1` in the init namespace, `10.200.200.1` inside the tunnel netns). Hostname candidates are re-resolved hourly.
 - Config parsing is strict for proxy-owned sections/keys and malformed lines; `[monitor].host`/`port` remain accepted for the external dashboard. Config load errors propagate as a non-zero process exit.

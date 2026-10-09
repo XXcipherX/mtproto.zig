@@ -21,34 +21,66 @@ Current FakeTLS and MTProto handshake assumptions:
 
 - ClientHello Session ID must be exactly 32 bytes; the proxy echoes it in the synthetic ServerHello. Authentication retains its strict parser's cipher and selected key share: PQ `0x11ec` (1216 client bytes) has priority over X25519 `0x001d` (32 bytes), and no supported share goes to masking. This is the proxy's acceptance contract, not a new platform behavior claim. WEB SNI routing keeps its independent bounds-checked walker for unrelated extensions.
 - The 64-byte MTProto obfuscation nonce may be split across TLS appdata records.
+- Reserved-prefix filtering applies to direct-obfuscated streams, including WEB backends. FakeTLS uses `fromAuthenticatedFakeTls` only after HMAC/replay validation, permitting arbitrary random prefixes while retaining authenticated-user key/tag and DC checks.
 - Extra client appdata bytes after that 64-byte nonce may arrive in the same TLS record; the proxy buffers them and forwards them after upstream setup.
 
 ## iOS (Telegram iOS)
 
 Version snapshot:
 
-- Repo/tag: `TelegramMessenger/Telegram-iOS` `build-26855`
-- Commit: `b16d9acdffa9b3f88db68e26b77a3713e87a92e3`
+- Repo/tag: `TelegramMessenger/Telegram-iOS` `release-13.0.0`
+- Commit: `f1dd7a2dbd02cbbf513e75d5695d8d36d1cf5838`
+- Embedded Rust engine: `macosswift/mtproto-engine` `0de759a36cbb50c1e98560c1ffa38590d317b0fc`, C ABI 3. Check this iOS submodule pin when reading other engine revisions; the C ABI is not the proxy wire protocol.
 
-Source-backed behavior:
+Source-backed MtProtoKit behavior:
 
 - TCP connect timeout: `12s`
 - Response watchdog base: `MTMinTcpResponseTimeout = 12.0`
 - Response timeout includes payload-dependent term and resets on partial reads
 - Incoming message confirmations may be queued for a later transaction rather than producing an immediate client write, so a short server→client silence alone is not proof of a wedge
 - Transport-level watchdog: `20s`
-- Reconnect backoff: `1s`, then `4s`, then `8s`
+- Reconnect backoff: first retry is immediate, followed by `1s`, `4s`, then `8s` tiers
 
 References:
 
-- https://github.com/TelegramMessenger/Telegram-iOS/blob/b16d9acdffa9b3f88db68e26b77a3713e87a92e3/submodules/MtProtoKit/Sources/MTTcpConnection.m#L980
-- https://github.com/TelegramMessenger/Telegram-iOS/blob/b16d9acdffa9b3f88db68e26b77a3713e87a92e3/submodules/MtProtoKit/Sources/MTTcpConnection.m#L576
-- https://github.com/TelegramMessenger/Telegram-iOS/blob/b16d9acdffa9b3f88db68e26b77a3713e87a92e3/submodules/MtProtoKit/Sources/MTTcpConnection.m#L1339
-- https://github.com/TelegramMessenger/Telegram-iOS/blob/b16d9acdffa9b3f88db68e26b77a3713e87a92e3/submodules/MtProtoKit/Sources/MTTcpConnection.m#L1398
-- https://github.com/TelegramMessenger/Telegram-iOS/blob/b16d9acdffa9b3f88db68e26b77a3713e87a92e3/submodules/MtProtoKit/Sources/MTTcpTransport.m#L312
-- https://github.com/TelegramMessenger/Telegram-iOS/blob/b16d9acdffa9b3f88db68e26b77a3713e87a92e3/submodules/MtProtoKit/Sources/MTTcpConnectionBehaviour.m#L66
+- https://github.com/TelegramMessenger/Telegram-iOS/blob/f1dd7a2dbd02cbbf513e75d5695d8d36d1cf5838/submodules/MtProtoKit/Sources/MTTcpConnection.m#L1127
+- https://github.com/TelegramMessenger/Telegram-iOS/blob/f1dd7a2dbd02cbbf513e75d5695d8d36d1cf5838/submodules/MtProtoKit/Sources/MTTcpConnection.m#L677
+- https://github.com/TelegramMessenger/Telegram-iOS/blob/f1dd7a2dbd02cbbf513e75d5695d8d36d1cf5838/submodules/MtProtoKit/Sources/MTTcpConnection.m#L1416
+- https://github.com/TelegramMessenger/Telegram-iOS/blob/f1dd7a2dbd02cbbf513e75d5695d8d36d1cf5838/submodules/MtProtoKit/Sources/MTTcpConnection.m#L1475
+- https://github.com/TelegramMessenger/Telegram-iOS/blob/f1dd7a2dbd02cbbf513e75d5695d8d36d1cf5838/submodules/MtProtoKit/Sources/MTProto.m#L1037
+- https://github.com/TelegramMessenger/Telegram-iOS/blob/f1dd7a2dbd02cbbf513e75d5695d8d36d1cf5838/submodules/MtProtoKit/Sources/MTTcpTransport.m#L312
+- https://github.com/TelegramMessenger/Telegram-iOS/blob/f1dd7a2dbd02cbbf513e75d5695d8d36d1cf5838/submodules/MtProtoKit/Sources/MTTcpConnectionBehaviour.m#L66
 
-Field-capture behavior:
+Source-backed WEB behavior shared by MtProtoKit and Rust:
+
+- Both engines use the same Swift carrier and relay framing; Rust supplies an already obfuscated raw MTProto stream with explicit consumption/backpressure callbacks.
+- Relay headers are 8 bytes, individual payloads are capped at 1 MiB, DATA is emitted in 64 KiB chunks, and native batches may reach 2 MiB including headers and 4096 frames. Both sides start with 4 MiB of credit per logical stream. Keep the message cap separate from the per-frame cap.
+- One carrier serves all accounts in an application process. Carrier reconnect uses exponential delay from 1 to 30 seconds plus jitter, independently of the legacy TCP backoff above.
+- Root/path capability HMAC contexts and marked base-path secrets match Desktop. The native bridge still uses the historical `android` fragment name; do not rename it for iOS.
+
+Source-backed optional Rust behavior:
+
+- In the pinned engine, online/previously busy read-disconnect delay is `3.5 * max(1.5 * RTT + 1, 2)` seconds; the online main-session ping-disconnect delay uses multiplier `2.5`. Offline/non-busy read-disconnect and other ping-disconnect paths use `135s + jitter`. These are not MtProtoKit's fixed response-watchdog base.
+- `RustCarrierStreams` still uses a 12-second raw-stream open timeout. Distinguish opening the WEB stream from an established MTProto response watchdog.
+- FakeTLS nonce generation permits arbitrary random prefixes. Direct-obfuscated generation excludes `0xef`, seven reserved first words and zero bytes 4..8; `PUT ` is not excluded.
+- On iOS, the Debug Settings engine choice applies at the next launch; live engine switching is macOS-only. Preserve MtProtoKit as a separate profile rather than assigning Rust's timers to it.
+
+References:
+
+- https://github.com/TelegramMessenger/Telegram-iOS/blob/f1dd7a2dbd02cbbf513e75d5695d8d36d1cf5838/submodules/WebProxyTransport/Sources/WebProxyFrame.swift#L3
+- https://github.com/TelegramMessenger/Telegram-iOS/blob/f1dd7a2dbd02cbbf513e75d5695d8d36d1cf5838/submodules/WebProxyTransport/Sources/WebProxyWebViewCarrier.swift#L139
+- https://github.com/TelegramMessenger/Telegram-iOS/blob/f1dd7a2dbd02cbbf513e75d5695d8d36d1cf5838/submodules/WebProxyTransport/Sources/WebProxyDemandSet.swift#L3
+- https://github.com/TelegramMessenger/Telegram-iOS/blob/f1dd7a2dbd02cbbf513e75d5695d8d36d1cf5838/submodules/WebProxyTransport/Sources/WebProxyTransport.swift#L331
+- https://github.com/TelegramMessenger/Telegram-iOS/blob/f1dd7a2dbd02cbbf513e75d5695d8d36d1cf5838/submodules/WebProxyTransport/Sources/WebProxyConfiguration.swift#L198
+- https://github.com/TelegramMessenger/Telegram-iOS/blob/f1dd7a2dbd02cbbf513e75d5695d8d36d1cf5838/submodules/MTProtoRustEngine/Sources/MTProtoRustEngine/RustCarrierStreams.swift#L15
+- https://github.com/TelegramMessenger/Telegram-iOS/blob/f1dd7a2dbd02cbbf513e75d5695d8d36d1cf5838/submodules/MTProtoRustEngine/Sources/MTProtoRustEngine/RustEngineRuntime.swift#L161
+- https://github.com/TelegramMessenger/Telegram-iOS/blob/f1dd7a2dbd02cbbf513e75d5695d8d36d1cf5838/submodules/TelegramCore/Sources/Network/Network.swift#L658
+- https://github.com/macosswift/mtproto-engine/blob/0de759a36cbb50c1e98560c1ffa38590d317b0fc/crates/mtproto-core/src/session/mod.rs#L1267
+- https://github.com/macosswift/mtproto-engine/blob/0de759a36cbb50c1e98560c1ffa38590d317b0fc/crates/mtproto-core/src/transport/obfuscation.rs#L23
+
+Field-capture behavior (historical MtProtoKit sessions, not Rust captures):
+
+The earlier source snapshot was `build-26855`, commit `b16d9acdffa9b3f88db68e26b77a3713e87a92e3`; retain these observations as historical context rather than evidence of Rust behavior.
 
 - Pre-warms multiple idle sockets.
 - Can split the 64-byte obfuscation handshake across TLS records.
@@ -60,6 +92,7 @@ Proxy implications:
 - Continue assembling MTProto handshake until full 64 bytes are collected.
 - Preserve pipelined appdata after the 64-byte MTProto nonce; some clients can send early payload without waiting for a separate relay read.
 - Do not treat short idle prewarmed sockets as protocol failure.
+- The existing 12-second recovery eligibility window derives from MtProtoKit and remains an engine-agnostic proxy heuristic. Do not describe it as Rust's watchdog or infer the client engine from timing; the relay carries opaque encrypted bytes.
 - Keep proxy-side wedge recovery limited to generic DC relays and treat it as an encrypted-stream heuristic. The relay cannot identify the client platform, so the enabled rule applies to the same timing pattern from any client. A request must reach upstream, a response must begin inside the source-backed 12-second window, and the response must drain to the client before silence timing starts. Any client progress cancels the candidate. Every recovery shares the internal per-real-IP/access-user/DC `T`/`2T`/`4T` budget; after those three waves, use normal idle timeout for 30 minutes from the most recent actual breaker close, without extending the cooldown for healthy matching traffic. Exclude media/DC203, masking, half-close, backpressure, and graceful shutdown. A continuation after an earlier delivered reply and at least 30 seconds in relay upgrades the candidate to `proven` for diagnostics, but never bypasses the group budget.
 
 ## Android (Telegram Android)

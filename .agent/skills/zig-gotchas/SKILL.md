@@ -215,7 +215,7 @@ processes after changing shared access settings.
 
 - Replay detection compares the full canonical HMAC digest even when the hash-table key collides. Its retention horizon must cover every still-valid FakeTLS timestamp, while saturation must never be reported as a proven replay.
 - `prepareTgNonce` accepts exactly a 48-byte key+IV pointer, MiddleProxy KDF rejects inputs that exceed its fixed transcript buffer, and unknown DC indices are rejected before routing.
-- Reserved MTProto obfuscation nonces are rejected before protocol-tag decryption.
+- Direct-obfuscated handshakes reject protocol-reserved nonce prefixes before tag decryption; `PUT ` is not reserved. Only FakeTLS after user HMAC/replay validation may use `fromAuthenticatedFakeTls`, which accepts arbitrary random prefixes with that authenticated user's secret. Trusted WEB streams still use `fromHandshake`; preserve key/tag and subsequent DC validation in both paths.
 - Obfuscated secret trials inspect a single 16-byte AES block, selected from tag/DC layout constants with comptime bounds checks. Use big-endian u128 wrapping counter addition (`IV +% block_index`), wipe trial plaintext/key/cipher state, and return the original traffic IV. Do not propagate the trial's advanced counter into `createDecryptor`; EventLoop separately skips the complete four-block handshake. Keep full-decrypt reference coverage for every tag, signed DC, counter carry/wrap and post-handshake split-call continuity.
 - Direct-user bypass only applies when the name exists in `[access.users]`; unknown names in `[access.direct_users]` warn and are ignored. DC203 is always exempt from the bypass because it has no direct DC endpoint.
 - Duplicate user/direct-user/config string entries are last-write-wins. Direct users accept `false`/`0`/`no` to remove a previous duplicate entry.
@@ -225,6 +225,7 @@ processes after changing shared access settings.
 
 ## Timeout and Lifetime Notes
 
+- The fixed 12-second silence-recovery eligibility window is derived from MtProtoKit, not a universal client watchdog. Optional Rust has RTT-dependent liveness timers; the encrypted relay cannot identify which engine is active. Keep both client profiles in `client-behavior/SKILL.md`.
 - Current runtime enforces a fixed 10-second pre-first-byte timeout, configured handshake timeout after first byte, and configured relay idle timeout.
 - Process shutdown has a separate `graceful_shutdown_timeout_sec` deadline. It is armed in the existing `timerfd`; it is not a per-connection lifetime and must not be lost when slot deadlines or accept backoff are rearmed.
 - iOS silence recovery is an encrypted-stream heuristic, not MTProto parsing: preserve upstream request-delivery accounting, the 12-second response window, client-queue delivery accounting, cancellation on any client progress, fresh-reconnect backoff keyed by real IP/access user/DC, the cooldown anchored to the most recent actual breaker close, one fresh-arm diagnostic per candidate, one proven-arm diagnostic per connection/backoff stage, one suppression diagnostic per logical episode, and exclusions for media/DC203, masking, half-close, backpressure, and graceful shutdown. Diagnostic deduplication must never disable candidate tracking or move its deadline. `client_silence_close_sec` is the only public control; do not reintroduce separate fast-path tuning keys.
