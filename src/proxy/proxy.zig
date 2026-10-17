@@ -3280,21 +3280,17 @@ const EventLoop = struct {
 
             if (slot.middle_ctx) |*mp| {
                 const required = mp.requiredC2sScratchCapacity(data) catch |err| {
-                    log.debug("[{d}] middleproxy pipelined scratch sizing failed: proto={s} pipelined={d} buffered={d} err={any}", .{
-                        slot.conn_id,
-                        @tagName(slot.proto_tag),
-                        data.len,
-                        mp.c2s_len,
-                        err,
-                    });
+                    self.logMiddleProxyError(slot, "pipelined c2s sizing", err, data.len, null);
                     self.closeSlot(slot, "compute middleproxy pipelined scratch failed");
                     return;
                 };
-                const scratch = self.ensureMpC2sScratch(required) catch {
+                const scratch = self.ensureMpC2sScratch(required) catch |err| {
+                    self.logMiddleProxyError(slot, "pipelined c2s scratch", err, data.len, required);
                     self.closeSlot(slot, "alloc middleproxy c2s scratch failed");
                     return;
                 };
-                const out_data = mp.encapsulateC2S(data, scratch) catch {
+                const out_data = mp.encapsulateC2S(data, scratch) catch |err| {
+                    self.logMiddleProxyError(slot, "pipelined c2s parse", err, data.len, required);
                     self.closeSlot(slot, "encapsulate pipelined middleproxy payload failed");
                     return;
                 };
@@ -3424,15 +3420,18 @@ const EventLoop = struct {
         if (slot.client_decryptor) |*decryptor| decryptor.apply(payload);
 
         if (slot.middle_ctx) |*mp| {
-            const required = mp.requiredC2sScratchCapacity(payload) catch {
+            const required = mp.requiredC2sScratchCapacity(payload) catch |err| {
+                self.logMiddleProxyError(slot, "direct c2s sizing", err, payload.len, null);
                 self.closeSlot(slot, "direct obfuscated middleproxy scratch sizing failed");
                 return;
             };
-            const scratch = self.ensureMpC2sScratch(required) catch {
+            const scratch = self.ensureMpC2sScratch(required) catch |err| {
+                self.logMiddleProxyError(slot, "direct c2s scratch", err, payload.len, required);
                 self.closeSlot(slot, "direct obfuscated middleproxy scratch allocation failed");
                 return;
             };
-            const framed = mp.encapsulateC2S(payload, scratch) catch {
+            const framed = mp.encapsulateC2S(payload, scratch) catch |err| {
+                self.logMiddleProxyError(slot, "direct c2s parse", err, payload.len, required);
                 self.closeSlot(slot, "direct obfuscated middleproxy c2s failed");
                 return;
             };
@@ -3479,15 +3478,18 @@ const EventLoop = struct {
 
         const raw = read_buf[0..n];
         if (slot.middle_ctx) |*mp| {
-            const required = mp.requiredS2cScratchCapacity(raw) catch {
+            const required = mp.requiredS2cScratchCapacity(raw) catch |err| {
+                self.logMiddleProxyError(slot, "direct s2c sizing", err, raw.len, null);
                 self.closeSlot(slot, "direct obfuscated middleproxy scratch sizing failed");
                 return;
             };
-            const scratch = self.ensureMpS2cScratch(required) catch {
+            const scratch = self.ensureMpS2cScratch(required) catch |err| {
+                self.logMiddleProxyError(slot, "direct s2c scratch", err, raw.len, required);
                 self.closeSlot(slot, "direct obfuscated middleproxy scratch allocation failed");
                 return;
             };
-            const payload = mp.decapsulateS2C(raw, scratch) catch {
+            const payload = mp.decapsulateS2C(raw, scratch) catch |err| {
+                self.logMiddleProxyError(slot, "direct s2c parse", err, raw.len, required);
                 self.closeSlot(slot, "direct obfuscated middleproxy s2c failed");
                 return;
             };
@@ -4131,6 +4133,15 @@ const EventLoop = struct {
         interest_rdhup.* = want_rdhup;
     }
 
+    fn logMiddleProxyError(self: *const EventLoop, slot: *const ConnectionSlot, stage: []const u8, err: anyerror, input_len: usize, scratch_required: ?usize) void {
+        const mp = if (slot.middle_ctx) |*ctx| ctx else return;
+        log.debug("[{d}] middleproxy {s} failed: err={any} proto={s} input={d} buffered_c2s={d} buffered_s2c={d} frame_limit={d} scratch_required={any} managed={d}/{d}", .{
+            slot.conn_id,                     stage,      err,             @tagName(mp.proto_tag), input_len,
+            mp.c2s_len,                       mp.s2c_len, mp.buffer_limit, scratch_required,       self.managed_buffers.used_bytes,
+            self.managed_buffers.limit_bytes,
+        });
+    }
+
     fn ensureMpC2sScratch(self: *EventLoop, min_capacity: usize) ![]u8 {
         const target_capacity = @max(self.state.config.middleProxyC2sScratchBytes(), min_capacity);
         if (self.mp_c2s_scratch) |buf| {
@@ -4543,9 +4554,18 @@ fn relayClientToUpstreamStep(self: *EventLoop, slot: *ConnectionSlot) !RelayProg
         if (slot.client_decryptor) |*dec| dec.apply(payload);
 
         if (slot.middle_ctx) |*mp| {
-            const required = try mp.requiredC2sScratchCapacity(payload);
-            const scratch = try self.ensureMpC2sScratch(required);
-            const out_data = try mp.encapsulateC2S(payload, scratch);
+            const required = mp.requiredC2sScratchCapacity(payload) catch |err| {
+                self.logMiddleProxyError(slot, "TLS c2s sizing", err, payload.len, null);
+                return err;
+            };
+            const scratch = self.ensureMpC2sScratch(required) catch |err| {
+                self.logMiddleProxyError(slot, "TLS c2s scratch", err, payload.len, required);
+                return err;
+            };
+            const out_data = mp.encapsulateC2S(payload, scratch) catch |err| {
+                self.logMiddleProxyError(slot, "TLS c2s parse", err, payload.len, required);
+                return err;
+            };
             if (out_data.len > 0) {
                 _ = try queueUpstream(slot, out_data);
                 slot.wedge_forwarded_c2s_seq +|= 1;
@@ -4580,9 +4600,18 @@ fn relayUpstreamToClientStep(self: *EventLoop, slot: *ConnectionSlot) !RelayProg
     const raw = read_buf[0..n];
 
     if (slot.middle_ctx) |*mp| {
-        const required = try mp.requiredS2cScratchCapacity(raw);
-        const scratch = try self.ensureMpS2cScratch(required);
-        const payload = try mp.decapsulateS2C(raw, scratch);
+        const required = mp.requiredS2cScratchCapacity(raw) catch |err| {
+            self.logMiddleProxyError(slot, "TLS s2c sizing", err, raw.len, null);
+            return err;
+        };
+        const scratch = self.ensureMpS2cScratch(required) catch |err| {
+            self.logMiddleProxyError(slot, "TLS s2c scratch", err, raw.len, required);
+            return err;
+        };
+        const payload = mp.decapsulateS2C(raw, scratch) catch |err| {
+            self.logMiddleProxyError(slot, "TLS s2c parse", err, raw.len, required);
+            return err;
+        };
         if (mp.diagnostic_unexpected_proxy_ans_flags) |flags| {
             log.debug("[{d}] accepting advisory middle-proxy response flags: dc_idx={d} mp_flags=0x{x} proto={s} ad_tag={}", .{
                 slot.conn_id,

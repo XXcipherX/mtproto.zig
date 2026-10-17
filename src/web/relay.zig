@@ -833,9 +833,17 @@ pub const Relay = struct {
             self.io_budget = &budget;
             defer self.io_budget = null;
             conn.batch_pending = false;
-            self.flushBatch(conn) catch self.closeConn(conn, "carrier batch write failed");
+            self.flushBatch(conn) catch |err| self.closeConnError(conn, "carrier batch write failed", err);
         }
         self.batch_fds.clearRetainingCapacity();
+    }
+
+    fn closeConnError(self: *Relay, conn: *Conn, reason: []const u8, err: anyerror) void {
+        log.debug("{s}: err={any} kind={s} input={d} fragments={d} batch={d} queued={d} retained={d}/{d}", .{
+            reason,               err,                @tagName(conn.kind), conn.in.items.len,          conn.msg.items.len,
+            conn.batch.items.len, conn.out.total_len, self.buffered_bytes, self.opts.max_buffer_bytes,
+        });
+        self.closeConn(conn, reason);
     }
 
     fn closeConn(self: *Relay, conn: *Conn, reason: []const u8) void {
@@ -1045,8 +1053,8 @@ pub const Relay = struct {
             self.closeConn(conn, "client closed");
             return;
         }
-        self.appendInput(conn, self.read_buf[0..n], false) catch {
-            self.closeConn(conn, "out of memory");
+        self.appendInput(conn, self.read_buf[0..n], false) catch |err| {
+            self.closeConnError(conn, "HTTP input buffer failed", err);
             return;
         };
         self.processHttpBuffer(conn);
@@ -1260,8 +1268,8 @@ pub const Relay = struct {
         }
         conn.close_after_flush = !keep_alive;
         const payload = if (head_only) "" else body;
-        const drained = self.writePair(conn, writer.buffered(), payload) catch {
-            self.closeConn(conn, "response write failed");
+        const drained = self.writePair(conn, writer.buffered(), payload) catch |err| {
+            self.closeConnError(conn, "response write failed", err);
             return;
         };
         // A short response usually leaves nothing queued, so no EPOLLOUT would ever
@@ -1342,8 +1350,8 @@ pub const Relay = struct {
         conn.deadline_ms = 0;
         self.session_count += 1;
 
-        _ = self.writePair(conn, head, "") catch {
-            self.closeConn(conn, "upgrade write failed");
+        _ = self.writePair(conn, head, "") catch |err| {
+            self.closeConnError(conn, "upgrade write failed", err);
             return;
         };
         // Whether the real client address survived the masking hop is the one thing an
@@ -1445,8 +1453,8 @@ pub const Relay = struct {
             self.closeConn(conn, "websocket closed by peer");
             return;
         }
-        self.appendInput(conn, self.read_buf[0..n], false) catch {
-            self.closeConn(conn, "out of memory");
+        self.appendInput(conn, self.read_buf[0..n], false) catch |err| {
+            self.closeConnError(conn, "WebSocket input buffer failed", err);
             return;
         };
         if (conn.session) |session| session.last_rx_ms = nowMs();
@@ -1508,8 +1516,8 @@ pub const Relay = struct {
                 }
                 var head: [ws.max_server_header]u8 = undefined;
                 const framing = ws.writeHeader(&head, true, .pong, payload.len) catch return;
-                _ = self.writePair(conn, framing, payload) catch {
-                    self.closeConn(conn, "pong write failed");
+                _ = self.writePair(conn, framing, payload) catch |err| {
+                    self.closeConnError(conn, "pong write failed", err);
                     return;
                 };
                 self.syncConn(conn);
@@ -1545,8 +1553,8 @@ pub const Relay = struct {
             self.failCarrier(conn, ws.close_message_too_big, "fragmented message too large");
             return;
         }
-        self.appendInput(conn, payload, true) catch {
-            self.closeConn(conn, "out of memory");
+        self.appendInput(conn, payload, true) catch |err| {
+            self.closeConnError(conn, "WebSocket fragment buffer failed", err);
             return;
         };
         conn.msg_active = !header.fin;
@@ -1786,8 +1794,8 @@ pub const Relay = struct {
         if (conn.close_after_flush) return error.CarrierClosed;
         if (kind != .welcome and kind != .bye) {
             if (conn.batch.items.len + frame.header_size + payload.len > data_frame_size or conn.batch_frames >= frame.max_batch_frames) {
-                self.flushBatch(conn) catch {
-                    self.closeConn(conn, "carrier batch write failed");
+                self.flushBatch(conn) catch |err| {
+                    self.closeConnError(conn, "carrier batch write failed", err);
                     return error.CarrierClosed;
                 };
             }
@@ -1804,8 +1812,8 @@ pub const Relay = struct {
             }
             var relay_header: [frame.header_size]u8 = undefined;
             frame.writeHeader(&relay_header, kind, stream_id, @intCast(payload.len));
-            self.reserveByteList(&conn.batch, relay_header.len + payload.len, ws.max_message) catch {
-                self.closeConn(conn, "out of memory");
+            self.reserveByteList(&conn.batch, relay_header.len + payload.len, ws.max_message) catch |err| {
+                self.closeConnError(conn, "carrier batch reserve failed", err);
                 return error.CarrierClosed;
             };
             conn.batch.appendSliceAssumeCapacity(&relay_header);
@@ -1814,8 +1822,8 @@ pub const Relay = struct {
             self.accountConn(conn);
             return;
         }
-        self.flushBatch(conn) catch {
-            self.closeConn(conn, "carrier batch write failed");
+        self.flushBatch(conn) catch |err| {
+            self.closeConnError(conn, "carrier batch write failed", err);
             return error.CarrierClosed;
         };
         var head: [ws.max_server_header + frame.header_size]u8 = undefined;
@@ -1829,8 +1837,8 @@ pub const Relay = struct {
             self.closeConn(conn, "carrier queue limit exceeded");
             return error.CarrierClosed;
         }
-        _ = self.writePair(conn, prefix, payload) catch {
-            self.closeConn(conn, "carrier write failed");
+        _ = self.writePair(conn, prefix, payload) catch |err| {
+            self.closeConnError(conn, "carrier write failed", err);
             return error.CarrierClosed;
         };
         self.syncConn(conn);
@@ -1983,8 +1991,8 @@ pub const Relay = struct {
         var buf: [64]u8 = undefined;
         const header = proxy_protocol.buildV2(&buf, session.client_addr, self.opts.backend);
         const before = conn.out.total_len;
-        _ = self.writePair(conn, header, "") catch {
-            self.closeConn(conn, "proxy header write failed");
+        _ = self.writePair(conn, header, "") catch |err| {
+            self.closeConnError(conn, "proxy header write failed", err);
             return;
         };
         // Only the part that landed in the queue can later look like a drain, so only
@@ -2008,8 +2016,8 @@ pub const Relay = struct {
         }
         const fd = conn.fd;
         const before = conn.out.total_len;
-        _ = self.writePair(conn, data, "") catch {
-            self.closeConn(conn, "backend write failed");
+        _ = self.writePair(conn, data, "") catch |err| {
+            self.closeConnError(conn, "backend write failed", err);
             return;
         };
         self.creditDrainWith(conn, before + data.len);

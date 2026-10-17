@@ -234,6 +234,10 @@ Trust is fixed from the kernel-reported peer at `accept()`: only loopback plus e
   queue blocks, freelists and pointer capacities. Growth is reserved before allocation
   and drained idle capacity is reclaimed. `web.max_buffer_mb` is not a whole-process RSS
   limit; unrelated metadata and kernel socket buffers remain outside it.
+- Preserve concrete buffer/parser errors in debug diagnostics before teardown.
+  WEB budget rejection is not allocator OOM; MiddleProxy framing, output-scratch,
+  and managed-allocation failures must retain their error name and numeric context.
+  Keep payloads, capabilities, tokens and secrets out of these messages.
 - DATA/WINDOW frames batch within an event-loop pass; timer-generated frames flush
   before waiting again. WebSocket input compacts once per read pass and processing
   stops after CLOSE. Recently closed stream IDs use a fixed 4096-entry bounded circular

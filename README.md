@@ -958,6 +958,12 @@ On startup, the proxy uses the lower of host RAM and every visible limit from th
 
 The memory estimate uses the effective total limit, not current `MemAvailable` or the cgroup `memory.high` throttle boundary. Numeric zero is a real hard limit in both cgroup v1 and v2. The main proxy's managed pool and the separate WEB relay's retained-buffer budget do not cover total stack RSS; leave headroom for other allocations, Caddy, kernel memory and other services.
 
+Buffer failures at debug level retain the concrete error name and current sizes.
+WEB `BufferBudgetExceeded` indicates a capacity/budget refusal; MiddleProxy logs
+also identify the framing or scratch stage and managed usage. Allocator
+`OutOfMemory` can reflect the managed budget, so correlate it with
+`memory_pressure` before attributing it to exhausted host RAM.
+
 User secrets and `tg://`/`t.me` links are redacted from the daemon banner by default so they do not enter journald or container logs. Use the one-shot `--print-links` mode in a private terminal to load the config, print the links, and exit before opening the listener. The existing `--show-secrets` flag remains available for an intentional foreground daemon run with secrets included in its startup banner.
 
 Validate TOML syntax and cross-field semantics without opening a listener:

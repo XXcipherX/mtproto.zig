@@ -70,6 +70,16 @@ Note:
 - A `phase=mask_relaying` close reports `mask_cause`, the client IP without its source port, and `raw_c2s`/`raw_s2c` (raw bytes queued toward and received from the mask backend). `reason` describes how that relay later ended; `mask_cause` records why it entered masking in the first place. `web_carrier` is the expected WEB-domain path; `sni_mismatch`, `secret_mismatch`, `timestamp_skew`, `replay`, `invalid_session_id`, and `malformed_client_hello` isolate ordinary FakeTLS rejection classes without repeating HMAC work. A `timestamp_skew` line also carries `skew_s=<server timestamp - authenticated client timestamp>`; positive means the client timestamp is behind the server and negative means it is ahead.
 - A healthy WEB carrier logs `web session opened ... (client address: real)` in the relay. `loopback` there means the browser address was not preserved through the Caddy/PROXY-v2 hop; inspect `[web].mask_backend`, Caddy listener wrappers, `X-Forwarded-For`, and `[web].trusted_http_sources`. That HTTP-terminator list is intentionally separate from data-plane `[web].relay_sources`.
 - WEB stream failures should be correlated across `mtproto-web-relay` and the main proxy. The relay opens one backend connection per logical stream, so those streams also appear in the proxy's ordinary connection and close statistics.
+- At debug level, `middleproxy <stage> failed` preserves `err`, `proto`, incoming
+  byte count, both buffered lengths, `frame_limit`, optional `scratch_required`, and
+  `managed=used/limit`. `MiddleProxyBufferOverflow` or `BadMiddleProxyFrameLen` is a
+  framing limit/rejection; `OutBufOverflow` concerns output scratch. An allocator
+  `OutOfMemory` can reflect the managed hard budget or the underlying allocator;
+  correlate it with `memory_pressure` denials instead of assuming host RAM exhaustion.
+- WEB buffer/write failures retain the exact `err` plus input, fragment, batch and
+  queued lengths and `retained=used/limit`. `BufferBudgetExceeded` is a configured
+  capacity/budget refusal, distinct from allocator `OutOfMemory` and socket errors.
+  These diagnostics contain counts and error names, never payloads or credentials.
 - In WEB-only mode, `web_only: direct clients masked+=N` counts external peers sent to Caddy instead of MTProto. It does not count trusted relay streams. If relay streams are also rejected, verify that `[web].backend` reaches the proxy from loopback or an explicit `[web].relay_sources` address; a PROXY header cannot grant trust.
 - `graceful shutdown started` means listener interest is already disabled while existing connections drain. `graceful shutdown complete` is a natural drain; `graceful shutdown timeout reached` means the remaining slots were force-closed. A second signal intentionally produces `forcing immediate shutdown`.
 
