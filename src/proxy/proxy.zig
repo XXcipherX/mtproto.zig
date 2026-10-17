@@ -149,7 +149,7 @@ fn webOnlyMasksPeer(web_only: bool, trusted_peer: bool) bool {
 const tunnel_mask_gateway_ip = "10.200.200.1";
 const min_nofile_soft: usize = 65535;
 const mp_handshake_frame_buf_size = middle_proxy_handshake.frame_buf_size;
-const relay_read_scratch_size: usize = 32 * 1024;
+const relay_read_scratch_size: usize = limits.relay_read_scratch_bytes;
 const pipelined_initial_capacity: usize = 4096;
 pub const default_managed_buffer_limit_bytes: u64 = 64 * 1024 * 1024;
 const min_worker_managed_bytes: u64 = 8 * 1024 * 1024;
@@ -4151,7 +4151,7 @@ const EventLoop = struct {
     }
 
     fn ensureMpS2cScratch(self: *EventLoop, min_capacity: usize) ![]u8 {
-        const target_capacity = @max(self.state.config.middleProxyBufferBytes(), min_capacity);
+        const target_capacity = @max(self.state.config.middleProxyS2cScratchBytes(), min_capacity);
         if (self.mp_s2c_scratch) |buf| {
             if (buf.len >= target_capacity) return buf;
         }

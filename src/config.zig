@@ -330,7 +330,11 @@ pub const Config = struct {
     }
 
     pub fn middleProxySharedScratchBytes(self: *const Config) usize {
-        return self.middleProxyC2sScratchBytes() + self.middleProxyBufferBytes();
+        return self.middleProxyC2sScratchBytes() + self.middleProxyS2cScratchBytes();
+    }
+
+    pub fn middleProxyS2cScratchBytes(self: *const Config) usize {
+        return self.middleProxyBufferBytes() + proxy_limits.middle_proxy_s2c_scratch_headroom;
     }
 
     pub fn userBypassesMiddleProxy(self: *const Config, user_name: []const u8) bool {
@@ -1195,7 +1199,7 @@ test "middle proxy runtime remains available for mandatory CDN routing" {
 
     try std.testing.expect(cfg.requiresMiddleProxyRuntime());
     try std.testing.expectEqual(@as(usize, 1024 * 1024 + Config.middle_proxy_c2s_scratch_headroom), cfg.middleProxyC2sScratchBytes());
-    try std.testing.expectEqual(@as(usize, 2 * 1024 * 1024 + Config.middle_proxy_c2s_scratch_headroom), cfg.middleProxySharedScratchBytes());
+    try std.testing.expectEqual(@as(usize, 2 * 1024 * 1024 + Config.middle_proxy_c2s_scratch_headroom + proxy_limits.middle_proxy_s2c_scratch_headroom), cfg.middleProxySharedScratchBytes());
 
     cfg.datacenter_override = net.ip4(.{ 127, 0, 0, 1 }, 443);
     try std.testing.expect(!cfg.requiresMiddleProxyRuntime());

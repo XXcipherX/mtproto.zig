@@ -3,6 +3,9 @@
 const std = @import("std");
 
 pub const relay_queue_max_pending_bytes: usize = 4 * 1024 * 1024;
+pub const relay_read_scratch_bytes: usize = 32 * 1024;
+pub const middle_proxy_cbc_lookahead_bytes: usize = 15;
+pub const middle_proxy_s2c_scratch_headroom: usize = relay_read_scratch_bytes + middle_proxy_cbc_lookahead_bytes;
 /// Leave room for MiddleProxy wrapping, TLS headers, and secure padding before
 /// a complete stream payload reaches the relay queue.
 pub const middle_proxy_relay_queue_headroom_bytes: usize = 256 * 1024;
