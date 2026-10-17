@@ -8,7 +8,8 @@ const obfuscation = @import("../protocol/obfuscation.zig");
 const middleproxy = @import("../protocol/middleproxy.zig");
 const middle_proxy_transport = @import("middle_proxy_transport.zig");
 const MessageQueue = @import("message_queue.zig").MessageQueue;
-const WedgeTracker = @import("wedge_recovery.zig").WedgeTracker;
+const wedge_recovery = @import("wedge_recovery.zig");
+const WedgeTracker = wedge_recovery.WedgeTracker;
 
 pub const tls_header_len = 5;
 pub const event_io_byte_budget: usize = 256 * 1024;
@@ -204,6 +205,7 @@ pub const ConnectionSlot = struct {
     validation_digest: [32]u8 = @splat(0),
     validation_session_id: [32]u8 = @splat(0),
     validation_session_id_len: u8 = 0,
+    /// Bounded handshake label, never the identity used for recovery budgets.
     validation_user: [32]u8 = @splat(0),
     validation_user_len: u8 = 0,
     validation_force_direct: bool = false,
@@ -298,6 +300,15 @@ pub const ConnectionSlot = struct {
     client_write_shutdown: bool = false,
     upstream_write_shutdown: bool = false,
     first_relay_eof: ?RelayEofSide = null,
+
+    /// Call after authentication and trusted PROXY address extraction, while the
+    /// complete configured user name is still available in either transport.
+    pub fn setValidatedUser(self: *ConnectionSlot, user: []const u8) void {
+        self.wedge_client_key = wedge_recovery.wedgeClientIdentityKey(self.peer_addr, user);
+        const len = @min(user.len, self.validation_user.len);
+        self.validation_user_len = @intCast(len);
+        @memcpy(self.validation_user[0..len], user[0..len]);
+    }
 
     /// Record only a complete relay-frame EOF. Duplicate notifications and
     /// non-relay phases must not affect the first observed source.
@@ -495,6 +506,23 @@ pub const ConnectionSlot = struct {
         self.upstream_candidate_next = 0;
     }
 };
+
+test "recovery identity retains the full user name after handshake labels are released" {
+    const prefix = "01234567890123456789012345678901";
+    var slot = ConnectionSlot{ .peer_addr = net.ip4(.{ 192, 0, 2, 1 }, 1234) };
+    slot.setValidatedUser(prefix ++ "alice");
+    const alice = slot.wedge_client_key;
+    try std.testing.expectEqualStrings(prefix, slot.validation_user[0..slot.validation_user_len]);
+    slot.setValidatedUser(prefix ++ "bob");
+    try std.testing.expect(alice != slot.wedge_client_key);
+    try std.testing.expectEqualStrings(prefix, slot.validation_user[0..slot.validation_user_len]);
+    slot.peer_addr = net.ip4(.{ 192, 0, 2, 1 }, 5678);
+    slot.setValidatedUser(prefix ++ "alice");
+    try std.testing.expectEqual(alice, slot.wedge_client_key);
+    slot.releaseHandshakeOnly(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 0), slot.validation_user_len);
+    try std.testing.expectEqual(alice, slot.wedge_client_key);
+}
 
 test "relay first EOF survives the opposite FIN and duplicate notifications" {
     var client_first = ConnectionSlot{ .phase = .relaying };

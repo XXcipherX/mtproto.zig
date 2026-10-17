@@ -330,6 +330,10 @@ Important behavior:
 - Cooldown refresh must find an existing endpoint before reusing an earlier inactive
   or expired slot. Promotion clears every matching entry, including legacy duplicates;
   all updates retain the metadata lock and secret-epoch check.
+- Both authenticated ingress paths capture wedge identity from the complete access
+  user name and the resolved real peer IP. The 32-byte validation label is only
+  temporary handshake metadata; never rebuild recovery identity from it. Media/CDN
+  routing disables the captured key, and handshake cleanup preserves generic keys.
 - Tunnel deployment supports `direct`, `preserve`, and `middleproxy` modes.
 
 ## Fast Mode

@@ -83,7 +83,6 @@ pub const queueMemoryBudget = message_queue.queueMemoryBudget;
 const wedge_recovery = @import("wedge_recovery.zig");
 const WedgeGateTicket = wedge_recovery.WedgeGateTicket;
 const WedgeRecoveryGate = wedge_recovery.WedgeRecoveryGate;
-const wedgeClientIdentityKey = wedge_recovery.wedgeClientIdentityKey;
 const security_state = @import("security_state.zig");
 const SubnetRateLimit = security_state.SubnetRateLimit;
 const SecurityState = security_state.SecurityState;
@@ -2351,9 +2350,7 @@ const EventLoop = struct {
         };
         defer result.params.wipe();
 
-        const user_len = @min(result.user.len, slot.validation_user.len);
-        slot.validation_user_len = @intCast(user_len);
-        @memcpy(slot.validation_user[0..user_len], result.user[0..user_len]);
+        slot.setValidatedUser(result.user);
         slot.validation_force_direct = self.state.config.userBypassesMiddleProxy(result.user);
         std.crypto.secureZero(u8, &slot.handshake_buf);
         slot.handshake_pos = 0;
@@ -2467,9 +2464,7 @@ const EventLoop = struct {
         slot.validation_digest = v.digest;
         slot.validation_session_id = v.session_id;
         slot.validation_session_id_len = @intCast(v.session_id.len);
-        const ulen = @min(v.user.len, slot.validation_user.len);
-        slot.validation_user_len = @intCast(ulen);
-        @memcpy(slot.validation_user[0..ulen], v.user[0..ulen]);
+        slot.setValidatedUser(v.user);
         slot.validation_force_direct = self.state.config.userBypassesMiddleProxy(v.user);
 
         const offers_pq = v.key_share == .x25519_mlkem768;
@@ -2725,10 +2720,7 @@ const EventLoop = struct {
         slot.dc_abs = @intCast(dc_abs);
         slot.use_middle_proxy = plan.use_middle_proxy;
         slot.is_media_path = plan.is_media_path;
-        slot.wedge_client_key = if (plan.is_media_path)
-            0
-        else
-            wedgeClientIdentityKey(slot.peer_addr, slot.validation_user[0..slot.validation_user_len]);
+        if (plan.is_media_path) slot.wedge_client_key = 0;
         slot.use_fast_mode = self.state.config.fast_mode and !slot.use_middle_proxy and (dc_abs >= 1 and dc_abs <= constants.tg_datacenters_v4.len);
         slot.direct_fallback_addr = plan.direct_fallback;
         slot.direct_fallback_used = false;
