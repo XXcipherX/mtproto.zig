@@ -1676,17 +1676,22 @@ pub const Relay = struct {
             unique += 1;
         }
         const active_states = states[0..unique];
+        var needs_closed_history = false;
         for (active_states) |*state| {
             if (session.streams.get(state.id)) |stream| {
                 state.exists = true;
                 state.recv_window = stream.recv_window;
+            } else {
+                needs_closed_history = true;
             }
         }
         // Scan bounded history once, searching only the sorted batch IDs.
-        // This costs O(history * log(batch)), rather than one scan per ID.
-        for (session.closed_ids) |id| {
-            if (id == 0) continue;
-            if (validationState(active_states, id)) |state| state.closed = true;
+        // Live IDs cannot be tombstoned: only unknown IDs need this lookup.
+        if (needs_closed_history) {
+            for (session.closed_ids) |id| {
+                if (id == 0) continue;
+                if (validationState(active_states, id)) |state| state.closed = true;
+            }
         }
 
         var semantics = frame.Iterator.init(message);
@@ -2886,6 +2891,39 @@ test "closed streams ignore only well-formed late frames and reject id reuse" {
     try std.testing.expectError(error.Protocol, relay.handleRelayFrame(&session, .{ .type = .close, .stream_id = 7, .payload = "x" }));
     try std.testing.expectError(error.Protocol, relay.handleRelayFrame(&session, .{ .type = .open, .stream_id = 7, .payload = "" }));
     try std.testing.expectEqual(@as(?*Stream, &neighbor), session.streams.get(8));
+}
+
+test "active-only carrier batches skip closed history without skipping transitions" {
+    const allocator = std.testing.allocator;
+    var relay = testRelay(allocator, 1024);
+    var session = Session{ .conn = undefined, .user = "test", .client_addr = null, .welcomed = true };
+    defer session.streams.deinit(allocator);
+    var stream = Stream{ .id = 7, .session = &session };
+    try session.streams.put(allocator, stream.id, &stream);
+    var message: [3 * frame.header_size + 5]u8 = undefined;
+    _ = try frame.serialize(message[0..9], .data, stream.id, "x");
+    _ = try frame.serialize(message[9..21], .window, stream.id, &frame.windowPayload(1));
+    _ = try frame.serialize(message[21..], .close, stream.id, "");
+    validation_comparisons_for_test = 0;
+    try relay.validateCarrierMessage(&session, &message);
+    const without_history = validation_comparisons_for_test;
+    var ids: [closed_history]u32 = undefined;
+    for (&ids, 0..) |*id, i| id.* = @intCast(i + 100);
+    session.closed_ids = &ids;
+    validation_comparisons_for_test = 0;
+    try relay.validateCarrierMessage(&session, &message);
+    try std.testing.expectEqual(without_history, validation_comparisons_for_test);
+    try std.testing.expectEqual(frame.initial_stream_window, stream.recv_window);
+    var close_then_open: [2 * frame.header_size]u8 = undefined;
+    _ = try frame.serialize(close_then_open[0..frame.header_size], .close, stream.id, "");
+    _ = try frame.serialize(close_then_open[frame.header_size..], .open, stream.id, "");
+    try std.testing.expectError(error.Protocol, relay.validateCarrierMessage(&session, &close_then_open));
+    _ = try frame.serialize(message[0..frame.header_size], .close, ids[0], "");
+    validation_comparisons_for_test = 0;
+    try relay.validateCarrierMessage(&session, message[0..frame.header_size]);
+    try std.testing.expect(validation_comparisons_for_test > without_history);
+    _ = try frame.serialize(message[0..frame.header_size], .close, 99, "");
+    try std.testing.expectError(error.Protocol, relay.validateCarrierMessage(&session, message[0..frame.header_size]));
 }
 
 test "validation work stays bounded for IDs colliding in the old table" {
