@@ -3017,6 +3017,8 @@ const EventLoop = struct {
             slot.direct_fallback_used = true;
             countStat(&self.state.stats_mp_fallback);
             slot.use_middle_proxy = false;
+            slot.use_fast_mode = self.state.config.fast_mode and
+                (slot.dc_abs >= 1 and slot.dc_abs <= constants.tg_datacenters_v4.len);
             const fallback = slot.direct_fallback_addr.?;
             const one = [_]net.Address{fallback};
             slot.setUpstreamCandidates(self.state.allocator, &one) catch {
@@ -4881,6 +4883,56 @@ test "middle proxy nonce response failure retries another candidate before direc
     try std.testing.expect(!loop.recoverMiddleProxyFailure(cdn_slot, .endpoint, error.BadMiddleProxyHandshakeResponse));
     try std.testing.expect(isInvalidFd(cdn_slot.upstream_fd));
     try std.testing.expect(!cdn_slot.direct_fallback_used);
+}
+
+test "connect exhaustion restores configured fast mode before starting direct fallback" {
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
+    var cfg = Config{
+        .users = std.StringHashMap([16]u8).init(std.testing.allocator),
+        .direct_users = std.StringHashMap(void).init(std.testing.allocator),
+        .mask = false,
+    };
+    defer cfg.deinit(std.testing.allocator);
+    var state = try ProxyState.init(std.testing.allocator, std.testing.io, cfg);
+    defer state.deinit();
+    var server = try net.listen(net.ip4(.{ 127, 0, 0, 1 }, 0), .{ .kernel_backlog = 8 });
+    defer server.deinit();
+    const fallback = try net.localAddress(server.handle);
+    const control = try createWorkerEventFd();
+    defer closeFd(control);
+    const loop = try EventLoop.init(&state, server.handle, control, 0, 4, default_managed_buffer_limit_bytes, null);
+    defer {
+        loop.deinit();
+        std.testing.allocator.destroy(loop);
+    }
+    for ([_]connection.ClientTransport{ .fake_tls, .direct_obfuscated }) |transport| {
+        for ([_]bool{ false, true }) |fast| {
+            state.config.fast_mode = fast;
+            const slot = loop.pool.acquire() orelse return error.TestUnexpectedResult;
+            defer if (slot.phase != .idle) loop.closeSlot(slot, "fallback test cleanup");
+            slot.phase = .connecting_upstream;
+            slot.client_transport = transport;
+            slot.peer_addr = net.ip4(.{ 127, 0, 0, 1 }, 1234);
+            slot.use_middle_proxy = true;
+            slot.use_fast_mode = false;
+            slot.dc_abs = 4;
+            slot.dc_idx = 4;
+            slot.direct_fallback_addr = fallback;
+            slot.obf_params = .{
+                .decrypt_key = @splat(0),
+                .decrypt_iv = 0,
+                .encrypt_key = @splat(1),
+                .encrypt_iv = 1,
+                .proto_tag = .intermediate,
+                .dc_idx = 4,
+            };
+            try std.testing.expect(loop.tryNextDcEndpoint(slot, error.ConnectionRefused, null));
+            try std.testing.expect(slot.direct_fallback_used and !slot.use_middle_proxy);
+            try std.testing.expectEqual(fast, slot.use_fast_mode);
+            try std.testing.expect(net.exactAddressEql(fallback, slot.current_upstream_addr.?));
+            try std.testing.expect(!loop.tryNextDcEndpoint(slot, error.ConnectionRefused, null));
+        }
+    }
 }
 
 test "ServerHello advances only after the queued bytes are fully written" {

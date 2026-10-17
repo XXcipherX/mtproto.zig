@@ -1333,7 +1333,7 @@ alice = true   # direct where possible; CDN DC203 still requires MiddleProxy
 | `[censorship]` | `desync_split_jitter_ms` | `2` | Random extra delay added to `desync_split_delay_ms` (`0..N` ms per connection), only with `desync=true` |
 | `[censorship]` | `fake_cert_size` | `0` | Fake TLS encrypted-certificate AppData size in bytes. `0` chooses one random size in `2400..3600` at process startup; explicit values take priority and are clamped to `256..16384` |
 | `[censorship]` | `drs` | `false` | Dynamic Record Sizing: start S2C FakeTLS records at 1369 bytes, then use the 16367-byte bulk cap after 8 records or 128 KiB |
-| `[censorship]` | `fast_mode` | `false` | **Recommended** for direct-path traffic. Delegates S2C AES encryption to Telegram DC and reduces proxy CPU/RAM pressure |
+| `[censorship]` | `fast_mode` | `false` | **Recommended** for direct-path traffic, including fallback from MiddleProxy connect or handshake failure. Delegates S2C AES encryption to Telegram DC and reduces proxy CPU/RAM pressure |
 | `[access.users]` | `<name>` | -- | 32 hex-char secret (16 bytes) per user |
 | `[access.direct_users]` | `<name> = true` | _(none)_ | Optional per-user MiddleProxy bypass. `<name>` must match a user from `[access.users]`; the bypass covers regular and media paths with real direct endpoints, without promotion even if a global tag is configured. CDN DC203 always uses its required MiddleProxy. Values `false`/`0`/`no` remove a previous duplicate entry. Alias section: `[access.admins]` |
 

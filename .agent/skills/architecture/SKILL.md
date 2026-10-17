@@ -339,6 +339,9 @@ Important behavior:
 ## Fast Mode
 
 `fast_mode` applies to direct path (non-MiddleProxy) and delegates S2C crypto work to Telegram DC by embedding client S2C key material into outbound nonce flow. MiddleProxy relay stays encapsulated in its own framing/crypto path.
+Restore the configured flag for DC1..5 before starting a direct fallback, both after
+TCP candidate exhaustion and after an RPC handshake failure. Changing it after
+`sendDcNonce` would disagree with the established S2C key material.
 
 For config compatibility, `fast_mode` is accepted in `[general]`, `[server]`, or `[censorship]`; all three set the same `Config.fast_mode` flag.
 
