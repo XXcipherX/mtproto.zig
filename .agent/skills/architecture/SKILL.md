@@ -407,6 +407,10 @@ storage, while 8 deliberately crosses into heap fallback. CI records all four
 signals (FakeTLS plus 1/4/8 candidates) as artifacts without hard timing gates,
 because shared-runner variance must not create false failures. Authentication,
 allocation, vector or process failures still fail the job.
+Soak operation/byte totals are worker-local and merged once through a deferred
+atomic publication, including partial progress on failure. Read totals only after
+joining every worker; stop and error signaling remain atomic. Do not reintroduce
+shared atomic RMW counters into each successful encapsulation.
 
 ## DPI Evasion Components
 

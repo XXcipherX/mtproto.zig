@@ -332,6 +332,16 @@ fn soakWorker(args: WorkerArgs) void {
     defer allocator.free(out_buf);
 
     var rng_state = makeSeed(args.worker_id);
+    var ops: u64 = 0;
+    var in_bytes: u64 = 0;
+    var out_bytes: u64 = 0;
+    // Results are read only after join. Publish once, including on an error
+    // after partial progress, instead of contending on three shared cache lines.
+    defer {
+        _ = args.shared.total_ops.fetchAdd(ops, .monotonic);
+        _ = args.shared.total_in_bytes.fetchAdd(in_bytes, .monotonic);
+        _ = args.shared.total_out_bytes.fetchAdd(out_bytes, .monotonic);
+    }
 
     while (!args.shared.stop.load(.acquire) and runtime_time.monotonicMilli() < args.shared.deadline_ms) {
         const payload_len = nextPayloadLen(&rng_state, args.max_payload);
@@ -343,9 +353,9 @@ fn soakWorker(args: WorkerArgs) void {
             return;
         };
 
-        _ = args.shared.total_ops.fetchAdd(1, .monotonic);
-        _ = args.shared.total_in_bytes.fetchAdd(@as(u64, @intCast(payload_len)), .monotonic);
-        _ = args.shared.total_out_bytes.fetchAdd(@as(u64, @intCast(written)), .monotonic);
+        ops +%= 1;
+        in_bytes +%= @intCast(payload_len);
+        out_bytes +%= @intCast(written);
     }
 }
 

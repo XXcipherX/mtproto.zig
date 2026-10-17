@@ -304,6 +304,9 @@ cannot pass as a complete installation.
 Its `handshake` and `handshake-path` modes additionally print match counts,
 operations per second and a checksum that keeps the measured work observable.
 `soak` prints aggregate `ops/s`, throughput, and `errors`; non-zero errors fail the step.
+Each worker accumulates successful-operation totals locally and publishes once on
+exit; the final report reads them after joining all workers. This avoids per-operation
+contention in the measurement counters.
 
 <details>
 <summary>All Make targets</summary>
