@@ -1914,6 +1914,141 @@ test "maximum-size s2c frame can end inside a CBC block" {
     try std.testing.expect(ctx.s2cAtFrameBoundary());
 }
 
+const TestStreamDirection = enum { c2s, s2c };
+const TestStreamResult = struct { written: usize, boundary: bool, seq: i32 };
+
+fn feedTestStream(direction: TestStreamDirection, proto: constants.ProtoTag, input: []const u8, chunk_size: usize, out: []u8) !TestStreamResult {
+    var ctx = try testStreamContext(proto, 64 * 1024);
+    defer ctx.deinit();
+    var pos: usize = 0;
+    var written: usize = 0;
+    while (pos < input.len) {
+        const end = @min(pos + chunk_size, input.len);
+        written += switch (direction) {
+            .c2s => (try ctx.encapsulateC2S(input[pos..end], out[written..])).len,
+            .s2c => (try ctx.decapsulateS2C(input[pos..end], out[written..])).len,
+        };
+        pos = end;
+    }
+    return .{
+        .written = written,
+        .boundary = if (direction == .c2s) ctx.c2sAtFrameBoundary() else ctx.s2cAtFrameBoundary(),
+        .seq = if (direction == .c2s) ctx.seq_no else ctx.read_seq_no,
+    };
+}
+
+test "c2s output and EOF state are invariant under stream segmentation" {
+    const allocator = std.testing.allocator;
+    const expected = try allocator.alloc(u8, 256 * 1024);
+    defer allocator.free(expected);
+    const actual = try allocator.alloc(u8, expected.len);
+    defer allocator.free(actual);
+    for ([_]constants.ProtoTag{ .abridged, .intermediate, .secure }) |proto| {
+        var input: std.ArrayList(u8) = .empty;
+        defer input.deinit(allocator);
+        for ([_]usize{ 24, 40, 60 * 1024 - 8 }, 0..) |payload_len, i| {
+            const padding: usize = if (proto == .secure) ([_]usize{ 0, 7, 15 })[i] else 0;
+            var header: [4]u8 = undefined;
+            var header_len: usize = 4;
+            if (proto == .abridged) {
+                const words = payload_len / 4;
+                if (words < 127) {
+                    header[0] = @intCast(words);
+                    header_len = 1;
+                } else {
+                    std.mem.writeInt(u32, &header, @as(u32, @intCast(words)) << 8 | 127, .little);
+                }
+                if (i == 1) header[0] |= 0x80;
+            } else {
+                const quickack: u32 = if (i == 1) 0x80000000 else 0;
+                std.mem.writeInt(u32, &header, @as(u32, @intCast(payload_len + padding)) | quickack, .little);
+            }
+            try input.appendSlice(allocator, header[0..header_len]);
+            try input.appendNTimes(allocator, 0x42, payload_len + padding);
+        }
+        for ([_]usize{ 0, 1 }) |missing_tail| {
+            const bytes = input.items[0 .. input.items.len - missing_tail];
+            const reference = try feedTestStream(.c2s, proto, bytes, bytes.len, expected);
+            try std.testing.expectEqual(missing_tail == 0, reference.boundary);
+            try std.testing.expectEqual(@as(i32, if (missing_tail == 0) 1 else 0), reference.seq);
+            for ([_]usize{ 1, 3, 15, 16, 17, 32 * 1024 }) |chunk_size| {
+                const result = try feedTestStream(.c2s, proto, bytes, chunk_size, actual);
+                try std.testing.expectEqual(reference, result);
+                try std.testing.expectEqualSlices(u8, expected[0..reference.written], actual[0..result.written]);
+            }
+        }
+    }
+}
+
+fn expectTestAnswerBodies(proto: constants.ProtoTag, output: []const u8, frame_lengths: []const usize) !void {
+    var rest = output;
+    for (frame_lengths) |frame_len| {
+        var header_len: usize = 4;
+        const declared: usize = if (proto == .abridged) blk: {
+            if (rest[0] < 127) {
+                header_len = 1;
+                break :blk @as(usize, rest[0]) * 4;
+            }
+            break :blk @as(usize, std.mem.readInt(u32, rest[0..4], .little) >> 8) * 4;
+        } else std.mem.readInt(u32, rest[0..4], .little);
+        const payload_len = frame_len - 28;
+        if (proto == .secure) {
+            try std.testing.expect(declared >= payload_len and declared <= payload_len + 3);
+        } else try std.testing.expectEqual(payload_len, declared);
+        try std.testing.expect(rest.len >= header_len + declared);
+        for (rest[header_len..][0..payload_len]) |byte| try std.testing.expectEqual(@as(u8, 0x42), byte);
+        rest = rest[header_len + declared ..];
+    }
+    try std.testing.expectEqual(@as(usize, 0), rest.len);
+}
+
+test "s2c bodies sequence and EOF state are invariant under CBC segmentation" {
+    const allocator = std.testing.allocator;
+    const lengths = [_]usize{ 60 * 1024, 60 * 1024, 52 };
+    const wire = try allocator.alloc(u8, 2 * 60 * 1024 + 64);
+    defer allocator.free(wire);
+    std.mem.writeInt(u32, wire[0..4], 4, .little);
+    var pos: usize = 4;
+    for (lengths, 0..) |len, i| {
+        writeTestProxyAnswer(wire[pos..][0..len], @intCast(i), .{ 1, 2, 3, 4, 5, 6, 7, 8 });
+        pos += len;
+    }
+    while (pos < wire.len) : (pos += 4) std.mem.writeInt(u32, wire[pos..][0..4], 4, .little);
+    const key: [32]u8 = @splat(0);
+    const iv: [16]u8 = @splat(0);
+    var server = crypto.AesCbc.init(&key, &iv);
+    try server.encryptInPlace(wire);
+    const output = try allocator.alloc(u8, wire.len);
+    defer allocator.free(output);
+    for ([_]constants.ProtoTag{ .abridged, .intermediate, .secure }) |proto| {
+        for ([_]usize{ 0, 1 }) |missing_tail| {
+            for ([_]usize{ 1, 15, 16, 17, 32 * 1024, wire.len }) |chunk_size| {
+                const result = try feedTestStream(.s2c, proto, wire[0 .. wire.len - missing_tail], chunk_size, output);
+                const count: usize = if (missing_tail == 0) 3 else 2;
+                try std.testing.expectEqual(@as(i32, @intCast(count)), result.seq);
+                try std.testing.expectEqual(missing_tail == 0, result.boundary);
+                // Secure transport padding is random; compare the recovered
+                // bodies and legal padding bounds, not its incidental bytes.
+                try expectTestAnswerBodies(proto, output[0..result.written], lengths[0..count]);
+            }
+        }
+    }
+}
+
+test "s2c checksum rejection is invariant under input segmentation" {
+    var wire: [32]u8 = undefined;
+    writeTestProxyAnswer(&wire, 0, .{ 1, 2, 3, 4, 5, 6, 7, 8 });
+    wire[31] ^= 1;
+    const key: [32]u8 = @splat(0);
+    const iv: [16]u8 = @splat(0);
+    var server = crypto.AesCbc.init(&key, &iv);
+    try server.encryptInPlace(&wire);
+    var output: [32]u8 = undefined;
+    for ([_]usize{ 1, 15, 16, 17, wire.len }) |chunk_size| {
+        try std.testing.expectError(error.BadMiddleProxyChecksum, feedTestStream(.s2c, .intermediate, &wire, chunk_size, &output));
+    }
+}
+
 test "middle proxy context still enforces configured c2s cap" {
     const allocator = std.testing.allocator;
     const key: [32]u8 = @splat(0);

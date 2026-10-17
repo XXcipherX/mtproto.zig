@@ -299,6 +299,9 @@ saved and `netfilter-persistent` to be enabled, so a live-only firewall setup
 cannot pass as a complete installation.
 
 `zig build test` runs the tests reachable from `src/main.zig` plus `src/bench.zig`. A normal `zig build` installs only `mtproto-proxy`; benchmark execution remains explicit through `bench`/`soak`, and `zig build install-bench` installs `mtproto-bench` when a standalone benchmark binary is needed.
+MiddleProxy regression coverage compares coalesced input with bytewise, CBC-boundary,
+and 32 KiB splits across all three client transports, including near-cap frames,
+partial EOF, and malformed checksums.
 
 `bench` prints per-payload throughput (`in_mib_per_s`, `out_mib_per_s`) and `ns_per_op`.
 Its `handshake` and `handshake-path` modes additionally print match counts,
