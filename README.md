@@ -668,6 +668,8 @@ including writes to other sockets and EINTR retries. Unsent bytes remain owned b
 queues; level-triggered readiness resumes work in the next pass. Deferred batch
 flushes and timer visits get a fresh budget per connection. Backend HUP is drained
 to EOF; while flow control blocks it, the fd is parked until WINDOW or carrier drain.
+If re-arming a backend also fails to notify the carrier, teardown stops that
+session's resume pass immediately.
 Every inbound relay message is validated completely before its first stream/window
 mutation; client control frames are restricted to HELLO before adoption and PONG after
 it, and 4096 deduplicated closed-stream tombstones make valid late DATA/WINDOW/CLOSE

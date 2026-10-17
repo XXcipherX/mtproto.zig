@@ -225,8 +225,11 @@ Trust is fixed from the kernel-reported peer at `accept()`: only loopback plus e
   before waiting again. WebSocket input compacts once per read pass and processing
   stops after CLOSE. Recently closed stream IDs use a fixed 4096-entry bounded circular
   history; duplicate IDs do not evict other tombstones.
-- Deferred fd/object teardown capacity is reserved before publishing a connection,
-  so OOM cannot cause an fd reuse or free inside the current epoll batch.
+- Deferred fd/Conn teardown capacity is reserved before publishing a connection,
+  so OOM cannot cause an fd reuse or Conn free inside the current epoll batch.
+  Sessions and stream maps are freed immediately: backend re-arm can close the
+  carrier re-entrantly, so resume loops and their callers must check carrier liveness
+  before reusing a session or advancing its iterator.
 - `src/web/dns_cache.zig` refreshes hostname backends and WEB Caddy targets every
   minute, preserves the last good snapshot, and joins on shutdown. Literal-only caches
   spawn no thread. Linux uses a five-second-bounded NSS/getent child, with inherited

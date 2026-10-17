@@ -391,6 +391,8 @@ pub const Relay = struct {
     carrier_tokens: tokens.Store = .{},
 
     epoll_fd: posix.fd_t,
+    /// Exercise re-arm failure without issuing an invalid syscall in tests.
+    fail_next_add_fd_for_test: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
     listen_fd: posix.fd_t,
     signal_fd: posix.fd_t,
     old_sigmask: posix.sigset_t,
@@ -579,6 +581,12 @@ pub const Relay = struct {
     /// by flow control avoids repeated half-close hints. An established backend with
     /// unmaskable HUP is removed entirely by sync() until reads can resume.
     fn addFd(self: *Relay, fd: posix.fd_t, want_in: bool, want_out: bool) !void {
+        if (builtin.is_test) {
+            if (self.fail_next_add_fd_for_test) {
+                self.fail_next_add_fd_for_test = false;
+                return error.SystemResources;
+            }
+        }
         var flags: u32 = linux.EPOLL.ERR | linux.EPOLL.HUP;
         if (want_in) flags |= linux.EPOLL.IN | linux.EPOLL.RDHUP;
         if (want_out) flags |= linux.EPOLL.OUT;
@@ -997,17 +1005,24 @@ pub const Relay = struct {
         // A carrier that was above the high-water mark parked every backend feeding it.
         // Nothing else would ever wake them, because their own sockets are quiet.
         if (conn.kind == .websocket and before >= carrier_high_water and conn.out.total_len < carrier_high_water) {
-            if (conn.session) |session| self.resumeBackends(session);
+            if (conn.session) |session| {
+                if (!self.resumeBackends(session)) return;
+            }
         }
         self.syncConn(conn);
     }
 
     /// Re-arm read interest on every backend of a session whose carrier just drained.
-    fn resumeBackends(self: *Relay, session: *Session) void {
+    fn resumeBackends(self: *Relay, session: *Session) bool {
+        const carrier_fd = session.conn.fd;
         var it = session.streams.valueIterator();
         while (it.next()) |stream_ptr| {
             if (stream_ptr.*.conn) |backend| self.syncConn(backend);
+            // A failed re-arm can fail its CLOSE notification too, destroying
+            // the session and its iterator. Only Conn/fd teardown is deferred.
+            if (!self.alive(carrier_fd)) return false;
         }
+        return true;
     }
 
     fn onReadable(self: *Relay, conn: *Conn) void {
@@ -2177,7 +2192,7 @@ pub const Relay = struct {
                 self.closeConn(conn, "carrier silent");
                 continue;
             }
-            if (was_throttled and !self.throttled) self.resumeBackends(session);
+            if (was_throttled and !self.throttled and !self.resumeBackends(session)) continue;
             // Grants recorded while throttled are announced only once the budget allows.
             if (session.needs_window_flush and !self.throttled) {
                 session.needs_window_flush = false;
@@ -2267,6 +2282,74 @@ fn expectQueuedBodylessStatus(conn: *const Conn, status: []const u8) !void {
     try std.testing.expect(std.mem.startsWith(u8, response, prefix));
     try std.testing.expect(std.mem.find(u8, response, "Content-Length: 0\r\n") != null);
     try std.testing.expect(std.mem.endsWith(u8, response, "\r\n\r\n"));
+}
+
+test "backend resume stops when re-arm and CLOSE allocation failures destroy the session" {
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
+    for ([_]bool{ false, true }) |via_tick| {
+        for ([_]usize{ 1, 3 }) |stream_count| {
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+            const allocator = failing.allocator();
+            var relay = testRelay(allocator, 1024 * 1024);
+            relay.opts.max_streams = 32;
+            defer relay.conns.deinit(allocator);
+            defer relay.pending_close.deinit(allocator);
+            defer relay.pending_free.deinit(allocator);
+            defer relay.tick_scratch.deinit(allocator);
+            defer relay.batch_fds.deinit(allocator);
+            try relay.pending_close.ensureTotalCapacity(allocator, stream_count + 1);
+            try relay.pending_free.ensureTotalCapacity(allocator, stream_count + 1);
+            try relay.tick_scratch.ensureTotalCapacity(allocator, stream_count + 1);
+            try relay.conns.ensureTotalCapacity(allocator, @intCast(stream_count + 1));
+            const carrier = try allocator.create(Conn);
+            carrier.* = .{ .fd = -1, .kind = .websocket, .peer = net_helpers.ip4(.{ 127, 0, 0, 1 }, 0), .out = .{ .allocator = allocator } };
+            relay.conns.putAssumeCapacity(carrier.fd, carrier);
+            defer {
+                if (relay.alive(-1)) relay.closeConn(carrier, "test cleanup");
+                relay.drainPendingCloses();
+            }
+            const session = try allocator.create(Session);
+            session.* = .{ .conn = carrier, .user = "alice", .client_addr = null, .welcomed = true, .last_rx_ms = 1000 };
+            carrier.session = session;
+            relay.session_count = 1;
+            relay.http_count = 1;
+            try session.streams.ensureTotalCapacity(allocator, @intCast(stream_count));
+            for (0..stream_count) |i| {
+                const stream = try allocator.create(Stream);
+                const backend = allocator.create(Conn) catch |err| {
+                    allocator.destroy(stream);
+                    return err;
+                };
+                stream.* = .{ .id = @intCast(i + 1), .session = session, .conn = backend };
+                backend.* = .{
+                    .fd = -2 - @as(posix.fd_t, @intCast(i)),
+                    .kind = .backend,
+                    .peer = carrier.peer,
+                    .out = .{ .allocator = allocator },
+                    .stream = stream,
+                    .backend_hup = true,
+                    .hup_parked = true,
+                };
+                session.streams.putAssumeCapacity(stream.id, stream);
+                relay.conns.putAssumeCapacity(backend.fd, backend);
+            }
+            // Inject a re-arm failure before the syscall; the resulting CLOSE
+            // cannot allocate its batch entry and tears down the entire carrier.
+            relay.fail_next_add_fd_for_test = true;
+            failing.fail_index = failing.alloc_index;
+            if (via_tick) {
+                relay.throttled = true;
+                relay.tick(1000);
+            } else {
+                try std.testing.expect(!relay.resumeBackends(session));
+            }
+            try std.testing.expect(!relay.fail_next_add_fd_for_test);
+            try std.testing.expect(failing.has_induced_failure);
+            try std.testing.expectEqual(@as(u32, 0), relay.conns.count());
+            try std.testing.expectEqual(@as(u32, 0), relay.session_count);
+            try std.testing.expectEqual(stream_count + 1, relay.pending_free.items.len);
+        }
+    }
 }
 
 test "backend diagnostic counters saturate without disrupting backpressure" {
