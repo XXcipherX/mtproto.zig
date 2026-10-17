@@ -34,8 +34,8 @@
 //!
 //! Every stream starts with an implicit 4 MiB window in each direction (never negotiated;
 //! both halves simply assume it). We spend `send_window` to push DATA at the client and
-//! only replenish `recv_window` once the client's bytes have actually left for the
-//! backend — so a stalled backend stops the client rather than growing our memory.
+//! only replenish `recv_window` when drained client bytes are announced in WINDOW.
+//! Pending grants remain unavailable to the client, including while throttled.
 //!
 //! Protocol reference: tdesktop `docs/web-proxy-plan.md` §6–§8.
 
@@ -298,7 +298,7 @@ const Stream = struct {
     send_window: u32 = frame.initial_stream_window,
     /// Credit the client may spend sending DATA to us.
     recv_window: u32 = frame.initial_stream_window,
-    /// Granted-but-unsent credit, coalesced into one WINDOW frame.
+    /// Drained credit awaiting a WINDOW frame; not included in recv_window.
     pending_grant: u32 = 0,
     /// Bytes queued to the backend that are ours, not the client's (the PROXY header).
     /// Draining those must not hand the client credit it never spent.
@@ -2032,10 +2032,9 @@ pub const Relay = struct {
     }
 
     fn grantWindow(self: *Relay, stream: *Stream, amount: u32) void {
-        const headroom = frame.initial_stream_window - stream.recv_window;
+        const headroom = frame.initial_stream_window - stream.recv_window - stream.pending_grant;
         const grant = @min(amount, headroom);
         if (grant == 0) return;
-        stream.recv_window += grant;
         stream.pending_grant += grant;
         // Over budget the grant is recorded but not announced: the client keeps waiting
         // on credit until the queues drain, and the accounting above guarantees the
@@ -2052,9 +2051,12 @@ pub const Relay = struct {
     }
 
     fn flushWindow(self: *Relay, stream: *Stream) void {
-        if (stream.pending_grant == 0) return;
+        if (stream.pending_grant == 0 or stream.session.conn.close_after_flush) return;
         const amount = stream.pending_grant;
         stream.pending_grant = 0;
+        // Commit before sendFrame: failure tears down the carrier and can free
+        // this stream. No live carrier can retain credit from a failed send.
+        stream.recv_window += amount;
         const payload = frame.windowPayload(amount);
         self.sendFrame(stream.session, .window, stream.id, &payload) catch {};
     }
@@ -2806,7 +2808,7 @@ test "idle retained buffers are reclaimed so throttled window grants resume" {
     defer conn.batch.deinit(allocator);
     var session = Session{ .conn = &conn, .user = "test", .client_addr = null, .needs_window_flush = true };
     defer session.streams.deinit(allocator);
-    var stream = Stream{ .id = 7, .session = &session, .pending_grant = 1024 };
+    var stream = Stream{ .id = 7, .session = &session, .recv_window = frame.initial_stream_window - 1024, .pending_grant = 1024 };
     try session.streams.put(allocator, stream.id, &stream);
     conn.session = &session;
     try relay.conns.put(allocator, conn.fd, &conn);
@@ -2819,6 +2821,7 @@ test "idle retained buffers are reclaimed so throttled window grants resume" {
     try std.testing.expect(!relay.throttled);
     try std.testing.expectEqual(@as(usize, 0), conn.msg.capacity);
     try std.testing.expectEqual(@as(u32, 0), stream.pending_grant);
+    try std.testing.expectEqual(frame.initial_stream_window, stream.recv_window);
     try std.testing.expect(!session.needs_window_flush);
     try std.testing.expectEqual(@as(usize, 1), conn.batch_frames);
 }
@@ -2997,11 +3000,42 @@ test "backend credit excludes PROXY header debt and grants only drained client b
     try std.testing.expectEqual(@as(usize, 0), stream.grant_debt);
     try std.testing.expectEqual(@as(u32, 0), stream.pending_grant);
     relay.creditDrainWith(&backend, 110);
-    try std.testing.expectEqual(frame.initial_stream_window, stream.recv_window);
+    try std.testing.expectEqual(frame.initial_stream_window - 100, stream.recv_window);
     try std.testing.expectEqual(@as(u32, 100), stream.pending_grant);
     try std.testing.expect(session.needs_window_flush);
     relay.creditDrainWith(&backend, 10); // no new bytes drained
     try std.testing.expectEqual(@as(u32, 100), stream.pending_grant);
+}
+
+test "unannounced WINDOW grants neither authorize DATA nor accumulate past the window" {
+    const allocator = std.testing.allocator;
+    var relay = testRelay(allocator, 1024 * 1024);
+    defer relay.batch_fds.deinit(allocator);
+    var carrier = Conn{ .fd = -1, .kind = .websocket, .peer = net_helpers.ip4(.{ 127, 0, 0, 1 }, 0), .out = .{ .allocator = allocator } };
+    defer carrier.batch.deinit(allocator);
+    var session = Session{ .conn = &carrier, .user = "test", .client_addr = null, .welcomed = true };
+    defer session.streams.deinit(allocator);
+    var stream = Stream{ .id = 7, .session = &session, .recv_window = 1 };
+    try session.streams.put(allocator, stream.id, &stream);
+    relay.throttled = true;
+    for (0..2048) |_| relay.grantWindow(&stream, frame.initial_stream_window);
+    try std.testing.expectEqual(@as(u32, 1), stream.recv_window);
+    try std.testing.expectEqual(frame.initial_stream_window - 1, stream.pending_grant);
+    try std.testing.expect(session.needs_window_flush);
+    var message: [frame.header_size + 2]u8 = undefined;
+    _ = try frame.serialize(&message, .data, stream.id, "ab");
+    try std.testing.expectError(error.Protocol, relay.validateCarrierMessage(&session, &message));
+    try std.testing.expectError(error.Protocol, relay.handleRelayFrame(&session, .{ .type = .data, .stream_id = stream.id, .payload = "ab" }));
+    relay.throttled = false;
+    relay.flushWindow(&stream);
+    try std.testing.expectEqual(frame.initial_stream_window, stream.recv_window);
+    try std.testing.expectEqual(@as(u32, 0), stream.pending_grant);
+    var frames = frame.Iterator.init(carrier.batch.items);
+    const grant = (try frames.next()).?;
+    try std.testing.expectEqual(frame.FrameType.window, grant.type);
+    try std.testing.expectEqual(frame.initial_stream_window - 1, frame.readWindow(grant.payload).?);
+    try std.testing.expect((try frames.next()) == null);
+    try relay.validateCarrierMessage(&session, &message);
 }
 
 test "metrics accepts direct loopback requests and rejects public or forwarded requests" {

@@ -211,6 +211,10 @@ Trust is fixed from the kernel-reported peer at `accept()`: only loopback plus e
   Preserve stream credit even for the pinned MtProtoKit adapter's exact-read edge
   case described in `client-behavior/SKILL.md`; fix client consumption rather than
   bypassing flow control or treating a larger message cap as a larger window.
+- WEB C2S receive credit includes only the initial window and queued WINDOW grants.
+  Backend drain accumulates a separate pending grant, bounded together with current
+  credit by 4 MiB; throttled/unflushed grants cannot authorize incoming DATA. Commit
+  the grant before sendFrame, which may destroy the stream on carrier failure.
 - `max_sessions` counts carriers across users, not devices/accounts. Android's main
   carrier is shared by accounts, but its separate availability checker can overlap
   it and consume another same-server session; reconnect/teardown also needs headroom.

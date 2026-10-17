@@ -660,6 +660,8 @@ WEB relay hardening includes the semantic fixes from upstream PR #429. Backend q
 the protocol's full 4 MiB receive window. Incoming WebSocket messages, including
 fragment reassembly, accept up to 2 MiB of complete relay frames including their headers,
 matching [native iOS batching](https://github.com/TelegramMessenger/Telegram-iOS/blob/f1dd7a2dbd02cbbf513e75d5695d8d36d1cf5838/submodules/WebProxyTransport/Sources/WebProxyFrame.swift#L3).
+Drained upload bytes replenish client credit only when a WINDOW grant is queued;
+grants held during throttling cannot authorize more incoming DATA.
 Each relay frame still has a 1 MiB payload limit, and each message is limited to 4096
 frames. Retained input and fragment capacities both count against `max_buffer_mb`.
 Outbound DATA/WINDOW frames are batched within an
