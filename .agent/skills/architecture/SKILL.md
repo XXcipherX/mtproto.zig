@@ -323,6 +323,9 @@ Important behavior:
 - `middleproxy_buffer_kb` is a per-direction cap. Each MiddleProxy context starts with 16 KiB C2S/S2C buffers and grows on demand up to `min(middleproxy_buffer_kb, 3840)` KiB; event-loop scratch buffers are lazy and reused. The effective cap reserves 256 KiB for MP/TLS framing before the 4 MiB relay-queue limit.
 - Endpoint-specific MiddleProxy handshake/read failures and upstream fatal hangups try remaining MP candidates first, then can fall back to direct when the connect plan has a real direct fallback address. Local resource errors do not cool or retry remote endpoints.
 - Route health requires two successful connect/auth samples, uses bounded EWMA and 20%/10 ms ordering hysteresis, and explores unknown/stale endpoints on every sixteenth selection. Existing 60-second cooldown always outranks scores; failure penalties last five minutes and successful authentication clears them. Secret changes clear health/cooldowns, metadata changes discard removed endpoints, and in-flight observations from an old secret epoch cannot repopulate current health.
+- Cooldown refresh must find an existing endpoint before reusing an earlier inactive
+  or expired slot. Promotion clears every matching entry, including legacy duplicates;
+  all updates retain the metadata lock and secret-epoch check.
 - Tunnel deployment supports `direct`, `preserve`, and `middleproxy` modes.
 
 ## Fast Mode

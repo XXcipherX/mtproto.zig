@@ -900,6 +900,7 @@ pub const ProxyState = struct {
 
         const now_ms = runtime_time.monotonicMilli();
         self.middle_proxy_health.noteFailure(addr, now_ms);
+        var first_available: ?usize = null;
         var replacement_index: usize = 0;
         var replacement_until_ms: i64 = std.math.maxInt(i64);
         for (&self.middle_proxy_cooldowns, 0..) |*entry, i| {
@@ -908,8 +909,8 @@ pub const ProxyState = struct {
                 return false;
             }
             if (!entry.active or entry.until_ms <= now_ms) {
-                replacement_index = i;
-                break;
+                if (first_available == null) first_available = i;
+                continue; // A matching endpoint can still be farther in the table.
             }
             if (entry.until_ms < replacement_until_ms) {
                 replacement_index = i;
@@ -917,7 +918,7 @@ pub const ProxyState = struct {
             }
         }
 
-        self.middle_proxy_cooldowns[replacement_index] = .{
+        self.middle_proxy_cooldowns[first_available orelse replacement_index] = .{
             .active = true,
             .addr = addr,
             .until_ms = now_ms + middle_proxy_connect_cooldown_ms,
@@ -930,7 +931,6 @@ pub const ProxyState = struct {
             if (entry.active and isSameIpEndpoint(entry.addr, addr)) {
                 entry.active = false;
                 entry.until_ms = 0;
-                return;
             }
         }
     }
@@ -6711,6 +6711,38 @@ test "shared subnet admission and unauthenticated caps are not multiplied" {
     for (0..hs_limit) |_| state.releaseSubnetHandshake(key);
     try std.testing.expect(state.reserveSubnetHandshake(key));
     state.releaseSubnetHandshake(key);
+}
+
+test "MiddleProxy cooldown refresh finds endpoints beyond holes and clear removes all matches" {
+    var cfg = Config{
+        .users = std.StringHashMap([16]u8).init(std.testing.allocator),
+        .direct_users = std.StringHashMap(void).init(std.testing.allocator),
+        .mask = false,
+    };
+    defer cfg.deinit(std.testing.allocator);
+    var state = try ProxyState.init(std.testing.allocator, std.testing.io, cfg);
+    defer state.deinit();
+    const target = constants.tg_middle_proxies_v4[0];
+    const other = net.ip4(.{ 192, 0, 2, 1 }, 443);
+    const version = state.middle_proxy_secret_version;
+    for ([_]bool{ false, true }) |expired| {
+        state.middle_proxy_cooldowns = @splat(.{});
+        state.middle_proxy_cooldowns[0] = .{ .active = expired, .addr = other, .until_ms = 0 };
+        state.middle_proxy_cooldowns[1] = .{ .active = true, .addr = target, .until_ms = std.math.maxInt(i64) };
+        try std.testing.expect(!state.cooldownMiddleProxyCandidate(target, version));
+        try std.testing.expectEqual(expired, state.middle_proxy_cooldowns[0].active);
+        try std.testing.expect(isSameIpEndpoint(other, state.middle_proxy_cooldowns[0].addr));
+        try std.testing.expect(state.middle_proxy_cooldowns[1].until_ms < std.math.maxInt(i64));
+        try std.testing.expect(!state.cooldownMiddleProxyCandidate(other, version +% 1));
+        // Also clean up duplicate entries left by older table population logic.
+        state.middle_proxy_cooldowns[2] = state.middle_proxy_cooldowns[1];
+        _ = state.promoteMiddleProxyCandidate(1, false, target, version);
+        for (state.middle_proxy_cooldowns) |entry| {
+            try std.testing.expect(!entry.active or !isSameIpEndpoint(entry.addr, target));
+        }
+        try std.testing.expect(state.cooldownMiddleProxyCandidate(target, version));
+        try std.testing.expect(isSameIpEndpoint(target, state.middle_proxy_cooldowns[0].addr));
+    }
 }
 
 const MiddleProxyMetadataRace = struct {
