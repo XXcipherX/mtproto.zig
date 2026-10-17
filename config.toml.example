@@ -188,7 +188,9 @@ port = 443
 # Same-origin WebSocket path embedded in the authenticated bridge page. The
 # permanent capability authenticates only the bridge GET; WSS has no bearer in
 # its URL and uses a short-lived token in Sec-WebSocket-Protocol instead. Use a
-# single leading slash; backslashes, whitespace, query and fragment are rejected.
+# single leading slash and a canonical ASCII path (maximum 2048 bytes). Dot
+# segments (including %2e variants), malformed percent escapes, and characters
+# rewritten by browsers are rejected, as are query, fragment and backslashes.
 # ws_path = "/api/v1/socket"
 
 # Caddy supplies X-Forwarded-For from the trusted PROXY v2 address. The relay

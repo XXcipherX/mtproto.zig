@@ -7,6 +7,7 @@ const std = @import("std");
 const net = @import("net_helpers.zig");
 const proxy_limits = @import("proxy/limits.zig");
 const web_capability = @import("web/capability.zig");
+const web_path = @import("web/path.zig");
 
 fn hasAsciiSpaceOrControl(value: []const u8) bool {
     for (value) |byte| {
@@ -63,16 +64,14 @@ fn isValidIpv4Literal(value: []const u8) bool {
 }
 
 fn isValidWsPath(value: []const u8) bool {
-    if (value.len == 0 or value.len > 2048 or value[0] != '/' or std.mem.startsWith(u8, value, "//")) return false;
-    for (value) |byte| {
-        if (byte <= ' ' or byte == 0x7f or byte == '?' or byte == '#' or byte == '\\') return false;
-    }
-    return true;
+    return value.len <= 2048 and web_path.isCanonicalWsPath(value);
 }
 
 test "WEB websocket paths match bridge renderer constraints" {
     try std.testing.expect(!isValidWsPath("//socket"));
     try std.testing.expect(!isValidWsPath("/api\\socket"));
+    try std.testing.expect(!isValidWsPath("/api/%2e%2E/socket"));
+    try std.testing.expect(!isValidWsPath("/api/<socket>"));
     try std.testing.expect(isValidWsPath("/api/v1/socket"));
     try std.testing.expect(isValidWsPath("/relay/Path_1/api/v1/socket"));
 }
@@ -358,7 +357,7 @@ pub const Config = struct {
             error.InvalidWebListenHost => "[web].host must be a valid IP literal",
             error.WebListenerPortCollision => "[web].port must not collide with the proxy or masking port",
             error.InvalidWebBasePath => "[web].base_path must be empty or contain canonical [A-Za-z0-9][A-Za-z0-9_-]* segments joined by / (maximum 128 bytes)",
-            error.InvalidWebSocketPath => "[web].ws_path must be a single-slash absolute path without backslashes, whitespace, query, or fragment",
+            error.InvalidWebSocketPath => "[web].ws_path must be a canonical ASCII absolute path (maximum 2048 bytes), without dot segments, malformed percent escapes, query, fragment, or characters rewritten by browsers",
             error.InvalidWebClientIpHeader => "[web].client_ip_header must be a valid HTTP field name",
             error.InvalidWebRelaySource => "every [web].relay_sources entry must be an IP literal",
             error.InvalidWebHttpSource => "every [web].trusted_http_sources entry must be an IP literal",

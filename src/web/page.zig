@@ -8,6 +8,7 @@
 //! only as the WebSocket subprotocol and never copied into the WebSocket URL.
 
 const std = @import("std");
+const path_rules = @import("path.zig");
 
 const bridge_document_head =
     \\<!doctype html>
@@ -205,7 +206,7 @@ const bridge_script_body =
 
 /// Render a self-contained bridge document for one short-lived carrier token.
 pub fn renderSessionBridge(allocator: std.mem.Allocator, ws_path: []const u8, token: []const u8, nonce: []const u8) ![]u8 {
-    try validateWsPath(ws_path);
+    if (!path_rules.isCanonicalWsPath(ws_path)) return error.InvalidWsPath;
     if (token.len != 43 or !isBase64Url(token)) return error.InvalidSessionToken;
     if (nonce.len == 0 or nonce.len > 128 or !isBase64Url(nonce)) return error.InvalidScriptNonce;
 
@@ -223,11 +224,6 @@ pub fn renderSessionBridge(allocator: std.mem.Allocator, ws_path: []const u8, to
     try appendJsString(allocator, &out, token);
     try out.appendSlice(allocator, bridge_script_body);
     return out.toOwnedSlice(allocator);
-}
-
-fn validateWsPath(ws_path: []const u8) !void {
-    if (ws_path.len == 0 or ws_path[0] != '/' or std.mem.startsWith(u8, ws_path, "//") or std.mem.findAny(u8, ws_path, "?#\\") != null) return error.InvalidWsPath;
-    for (ws_path) |c| if (c < 0x20 or c == 0x7f) return error.InvalidWebSocketPath;
 }
 
 fn isBase64Url(value: []const u8) bool {
@@ -278,10 +274,9 @@ test "session bridge is standalone and keeps bearer out of websocket URL" {
 test "session bridge validates all values embedded in markup" {
     const allocator = std.testing.allocator;
     const token = "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT";
-    for ([_][]const u8{ "", "socket", "//other.test/socket", "/socket?x=1", "/socket#fragment", "/a\\b" }) |path| {
+    for ([_][]const u8{ "", "socket", "//other.test/socket", "/socket?x=1", "/socket#fragment", "/a\\b", "/a\nb", "/a/../socket", "/a/%2E/socket", "/a<b>" }) |path| {
         try std.testing.expectError(error.InvalidWsPath, renderSessionBridge(allocator, path, token, "nonce"));
     }
-    try std.testing.expectError(error.InvalidWebSocketPath, renderSessionBridge(allocator, "/a\nb", token, "nonce"));
     try std.testing.expectError(error.InvalidSessionToken, renderSessionBridge(allocator, "/s", "short", "nonce"));
     try std.testing.expectError(error.InvalidScriptNonce, renderSessionBridge(allocator, "/s", token, "bad nonce"));
 }
@@ -290,13 +285,11 @@ test "session bridge escapes websocket path for HTML and JavaScript" {
     const allocator = std.testing.allocator;
     const html = try renderSessionBridge(
         allocator,
-        "/a<b>c&d\"e",
+        "/a&b'c/%22",
         "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT",
         "nonce",
     );
     defer allocator.free(html);
-    try std.testing.expect(!std.mem.containsAtLeast(u8, html, 1, "<b>"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, html, 1, "/a&lt;b&gt;c&amp;d&quot;e"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, html, 1, "\\u003c"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, html, 1, "\\\""));
+    try std.testing.expect(std.mem.containsAtLeast(u8, html, 1, "/a&amp;b'c/%22"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, html, 1, "/a\\u0026b'c/%22"));
 }

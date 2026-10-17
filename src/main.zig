@@ -710,6 +710,7 @@ test {
     _ = @import("web/ws.zig");
     _ = @import("web/http.zig");
     _ = @import("web/page.zig");
+    _ = @import("web/path.zig");
     _ = @import("web/tokens.zig");
     _ = @import("web/site.zig");
     _ = web_probe_material;

@@ -1315,7 +1315,7 @@ alice = true   # direct where possible; CDN DC203 still requires MiddleProxy
 | `[web]` | `port` | `8081` | Local relay listener port |
 | `[web]` | `backend` | `127.0.0.1:<server.port>` | MTProto data-plane endpoint opened for each logical WEB stream. Tunnel-netns installs use `10.200.200.2:443` |
 | `[web]` | `mask_backend` | _(none)_ | Local Caddy TLS listener that accepts PROXY v2 for WEB-domain SNI, normally `127.0.0.1:8444` or `10.200.200.1:8444` from the tunnel namespace |
-| `[web]` | `ws_path` | `"/api/v1/socket"` | Same-origin WebSocket endpoint embedded in the bridge page. It has no bearer query; the short-lived token is carried only in `Sec-WebSocket-Protocol` |
+| `[web]` | `ws_path` | `"/api/v1/socket"` | Same-origin WebSocket endpoint embedded in the bridge page. Canonical ASCII absolute path, at most 2048 bytes: no dot segments (including encoded variants), malformed percent escapes, query, fragment, backslashes, or characters rewritten by browsers. It has no bearer query; the short-lived token is carried only in `Sec-WebSocket-Protocol` |
 | `[web]` | `trust_forwarded_for` | `true` | Read the real browser address from the configured forwarded header, but only from loopback or `trusted_http_sources`; the right-most entry of the last field line is used |
 | `[web]` | `client_ip_header` | `"x-forwarded-for"` | Header Caddy uses to pass the real browser address to the relay |
 | `[web]` | `trusted_http_sources` | `[]` | Extra IP literals trusted only as HTTP terminators for forwarded client identity. This does not grant data-plane relay trust; loopback is implicit |
