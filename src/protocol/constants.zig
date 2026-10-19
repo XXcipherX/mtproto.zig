@@ -15,14 +15,6 @@ pub const tg_datacenters_v4 = [5]net.Address{
     net.ip4(.{ 149, 154, 171, 5 }, tg_datacenter_port),
 };
 
-pub const tg_datacenters_v6 = [5]net.Address{
-    net.ip6(.{ 0x20, 0x01, 0x0b, 0x28, 0xf2, 0x3d, 0xf0, 0x01, 0, 0, 0, 0, 0, 0, 0, 0x0a }, tg_datacenter_port, 0, 0),
-    net.ip6(.{ 0x20, 0x01, 0x06, 0x7c, 0x04, 0xe8, 0xf0, 0x02, 0, 0, 0, 0, 0, 0, 0, 0x0a }, tg_datacenter_port, 0, 0),
-    net.ip6(.{ 0x20, 0x01, 0x0b, 0x28, 0xf2, 0x3d, 0xf0, 0x03, 0, 0, 0, 0, 0, 0, 0, 0x0a }, tg_datacenter_port, 0, 0),
-    net.ip6(.{ 0x20, 0x01, 0x06, 0x7c, 0x04, 0xe8, 0xf0, 0x04, 0, 0, 0, 0, 0, 0, 0, 0x0a }, tg_datacenter_port, 0, 0),
-    net.ip6(.{ 0x20, 0x01, 0x0b, 0x28, 0xf2, 0x3f, 0xf0, 0x05, 0, 0, 0, 0, 0, 0, 0, 0x0a }, tg_datacenter_port, 0, 0),
-};
-
 pub const tg_middle_proxy_port: u16 = 8888;
 
 /// Default MiddleProxy endpoints per primary DC (1..5), regular (non-media) path.
@@ -124,20 +116,10 @@ pub const max_tls_ciphertext_size: usize = 16_384 + 256;
 /// Structural minimum for a valid TLS 1.3 ClientHello with SNI
 pub const min_tls_client_hello_size: usize = 100;
 
-// ============= Message Limits =============
-
-pub const min_msg_len: usize = 12;
-pub const max_msg_len: usize = 1 << 24; // 16 MB
-
-// ============= Buffer Sizes =============
-
-pub const default_buffer_size: usize = 16384;
-
 // ============= TLS Handshake Constants =============
 
 pub const tls_digest_len: usize = 32;
 pub const tls_digest_pos: usize = 11;
-pub const tls_digest_half_len: usize = 16;
 
 /// Time skew limits for anti-replay (seconds)
 pub const time_skew_min: i64 = -2 * 60;

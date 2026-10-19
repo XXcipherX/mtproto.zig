@@ -74,14 +74,6 @@ pub fn seekFdToStart(fd: posix.fd_t) !void {
     }
 }
 
-pub fn setTcpUserTimeout(fd: posix.fd_t, timeout_ms: u32) void {
-    tcp_options.setTcpUserTimeout(fd, timeout_ms, .proxy_raw);
-}
-
-pub fn setTcpKeepalive(fd: posix.fd_t) void {
-    tcp_options.setTcpKeepalive(fd, .proxy_raw);
-}
-
 pub fn setTcpNoDelay(fd: posix.fd_t) void {
     tcp_options.setTcpNoDelay(fd, .proxy_raw);
 }

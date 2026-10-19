@@ -38,15 +38,6 @@ pub const AesCtr = struct {
         };
     }
 
-    pub fn initFromSlices(key: []const u8, iv: []const u8) !AesCtr {
-        if (key.len != 32) return error.InvalidKeyLength;
-        if (iv.len != 16) return error.InvalidIvLength;
-        const k: *const [32]u8 = key[0..32];
-        var iv_val = std.mem.readInt(u128, iv[0..16], .big);
-        defer std.crypto.secureZero(u8, std.mem.asBytes(&iv_val));
-        return init(k, iv_val);
-    }
-
     /// Apply keystream to data in-place (encrypt or decrypt).
     pub fn apply(self: *AesCtr, data: []u8) void {
         var i: usize = 0;

@@ -27,64 +27,6 @@ import struct
 import sys
 import os
 
-# TLS 1.3 ClientHello (Chrome 120-like) — enough to trigger a real ServerHello
-# This is a minimal ClientHello that advertises TLS 1.3 support
-MINIMAL_CLIENT_HELLO = bytes.fromhex(
-    # TLS Record: Handshake, TLS 1.0 (for compat), length placeholder
-    "160301"
-    "00c1"  # length = 193
-    # Handshake: ClientHello
-    "01"
-    "0000bd"  # length = 189
-    # Client Version: TLS 1.2 (real version in supported_versions ext)
-    "0303"
-    # Client Random (32 bytes)
-    "0001020304050607080910111213141516171819202122232425262728293031"
-    # Session ID length + 32-byte session ID (TLS 1.3 middlebox compat)
-    "20"
-    "e0e1e2e3e4e5e6e7e8e9f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff0011223344"
-    # Cipher suites (2 bytes length + suites)
-    "0004"
-    "1301"  # TLS_AES_128_GCM_SHA256
-    "1303"  # TLS_CHACHA20_POLY1305_SHA256
-    # Compression methods
-    "0100"  # 1 method, null
-    # Extensions length
-    "006e"  # 110 bytes of extensions
-    # SNI extension (will be patched with actual hostname)
-    "0000"  # type: server_name
-    "0000"  # length placeholder (patched below)
-    "0000"  # server_name_list length placeholder
-    "00"  # host_name type
-    "0000"  # hostname length placeholder
-    # ... hostname bytes will be appended
-    # supported_groups
-    "000a"
-    "0004"
-    "001d"  # x25519
-    "0017"  # secp256r1
-    # signature_algorithms
-    "000d"
-    "0008"
-    "0403"  # ecdsa_secp256r1_sha256
-    "0804"  # rsa_pss_rsae_sha256
-    "0401"  # rsa_pkcs1_sha256
-    "0201"  # rsa_pkcs1_sha1
-    # supported_versions
-    "002b"
-    "0003"
-    "02"
-    "0304"  # TLS 1.3
-    # key_share (x25519)
-    "0033"
-    "0026"
-    "0024"
-    "001d"  # x25519
-    "0020"  # 32 bytes
-    "358072d6365880d1aeea329adf9121383851ed21a28e3b75e965d0d2cd166254"
-)
-
-
 def build_client_hello(hostname: str) -> bytes:
     """Build a TLS ClientHello with the given SNI hostname."""
     host_bytes = hostname.encode("ascii")

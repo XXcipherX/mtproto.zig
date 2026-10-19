@@ -622,7 +622,6 @@ comptime {
 
 /// Total template size: ServerHello(127) + CCS(6) + AppData(5 + 2878)
 const server_template_len: usize = 127 + 6 + 5 + fake_cert_payload_size;
-pub const server_hello_template_len: usize = server_template_len;
 /// Fixed ServerHello+CCS+AppData-header prefix length.
 const tmpl_appdata_offset: usize = server_template_len - fake_cert_payload_size;
 pub const server_hello_prefix_len: usize = tmpl_appdata_offset;

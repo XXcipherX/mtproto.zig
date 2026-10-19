@@ -3,7 +3,6 @@
 const std = @import("std");
 
 pub const encoded_len: usize = 43;
-pub const prefix_bits: usize = 64;
 
 /// Read the first eight decoded bytes without decoding or allocating the whole
 /// credential. Eleven base64url characters contain 66 bits: the low two bits of

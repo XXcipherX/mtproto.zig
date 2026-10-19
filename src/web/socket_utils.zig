@@ -24,13 +24,6 @@ pub const AcceptResult = struct {
 
 pub const epollCreate = linux_events.epollCreate;
 
-pub fn realtimeSeconds() i64 {
-    var ts: posix.timespec = undefined;
-    const rc = posix.system.clock_gettime(.REALTIME, &ts);
-    if (posix.errno(rc) == .SUCCESS) return @intCast(ts.sec);
-    return @divTrunc(nowMs(), 1000);
-}
-
 pub fn nowMs() i64 {
     var ts: posix.timespec = undefined;
     const rc = posix.system.clock_gettime(.MONOTONIC, &ts);
@@ -39,31 +32,6 @@ pub fn nowMs() i64 {
             @as(i64, @intCast(@divTrunc(ts.nsec, std.time.ns_per_ms)));
     }
     return 0;
-}
-
-pub fn nowNs() i128 {
-    var ts: posix.timespec = undefined;
-    const rc = posix.system.clock_gettime(.MONOTONIC, &ts);
-    if (posix.errno(rc) == .SUCCESS) {
-        return @as(i128, @intCast(ts.sec)) * std.time.ns_per_s + @as(i128, @intCast(ts.nsec));
-    }
-    return @as(i128, nowMs()) * std.time.ns_per_ms;
-}
-
-pub fn sleepNs(ns: u64) void {
-    var req: posix.timespec = .{
-        .sec = @intCast(ns / std.time.ns_per_s),
-        .nsec = @intCast(ns % std.time.ns_per_s),
-    };
-    while (true) {
-        var rem: posix.timespec = undefined;
-        const rc = posix.system.nanosleep(&req, &rem);
-        switch (posix.errno(rc)) {
-            .SUCCESS => return,
-            .INTR => req = rem,
-            else => return,
-        }
-    }
 }
 
 pub fn closeFd(fd: posix.fd_t) void {
@@ -191,27 +159,8 @@ pub fn secondsToMs(sec: u32) i64 {
     return @as(i64, @intCast(sec)) * std.time.ms_per_s;
 }
 
-pub fn setTcpUserTimeout(fd: posix.fd_t, timeout_ms: u32) void {
-    tcp_options.setTcpUserTimeout(fd, timeout_ms, .web_posix);
-}
-
-pub fn setTcpKeepalive(fd: posix.fd_t) void {
-    tcp_options.setTcpKeepalive(fd, .web_posix);
-}
-
 pub fn setTcpNoDelay(fd: posix.fd_t) void {
     tcp_options.setTcpNoDelay(fd, .web_posix);
-}
-
-/// Force a TCP RST on close instead of a graceful FIN, via SO_LINGER with a zero
-/// timeout. Used to mirror a server/middlebox that resets a rejected handshake.
-pub fn setLingerReset(fd: posix.fd_t) void {
-    // Linux `struct linger { int l_onoff; int l_linger; }`. Defined locally as an
-    // i32/i32 extern struct so it compiles on every target (only the Linux runtime
-    // path actually sets it); setsockopt just copies the bytes.
-    const Linger = extern struct { l_onoff: i32, l_linger: i32 };
-    const lin = Linger{ .l_onoff = 1, .l_linger = 0 };
-    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.LINGER, std.mem.asBytes(&lin)) catch return;
 }
 
 pub fn configureRelaySocket(fd: posix.fd_t) void {

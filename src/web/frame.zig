@@ -185,11 +185,6 @@ pub fn serialize(dest: []u8, kind: FrameType, stream_id: u32, payload: []const u
     return dest[0..total];
 }
 
-/// Size a frame will occupy once serialized.
-pub fn framedLen(payload_len: usize) usize {
-    return header_size + payload_len;
-}
-
 /// Encode a WINDOW credit delta. Zero is a protocol error on both sides, so callers
 /// must never flush an empty grant.
 pub fn windowPayload(amount: u32) [4]u8 {

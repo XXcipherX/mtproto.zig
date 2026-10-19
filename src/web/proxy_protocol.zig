@@ -118,9 +118,6 @@ fn unmapV4(addr: Address) Address {
     }
 }
 
-/// Longest header `buildV2` can produce (signature + TCP6 address block).
-pub const max_v2_len: usize = 52;
-
 /// Build a PROXY protocol v2 header announcing `src` as the client of a connection to
 /// `dst`. Binary v2 avoids having to render an IPv6 address as text, and `parse` above
 /// reads it back.

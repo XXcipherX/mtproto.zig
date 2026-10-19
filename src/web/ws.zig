@@ -51,9 +51,7 @@ pub const Opcode = enum(u4) {
 pub const close_normal: u16 = 1000;
 pub const close_protocol_error: u16 = 1002;
 pub const close_unsupported_data: u16 = 1003;
-pub const close_policy_violation: u16 = 1008;
 pub const close_message_too_big: u16 = 1009;
-pub const close_internal_error: u16 = 1011;
 
 /// Compute `Sec-WebSocket-Accept` for a client's `Sec-WebSocket-Key`.
 pub fn acceptKey(client_key: []const u8) [accept_len]u8 {
