@@ -43,6 +43,10 @@ Production MTProto proxy implemented in Zig with FakeTLS entry, obfuscated MTPro
   Its plain `u64` counter wraps exactly as the former relaxed atomic counter did;
   count successful socket bytes only. The DNS worker never accesses it. Keep
   atomics for genuinely shared main-proxy statistics and DNS stop signaling.
+- WEB's initial single backend address parses IP literals without a temporary
+  allocated list. Hostname resolution still supplies separate initial address
+  and cache snapshots; do not merge those lookups without defining round-robin,
+  startup-error and PROXY destination behavior. Refresh remains independent.
 - Config and bridge rendering share `web/path.zig`: the literal carrier route must
   survive WHATWG URL path parsing unchanged. Reject raw/percent-encoded dot segments
   and characters requiring browser encoding; preserve valid non-dot percent escapes.

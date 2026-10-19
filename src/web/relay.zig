@@ -190,6 +190,8 @@ pub fn resolveBackend(allocator: std.mem.Allocator, io: std.Io, cfg: *const conf
     const host = std.mem.trim(u8, spec[0..colon], "[] ");
     const port = std.fmt.parseInt(u16, spec[colon + 1 ..], 10) catch return error.InvalidBackend;
     if (host.len == 0) return error.InvalidBackend;
+    // Match getAddressList's literal fast path without allocating a temporary list.
+    if (Address.parse(host, port)) |literal| return literal else |_| {}
     const list = net_helpers.getAddressList(allocator, io, host, port) catch return error.InvalidBackend;
     defer list.deinit();
     if (list.addrs.len == 0) return error.InvalidBackend;
@@ -3714,8 +3716,17 @@ test "backend spec parsing rejects nonsense" {
     try std.testing.expectEqualSlices(u8, &[_]u8{ 127, 0, 0, 1 }, &fallback.ip4.bytes);
 
     cfg.web.backend = try std.testing.allocator.dupe(u8, "127.0.0.1:8443");
-    const parsed = try resolveBackend(std.testing.allocator, std.testing.io, &cfg);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const parsed = try resolveBackend(failing.allocator(), std.testing.io, &cfg);
     try std.testing.expectEqual(@as(u16, 8443), parsed.ip4.port);
+
+    const ipv6_spec = try std.testing.allocator.dupe(u8, "[::1]:8444");
+    std.testing.allocator.free(cfg.web.backend.?);
+    cfg.web.backend = ipv6_spec;
+    const parsed_ipv6 = try resolveBackend(failing.allocator(), std.testing.io, &cfg);
+    try std.testing.expectEqual(@as(u16, 8444), parsed_ipv6.ip6.port);
+    try std.testing.expect(std.mem.allEqual(u8, parsed_ipv6.ip6.bytes[0..15], 0));
+    try std.testing.expectEqual(@as(u8, 1), parsed_ipv6.ip6.bytes[15]);
 
     std.testing.allocator.free(cfg.web.backend.?);
     cfg.web.backend = try std.testing.allocator.dupe(u8, "no-port-here");
