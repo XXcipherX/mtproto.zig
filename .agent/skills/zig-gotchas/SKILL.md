@@ -59,6 +59,10 @@ Do not reintroduce thread-per-connection or blocking relay loops.
 - Project uses custom lock-free `logFn` in `src/main.zig`.
 - Left-align standard log level names to Zig's longest built-in label (`warning`), then print ` (scope):` and exactly one separator space. This aligns the left edge, scope, and message columns for every level within any scope without enumerating or constraining scope names; keep message text free of manual leading padding.
 - Keep hot-path logging minimal (`debug` only where needed, avoid noisy per-packet logs).
+- Guard WEB pause tracking with `runtime_io.logEnabled(.debug, .web)` before clock
+  reads or counter updates. Runtime log filtering happens inside the logger and
+  cannot prevent evaluation of expensive log arguments. Saturate diagnostics and
+  report state transitions/periodic waits rather than every readiness sync.
 - WEB lifetime diagnostic totals (`rx_passes`, stalls, received bytes and session DATA totals) use saturating addition. Flow-control windows and bounded batch/session counts retain their protocol semantics; never let diagnostic overflow introduce fast illegal behavior.
 - Do not force global `.log_level = .debug` in production builds.
 - The authenticated `valid FakeTLS ClientHello` debug line includes the real client IP (without its ephemeral source port) from `slot.peer_addr`; keep this address-bearing diagnostic at debug level and never move it into normal production logs.

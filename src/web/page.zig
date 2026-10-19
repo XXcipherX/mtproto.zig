@@ -10,6 +10,10 @@
 const std = @import("std");
 const path_rules = @import("path.zig");
 
+/// Shared relay/native-bridge grouping target, including complete frame headers.
+/// This is a batching policy, not the protocol's individual DATA payload limit.
+pub const native_batch_bytes: usize = 256 * 1024;
+
 const bridge_document_head =
     \\<!doctype html>
     \\<html lang="en"><head>
@@ -42,7 +46,7 @@ const bridge_token_var =
 
 const bridge_script_body =
     \\;
-    \\var QUEUE_BYTES=33554432,QUEUE_ITEMS=16384,MAX_FRAME=1048576,MAX_FRAMES=4096,NATIVE_BATCH_BYTES=65536;
+    \\var QUEUE_BYTES=33554432,QUEUE_ITEMS=16384,MAX_FRAME=1048576,MAX_FRAMES=4096;
     \\var client=null,nativeBridge=null,ws=null,wsReady=false,adopted=false,dead=false;
     \\// Keep bounded pre-WELCOME payload references for retry. Browser send() only
     \\// queues bytes locally; it does not prove the relay parsed HELLO. If it did parse
@@ -106,7 +110,7 @@ const bridge_script_body =
     \\function deliverNative(value,frames){
     \\ // Forward an existing small batch without copying or waiting for more bytes.
     \\ if(value.byteLength<=NATIVE_BATCH_BYTES||frames.length===1){client.binary(value);return}
-    \\ // Group larger batches up to 64 KiB at frame boundaries. A single
+    \\ // Group larger batches up to the relay's shared target at frame boundaries. A single
     \\ // frame may still carry 1 MiB; even its base64 form fits Desktop's 2 MiB cap.
     \\ var start=0,end=0;
     \\ for(var i=0;i<frames.length;i++){
@@ -222,6 +226,7 @@ pub fn renderSessionBridge(allocator: std.mem.Allocator, ws_path: []const u8, to
     try appendJsString(allocator, &out, ws_path);
     try out.appendSlice(allocator, bridge_token_var);
     try appendJsString(allocator, &out, token);
+    try out.print(allocator, ";var NATIVE_BATCH_BYTES={d}", .{native_batch_bytes});
     try out.appendSlice(allocator, bridge_script_body);
     return out.toOwnedSlice(allocator);
 }
@@ -267,6 +272,7 @@ test "session bridge is standalone and keeps bearer out of websocket URL" {
     try std.testing.expect(std.mem.containsAtLeast(u8, html, 1, "<meta name=\"tproxy-token\" content=\"" ++ token ++ "\">"));
     try std.testing.expect(std.mem.containsAtLeast(u8, html, 1, "<meta name=\"tproxy-ws-path\" content=\"/relay/Path_1/api/v1/socket\">"));
     try std.testing.expect(std.mem.containsAtLeast(u8, html, 1, "<script nonce=\"nonce_123\">"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, html, 1, ";var NATIVE_BATCH_BYTES=262144;"));
     try std.testing.expect(std.mem.containsAtLeast(u8, html, 1, "new WebSocket(\"wss://\"+location.host+WS_PATH,\"tproxy-v1.\"+TOKEN)"));
     try std.testing.expect(!std.mem.containsAtLeast(u8, html, 1, "location.search"));
 }

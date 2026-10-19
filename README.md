@@ -670,8 +670,10 @@ Drained upload bytes replenish client credit only when a WINDOW grant is queued;
 grants held during throttling cannot authorize more incoming DATA.
 Each relay frame still has a 1 MiB payload limit, and each message is limited to 4096
 frames. Retained input and fragment capacities both count against `max_buffer_mb`.
-Outbound DATA/WINDOW frames are batched within an
-event-loop pass; input frames are consumed with one buffer compaction per pass.
+Outbound DATA/WINDOW frames share a 256 KiB grouping target with the native bridge,
+including frame headers; DATA payloads remain at most 64 KiB. Pending batches flush
+at the end of the current event-loop pass without waiting for more data or a timer.
+Input frames are consumed with one buffer compaction per pass.
 Each WEB dispatch shares a 256 KiB/64-operation I/O budget across reads and writes,
 including writes to other sockets and EINTR retries. Unsent bytes remain owned by
 queues; level-triggered readiness resumes work in the next pass. Deferred batch
@@ -685,7 +687,7 @@ it, and 4096 deduplicated closed-stream tombstones make valid late DATA/WINDOW/C
 races harmless without permitting stream-id reuse. Pre-adoption browser reconnects
 replay the initial handshake only once. The nonce-CSP bridge validates the entire
 downlink message before delivery. Native bridges receive existing batches in groups
-of at most 64 KiB at complete frame boundaries, without a batching timer; a larger
+of at most 256 KiB at complete frame boundaries, without a batching timer; a larger
 single frame retains its 1 MiB payload limit. Small batches and standalone frames
 reuse the original buffer, reducing native calls and buffer copies. Each group's
 base64 representation also fits Telegram Desktop's 2 MiB native-message limit on
@@ -733,6 +735,16 @@ curl -sS http://127.0.0.1:8081/metrics
 They report sessions, streams, refused streams/accepts, throttling, retained userspace
 buffer capacity and outgoing bytes. The public Caddy routes do not expose this endpoint.
 Existing Docker/source configurations need no new parameters for these changes.
+
+For download-stall diagnosis, temporarily set `[server].log_level = "debug"` and
+restart the relay. `backend read flow` logs identify the backend fd, carrier fd and
+stream, with `window_paused` / `carrier_paused`, episode counts and cumulative
+`window_ms` / `carrier_ms` including the current wait. Observed transitions log once;
+an ongoing wait reports at most once every five seconds, and `closed backend conn`
+retains the final totals. These diagnostics are collected only at debug level;
+they are separate from `/metrics`. WINDOW and carrier waits can overlap and do not
+prove that the backend has data ready. Batching reduces bridge calls for available
+frames; its effect on download pauses still requires measurement on the client.
 
 Re-running WEB setup preserves an existing WEB-only gate. Activating a new gate
 requires a certificate-verified end-to-end probe: authenticated bridge metadata,

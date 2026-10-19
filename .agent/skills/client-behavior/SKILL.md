@@ -233,7 +233,9 @@ Further source-backed bridge delivery details for the profiles above:
 
 Proxy implications:
 
-- Keep native downlink groups at complete frame boundaries with a 64 KiB target.
+- Keep relay/native downlink groups at complete frame boundaries with the shared
+  256 KiB target (including headers); this is fork policy, not a client limit.
+  Three full 64 KiB DATA frames fit together; four exceed the target with headers.
   A single larger frame may retain its original 1 MiB payload plus 8-byte header;
   its base64 form and Desktop prefix still fit the encoded 2 MiB limit. Never pass
   arbitrary 2 MiB raw batches to Desktop's native bridge.

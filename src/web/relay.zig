@@ -105,6 +105,9 @@ const data_frame_size: usize = 64 * 1024;
 /// Stop draining backends into a carrier this far behind.
 const carrier_high_water: usize = 4 * 1024 * 1024;
 
+/// Long debug waits get a bounded progress report; short waits log transitions only.
+const read_pause_report_ms: i64 = 5_000;
+
 /// Hard ceiling on one carrier's outbound queue. Past this the client is simply not
 /// reading, and the queue is memory we can never hand over.
 const carrier_queue_limit: usize = 8 * 1024 * 1024;
@@ -248,6 +251,60 @@ fn buildCapabilities(
 
 const ConnKind = enum { http, websocket, backend };
 
+const ReadPause = struct {
+    since_ms: ?i64 = null,
+    episodes: u32 = 0,
+    completed_ms: u64 = 0,
+
+    fn totalMs(self: ReadPause, now: i64) u64 {
+        const elapsed: u64 = if (self.since_ms) |since| @intCast(@max(0, now -| since)) else 0;
+        return self.completed_ms +| elapsed;
+    }
+
+    fn observe(self: *ReadPause, blocked: bool, now: i64) void {
+        if (blocked == (self.since_ms != null)) return;
+        if (blocked) {
+            self.since_ms = now;
+            self.episodes +|= 1;
+        } else {
+            self.completed_ms = self.totalMs(now);
+            self.since_ms = null;
+        }
+    }
+};
+
+/// Only observed at debug level. The two constraints may overlap; their durations
+/// describe parked read eligibility, not proof that the backend has bytes ready.
+const BackendReadDebug = struct {
+    window: ReadPause = .{},
+    carrier: ReadPause = .{},
+    last_report_ms: i64 = 0,
+
+    fn changed(self: BackendReadDebug, window: bool, carrier: bool) bool {
+        return window != (self.window.since_ms != null) or carrier != (self.carrier.since_ms != null);
+    }
+
+    fn observe(self: *BackendReadDebug, window: bool, carrier: bool, now: i64) bool {
+        if (!self.changed(window, carrier) and
+            (!(window or carrier) or now -| self.last_report_ms < read_pause_report_ms)) return false;
+        self.window.observe(window, now);
+        self.carrier.observe(carrier, now);
+        self.last_report_ms = now;
+        return true;
+    }
+
+    fn finish(self: *BackendReadDebug, now: i64) void {
+        self.window.observe(false, now);
+        self.carrier.observe(false, now);
+    }
+};
+
+const BackendReadState = struct {
+    readable: bool = false,
+    window_blocked: bool = false,
+    carrier_blocked: bool = false,
+};
+
 const Conn = struct {
     accounted_bytes: usize = 0,
     batch: std.ArrayList(u8) = .empty,
@@ -278,12 +335,14 @@ const Conn = struct {
     /// Diagnostics for the one failure mode that matters here — bytes arriving from the
     /// proxy but never reaching the client. Comparing `rx_bytes` against the proxy's own
     /// `s2c=` for the same connection localises a stall to one side of the socket in a
-    /// single log line, and the stall counters say which backpressure rule parked it.
+    /// single log line. Stall counters count blocked read passes; read_debug tracks
+    /// distinct pause episodes and their elapsed time only when debug is enabled.
     rx_bytes: u64 = 0,
     /// Lifetime diagnostic totals saturate; they must never affect relay safety.
     rx_passes: u32 = 0,
     stall_window: u32 = 0,
     stall_carrier: u32 = 0,
+    read_debug: BackendReadDebug = .{},
     /// Client credit seen on the last read pass. Sampled here because closeStream
     /// detaches the stream before closeConn logs, so reading it at close is always 0.
     last_window: u32 = 0,
@@ -322,8 +381,7 @@ const Session = struct {
     ping_payload: [8]u8 = @splat(0),
     needs_window_flush: bool = false,
     /// DATA frames and payload bytes pushed at the client. Their ratio is the average
-    /// frame size, which is what decides how much work the client's JS thread does per
-    /// megabyte — it base64-encodes and crosses the native bridge once per frame.
+    /// frame size. Several complete frames can share one native bridge crossing.
     data_frames: u64 = 0,
     data_bytes: u64 = 0,
     /// Most streams this carrier ever held at once, and how many OPENs were refused for
@@ -851,6 +909,10 @@ pub const Relay = struct {
         if (self.conns.fetchRemove(fd) == null) return;
         self.delFd(fd);
         self.deferClose(fd);
+        if (conn.kind == .backend and runtime_io.logEnabled(.debug, .web)) {
+            const active = conn.read_debug.window.since_ms != null or conn.read_debug.carrier.since_ms != null;
+            conn.read_debug.finish(if (active) nowMs() else 0);
+        }
 
         switch (conn.kind) {
             .http => self.http_count -|= 1,
@@ -870,14 +932,19 @@ pub const Relay = struct {
             },
         }
         if (conn.kind == .backend) {
-            log.debug("closed backend conn: {s} rx={d} passes={d} stall_window={d} stall_carrier={d} window={d} want_in={}", .{
+            log.debug("closed backend conn: {s} fd={d} rx={d} passes={d} stall_window={d} stall_carrier={d} window={d} want_in={} window_episodes={d} window_ms={d} carrier_episodes={d} carrier_ms={d}", .{
                 reason,
+                fd,
                 conn.rx_bytes,
                 conn.rx_passes,
                 conn.stall_window,
                 conn.stall_carrier,
                 conn.last_window,
                 conn.want_in,
+                conn.read_debug.window.episodes,
+                conn.read_debug.window.completed_ms,
+                conn.read_debug.carrier.episodes,
+                conn.read_debug.carrier.completed_ms,
             });
         } else {
             log.debug("closed {s} conn: {s}", .{ @tagName(conn.kind), reason });
@@ -917,33 +984,42 @@ pub const Relay = struct {
         self.modFd(conn.fd, want_in, want_out);
     }
 
+    fn backendReadState(self: *const Relay, conn: *const Conn) BackendReadState {
+        if (conn.connecting) return .{};
+        const stream = conn.stream orelse return .{};
+        if (stream.session.conn.close_after_flush) return .{};
+        const window = stream.send_window == 0;
+        const carrier = stream.session.conn.out.total_len >= carrier_high_water;
+        return .{ .readable = !self.throttled and !window and !carrier, .window_blocked = window, .carrier_blocked = carrier };
+    }
+
+    fn debugBackendReadAt(self: *Relay, conn: *Conn, state: BackendReadState, now: i64) void {
+        if (!runtime_io.logEnabled(.debug, .web)) return;
+        if (!conn.read_debug.observe(state.window_blocked, state.carrier_blocked, now)) return;
+        const stream = conn.stream;
+        log.debug("backend read flow: fd={d} carrier_fd={d} stream={d} readable={} throttled={} window_paused={} window_episodes={d} window_ms={d} carrier_paused={} carrier_episodes={d} carrier_ms={d} window={d} carrier_out={d} rx={d}", .{
+            conn.fd,                                             if (stream) |s| s.session.conn.fd else -1, if (stream) |s| s.id else 0,
+            state.readable,                                      self.throttled,                            state.window_blocked,
+            conn.read_debug.window.episodes,                     conn.read_debug.window.totalMs(now),       state.carrier_blocked,
+            conn.read_debug.carrier.episodes,                    conn.read_debug.carrier.totalMs(now),      if (stream) |s| s.send_window else 0,
+            if (stream) |s| s.session.conn.out.total_len else 0, conn.rx_bytes,
+        });
+    }
+
     fn syncConn(self: *Relay, conn: *Conn) void {
         switch (conn.kind) {
             .http => self.sync(conn, !conn.close_after_flush, !conn.out.isEmpty()),
             .websocket => self.sync(conn, !conn.close_after_flush, !conn.out.isEmpty()),
             .backend => {
-                const stream = conn.stream;
-                const readable = blk: {
-                    if (conn.connecting) break :blk false;
-                    if (self.throttled) break :blk false;
-                    const s = stream orelse break :blk false;
-                    if (s.session.conn.close_after_flush) break :blk false;
-                    if (s.send_window == 0) break :blk false;
-                    break :blk s.session.conn.out.total_len < carrier_high_water;
-                };
-                // Every "the WEB proxy is slow" report so far has had the same shape: the
-                // proxy keeps writing while the relay stops reading its backends. Naming
-                // the reason costs one debug line and saves a kernel-level hunt.
-                if (!readable and !conn.connecting) {
-                    log.debug("backend read parked: was_armed={} throttled={} stream={} window={d} carrier_out={d}", .{
-                        conn.want_in,
-                        self.throttled,
-                        stream != null,
-                        if (stream) |s| s.send_window else 0,
-                        if (stream) |s| s.session.conn.out.total_len else 0,
-                    });
+                const state = self.backendReadState(conn);
+                // No clocks or counter updates on the info/warn data path, and no
+                // repeated log for every sync of an already parked backend.
+                if (runtime_io.logEnabled(.debug, .web) and
+                    conn.read_debug.changed(state.window_blocked, state.carrier_blocked))
+                {
+                    self.debugBackendReadAt(conn, state, nowMs());
                 }
-                self.sync(conn, readable, conn.connecting or !conn.out.isEmpty());
+                self.sync(conn, state.readable, conn.connecting or !conn.out.isEmpty());
             },
         }
     }
@@ -1793,7 +1869,7 @@ pub const Relay = struct {
         const conn = session.conn;
         if (conn.close_after_flush) return error.CarrierClosed;
         if (kind != .welcome and kind != .bye) {
-            if (conn.batch.items.len + frame.header_size + payload.len > data_frame_size or conn.batch_frames >= frame.max_batch_frames) {
+            if (conn.batch.items.len + frame.header_size + payload.len > page.native_batch_bytes or conn.batch_frames >= frame.max_batch_frames) {
                 self.flushBatch(conn) catch |err| {
                     self.closeConnError(conn, "carrier batch write failed", err);
                     return error.CarrierClosed;
@@ -2112,12 +2188,9 @@ pub const Relay = struct {
             }
 
             // Coalesce whatever the socket already holds into ONE frame rather than
-            // emitting a frame per read. The client pays per frame, not per byte: each
-            // one is a base64 encode plus a native bridge crossing on the WebView's JS
-            // thread, and that thread also has to answer the client's own health probe.
-            // A download arriving as thousands of small frames can starve it; the same
-            // bytes as tens of 64 KiB frames do not. Reads are non-blocking, so this only
-            // gathers data already buffered — it adds no latency for interactive traffic.
+            // emitting a frame per read. The native bridge can then group several
+            // complete DATA frames in one crossing. Reads are non-blocking: neither
+            // this coalescing nor event-pass batching waits for additional bytes.
             var filled: usize = 0;
             var hit_eof = false;
             var read_failed = false;
@@ -2197,6 +2270,9 @@ pub const Relay = struct {
                 if (conn.connecting and self.retryBackend(conn)) continue;
                 self.closeConn(conn, "timed out");
                 continue;
+            }
+            if (conn.kind == .backend and runtime_io.logEnabled(.debug, .web)) {
+                self.debugBackendReadAt(conn, self.backendReadState(conn), now);
             }
             if (conn.kind != .websocket) continue;
             const session = conn.session orelse continue;
@@ -2297,6 +2373,67 @@ fn expectQueuedBodylessStatus(conn: *const Conn, status: []const u8) !void {
     try std.testing.expect(std.mem.startsWith(u8, response, prefix));
     try std.testing.expect(std.mem.find(u8, response, "Content-Length: 0\r\n") != null);
     try std.testing.expect(std.mem.endsWith(u8, response, "\r\n\r\n"));
+}
+
+test "debug read waits count episodes and overlapping durations without per-sync reports" {
+    var debug: BackendReadDebug = .{};
+    try std.testing.expect(!debug.observe(false, false, 0));
+    try std.testing.expect(debug.observe(true, false, 0));
+    try std.testing.expect(!debug.observe(true, false, 100));
+    try std.testing.expectEqual(@as(u64, 100), debug.window.totalMs(100));
+    try std.testing.expect(debug.observe(true, true, 250));
+    try std.testing.expect(!debug.observe(true, true, 5_249));
+    try std.testing.expect(debug.observe(true, true, 5_250));
+    try std.testing.expectEqual(@as(u32, 1), debug.window.episodes);
+    try std.testing.expectEqual(@as(u32, 1), debug.carrier.episodes);
+    try std.testing.expectEqual(@as(u64, 5_250), debug.window.totalMs(5_250));
+    try std.testing.expectEqual(@as(u64, 5_000), debug.carrier.totalMs(5_250));
+    try std.testing.expect(debug.observe(false, true, 5_300));
+    debug.finish(5_600); // Closing a still-parked backend retains the active interval.
+    try std.testing.expectEqual(@as(u64, 5_300), debug.window.totalMs(10_000));
+    try std.testing.expectEqual(@as(u64, 5_350), debug.carrier.totalMs(10_000));
+    try std.testing.expect(!debug.changed(false, false));
+    try std.testing.expect(debug.observe(true, false, 6_000));
+    try std.testing.expectEqual(@as(u32, 2), debug.window.episodes);
+    debug.finish(6_200);
+    try std.testing.expectEqual(@as(u64, 5_500), debug.window.completed_ms);
+
+    var saturated = ReadPause{ .episodes = std.math.maxInt(u32), .completed_ms = std.math.maxInt(u64) - 1 };
+    saturated.observe(true, 10);
+    try std.testing.expectEqual(std.math.maxInt(u64) - 1, saturated.totalMs(9));
+    saturated.observe(false, 20);
+    try std.testing.expectEqual(std.math.maxInt(u32), saturated.episodes);
+    try std.testing.expectEqual(std.math.maxInt(u64), saturated.completed_ms);
+}
+
+test "backend read eligibility keeps WINDOW carrier and global pressure distinct" {
+    const allocator = std.testing.allocator;
+    var relay = testRelay(allocator, 4096);
+    var carrier = Conn{ .fd = -1, .kind = .websocket, .peer = net_helpers.ip4(.{ 127, 0, 0, 1 }, 0), .out = .{ .allocator = allocator } };
+    var session = Session{ .conn = &carrier, .user = "test", .client_addr = null };
+    var stream = Stream{ .id = 1, .session = &session };
+    var backend = Conn{ .fd = -1, .kind = .backend, .peer = carrier.peer, .stream = &stream, .out = .{ .allocator = allocator } };
+    try std.testing.expect(relay.backendReadState(&backend).readable);
+    stream.send_window = 0;
+    carrier.out.total_len = carrier_high_water;
+    try std.testing.expectEqual(BackendReadState{ .window_blocked = true, .carrier_blocked = true }, relay.backendReadState(&backend));
+    stream.send_window = 1;
+    carrier.out.total_len -= 1;
+    relay.throttled = true;
+    try std.testing.expectEqual(BackendReadState{}, relay.backendReadState(&backend));
+    relay.throttled = false;
+    try std.testing.expect(relay.backendReadState(&backend).readable);
+    backend.connecting = true;
+    try std.testing.expectEqual(BackendReadState{}, relay.backendReadState(&backend));
+    backend.connecting = false;
+    carrier.close_after_flush = true;
+    try std.testing.expectEqual(BackendReadState{}, relay.backendReadState(&backend));
+
+    if (!runtime_io.logEnabled(.debug, .web)) {
+        relay.debugBackendReadAt(&backend, .{ .window_blocked = true, .carrier_blocked = true }, 100);
+        try std.testing.expectEqual(@as(u32, 0), backend.read_debug.window.episodes);
+        try std.testing.expectEqual(@as(u32, 0), backend.read_debug.carrier.episodes);
+    }
 }
 
 test "backend resume stops when re-arm and CLOSE allocation failures destroy the session" {
@@ -3004,6 +3141,97 @@ test "carrier rejects more than the maximum inbound frame count" {
     for (0..count) |i| frame.writeHeader(payload[i * frame.header_size ..][0..frame.header_size], .pong, 0, 0);
     relay.handleCarrierMessage(&conn, &payload);
     try std.testing.expect(conn.close_after_flush);
+}
+
+test "relay groups full DATA frames and flushes the residual batch in the same event pass" {
+    const allocator = std.testing.allocator;
+    var relay = testRelay(allocator, 4 * 1024 * 1024);
+    defer relay.conns.deinit(allocator);
+    defer relay.batch_fds.deinit(allocator);
+    // Connecting queues output without socket syscalls. Pre-set the unchanged
+    // carrier interests so the test needs neither a real fd nor epoll registration.
+    var conn = Conn{
+        .fd = -1,
+        .kind = .websocket,
+        .peer = net_helpers.ip4(.{ 127, 0, 0, 1 }, 0),
+        .out = .{ .allocator = allocator },
+        .connecting = true,
+        .want_in = true,
+        .want_out = true,
+    };
+    defer conn.batch.deinit(allocator);
+    defer conn.out.deinit();
+    try relay.conns.put(allocator, conn.fd, &conn);
+    var session = Session{ .conn = &conn, .user = "test", .client_addr = null };
+    try relay.sendFrame(&session, .welcome, 0, "");
+    const welcome_bytes = conn.out.total_len;
+    var data: [data_frame_size]u8 = undefined;
+    for (0..3) |i| {
+        @memset(&data, @as(u8, @intCast(0x31 + i)));
+        try relay.sendFrame(&session, .data, @intCast(7 + i), &data);
+    }
+    const grant = frame.windowPayload(4096);
+    try relay.sendFrame(&session, .window, 7, &grant);
+    try relay.sendFrame(&session, .close, 7, "");
+    try std.testing.expectEqual(welcome_bytes, conn.out.total_len);
+    try std.testing.expectEqual(@as(usize, 5), conn.batch_frames);
+    const first_batch_bytes = conn.batch.items.len;
+    try std.testing.expect(first_batch_bytes <= page.native_batch_bytes);
+    @memset(&data, 0x34);
+    try relay.sendFrame(&session, .data, 10, &data);
+    @memset(&data, 0xaa); // Queued/batched bytes must own their input.
+    try std.testing.expectEqual(@as(usize, 1), conn.batch_frames);
+    try std.testing.expect(conn.out.total_len > welcome_bytes);
+    relay.flushBatches();
+    try std.testing.expectEqual(@as(usize, 0), conn.batch.items.len);
+    try std.testing.expectEqual(@as(usize, 0), relay.batch_fds.items.len);
+    try std.testing.expect(!conn.batch_pending);
+    try relay.sendFrame(&session, .bye, 0, "");
+
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(allocator);
+    while (!conn.out.isEmpty()) {
+        var iovecs: [16]posix.iovec_const = undefined;
+        const count = conn.out.prepareIovecs(&iovecs);
+        try std.testing.expect(count > 0);
+        var consumed: usize = 0;
+        for (iovecs[0..count]) |iov| {
+            try wire.appendSlice(allocator, iov.base[0..iov.len]);
+            consumed += iov.len;
+        }
+        try conn.out.consume(consumed);
+    }
+    const kinds = [_]frame.FrameType{ .welcome, .data, .data, .data, .window, .close, .data, .bye };
+    const ids = [_]u32{ 0, 7, 8, 9, 7, 7, 10, 0 };
+    var offset: usize = 0;
+    var frame_index: usize = 0;
+    var data_index: u8 = 0;
+    for ([_]usize{ frame.header_size, first_batch_bytes, frame.header_size + data_frame_size, frame.header_size }) |payload_len| {
+        const header_len: usize = if (payload_len <= 125) 2 else 10;
+        try std.testing.expect(offset + header_len + payload_len <= wire.items.len);
+        const message = wire.items[offset..][0 .. header_len + payload_len];
+        try std.testing.expectEqual(@as(u8, 0x82), message[0]);
+        try std.testing.expectEqual(@as(u8, if (header_len == 2) @intCast(payload_len) else 127), message[1]);
+        if (header_len == 10) try std.testing.expectEqual(@as(u64, payload_len), std.mem.readInt(u64, message[2..10], .big));
+        try std.testing.expect(payload_len <= page.native_batch_bytes);
+        var frames = frame.Iterator.init(message[header_len..]);
+        while (try frames.next()) |item| {
+            try std.testing.expect(frame_index < kinds.len);
+            try std.testing.expectEqual(kinds[frame_index], item.type);
+            try std.testing.expectEqual(ids[frame_index], item.stream_id);
+            if (item.type == .data) {
+                try std.testing.expectEqual(data_frame_size, item.payload.len);
+                try std.testing.expect(std.mem.allEqual(u8, item.payload, 0x31 + data_index));
+                data_index += 1;
+            } else if (item.type == .window) {
+                try std.testing.expectEqualSlices(u8, &grant, item.payload);
+            } else try std.testing.expectEqual(@as(usize, 0), item.payload.len);
+            frame_index += 1;
+        }
+        offset += message.len;
+    }
+    try std.testing.expectEqual(wire.items.len, offset);
+    try std.testing.expectEqual(kinds.len, frame_index);
 }
 
 test "production emitter batches exact DATA and WINDOW bytes and refuses condemned carriers" {

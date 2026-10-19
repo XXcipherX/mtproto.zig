@@ -70,6 +70,19 @@ Note:
 - A `phase=mask_relaying` close reports `mask_cause`, the client IP without its source port, and `raw_c2s`/`raw_s2c` (raw bytes queued toward and received from the mask backend). `reason` describes how that relay later ended; `mask_cause` records why it entered masking in the first place. `web_carrier` is the expected WEB-domain path; `sni_mismatch`, `secret_mismatch`, `timestamp_skew`, `replay`, `invalid_session_id`, and `malformed_client_hello` isolate ordinary FakeTLS rejection classes without repeating HMAC work. A `timestamp_skew` line also carries `skew_s=<server timestamp - authenticated client timestamp>`; positive means the client timestamp is behind the server and negative means it is ahead.
 - A healthy WEB carrier logs `web session opened ... (client address: real)` in the relay. `loopback` there means the browser address was not preserved through the Caddy/PROXY-v2 hop; inspect `[web].mask_backend`, Caddy listener wrappers, `X-Forwarded-For`, and `[web].trusted_http_sources`. That HTTP-terminator list is intentionally separate from data-plane `[web].relay_sources`.
 - WEB stream failures should be correlated across `mtproto-web-relay` and the main proxy. The relay opens one backend connection per logical stream, so those streams also appear in the proxy's ordinary connection and close statistics.
+- For WEB download pauses, enable `[server].log_level = "debug"` and restart the
+  relay. `backend read flow` reports `fd`, `carrier_fd`, `stream`, `rx`, client
+  `window`, queued `carrier_out`, `readable`, and global `throttled`. A zero client
+  WINDOW and carrier output at the 4 MiB high-water mark have separate
+  `window_paused` / `carrier_paused`, `*_episodes` and cumulative `*_ms` fields.
+  Repeated syncs do not count as new episodes. Reports occur on constraint changes
+  and every five seconds of an ongoing wait, including its elapsed time; backend
+  close retains the completed totals even if a wait was still active. These two
+  durations can overlap and include idle backends with no data ready: they locate
+  an observed flow-control constraint, not an established cause of every UI pause.
+  No new pause tracking runs at info/warn and these fields are not `/metrics`.
+  Capture both proxy processes across the same transfer; compare timed pause
+  transitions with client progress before changing flow-control windows.
 - At debug level, `middleproxy <stage> failed` preserves `err`, `proto`, incoming
   byte count, both buffered lengths, `frame_limit`, optional `scratch_required`, and
   `managed=used/limit`. `MiddleProxyBufferOverflow` or `BadMiddleProxyFrameLen` is a

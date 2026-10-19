@@ -238,8 +238,10 @@ Trust is fixed from the kernel-reported peer at `accept()`: only loopback plus e
   WEB budget rejection is not allocator OOM; MiddleProxy framing, output-scratch,
   and managed-allocation failures must retain their error name and numeric context.
   Keep payloads, capabilities, tokens and secrets out of these messages.
-- DATA/WINDOW frames batch within an event-loop pass; timer-generated frames flush
-  before waiting again. WebSocket input compacts once per read pass and processing
+- DATA/WINDOW frames batch up to the shared `page.native_batch_bytes` target
+  (256 KiB including headers), while DATA payloads remain at most 64 KiB. Flush
+  residual and timer-generated batches before waiting again; never add a batching
+  timer. WebSocket input compacts once per read pass and processing
   stops after CLOSE. Recently closed stream IDs use a fixed 4096-entry bounded circular
   history; duplicate IDs do not evict other tombstones.
 - Deferred fd/Conn teardown capacity is reserved before publishing a connection,
@@ -263,7 +265,8 @@ Trust is fixed from the kernel-reported peer at `accept()`: only loopback plus e
   WebView isolation limits access to off-origin response data but is not a promise that
   every browser engine emits no off-origin packet. Keep the fork's empty Caddy 404 when
   no operator public directory is configured, not an upstream generated cover page.
-- Native downlink delivery groups already-received complete frames up to 64 KiB,
+- Native downlink delivery groups already-received complete frames up to the same
+  256 KiB target, rendered into JavaScript from `page.native_batch_bytes`,
   without waiting or joining separate WebSocket messages. Validate every frame and
   the 4096-frame limit before the first native call; a malformed tail must deliver no
   prefix. Reuse the original buffer for a small batch or a standalone frame. A single
@@ -271,6 +274,13 @@ Trust is fixed from the kernel-reported peer at `accept()`: only loopback plus e
   this preserves the old frame limit and fits Desktop's 2 MiB base64-string cap.
   Preserve byte/frame order, lone initial WELCOME, and whole-buffer transfer on the
   loopback-iframe path. Incoming 2 MiB C2S batches do not define a native S2C limit.
+- WEB `backend read flow` diagnostics collect per-backend WINDOW/carrier pause
+  episodes and cumulative milliseconds only behind `runtime_io.logEnabled(.debug,
+  .web)`. Read clocks on transitions only; use the existing tick timestamp for
+  five-second ongoing reports. Include active intervals and finish them before
+  backend teardown without dereferencing a detached/freed stream. Durations may
+  overlap and measure read constraints, not backend-data readiness. Do not change
+  epoll interest for diagnostics or add these counters to normal-level `/metrics`.
 - Caddy must proxy the whole WEB hostname to the relay rather than selecting
   carrier-looking paths before authentication. Strip its outer `Via` header, map relay
   failures to the common empty 404, and accept only the exact root or base-prefixed

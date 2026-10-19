@@ -267,7 +267,7 @@ cases['native downlink forwards a validated batch without copying or waiting'] =
   t.eq(p.toClient.filter(m => m instanceof ArrayBuffer).at(-1), received, 'small native batch reuses the original buffer');
   t.eq(p.timers.length, 0, 'native delivery does not add a batching timer');
 
-  const prefix = frame(0x02, 7, Buffer.alloc(64 * 1024));
+  const prefix = frame(0x02, 7, Buffer.alloc(256 * 1024));
   const partial = frame(0x05, 0, Buffer.from('bad')).subarray(0, 9);
   p.sockets[0].deliver(Buffer.concat([prefix, partial]));
   t.eq(p.binaries().length, 2, 'malformed tail prevents delivery of even a large valid prefix');
@@ -280,22 +280,44 @@ cases['native downlink forwards a validated batch without copying or waiting'] =
   t.ok(bad.controls().some(c => c.state === 'failed'), 'invalid first downlink fails closed');
 };
 
-cases['native batches split at complete frame boundaries above 64 KiB'] = (t) => {
+cases['native batches split at complete frame boundaries above 256 KiB'] = (t) => {
   const p = boot({ native: true });
   p.sockets[0].open();
   p.sockets[0].deliver(WELCOME);
-  const data = frame(0x02, 7, Buffer.alloc(32760, 0x31));
+  const data = frame(0x02, 7, Buffer.alloc(131064, 0x31));
   const window = frame(0x04, 7, Buffer.from([0, 1, 0, 0]));
-  const other = frame(0x02, 8, Buffer.alloc(32748, 0x32));
+  const other = frame(0x02, 8, Buffer.alloc(131052, 0x32));
   const close = frame(0x03, 7);
   const head = Buffer.concat([data, window, other]);
   const batch = Buffer.concat([head, close]);
   p.sockets[0].deliver(batch);
   const bins = p.binaries().slice(1);
   t.eq(bins.length, 2, 'large batch needs only two native messages');
-  t.eq(bins[0].length, 64 * 1024, 'batch exactly at the target includes its frame headers');
+  t.eq(bins[0].length, 256 * 1024, 'batch exactly at the target includes its frame headers');
   t.ok(bins[0].equals(head) && bins[1].equals(close), 'split preserves DATA, WINDOW and CLOSE order');
   t.ok(Buffer.concat(bins).equals(batch), 'no byte is dropped or duplicated at the split');
+};
+
+cases['native delivery groups ordinary full DATA frames without waiting'] = (t) => {
+  const p = boot({ native: true });
+  p.sockets[0].open();
+  p.sockets[0].deliver(WELCOME);
+  const frames = Array.from({ length: 4 }, (_, i) => frame(0x02, 7 + i, Buffer.alloc(64 * 1024, 0x31 + i)));
+  // Headers count toward the target: three full DATA frames fit, four do not.
+  const first = Buffer.concat(frames.slice(0, 3));
+  const received = p.sockets[0].deliver(first);
+  t.eq(p.binaries().length, 2, 'three ordinary frames cross the native bridge together');
+  t.eq(p.toClient.filter(m => m instanceof ArrayBuffer).at(-1), received, 'group below the target reuses the input buffer');
+  const batch = Buffer.concat(frames);
+  p.sockets[0].deliver(batch);
+  const bins = p.binaries().slice(2);
+  t.eq(bins.length, 2, 'four full DATA frames split into two complete-frame groups');
+  t.ok(bins[0].equals(first) && bins[1].equals(frames[3]), 'grouping preserves every DATA byte and stream order');
+  for (const bin of bins) {
+    t.ok(bin.length <= 256 * 1024, 'ordinary groups include headers within the shared target');
+    t.ok(1 + bin.toString('base64').length <= 2 * 1024 * 1024, 'encoded group fits Desktop on Windows/macOS');
+  }
+  t.eq(p.timers.length, 0, 'delivery of either message never waits for another message or a timer');
 };
 
 cases['native batching preserves standalone full-size DATA frames'] = (t) => {
@@ -326,8 +348,8 @@ cases['native delivery failure stops the remaining batch'] = (t) => {
   const p = boot({ native: true, throwBinaryAt: 3 });
   p.sockets[0].open();
   p.sockets[0].deliver(WELCOME);
-  const prefix = frame(0x02, 7, Buffer.alloc(64 * 1024));
-  const next = frame(0x02, 8, Buffer.alloc(64 * 1024));
+  const prefix = Buffer.concat(Array.from({ length: 3 }, () => frame(0x02, 7, Buffer.alloc(64 * 1024))));
+  const next = Buffer.concat(Array.from({ length: 3 }, () => frame(0x02, 8, Buffer.alloc(64 * 1024))));
   p.sockets[0].deliver(Buffer.concat([prefix, next, frame(0x03, 7)]));
   t.eq(p.binaries().length, 2, 'native failure prevents delivery of the remaining groups');
   t.ok(p.binaries()[1].equals(prefix), 'successfully delivered group is unchanged');
