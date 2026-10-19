@@ -84,19 +84,16 @@ pub const MiddleProxyHandshakeStep = middle_proxy_transport.Step;
 pub const DynamicRecordSizer = struct {
     current_size: usize,
     records_sent: u32,
-    bytes_sent: u64,
     enabled: bool,
 
     const initial_size: usize = 1369;
     pub const full_size: usize = constants.max_tls_plaintext_size;
     const ramp_record_threshold: u32 = 8;
-    const ramp_byte_threshold: u64 = 128 * 1024;
 
     pub fn init(enabled: bool) DynamicRecordSizer {
         return .{
             .current_size = if (enabled) initial_size else full_size,
             .records_sent = 0,
-            .bytes_sent = 0,
             .enabled = enabled,
         };
     }
@@ -105,13 +102,10 @@ pub const DynamicRecordSizer = struct {
         return self.current_size;
     }
 
-    pub fn recordSent(self: *DynamicRecordSizer, payload_len: usize) void {
+    pub fn recordSent(self: *DynamicRecordSizer) void {
         if (!self.enabled or self.current_size == full_size) return;
         self.records_sent +|= 1;
-        self.bytes_sent +|= @as(u64, @intCast(payload_len));
-        if (self.current_size == initial_size and
-            (self.records_sent >= ramp_record_threshold or self.bytes_sent >= ramp_byte_threshold))
-        {
+        if (self.current_size == initial_size and self.records_sent >= ramp_record_threshold) {
             self.current_size = full_size;
         }
     }
@@ -251,7 +245,6 @@ pub const ConnectionSlot = struct {
     drs: DynamicRecordSizer = DynamicRecordSizer{
         .current_size = DynamicRecordSizer.full_size,
         .records_sent = 0,
-        .bytes_sent = 0,
         .enabled = false,
     },
     c2s_bytes: u64 = 0,
@@ -704,19 +697,20 @@ test "candidate traversal preserves order across 255 256 and 257 addresses" {
 test "DRS disabled skips ramp and uses full TLS record size" {
     var drs = DynamicRecordSizer.init(false);
     try std.testing.expectEqual(DynamicRecordSizer.full_size, drs.nextRecordSize());
-    for (0..32) |_| drs.recordSent(1369);
+    for (0..32) |_| drs.recordSent();
     try std.testing.expectEqual(DynamicRecordSizer.full_size, drs.nextRecordSize());
 }
 
 test "DRS enabled ramps" {
     var drs = DynamicRecordSizer.init(true);
-    for (0..8) |_| drs.recordSent(1369);
+    for (0..8) |_| {
+        try std.testing.expectEqual(@as(usize, 1369), drs.nextRecordSize());
+        drs.recordSent();
+    }
     try std.testing.expectEqual(DynamicRecordSizer.full_size, drs.nextRecordSize());
     const records_at_ramp = drs.records_sent;
-    const bytes_at_ramp = drs.bytes_sent;
-    drs.recordSent(std.math.maxInt(usize));
+    drs.recordSent();
     try std.testing.expectEqual(records_at_ramp, drs.records_sent);
-    try std.testing.expectEqual(bytes_at_ramp, drs.bytes_sent);
 }
 
 test "handshakeInProgress - phases" {

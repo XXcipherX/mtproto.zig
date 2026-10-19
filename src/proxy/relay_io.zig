@@ -174,7 +174,7 @@ pub fn queueTlsAppRecords(slot: *ConnectionSlot, payload: []u8) !void {
         parts[count] = header[0..];
         parts[count + 1] = payload[off .. off + chunk_len];
         count += 2;
-        slot.drs.recordSent(chunk_len);
+        slot.drs.recordSent();
         off += chunk_len;
         if (count == parts.len) {
             _ = try queueOrWriteParts(slot, slot.client_fd, &slot.client_queue, &parts);

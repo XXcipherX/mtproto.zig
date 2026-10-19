@@ -478,6 +478,10 @@ shared atomic RMW counters into each successful encapsulation.
 - The shared multipart helper chooses `writeSlotFd` for exactly one part and `writevSlotFd` for two or more. Both retain the original pre-write byte-cap check and atomic `appendParts` suffix reservation, including pending-output ordering, WouldBlock and shared event-budget accounting. Do not replace this with `queueUpstream` blindly: its older `appendCopy` fallback can partially mutate a queue on OOM.
 - FakeTLS S2C groups up to 32 TLS records into one bounded scatter write. Queued suffixes own their bytes in the existing page-block queue; multipart reservation preserves queue contents on OOM/overflow and charges the worker's managed allocator, including retained pool blocks.
 - The S2C encoder caps FakeTLS application payloads at 16367 bytes for both DRS policies, avoiding repeated bulk wire length `0x4000`. DRS still requests 16384 after its unchanged warmup. The 17-byte content-type/tag margin is a sizing heuristic, not a TLS restriction: real TLS 1.3 can legally produce ciphertext length `0x4000`. General inbound TLS limits and encrypted-certificate sizing remain separate.
+- DRS warmup emits eight records capped at 1369 bytes before requesting full
+  size. The former 128 KiB byte threshold could never win (eight warmup records
+  total at most 10952 bytes), so state tracks record count only. Disabled DRS,
+  the eighth-record transition and post-ramp saturation behavior are unchanged.
 - Self-domain masking setup (`setup_masking.sh`) configures Caddy 2.10+ on `127.0.0.1:8443` and, in tunnel netns mode, `10.200.200.1:8443`; non-proxy requests receive 404. Optional WEB setup extends that same Caddy instance with an internal PROXY-protocol listener on `8444` and a loopback relay on `8081`. Both local TLS listeners are limited to HTTP/1.1 and HTTP/2 so Caddy cannot advertise the non-public UDP `8443` or `8444` as an HTTP/3 alternative. Source installs use `mtproto-mask-caddy.service`; Docker Compose installs use the `mtproto-mask-caddy` service/container.
 
 ## What To Verify During Changes
