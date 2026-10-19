@@ -47,9 +47,8 @@ const linux = std.os.linux;
 const config = @import("../config.zig");
 const crypto = @import("../crypto/crypto.zig");
 const runtime_io = @import("../runtime/io.zig");
-// The current fork keeps the data plane monolithic.  Relay-only copies of these
-// small epoll/address/queue helpers keep the WEB process isolated without pulling
-// upstream's unrelated proxy refactor into the main event loop.
+// Keep WEB resolver, queue and socket error policies local; epoll creation and
+// TCP tuning primitives are shared through runtime helpers.
 const socket_utils = @import("socket_utils.zig");
 const net_helpers = @import("net_helpers.zig");
 const dns_cache = @import("dns_cache.zig");

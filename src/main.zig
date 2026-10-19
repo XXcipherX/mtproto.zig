@@ -537,9 +537,8 @@ fn printBanner(
 }
 
 pub fn main(init: std.process.Init) !void {
-    // Use page_allocator instead of GeneralPurposeAllocator for production.
-    // GPA has an internal mutex that causes deadlocks under heavy thread contention
-    // (1000+ simultaneous connections all doing TLS validation allocations).
+    // Process backing allocator; dynamic relay storage also enforces worker-local
+    // managed budgets. Changing this policy requires allocation profiles.
     const allocator = std.heap.page_allocator;
     const io = init.io;
     signals.ignoreSigpipe();

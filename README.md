@@ -7,7 +7,7 @@
 Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorship.
 
 <p align="center">
-  <strong>12,000 stable idle connections on 1GB RAM in the current benchmark snapshot. Zero third-party Zig dependencies.</strong>
+  <strong>Zero third-party Zig dependencies. Historical capacity snapshot: <a href="test/README.md#historical-capacity-snapshot">12,000 stable idle connections on 1GB RAM</a>.</strong>
 </p>
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)

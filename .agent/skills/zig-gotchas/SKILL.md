@@ -73,7 +73,7 @@ Do not reintroduce thread-per-connection or blocking relay loops.
 
 ## Allocator and Concurrency
 
-- Runtime uses `std.heap.page_allocator` to avoid allocator mutex contention seen with GPA under heavy connection churn.
+- Runtime uses `std.heap.page_allocator` as its process backing allocator, with worker-local managed budgets for dynamic relay storage. Reassess this policy using allocation profiles; historical thread-per-connection contention is not the current event-loop model.
 - AES-CTR processes aligned bulk in eight-block batches and then a `4/2/1` cascade before its partial-block tail. Keep cross-call keystream continuity and counter wraparound covered by the byte-at-a-time equivalence test; a plain `4` to `8` threshold change would regress 64–127-byte inputs to scalar AES.
 - Keep ownership boundaries explicit and wipe crypto material on teardown (`resetOwnedBuffers` paths).
 - Prepared FakeTLS HMAC states depend on Zig 0.17 `HmacSha256`/`Sha256` being arrays and integer state, with no borrowed storage; `Sha256.peek` also finalizes a by-value copy. Recheck that layout on Zig upgrades. Share only immutable prepared states and wipe each mutable clone. The startup cache uses a finalized user snapshot, stays in identical secret order, and is wiped on error/teardown before freeing. Check erasure while storage is still owned: `Allocator.free` itself writes `undefined`, so a post-free zero-byte assertion is invalid.

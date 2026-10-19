@@ -204,7 +204,7 @@ pub const Config = struct {
     /// use_middle_proxy is false. CDN DC 203 always requires MiddleProxy.
     force_media_middle_proxy: bool = true,
     port: u16 = 443,
-    /// Explicit public IP address. If set, bypasses detection via external services.
+    /// Client-facing IP/domain for links; independent of MiddleProxy egress discovery.
     public_ip: ?[]const u8 = null,
     /// Explicit IPv4 to use in Telegram MiddleProxy AES key derivation.
     /// Useful when `public_ip` is a domain name or when tunnel egress differs

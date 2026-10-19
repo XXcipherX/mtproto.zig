@@ -19,7 +19,7 @@ use_middle_proxy = true
 [server]
 port = 443
 
-# Override the auto-detected public IP/domain shown in startup links.
+# IP/domain shown in startup links; unset values print <SERVER_IP>.
 # For self-domain masking, set this to the same domain as censorship.tls_domain
 # and point its DNS A record to this VPS. Tunnel deploys preserve a configured
 # domain instead of replacing it with the tunnel exit IP.

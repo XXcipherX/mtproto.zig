@@ -66,7 +66,7 @@ Code anchors:
 - `src/proxy/middle_proxy_nat.zig`, `middle_proxy_routing.zig`, `middle_proxy_handshake.zig`, `timeout_policy.zig` (egress discovery, route/cooldown policy, handshake KDF/frame preparation, pure slot-deadline calculations)
 - MiddleProxy reachability batches stop when every pending fd fails. Poll waits derive from one monotonic batch deadline, including early wakeups and EINTR, with at most 100 ms between stop checks; never spend the remaining timeout polling an all-negative fd list.
 - `src/proxy/socket_ops.zig`, `src/runtime/tcp_options.zig`, `src/runtime/linux_events.zig` (proxy-specific socket errors, shared best-effort TCP tuning, and epoll/timerfd/eventfd primitives)
-- `src/main.zig` (CLI/startup orchestration, capacity policy/banner, lock-free logger, public-IP detection)
+- `src/main.zig` (CLI/startup orchestration, capacity policy/banner, lock-free logger, client-facing link metadata)
 - `src/runtime/io.zig` shares the startup-only runtime log level between the logger and `logEnabled(level, scope)` guards. Set it before starting workers; guard diagnostic-only address formatting, clocks and divisions before computing their arguments. Preserve functional preparation and enabled log contents.
 - `src/runtime/resources.zig`, `src/runtime/signals.zig` (host/cgroup memory detection and the process signal/eventfd bridge; neither owns the application `std.Io` backend)
 - `src/http_fetch.zig` (bounded HTTPS fetch helper for background public-IPv4 and MiddleProxy metadata discovery)
@@ -126,7 +126,7 @@ epoll interest updates, and timeout actions. The proxy and WEB relay share
 TCP_USER_TIMEOUT values in `runtime/tcp_options.zig`. The per-fd first-probe
 delay is staggered across 30–60 seconds so mass admission does not synchronize
 kernel probes. The 90-second user timeout covers the latest first probe plus
-10 × 3-second keepalive probe window; otherwise Linux can
+three-probe window at 10-second intervals; otherwise Linux can
 abort an idle connection after only one lost probe. Socket tuning remains
 best-effort: proxy keeps trying keepalive options after one failure, while WEB
 stops that keepalive sequence; both still attempt TCP_USER_TIMEOUT. Their
@@ -183,8 +183,8 @@ response stream; retained `MessageBlockPool` pages may keep current managed
 usage nonzero. Optional `endurance` holds a full persistent population over
 seeded, jittered light traffic and gradual full-relay reconnects, with periodic
 TCP/DC population and worker-heartbeat reconciliation. Its 20-minute default
-is manual only; the validation branch does not make the workflow's UI button or
-weekly schedule available without a default-branch workflow file.
+is manual only. The workflow is present on `main`, with weekly full runs and
+manual dispatch from the Actions UI or an explicit `--ref main` CLI request.
 Its live-population invariant uses per-client Linux TCP inode/state plus
 proxy-side `ESTABLISHED` and fake-DC active logical IDs; retained Python session
 objects alone never prove liveness. Failure-time evidence must be captured

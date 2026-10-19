@@ -302,15 +302,13 @@ safe two-worker variant with ThreadSanitizer instrumentation.
 ## Offline full-relay Stress CI
 
 `.github/workflows/stress-ci.yml` is a separate Ubuntu 26.04 job; it is **not**
-part of each push/PR test. While this workflow lives only on the validation
-branch, GitHub does not show its `Run workflow` button or run its weekly schedule:
-those triggers require a workflow file on the default branch. The registered
-workflow can instead be dispatched explicitly from the validation branch with
-GitHub CLI (do not omit `--ref`):
+part of each push/PR test. The workflow is on `main`, with a weekly schedule and
+manual dispatch from the Actions UI or GitHub CLI. The extended `endurance`
+scenario is manual only:
 
 ```bash
-gh workflow run stress-ci.yml --repo XXcipherX/mtproto.zig --ref stress-validation-36359107644 -f scenario=full
-gh workflow run stress-ci.yml --repo XXcipherX/mtproto.zig --ref stress-validation-36359107644 -f scenario=endurance -f endurance_minutes=20
+gh workflow run stress-ci.yml --repo XXcipherX/mtproto.zig --ref main -f scenario=full
+gh workflow run stress-ci.yml --repo XXcipherX/mtproto.zig --ref main -f scenario=endurance -f endurance_minutes=20
 ```
 
 These commands start remote GitHub jobs; they do not build or test on the local
@@ -567,7 +565,15 @@ sudo -E python3 test/capacity_connections_probe.py \
   --output /root/benchmarks/results/capacity_connections_mtproto_zig.tls_auth_full_smoke_v2.json
 ```
 
-## Final Snapshot (Current)
+<a id="final-snapshot-current"></a>
+
+## Historical Capacity Snapshot
+
+These results were recorded in commit
+[`c2c32f6`](https://github.com/XXcipherX/mtproto.zig/commit/c2c32f6627ec2779be2118ad7adee36b1de1616d)
+on 2026-04-05. They predate subsequent runtime changes and the Zig 0.17 migration;
+they are not measurements of the current revision. Idle/TLS-auth capacity does
+not establish full-relay throughput. New performance claims require new runs.
 
 Host: (1 vCPU / 1 GB RAM)
 
