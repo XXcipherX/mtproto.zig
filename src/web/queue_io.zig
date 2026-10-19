@@ -63,13 +63,9 @@ fn writevFd(fd: posix.fd_t, iovecs: []const posix.iovec_const, budget: ?*IoBudge
     }
 }
 
-fn noteTraffic(counter: *std.atomic.Value(u64), bytes: usize) void {
+fn noteTraffic(counter: *u64, bytes: usize) void {
     if (bytes == 0) return;
-    _ = counter.fetchAdd(@intCast(bytes), .monotonic);
-}
-
-fn noteTrafficOptional(counter: ?*std.atomic.Value(u64), bytes: usize) void {
-    if (counter) |ptr| noteTraffic(ptr, bytes);
+    counter.* +%= @intCast(bytes);
 }
 
 /// A zero result means WouldBlock (or empty input); the caller owns the suffix.
@@ -77,8 +73,7 @@ pub fn writeMsgPair(
     fd: posix.fd_t,
     first: []const u8,
     second: []const u8,
-    counter: *std.atomic.Value(u64),
-    user_counter: ?*std.atomic.Value(u64),
+    counter: *u64,
     budget: ?*IoBudget,
 ) !usize {
     var iovecs: [2]posix.iovec_const = undefined;
@@ -101,15 +96,13 @@ pub fn writeMsgPair(
     };
     if (n == 0) return error.ConnectionReset;
     noteTraffic(counter, n);
-    noteTrafficOptional(user_counter, n);
     return n;
 }
 
 pub fn flushQueue(
     fd: posix.fd_t,
     queue: *MessageQueue,
-    counter: *std.atomic.Value(u64),
-    user_counter: ?*std.atomic.Value(u64),
+    counter: *u64,
     budget: ?*IoBudget,
 ) !bool {
     if (queue.isEmpty()) return true;
@@ -143,11 +136,18 @@ pub fn flushQueue(
 
         if (n == 0) return error.ConnectionReset;
         noteTraffic(counter, n);
-        noteTrafficOptional(user_counter, n);
         try queue.consume(n);
 
         if (n < total_req) return false;
     }
 
     return true;
+}
+
+test "traffic counter preserves wrapping and zero-byte accounting" {
+    var counter: u64 = std.math.maxInt(u64) - 2;
+    noteTraffic(&counter, 0);
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64) - 2), counter);
+    noteTraffic(&counter, 4);
+    try std.testing.expectEqual(@as(u64, 1), counter);
 }

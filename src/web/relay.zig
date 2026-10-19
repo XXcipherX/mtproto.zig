@@ -469,7 +469,7 @@ pub const Relay = struct {
     session_count: u32 = 0,
     http_count: u32 = 0,
 
-    bytes_out: std.atomic.Value(u64) = .init(0),
+    bytes_out: u64 = 0,
     buffered_bytes: usize = 0,
     streams_refused: u64 = 0,
     accepts_refused: u64 = 0,
@@ -840,7 +840,7 @@ pub const Relay = struct {
             try conn.out.appendCopy(second);
             return false;
         }
-        const written = try queue_io.writeMsgPair(conn.fd, first, second, &self.bytes_out, null, self.io_budget);
+        const written = try queue_io.writeMsgPair(conn.fd, first, second, &self.bytes_out, self.io_budget);
         if (written == total) {
             releaseEmptyQueue(conn);
             return true;
@@ -1073,7 +1073,7 @@ pub const Relay = struct {
         }
         const fd = conn.fd;
         const before = conn.out.total_len;
-        const drained = queue_io.flushQueue(conn.fd, &conn.out, &self.bytes_out, null, self.io_budget) catch {
+        const drained = queue_io.flushQueue(conn.fd, &conn.out, &self.bytes_out, self.io_budget) catch {
             self.closeConn(conn, "write failed");
             return;
         };
@@ -1294,7 +1294,7 @@ pub const Relay = struct {
             "# TYPE mtproto_web_accept_refused_total counter\nmtproto_web_accept_refused_total {d}\n" ++
             "# TYPE mtproto_web_throttled gauge\nmtproto_web_throttled {d}\n" ++
             "# TYPE mtproto_web_buffered_bytes gauge\nmtproto_web_buffered_bytes {d}\n" ++
-            "# TYPE mtproto_web_bytes_out_total counter\nmtproto_web_bytes_out_total {d}\n", .{ self.session_count, streams, self.streams_refused, self.accepts_refused, @intFromBool(self.throttled), self.buffered_bytes, self.bytes_out.load(.monotonic) });
+            "# TYPE mtproto_web_bytes_out_total counter\nmtproto_web_bytes_out_total {d}\n", .{ self.session_count, streams, self.streams_refused, self.accepts_refused, @intFromBool(self.throttled), self.buffered_bytes, self.bytes_out });
     }
 
     /// Unknown 64-bit prefixes never scan the user snapshot. After a prefix hit,
@@ -2579,9 +2579,9 @@ test "WEB dispatch yields bulk input while interactive WINDOW and control traffi
         relay.syncConn(conn);
     }
     const payload: [16 * 1024]u8 = @splat(0xa5);
-    var setup_bytes: std.atomic.Value(u64) = .init(0);
-    try std.testing.expectEqual(@as(usize, payload.len), try queue_io.writeMsgPair(pairs[0][1], &payload, "", &setup_bytes, null, null));
-    try std.testing.expectEqual(@as(usize, 2), try queue_io.writeMsgPair(pairs[1][1], "hi", "", &setup_bytes, null, null));
+    var setup_bytes: u64 = 0;
+    try std.testing.expectEqual(@as(usize, payload.len), try queue_io.writeMsgPair(pairs[0][1], &payload, "", &setup_bytes, null));
+    try std.testing.expectEqual(@as(usize, 2), try queue_io.writeMsgPair(pairs[1][1], "hi", "", &setup_bytes, null));
     var bulk_budget = queue_io.IoBudget{ .bytes_remaining = 4096, .operations_remaining = 4 };
     relay.dispatchWithBudget(&bulk, linux.EPOLL.IN, &bulk_budget);
     try std.testing.expectEqual(@as(u64, 4096), bulk.rx_bytes);
@@ -2605,20 +2605,20 @@ test "WEB dispatch yields bulk input while interactive WINDOW and control traffi
     const grant = frame.windowPayload(4096);
     @memcpy(incoming[14..18], &grant);
     @memcpy(incoming[18..], &[_]u8{ 0x89, 0x81, 0, 0, 0, 0, 'p' });
-    try std.testing.expectEqual(@as(usize, incoming.len), try queue_io.writeMsgPair(pairs[2][1], &incoming, "", &setup_bytes, null, null));
+    try std.testing.expectEqual(@as(usize, incoming.len), try queue_io.writeMsgPair(pairs[2][1], &incoming, "", &setup_bytes, null));
     var control_budget = queue_io.IoBudget{ .operations_remaining = 1 };
     relay.dispatchWithBudget(&carrier, linux.EPOLL.IN, &control_budget);
     try std.testing.expectEqual(frame.initial_stream_window, bulk_stream.send_window);
     try std.testing.expectEqual(@as(usize, 0), control_budget.operations_remaining);
     try std.testing.expectEqual(@as(usize, 0), carrier.in.items.len);
     try std.testing.expectEqual(@as(usize, 3), carrier.out.total_len); // PONG owned until next OUT
-    try std.testing.expectEqual(@as(u64, 0), relay.bytes_out.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), relay.bytes_out);
     const batch = try allocator.dupe(u8, carrier.batch.items);
     defer allocator.free(batch);
     relay.flushBatches();
     var flush_budget = queue_io.IoBudget{ .bytes_remaining = 9, .operations_remaining = 1 };
     relay.dispatchWithBudget(&carrier, linux.EPOLL.OUT, &flush_budget);
-    try std.testing.expectEqual(@as(u64, 9), relay.bytes_out.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 9), relay.bytes_out);
     try std.testing.expect(carrier.out.total_len > 0);
     var received: [8192]u8 = undefined;
     const prefix = try posix.read(pairs[2][1], &received);
@@ -2665,8 +2665,8 @@ test "WEB budgeted backend HUP parks under zero window and resumes unread bytes"
     try relay.addFd(backend.fd, false, false);
     relay.syncConn(&backend);
     const payload: [16 * 1024]u8 = @splat(0xa5);
-    var setup_bytes: std.atomic.Value(u64) = .init(0);
-    try std.testing.expectEqual(@as(usize, payload.len), try queue_io.writeMsgPair(fds[1], &payload, "", &setup_bytes, null, null));
+    var setup_bytes: u64 = 0;
+    try std.testing.expectEqual(@as(usize, payload.len), try queue_io.writeMsgPair(fds[1], &payload, "", &setup_bytes, null));
     closeFd(fds[1]);
     fds[1] = -1;
     var event: [1]linux.epoll_event = undefined;
@@ -2851,7 +2851,7 @@ test "WEB full writes allocate no queue metadata and reject budget before writin
     }
     try std.testing.expect(!failing.has_induced_failure);
     try std.testing.expectEqual(@as(usize, 0), relay.buffered_bytes);
-    try std.testing.expectEqual(@as(u64, 16 * 11), relay.bytes_out.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 16 * 11), relay.bytes_out);
     relay.opts.max_buffer_bytes = 0;
     try std.testing.expectError(error.BufferBudgetExceeded, relay.writePair(&conn, "head", "payload"));
     try std.testing.expectError(error.WouldBlock, posix.read(fds[1], &received));
@@ -2875,7 +2875,7 @@ test "WEB partial pair writes retain only an owned ordered suffix" {
         @memset(input[0..prefix_len], 0x11);
         @memset(input[prefix_len..], 0x22);
         try std.testing.expect(!try relay.writePair(&conn, input[0..prefix_len], input[prefix_len..]));
-        const written: usize = @intCast(relay.bytes_out.load(.monotonic));
+        const written: usize = @intCast(relay.bytes_out);
         try std.testing.expect(written > 0 and written < input.len);
         try std.testing.expectEqual(input.len - written, conn.out.total_len);
         @memset(&input, 0xaa); // The unsent suffix must not borrow this storage.
@@ -3494,7 +3494,7 @@ test "backend retry freezes candidates and preserves queued bytes while retiring
     try std.testing.expect(relay.alive(conn.fd));
     try std.testing.expectEqual(@as(usize, 1), relay.pending_close.items.len);
     try std.testing.expectEqual(@as(usize, 12), conn.out.total_len);
-    try std.testing.expectEqual(@as(u64, 0), relay.bytes_out.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), relay.bytes_out);
     const second = conn.fd;
     relay.tick(conn.deadline_ms);
     try std.testing.expect(!relay.alive(second));
