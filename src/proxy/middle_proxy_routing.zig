@@ -419,20 +419,6 @@ pub fn buildDcConnectPlan(
         appendUniqueAddress(&plan.candidates, &plan.count, addr);
     }
 
-    if (plan.count == 0 and middle_addr != null) {
-        appendUniqueAddress(&plan.candidates, &plan.count, middle_addr.?);
-    }
-
-    if (plan.count == 0) {
-        // DC1..5 have real direct endpoints, so an empty optional MiddleProxy
-        // snapshot can safely fall back without changing application protocol.
-        plan.use_middle_proxy = false;
-        plan.candidates[0] = direct;
-        plan.count = 1;
-        plan.direct_fallback = null;
-        return plan;
-    }
-
     // Optional MiddleProxy routing for DC1..5 may retry their real direct endpoint.
     plan.direct_fallback = direct;
     return plan;
