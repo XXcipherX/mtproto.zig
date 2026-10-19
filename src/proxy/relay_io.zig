@@ -205,10 +205,6 @@ fn queueOrWriteMsg(slot: *ConnectionSlot, fd: posix.fd_t, queue: *MessageQueue, 
     return false;
 }
 
-fn queueOrWriteMsgPair(slot: *ConnectionSlot, fd: posix.fd_t, queue: *MessageQueue, first: []const u8, second: []const u8) !bool {
-    return queueOrWriteParts(slot, fd, queue, &.{ first, second });
-}
-
 fn queueOrWriteParts(slot: *ConnectionSlot, fd: posix.fd_t, queue: *MessageQueue, parts: []const []const u8) !bool {
     if (parts.len > max_scatter_parts) return error.TooManyParts;
     var total: usize = 0;
@@ -285,10 +281,6 @@ fn flushQueue(slot: *ConnectionSlot, fd: posix.fd_t, queue: *MessageQueue) !usiz
 
 pub fn queueClient(slot: *ConnectionSlot, data: []const u8) !bool {
     return queueOrWriteMsg(slot, slot.client_fd, &slot.client_queue, data);
-}
-
-pub fn queueClientPair(slot: *ConnectionSlot, first: []const u8, second: []const u8) !bool {
-    return queueOrWriteMsgPair(slot, slot.client_fd, &slot.client_queue, first, second);
 }
 
 pub fn queueUpstream(slot: *ConnectionSlot, data: []const u8) !bool {

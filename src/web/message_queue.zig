@@ -124,11 +124,6 @@ pub const MessageQueue = struct {
         }
     }
 
-    pub fn appendOwned(self: *MessageQueue, owned: []u8) !void {
-        defer self.allocator.free(owned);
-        try self.appendCopy(owned);
-    }
-
     pub fn prepareIovecs(self: *const MessageQueue, out: []posix.iovec_const) usize {
         if (self.head_idx >= self.blocks.items.len) return 0;
 

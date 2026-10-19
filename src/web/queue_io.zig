@@ -45,19 +45,6 @@ pub fn readFd(fd: posix.fd_t, buffer: []u8, budget: ?*IoBudget) !usize {
     }
 }
 
-fn writeFd(fd: posix.fd_t, data: []const u8) !usize {
-    while (true) {
-        const rc = posix.system.write(fd, data.ptr, data.len);
-        switch (posix.errno(rc)) {
-            .SUCCESS => return @intCast(rc),
-            .INTR => continue,
-            .AGAIN => return error.WouldBlock,
-            .CONNRESET, .PIPE => return error.ConnectionReset,
-            else => |err| return posix.unexpectedErrno(err),
-        }
-    }
-}
-
 fn writevFd(fd: posix.fd_t, iovecs: []const posix.iovec_const, budget: ?*IoBudget) !usize {
     while (true) {
         if (budget) |b| if (!b.begin()) return error.WouldBlock;
@@ -83,36 +70,6 @@ fn noteTraffic(counter: *std.atomic.Value(u64), bytes: usize) void {
 
 fn noteTrafficOptional(counter: ?*std.atomic.Value(u64), bytes: usize) void {
     if (counter) |ptr| noteTraffic(ptr, bytes);
-}
-
-pub fn queueOrWriteMsg(
-    fd: posix.fd_t,
-    queue: *MessageQueue,
-    data: []const u8,
-    counter: *std.atomic.Value(u64),
-    user_counter: ?*std.atomic.Value(u64),
-) !bool {
-    if (data.len == 0) return true;
-
-    if (queue.isEmpty()) {
-        const n = writeFd(fd, data) catch |err| {
-            if (err == error.WouldBlock) {
-                try queue.appendCopy(data);
-                return false;
-            }
-            return err;
-        };
-
-        if (n == 0) return error.ConnectionReset;
-        noteTraffic(counter, n);
-        noteTrafficOptional(user_counter, n);
-        if (n == data.len) return true;
-        try queue.appendCopy(data[n..]);
-        return false;
-    }
-
-    try queue.appendCopy(data);
-    return false;
 }
 
 /// A zero result means WouldBlock (or empty input); the caller owns the suffix.
@@ -146,83 +103,6 @@ pub fn writeMsgPair(
     noteTraffic(counter, n);
     noteTrafficOptional(user_counter, n);
     return n;
-}
-
-pub fn queueOrWriteMsgPair(
-    fd: posix.fd_t,
-    queue: *MessageQueue,
-    first: []const u8,
-    second: []const u8,
-    counter: *std.atomic.Value(u64),
-    user_counter: ?*std.atomic.Value(u64),
-) !bool {
-    if (first.len == 0 and second.len == 0) return true;
-
-    if (queue.isEmpty()) {
-        const total_len = first.len + second.len;
-        const n = try writeMsgPair(fd, first, second, counter, user_counter, null);
-        if (n == total_len) return true;
-
-        if (n < first.len) {
-            try queue.appendCopy(first[n..]);
-            try queue.appendCopy(second);
-            return false;
-        }
-
-        const consumed_second = n - first.len;
-        if (consumed_second < second.len) {
-            try queue.appendCopy(second[consumed_second..]);
-        }
-        return false;
-    }
-
-    try queue.appendCopy(first);
-    try queue.appendCopy(second);
-    return false;
-}
-
-pub fn queueOrWriteOwnedMsg(
-    fd: posix.fd_t,
-    queue: *MessageQueue,
-    owned: []u8,
-    counter: *std.atomic.Value(u64),
-    user_counter: ?*std.atomic.Value(u64),
-) !bool {
-    if (owned.len == 0) {
-        queue.allocator.free(owned);
-        return true;
-    }
-
-    if (queue.isEmpty()) {
-        const n = writeFd(fd, owned) catch |err| {
-            if (err == error.WouldBlock) {
-                try queue.appendOwned(owned);
-                return false;
-            }
-            queue.allocator.free(owned);
-            return err;
-        };
-
-        noteTraffic(counter, n);
-        noteTrafficOptional(user_counter, n);
-        if (n == owned.len) {
-            queue.allocator.free(owned);
-            return true;
-        }
-
-        const remaining = owned[n..];
-        // Free `owned` on the appendCopy error path too — `try` here would leak it (every
-        // other exit frees it). Matches the OOM-safety of the sibling write helpers.
-        queue.appendCopy(remaining) catch |err| {
-            queue.allocator.free(owned);
-            return err;
-        };
-        queue.allocator.free(owned);
-        return false;
-    }
-
-    try queue.appendOwned(owned);
-    return false;
 }
 
 pub fn flushQueue(
