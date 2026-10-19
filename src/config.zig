@@ -415,7 +415,7 @@ pub const Config = struct {
         }
     }
 
-    /// Emit startup warnings for configuration values known to cause issues.
+    /// Emit recommendations after validate() succeeds; invalid configurations are fatal.
     pub fn emitWarnings(self: *const Config) void {
         if (self.web.enabled) {
             const log = std.log.scoped(.config);
@@ -428,32 +428,6 @@ pub const Config = struct {
                     .{ budget.total_slots, budget.sessions, self.web.max_streams, budget.http_slots, pause_at, self.max_connections },
                 );
             }
-            if (self.web.domain == null) {
-                log.err("[web].enabled=true requires [web].domain", .{});
-            } else if (std.ascii.eqlIgnoreCase(self.web.domain.?, self.tls_domain)) {
-                log.err("[web].domain must differ from censorship.tls_domain", .{});
-            }
-            if (!self.mask) {
-                log.err("[web].enabled=true requires censorship.mask=true on a shared :443 listener", .{});
-            }
-            if (self.web.mask_backend == null) {
-                log.warn("[web].mask_backend is unset; WEB traffic reaching the proxy's :443 listener cannot be routed to its Caddy terminator", .{});
-            }
-            if (self.web.port == self.port or self.web.port == self.mask_port) {
-                log.err("[web].port={d} collides with proxy or masking listener", .{self.web.port});
-            }
-            for (self.web.relay_sources) |source| {
-                _ = std.Io.net.IpAddress.parse(source, 0) catch {
-                    log.warn("[web].relay_sources entry '{s}' is not an IP literal and will be ignored", .{source});
-                    continue;
-                };
-            }
-            for (self.web.trusted_http_sources) |source| {
-                _ = std.Io.net.IpAddress.parse(source, 0) catch {
-                    log.warn("[web].trusted_http_sources entry '{s}' is not an IP literal and will be ignored", .{source});
-                    continue;
-                };
-            }
             if (self.web.onlyActive()) {
                 log.warn(
                     "[web].only=true: direct MTProto is masked for every peer except the trusted WEB relay",
@@ -464,11 +438,6 @@ pub const Config = struct {
             const log = std.log.scoped(.config);
             log.warn("[web].only is ignored because [web].enabled=false", .{});
         }
-        if (self.users.count() == 0) {
-            const log = std.log.scoped(.config);
-            log.warn("access.users is empty; no clients can authenticate until at least one user secret is configured", .{});
-        }
-
         if (self.requiresMiddleProxyRuntime() and self.middleproxy_buffer_kb < 1024) {
             const log = std.log.scoped(.config);
             log.warn(
