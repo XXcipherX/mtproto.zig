@@ -102,7 +102,9 @@ queue ceiling, 256 KiB ME framing headroom, and resulting stream cap; the queue
 and MiddleProxy protocol no longer import the config schema for those values.
 `ConnectionSlot.releaseHandshakeOnly()` drops temporary handshake
 storage at relay start, while `resetOwnedBuffers()` wipes all remaining owned
-secrets and buffers at close. Candidate addresses are inline for up to four
+secrets and buffers at close. Their shared embedded handshake-state wipe keeps
+the existing per-caller release order; early release must preserve pipelined
+relay bytes and established cipher state. Candidate addresses are inline for up to four
 entries or owned heap fallback; `ProxyState` copies the selected route into a
 local snapshot under the MiddleProxy metadata lock, then the slot copies its
 candidate list from that snapshot. The protocol wire/crypto

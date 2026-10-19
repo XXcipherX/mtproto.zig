@@ -401,18 +401,7 @@ pub const ConnectionSlot = struct {
         self.client_decryptor = null;
         self.tg_encryptor = null;
         self.tg_decryptor = null;
-        std.crypto.secureZero(u8, &self.validation_secret);
-        std.crypto.secureZero(u8, &self.validation_digest);
-        std.crypto.secureZero(u8, &self.validation_session_id);
-        std.crypto.secureZero(u8, &self.validation_user);
-        std.crypto.secureZero(u8, &self.handshake_buf);
-        self.validation_session_id_len = 0;
-        self.validation_user_len = 0;
-        self.validation_force_direct = false;
-        self.handshake_pos = 0;
-        self.mp_secret_version = 0;
-        self.mp_auth_started_at_ms = 0;
-        self.mp_nat_ip4 = null;
+        self.wipeHandshakeState();
     }
 
     pub fn releaseClientHello(self: *ConnectionSlot, allocator: std.mem.Allocator) void {
@@ -442,6 +431,11 @@ pub const ConnectionSlot = struct {
         if (self.obf_params) |*params| params.wipe();
         self.obf_params = null;
 
+        self.wipeHandshakeState();
+    }
+
+    /// Shared embedded-state wipe; callers preserve their resource-release order.
+    fn wipeHandshakeState(self: *ConnectionSlot) void {
         std.crypto.secureZero(u8, &self.validation_secret);
         std.crypto.secureZero(u8, &self.validation_digest);
         std.crypto.secureZero(u8, &self.validation_session_id);
@@ -521,6 +515,41 @@ test "recovery identity retains the full user name after handshake labels are re
     slot.releaseHandshakeOnly(std.testing.allocator);
     try std.testing.expectEqual(@as(u8, 0), slot.validation_user_len);
     try std.testing.expectEqual(alice, slot.wedge_client_key);
+}
+
+test "handshake release wipes embedded secrets but preserves owned relay state" {
+    const allocator = std.testing.allocator;
+    var slot = ConnectionSlot{};
+    defer slot.resetOwnedBuffers(allocator);
+
+    for ([_][]u8{ &slot.validation_secret, &slot.validation_digest, &slot.validation_session_id, &slot.validation_user, &slot.handshake_buf }) |bytes| {
+        @memset(bytes, 0xa5);
+    }
+    slot.validation_session_id_len = 32;
+    slot.validation_user_len = 32;
+    slot.validation_force_direct = true;
+    slot.handshake_pos = 64;
+    slot.server_hello = try allocator.dupe(u8, "hello");
+    slot.pipelined_data = try allocator.dupe(u8, "pending relay bytes");
+    slot.pipelined_len = slot.pipelined_data.?.len;
+    const key: [32]u8 = @splat(7);
+    slot.client_encryptor = crypto.AesCtr.init(&key, 7);
+
+    slot.releaseHandshakeOnly(allocator);
+    for ([_][]const u8{ &slot.validation_secret, &slot.validation_digest, &slot.validation_session_id, &slot.validation_user, &slot.handshake_buf }) |bytes| {
+        try std.testing.expect(std.mem.allEqual(u8, bytes, 0));
+    }
+    try std.testing.expectEqual(@as(u8, 0), slot.validation_session_id_len);
+    try std.testing.expectEqual(@as(u8, 0), slot.validation_user_len);
+    try std.testing.expect(!slot.validation_force_direct);
+    try std.testing.expectEqual(@as(u8, 0), slot.handshake_pos);
+    try std.testing.expect(slot.server_hello == null);
+    try std.testing.expectEqualStrings("pending relay bytes", slot.pipelined_data.?[0..slot.pipelined_len]);
+    try std.testing.expectEqual(@as(u128, 7), slot.client_encryptor.?.ctr);
+
+    slot.resetOwnedBuffers(allocator);
+    try std.testing.expect(slot.pipelined_data == null);
+    try std.testing.expect(slot.client_encryptor == null);
 }
 
 test "relay first EOF survives the opposite FIN and duplicate notifications" {
