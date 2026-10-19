@@ -3924,11 +3924,6 @@ const EventLoop = struct {
             self.advanceServerHelloWrite(slot);
         }
 
-        if (slot.phase == .closing) {
-            self.closeSlot(slot, "closing phase");
-            return;
-        }
-
         if (slot.phase == .connecting_upstream and slot.upstream_connect_deadline_ms > 0 and
             now_ms >= slot.upstream_connect_deadline_ms)
         {

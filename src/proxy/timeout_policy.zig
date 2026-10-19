@@ -112,7 +112,6 @@ pub const SlotDeadline = struct {
 /// deadlines win ties so idle extension cannot defer a mandatory stage/wedge.
 pub fn nextSlotDeadline(slot: *const ConnectionSlot, inputs: SlotDeadlineInputs) ?SlotDeadline {
     if (slot.phase == .idle) return null;
-    if (slot.phase == .closing) return .{ .deadline_ns = 1, .kind = .absolute };
 
     var deadline: ?i128 = null;
     if (slot.phase == .desync_wait) {
@@ -317,9 +316,6 @@ test "only a selected sliding relay idle deadline permits lazy extension" {
     slot.web_carrier = false;
     inputs.mask_relay_max_secs = 0;
     try std.testing.expect(nextSlotDeadline(&slot, inputs).?.kind == .relay_idle);
-    slot.phase = .closing;
-    try std.testing.expect(nextSlotDeadline(&slot, inputs).?.kind == .absolute);
-    try std.testing.expectEqual(@as(?i128, 1), nextSlotDeadlineNs(&slot, inputs));
     slot.phase = .idle;
     try std.testing.expect(nextSlotDeadline(&slot, inputs) == null);
 }

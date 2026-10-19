@@ -77,7 +77,6 @@ pub const ConnectionPhase = enum {
     middle_proxy_handshake,
     relaying,
     mask_relaying,
-    closing,
 };
 
 pub const MiddleProxyHandshakeStep = middle_proxy_transport.Step;
@@ -719,7 +718,5 @@ test "handshakeInProgress - phases" {
     slot.phase = .relaying;
     try std.testing.expect(!slot.handshakeInProgress());
     slot.phase = .mask_relaying;
-    try std.testing.expect(!slot.handshakeInProgress());
-    slot.phase = .closing;
     try std.testing.expect(!slot.handshakeInProgress());
 }
