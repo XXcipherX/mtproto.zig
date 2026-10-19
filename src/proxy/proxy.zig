@@ -104,7 +104,6 @@ const MiddleProxyHandshakeStep = connection.MiddleProxyHandshakeStep;
 const DynamicRecordSizer = connection.DynamicRecordSizer;
 const EventIoBudget = connection.EventIoBudget;
 const ConnectionSlot = connection.ConnectionSlot;
-pub const BenchCandidatePath = connection.BenchCandidatePath;
 const secureFree = connection.secureFree;
 const connection_pool = @import("connection_pool.zig");
 const epoll_listener_token = connection_pool.epoll_listener_token;

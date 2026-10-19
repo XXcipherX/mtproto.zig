@@ -168,6 +168,8 @@ pub fn build(b: *std.Build) void {
 
     const bench_tests = b.addTest(.{
         .root_module = bench_test_mod,
+        // Shared protocol tests already run in the unfiltered main test root.
+        .filters = &.{"benchmark:"},
     });
 
     const run_bench_tests = b.addRunArtifact(bench_tests);

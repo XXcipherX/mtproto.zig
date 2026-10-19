@@ -439,6 +439,10 @@ storage, while 8 deliberately crosses into heap fallback. CI records all four
 signals (FakeTLS plus 1/4/8 candidates) as artifacts without hard timing gates,
 because shared-runner variance must not create false failures. Authentication,
 allocation, vector or process failures still fail the job.
+The benchmark imports its candidate adapter directly from `connection.zig`.
+Every test owned by `bench.zig` must use the `benchmark:` prefix: its separate
+test root filters on that prefix, while the unfiltered main root retains shared
+protocol coverage. Keep all benchmark fixtures and fuzz-root isolation.
 Soak operation/byte totals are worker-local and merged once through a deferred
 atomic publication, including partial progress on failure. Read totals only after
 joining every worker; stop and error signaling remain atomic. Do not reintroduce

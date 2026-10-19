@@ -6,7 +6,7 @@ const middleproxy = @import("protocol/middleproxy.zig");
 const obfuscation = @import("protocol/obfuscation.zig");
 const constants = @import("protocol/constants.zig");
 const tls = @import("protocol/tls.zig");
-const proxy = @import("proxy/proxy.zig");
+const connection = @import("proxy/connection.zig");
 
 const Mode = enum {
     bench,
@@ -179,7 +179,7 @@ fn runHandshakePathBench(allocator: std.mem.Allocator, opts: Options) !void {
     fillBenchmarkCandidates(&candidates);
     const windows = candidates.len - opts.candidate_count + 1;
 
-    var candidate_state = proxy.BenchCandidatePath{};
+    var candidate_state = connection.BenchCandidatePath{};
     defer candidate_state.deinit(allocator);
 
     const warmup_iters = @min(opts.iterations, @as(usize, 2000));
@@ -619,7 +619,9 @@ fn nextPayloadLen(state: *u64, max_payload: usize) usize {
     return (1 + @as(usize, @intCast(nextRand(state) % aligned_slots))) * payload_alignment;
 }
 
-test "soak payload lengths stay aligned and in range" {
+// Keep this prefix on every benchmark-owned test: build.zig filters this root
+// while the unfiltered main root retains all shared protocol tests.
+test "benchmark: soak payload lengths stay aligned and in range" {
     var state: u64 = 0x0123_4567_89ab_cdef;
     const max_payload: usize = 131071;
     const aligned_max = max_payload - (max_payload % payload_alignment);
@@ -632,7 +634,7 @@ test "soak payload lengths stay aligned and in range" {
     }
 }
 
-test "FakeTLS benchmark handshake remains structurally valid" {
+test "benchmark: FakeTLS benchmark handshake remains structurally valid" {
     const secret: [16]u8 = @splat(0x42);
     const users = [_]tls.UserSecret{.{ .name = "bench", .secret = secret }};
     const handshake = buildTlsBenchmarkHandshake(&secret, 0x11223344);
@@ -648,7 +650,7 @@ test "FakeTLS benchmark handshake remains structurally valid" {
     try std.testing.expectEqual(@as(u32, 0x11223344), validation.timestamp);
 }
 
-test "obfuscated benchmark handshake roundtrips" {
+test "benchmark: obfuscated benchmark handshake roundtrips" {
     const secret: [16]u8 = @splat(0x33);
     const users = [_]obfuscation.UserSecret{.{ .name = "bench", .secret = secret }};
     const handshake = buildObfuscationHandshake(&secret, .intermediate, -4, 23);
