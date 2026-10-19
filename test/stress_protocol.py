@@ -72,6 +72,11 @@ def parse_request(body: bytes) -> tuple[int, int]:
 
 def response_body(request: bytes) -> bytes:
     connection_id, sequence = parse_request(request)
+    return _response_from_validated_request(request, connection_id, sequence)
+
+
+def _response_from_validated_request(request: bytes, connection_id: int, sequence: int) -> bytes:
+    """Encode the same immutable body whose identity and checksum were checked."""
     filler = request[_HEADER.size : -_DIGEST_LEN][::-1]
     content = _HEADER.pack(RESP_MAGIC, connection_id, sequence) + filler
     return content + hashlib.blake2s(content, digest_size=_DIGEST_LEN).digest()
@@ -241,7 +246,7 @@ class FakeDatacenter:
                 next_sequence += 1
                 self.validated += 1
                 self.requests_by_id[connection_id] = next_sequence
-                response = response_body(body)
+                response = _response_from_validated_request(body, connection_id, sequence)
                 packet = send.apply(struct.pack("<I", len(response)) + response)
                 burst = self.response_bursts.get(bound_id)
                 if burst is not None:

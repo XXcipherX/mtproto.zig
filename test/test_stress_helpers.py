@@ -191,6 +191,8 @@ class StressHelperTests(unittest.TestCase):
         corrupted[-1] ^= 1
         with self.assertRaises(IntegrityError):
             parse_request(bytes(corrupted))
+        with self.assertRaises(IntegrityError):
+            response_body(bytes(corrupted))
 
     def test_openssl_ctr_matches_aes256_vector_and_streaming(self) -> None:
         key = bytes.fromhex(
