@@ -1,4 +1,4 @@
-//! Address helpers shared by the WEB relay's PROXY-protocol path.
+//! Pure address trust helpers shared by the WEB relay and ordinary data plane.
 //!
 //! The data plane masks non-TLS bytes received from public peers, so the Internet never
 //! gets a fingerprintable `dd` responder. The WEB relay is a dumb byte pipe carrying
@@ -64,7 +64,7 @@ pub fn sameHost(a: Address, b: Address) bool {
 
 /// Collapse an IPv4-mapped IPv6 address to plain IPv4, matching the data plane's
 /// per-subnet limiter normalization.
-fn normalize(addr: Address) Address {
+pub fn normalize(addr: Address) Address {
     switch (addr) {
         .ip4 => return addr,
         .ip6 => |v6| {
@@ -77,7 +77,8 @@ fn normalize(addr: Address) Address {
 }
 
 /// Parse `[web].relay_sources` (plain IP literals, never CIDRs) into addresses.
-/// Unparseable entries are skipped by the caller's warning path.
+/// Invalid literals are skipped with an optional callback. Config validation
+/// rejects them before production startup; retain this helper's standalone API.
 pub fn parseSources(
     allocator: std.mem.Allocator,
     sources: []const []const u8,
@@ -160,6 +161,7 @@ test "IPv6 relay trust includes the interface scope but ignores the port" {
     const bytes = (try Address.parse("fe80::1", 0)).ip6.bytes;
     const expected = net_helpers.ip6(bytes, 443, 0, 2);
     try std.testing.expect(sameHost(expected, net_helpers.ip6(bytes, 1234, 0, 2)));
+    try std.testing.expect(sameHost(expected, net_helpers.ip6(bytes, 1234, 99, 2)));
     try std.testing.expect(!sameHost(expected, net_helpers.ip6(bytes, 443, 0, 3)));
 }
 
@@ -167,4 +169,15 @@ test "v4 and v6 never match each other" {
     var v6: [16]u8 = @splat(0);
     v6[15] = 2;
     try std.testing.expect(!sameHost(net_helpers.ip4(.{ 0, 0, 0, 2 }, 0), net_helpers.ip6(v6, 0, 0, 0)));
+}
+
+test "mapped IPv4 trust ignores IPv6 flow and scope after normalization" {
+    const v4 = net_helpers.ip4(.{ 192, 0, 2, 7 }, 443);
+    const mapped_bytes: [16]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 0, 2, 7 };
+    const mapped = net_helpers.ip6(mapped_bytes, 1234, 99, 7);
+    try std.testing.expect(sameHost(v4, mapped));
+    try std.testing.expect(sameHost(mapped, v4));
+    const peers = TrustedPeers{ .enabled = true, .extra = &.{v4} };
+    try std.testing.expect(peers.contains(mapped));
+    try std.testing.expect(!(TrustedPeers{}).contains(mapped));
 }

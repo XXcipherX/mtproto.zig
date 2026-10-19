@@ -21,19 +21,12 @@ pub fn createMaskDns(allocator: std.mem.Allocator, io: std.Io, spec: []const u8)
     return cache;
 }
 
-pub const TrustedPeers = struct {
-    enabled: bool = false,
-    extra: []const net.Address = &.{},
-
-    pub fn contains(self: *const TrustedPeers, addr: net.Address) bool {
-        if (!self.enabled) return false;
-        if (isLoopback(addr)) return true;
-        for (self.extra) |candidate| {
-            if (sameHost(candidate, addr)) return true;
-        }
-        return false;
-    }
-};
+// Share only pure address rules; source parsing and PROXY policy stay local.
+const address_trust = @import("../web/trusted_peers.zig");
+pub const TrustedPeers = address_trust.TrustedPeers;
+pub const isLoopback = address_trust.isLoopback;
+pub const sameHost = address_trust.sameHost;
+const normalized = address_trust.normalize;
 
 pub fn parseSources(allocator: std.mem.Allocator, sources: []const []const u8) ![]net.Address {
     if (sources.len == 0) return &.{};
@@ -49,37 +42,6 @@ pub fn parseSources(allocator: std.mem.Allocator, sources: []const []const u8) !
         return &.{};
     }
     return try out.toOwnedSlice(allocator);
-}
-
-fn normalized(addr: net.Address) net.Address {
-    return switch (addr) {
-        .ip4 => addr,
-        .ip6 => |v6| net.Address.fromIp6(v6),
-    };
-}
-
-pub fn isLoopback(raw: net.Address) bool {
-    const addr = normalized(raw);
-    return switch (addr) {
-        .ip4 => |v4| v4.bytes[0] == 127,
-        .ip6 => |v6| std.mem.allEqual(u8, v6.bytes[0..15], 0) and v6.bytes[15] == 1,
-    };
-}
-
-pub fn sameHost(a_raw: net.Address, b_raw: net.Address) bool {
-    const a = normalized(a_raw);
-    const b = normalized(b_raw);
-    return switch (a) {
-        .ip4 => |v4| switch (b) {
-            .ip4 => |other| std.mem.eql(u8, &v4.bytes, &other.bytes),
-            .ip6 => false,
-        },
-        .ip6 => |v6| switch (b) {
-            .ip4 => false,
-            .ip6 => |other| std.mem.eql(u8, &v6.bytes, &other.bytes) and
-                v6.interface.index == other.interface.index,
-        },
-    };
 }
 
 pub const ParseResult = union(enum) {
