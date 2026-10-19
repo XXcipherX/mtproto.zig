@@ -11,8 +11,58 @@ permissions:
   contents: read
 
 jobs:
+  changes:
+    name: Classify changes
+    runs-on: ubuntu-26.04
+    outputs:
+      run_ci: ${{ steps.classify.outputs.run_ci }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Keep full CI unless every changed path is documentation
+        id: classify
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import subprocess
+
+          documentation = {
+              b"README.md", b"test/README.md", b"LICENSE",
+              b".agent/skills/architecture/SKILL.md",
+              b".agent/skills/client-behavior/SKILL.md",
+              b".agent/skills/zig-gotchas/SKILL.md",
+              b".agent/workflows/deployment.md",
+              b".agent/workflows/diagnostics.md",
+              b".agent/workflows/migration.md",
+          }
+          run_ci = True
+          base = os.environ.get("BASE_SHA", "")
+          if (os.environ["GITHUB_EVENT_NAME"] in {"push", "pull_request"}
+                  and re.fullmatch(r"[0-9a-fA-F]{40}", base) and int(base, 16)):
+              try:
+                  subprocess.run(
+                      ["git", "fetch", "--no-tags", "--depth=1", "origin", base],
+                      check=True,
+                  )
+                  paths = subprocess.check_output([
+                      "git", "diff", "--name-only", "--no-renames", "-z",
+                      base, os.environ["GITHUB_SHA"], "--",
+                  ]).split(b"\0")
+                  paths = [path for path in paths if path]
+                  run_ci = not paths or any(path not in documentation for path in paths)
+              except (OSError, subprocess.CalledProcessError):
+                  print("Change comparison unavailable; running full CI")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"run_ci={str(run_ci).lower()}\n")
+          PY
+
   test:
     name: Test & Build
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.run_ci != 'false' }}
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
@@ -133,6 +183,8 @@ jobs:
 
   fuzz:
     name: Security Fuzz
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.run_ci != 'false' }}
     runs-on: ubuntu-26.04
     timeout-minutes: 15
     steps:
@@ -166,7 +218,8 @@ jobs:
   bench:
     name: Bench & Soak
     runs-on: ubuntu-26.04
-    needs: test
+    needs: [changes, test]
+    if: ${{ !cancelled() && needs.test.result == 'success' && needs.changes.outputs.run_ci != 'false' }}
     defaults:
       run:
         shell: bash
@@ -219,6 +272,8 @@ jobs:
 
   arm64:
     name: Native ARM64 Runtime
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.run_ci != 'false' }}
     runs-on: ubuntu-26.04-arm
     timeout-minutes: 20
     steps:

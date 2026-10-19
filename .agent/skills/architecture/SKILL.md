@@ -464,6 +464,10 @@ shared atomic RMW counters into each successful encapsulation.
 
 ## What To Verify During Changes
 
+- CI classifies push/PR changes against the event's base SHA. Only its explicit
+  documentation allowlist may skip heavy jobs; unknown/mixed paths, comparison
+  failures and manual dispatch retain full checks. Preserve existing check names
+  and review the allowlist if any documentation becomes a build/runtime input.
 - `epoll` interests and queue flushing remain non-blocking and symmetric.
 - FakeTLS validation keeps the 32-byte Session ID contract with `src/protocol/tls.zig` templates.
 - Pipelined appdata after the 64-byte MTProto nonce is preserved across direct and MiddleProxy startup.

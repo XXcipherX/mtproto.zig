@@ -191,6 +191,11 @@ file even when `zig build` returns success. `make fuzz` stores its evidence unde
 `fuzz-artifacts/`; failed CI campaigns preserve the run log and crash input as a
 90-day artifact.
 
+Push/PR CI skips its heavy jobs only when every changed path is in an explicit
+documentation allowlist. Existing check names are retained; mixed or unknown
+paths and unavailable comparisons run the full checks. Manual CI runs are always
+full. Review that allowlist when adding documentation as a build or runtime input.
+
 The separate **Deep CI** workflow runs weekly and on demand. Its ThreadSanitizer
 job instruments the unit-test, real multi-worker E2E proxy, and benchmark/soak artifacts; normal production
 builds are unchanged. A separate Valgrind Memcheck job drives the real daemon
