@@ -19,7 +19,11 @@ CI matrix or `MTPROTO_INSTALLER_E2E_IMAGE`.
 The test uses a local short-lived certificate issuer and a sleeping `nfqws`
 stand-in so it does not depend on public DNS, Let's Encrypt, or a source build
 of zapret. Caddy, the proxy image, Docker Compose, systemd, and iptables remain
-real. The proxy image is built from the current checkout, loaded into an isolated
+real. CI builds the proxy image once per workflow run and passes the same image
+artifact to all four distribution jobs. Its revision label must match each job's
+checkout; a missing image or mismatch fails without a published-image fallback.
+The standalone script still builds locally unless explicitly given
+`MTPROTO_INSTALLER_E2E_PREBUILT_IMAGE`. The current checkout image is loaded into an isolated
 registry, pulled by the real installer, and compared by image ID for both proxy
 services. It never substitutes a previously published `latest` image for the code
 under test. Run one image locally with:

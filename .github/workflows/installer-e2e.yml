@@ -33,8 +33,37 @@ permissions:
   contents: read
 
 jobs:
+  proxy-image:
+    name: Build current installer image
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build and save the current checkout image
+        env:
+          CURRENT_IMAGE: mtproto-installer-e2e:${{ github.sha }}
+        run: |
+          docker build --build-arg ZIG_VERSION=0.17.0 \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            -t "$CURRENT_IMAGE" .
+          docker save -o "$RUNNER_TEMP/installer-e2e-image.tar" "$CURRENT_IMAGE"
+
+      - name: Upload current image
+        uses: actions/upload-artifact@v7
+        with:
+          name: installer-e2e-image-${{ github.sha }}
+          path: ${{ runner.temp }}/installer-e2e-image.tar
+          if-no-files-found: error
+          overwrite: true
+          compression-level: 0
+          retention-days: 14
+
   docker-compose-installer:
     name: ${{ matrix.name }}
+    needs: proxy-image
+    # A producer failure must fail the existing matrix checks, not skip them.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-26.04
     timeout-minutes: 35
     strategy:
@@ -55,11 +84,26 @@ jobs:
             artifact: ubuntu-26-04
 
     steps:
+      - name: Require a successful current image build
+        env:
+          IMAGE_BUILD_RESULT: ${{ needs.proxy-image.result }}
+        run: test "$IMAGE_BUILD_RESULT" = success
+
       - uses: actions/checkout@v7
+
+      - name: Download current image
+        uses: actions/download-artifact@v8
+        with:
+          name: installer-e2e-image-${{ github.sha }}
+          path: ${{ runner.temp }}/installer-e2e-image
+
+      - name: Load current image
+        run: docker load -i "$RUNNER_TEMP/installer-e2e-image/installer-e2e-image.tar"
 
       - name: Run isolated installer E2E
         env:
           MTPROTO_INSTALLER_E2E_IMAGE: ${{ matrix.image }}
+          MTPROTO_INSTALLER_E2E_PREBUILT_IMAGE: mtproto-installer-e2e:${{ github.sha }}
         run: test/installer-e2e/run.sh
 
       - name: Upload installer logs

@@ -486,6 +486,10 @@ shared atomic RMW counters into each successful encapsulation.
   documentation allowlist may skip heavy jobs; unknown/mixed paths, comparison
   failures and manual dispatch retain full checks. Preserve existing check names
   and review the allowlist if any documentation becomes a build/runtime input.
+- Installer E2E builds one current-checkout app image and distributes its artifact
+  to all four OS fixtures; each validates the image revision before use. Preserve
+  image-ID assertions, every OS/install/reinstall probe and failure propagation
+  from the producer to the existing matrix checks. Standalone runs still build.
 - `epoll` interests and queue flushing remain non-blocking and symmetric.
 - FakeTLS validation keeps the 32-byte Session ID contract with `src/protocol/tls.zig` templates.
 - Pipelined appdata after the 64-byte MTProto nonce is preserved across direct and MiddleProxy startup.

@@ -324,8 +324,19 @@ echo "::group::Build isolated ${BASE_IMAGE} host"
 docker build --build-arg "BASE_IMAGE=$BASE_IMAGE" -t "$TEST_IMAGE" "$ROOT/test/installer-e2e"
 echo "::endgroup::"
 
-echo "::group::Build proxy image from current checkout"
-docker build --build-arg ZIG_VERSION=0.17.0 -t "$CURRENT_IMAGE" "$ROOT"
+echo "::group::Prepare proxy image from current checkout"
+if [[ -n "${MTPROTO_INSTALLER_E2E_PREBUILT_IMAGE:-}" ]]; then
+    checkout_revision="$(git -C "$ROOT" rev-parse HEAD)"
+    image_revision="$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
+        "$MTPROTO_INSTALLER_E2E_PREBUILT_IMAGE")"
+    if [[ "$image_revision" != "$checkout_revision" ]]; then
+        echo 'prebuilt installer image does not match the current checkout' >&2
+        exit 1
+    fi
+    docker tag "$MTPROTO_INSTALLER_E2E_PREBUILT_IMAGE" "$CURRENT_IMAGE"
+else
+    docker build --build-arg ZIG_VERSION=0.17.0 -t "$CURRENT_IMAGE" "$ROOT"
+fi
 echo "::endgroup::"
 
 echo "::group::Boot isolated systemd + Docker host"
