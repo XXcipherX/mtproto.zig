@@ -18,7 +18,7 @@ ARG ZIG_SHA256=
 ARG MTPROTO_CPU=
 ARG DATAPLANE_SAFETY=false
 
-FROM debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f AS builder
+FROM debian:trixie-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad AS builder
 ARG ZIG_VERSION
 ARG ZIG_SHA256
 ARG MTPROTO_CPU
@@ -75,7 +75,7 @@ RUN set -eu \
          zig build -Doptimize=fast -Ddataplane_safety="$DATAPLANE_SAFETY" -Dtarget="$target"; \
        fi
 
-FROM debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f
+FROM debian:trixie-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl ca-certificates \
