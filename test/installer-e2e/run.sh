@@ -335,7 +335,7 @@ if [[ -n "${MTPROTO_INSTALLER_E2E_PREBUILT_IMAGE:-}" ]]; then
     fi
     docker tag "$MTPROTO_INSTALLER_E2E_PREBUILT_IMAGE" "$CURRENT_IMAGE"
 else
-    docker build --build-arg ZIG_VERSION=0.17.0 -t "$CURRENT_IMAGE" "$ROOT"
+    docker build --build-arg ZIG_VERSION=0.17.1 -t "$CURRENT_IMAGE" "$ROOT"
 fi
 echo "::endgroup::"
 

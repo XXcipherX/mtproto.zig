@@ -8,7 +8,7 @@ This workflow documents current build and deploy paths as implemented in `Makefi
 
 ## Prerequisites
 
-- Zig 0.17.0 for local builds
+- Zig 0.17.1 for local builds
 - SSH access to VPS
 - systemd on target host
 - GNU coreutils `env` for Linux WEB DNS children; use the existing `/usr/bin/gnuenv` on Ubuntu 26.04 or `/usr/bin/env` on Debian/Ubuntu 24.04. The Rust implementation does not unblock the relay's inherited signal mask.
@@ -70,7 +70,7 @@ zig build -Doptimize=fast -Dtarget=x86_64-linux
 zig build -Doptimize=fast -Dtarget=x86_64-linux -Dcpu=x86_64_v3+aes
 bash test/check_hardware_aes.sh
 zig build -Doptimize=fast -Dtarget=aarch64-linux
-docker build --build-arg ZIG_VERSION=0.17.0 -t mtproto-zig-smoke .
+docker build --build-arg ZIG_VERSION=0.17.1 -t mtproto-zig-smoke .
 zig build -Doptimize=fast bench
 zig build -Doptimize=fast soak -- --seconds=10
 ```

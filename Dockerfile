@@ -2,7 +2,7 @@
 #
 # Build (see README "Docker image" for --platform and build-args):
 #   docker build -t mtproto-zig .
-#   docker build --platform linux/amd64 --build-arg ZIG_VERSION=0.17.0 -t mtproto-zig .
+#   docker build --platform linux/amd64 --build-arg ZIG_VERSION=0.17.1 -t mtproto-zig .
 #   docker build --platform linux/amd64 --build-arg MTPROTO_CPU=x86_64_v3+aes -t mtproto-zig:amd64-v3 .
 # Production defaults to fast + PIE; opt into safe + PIE with:
 #   docker build --build-arg DATAPLANE_SAFETY=true -t mtproto-zig:release-safe .
@@ -13,7 +13,7 @@
 # To use 8443, set server.port = 8443 in config.toml and run with -p 8443:8443 or manipulate the port mapping like
 # -p 48443:8443
 
-ARG ZIG_VERSION=0.17.0
+ARG ZIG_VERSION=0.17.1
 ARG ZIG_SHA256=
 ARG MTPROTO_CPU=
 ARG DATAPLANE_SAFETY=false

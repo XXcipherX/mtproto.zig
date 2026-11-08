@@ -10,7 +10,7 @@ on:
       zig_version:
         description: Zig version used by the Docker build
         required: true
-        default: 0.17.0
+        default: 0.17.1
       production_mode:
         description: Production mode
         required: true

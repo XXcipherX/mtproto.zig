@@ -11,7 +11,7 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 </p>
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Zig](https://img.shields.io/badge/zig-0.17.0-f7a41d.svg?logo=zig&logoColor=white)](https://ziglang.org)
+[![Zig](https://img.shields.io/badge/zig-0.17.1-f7a41d.svg?logo=zig&logoColor=white)](https://ziglang.org)
 [![Platform](https://img.shields.io/badge/platform-linux-blueviolet.svg?logo=linux&logoColor=white)](#-quick-start)
 [![Dependencies](https://img.shields.io/badge/dependencies-0-success)](build.zig)
 
@@ -110,7 +110,7 @@ dependency boundaries are documented in
 ### Prerequisites
 
 - **Linux 5.10+** (x86_64 or aarch64) — the proxy uses `epoll` and does not support macOS, FreeBSD, or OpenBSD at runtime
-- [Zig](https://ziglang.org/download/) **0.17.0** (the version pinned by CI, Docker, and installers; macOS is fine for cross-compilation)
+- [Zig](https://ziglang.org/download/) **0.17.1** (the version pinned by CI, Docker, and installers; macOS is fine for cross-compilation)
 
 ### Build & Run locally
 
@@ -382,7 +382,7 @@ the optional `amd64-v3` CPU profile. Set `--build-arg DATAPLANE_SAFETY=true` for
 
 | Argument       | Default   | Description |
 |----------------|-----------|-------------|
-| `ZIG_VERSION`  | `0.17.0`  | Version string passed to `ziglang.org/download/…/zig-<arch>-linux-<version>.tar.xz`. Must match a published Zig release. |
+| `ZIG_VERSION`  | `0.17.1`  | Version string passed to `ziglang.org/download/…/zig-<arch>-linux-<version>.tar.xz`. Must match a published Zig release. |
 | `ZIG_SHA256`   | _(empty)_ | Optional pinned SHA256 for the downloaded Zig tarball. If set, Docker build verifies integrity before extraction. |
 | `MTPROTO_CPU`  | `x86_64` on `amd64`, Zig default on `arm64` | Optional Zig CPU baseline. Use `x86_64_v3+aes` on modern `amd64` hosts to enable hardware AES and avoid software-only AES builds. |
 | `DATAPLANE_SAFETY` | `false` | Production mode: `false` builds genuine `fast`; `true` selects `safe`. PIE is enabled in both modes. |
@@ -390,7 +390,7 @@ the optional `amd64-v3` CPU profile. Set `--build-arg DATAPLANE_SAFETY=true` for
 Example:
 
 ```bash
-docker build --build-arg ZIG_VERSION=0.17.0 -t mtproto-zig .
+docker build --build-arg ZIG_VERSION=0.17.1 -t mtproto-zig .
 docker build --platform linux/amd64 --build-arg MTPROTO_CPU=x86_64_v3+aes -t mtproto-zig:amd64-v3 .
 docker build --build-arg DATAPLANE_SAFETY=true -t mtproto-zig:release-safe .
 ```
@@ -807,7 +807,7 @@ curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/in
 ```
 
 This will:
-1. Install **Zig 0.17.0** (if not present)
+1. Install **Zig 0.17.1** (if not present)
 2. Clone and build the proxy as `fast` + PIE for the native CPU by default
 3. Generate a random 16-byte secret on first install
 4. Create a `systemd` service (`mtproto-proxy`)
@@ -908,12 +908,12 @@ curl -sSf https://raw.githubusercontent.com/XXcipherX/mtproto.zig/main/deploy/in
 
 ```bash
 # x86_64
-curl -sSfL https://ziglang.org/download/0.17.0/zig-x86_64-linux-0.17.0.tar.xz | \
+curl -sSfL https://ziglang.org/download/0.17.1/zig-x86_64-linux-0.17.1.tar.xz | \
   sudo tar xJ -C /usr/local
-sudo ln -sf /usr/local/zig-x86_64-linux-0.17.0/zig /usr/local/bin/zig
+sudo ln -sf /usr/local/zig-x86_64-linux-0.17.1/zig /usr/local/bin/zig
 
 # Verify
-zig version   # → 0.17.0
+zig version   # → 0.17.1
 ```
 
 **2. Build the proxy**

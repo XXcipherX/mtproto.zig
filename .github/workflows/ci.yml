@@ -70,7 +70,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.17.0
+          version: 0.17.1
 
       - name: Check Zig formatting
         run: zig fmt --check build.zig src test/hardware_aes_probe.zig
@@ -150,7 +150,7 @@ jobs:
           readelf -h zig-out/bin/mtproto-proxy | grep -Eq 'Type:[[:space:]]+DYN'
 
       - name: Docker build smoke
-        run: docker build --build-arg ZIG_VERSION=0.17.0 -t mtproto-zig-smoke .
+        run: docker build --build-arg ZIG_VERSION=0.17.1 -t mtproto-zig-smoke .
 
       - name: Docker safe-default smoke
         shell: bash
@@ -193,7 +193,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.17.0
+          version: 0.17.1
 
       - name: Run bounded coverage-guided fuzzing
         shell: bash
@@ -229,7 +229,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.17.0
+          version: 0.17.1
 
       - name: Run microbenchmark
         run: zig build -Doptimize=fast bench 2>&1 | tee bench-output.txt
@@ -282,7 +282,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.17.0
+          version: 0.17.1
 
       - name: Run native ARM64 tests
         run: zig build test

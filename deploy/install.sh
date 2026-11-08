@@ -18,7 +18,7 @@
 #   - On subsequent runs: rebuilds from latest source, replaces binary, preserves config.toml.
 #
 # What it does:
-#   1. Installs Zig 0.17.0 (if not present)
+#   1. Installs Zig 0.17.1 (if not present)
 #   2. Clones and builds the proxy from latest source
 #   3. Generates a random user secret (only on first install)
 #   4. Creates a systemd service
@@ -31,7 +31,7 @@
 
 set -euo pipefail
 
-ZIG_VERSION="0.17.0"
+ZIG_VERSION="0.17.1"
 INSTALL_DIR="/opt/mtproto-proxy"
 REPO_URL="https://github.com/XXcipherX/mtproto.zig.git"
 SERVICE_NAME="mtproto-proxy"

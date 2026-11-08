@@ -44,7 +44,7 @@ jobs:
         env:
           CURRENT_IMAGE: mtproto-installer-e2e:${{ github.sha }}
         run: |
-          docker build --build-arg ZIG_VERSION=0.17.0 \
+          docker build --build-arg ZIG_VERSION=0.17.1 \
             --label "org.opencontainers.image.revision=$GITHUB_SHA" \
             -t "$CURRENT_IMAGE" .
           docker save -o "$RUNNER_TEMP/installer-e2e-image.tar" "$CURRENT_IMAGE"

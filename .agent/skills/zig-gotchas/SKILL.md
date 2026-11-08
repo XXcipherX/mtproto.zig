@@ -7,7 +7,7 @@ description: Critical Zig-specific execution gotchas, profiling, stability fixes
 
 This file tracks practical pitfalls and current runtime constraints for `mtproto.zig`.
 
-Use stable Zig 0.17.0. Build modes are `std.lang.Optimize` values
+Use stable Zig 0.17.1. Build modes are `std.lang.Optimize` values
 `debug`/`safe`/`fast`/`small`; target fields come from `builtin.target`.
 Repeat array elements with `@splat`, specifying the array type when there is
 no result context. Use `@backingInt`/`@fromBackingInt` for enums,
